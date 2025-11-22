@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir:*)",
+      "Bash(mv:*)",
+      "Bash(unzip:*)",
+      "Bash(python -c:*)",
+      "Bash(powershell -Command \"Get-Content conversations.json -Raw | ConvertFrom-Json | Select-Object -First 1\")",
+      "Bash(python:*)",
+      "Bash(venv/Scripts/pip install:*)",
+      "Bash(venv/Scripts/python -m uvicorn:*)",
+      "Bash(timeout:*)",
+      "Bash(curl:*)",
+      "Bash(powershell -Command \"Start-Sleep -Seconds 3; Invoke-RestMethod -Uri http://localhost:8000/health\")",
+      "Bash(powershell -Command \"Start-Sleep -Seconds 5; Invoke-RestMethod -Uri http://localhost:8000/health\")",
+      "Bash(powershell -Command \"(Get-Item ''C:\\Users\\ekkek\\source\\repos\\Mycelica\\backend\\app\\main.py'').LastWriteTime = Get-Date\")",
+      "Bash(powershell -Command \"Start-Sleep -Seconds 8; Invoke-RestMethod -Uri http://localhost:8000/health\")",
+      "Bash(npm create vite:*)",
+      "Bash(npm install)",
+      "Bash(npm install:*)",
+      "Bash(npm run dev:*)",
+      "Bash(Invoke-RestMethod -Method POST -Uri http://localhost:8000/analyze)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
