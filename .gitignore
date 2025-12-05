@@ -93,3 +93,27 @@ logs/
 # Test coverage
 coverage/
 .nyc_output/
+
+# =============================================================================
+# ADDITIONS - Security & Strategy
+# =============================================================================
+
+# API keys (explicit)
+*.key
+*.pem
+*_key.txt
+api_key*
+
+# Manifesto - contains personal context, strategic thinking
+# Keep private until ready to publish revised public version
+docs/manifesto/
+
+# Private notes
+*.personal.md
+*.private.md
+scratch/
+notes/
+
+# User uploads (if you add upload feature)
+uploads/
+backup/
