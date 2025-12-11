@@ -73,6 +73,10 @@ export interface Node {
   // --- Quick access (Sidebar) ---
   isPinned: boolean;        // User-pinned favorite
   lastAccessedAt?: number;  // For recency tracking in sidebar
+
+  // --- Conversation context (for message Leafs) ---
+  conversationId?: string;  // ID of parent conversation this message belongs to
+  sequenceIndex?: number;   // Position in original conversation (0, 1, 2...)
 }
 
 export interface Edge {

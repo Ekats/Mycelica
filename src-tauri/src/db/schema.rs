@@ -1535,6 +1535,7 @@ impl Database {
 
     /// Create semantic "Related" edges between nodes based on embedding similarity
     /// Gives +0.2 bonus to siblings (same parent) so within-view edges are prioritized
+    /// Uses lower threshold (min_similarity - 0.2) for category-to-category edges
     /// Returns the number of edges created
     pub fn create_semantic_edges(&self, min_similarity: f32, max_edges_per_node: usize) -> Result<usize> {
         use crate::similarity::cosine_similarity;
@@ -1545,39 +1546,65 @@ impl Database {
             return Ok(0);
         }
 
-        // Build parent_id lookup for sibling bonus
-        let parent_map: std::collections::HashMap<String, Option<String>> = {
+        // Build parent_id and is_item lookup
+        let (parent_map, is_item_map): (
+            std::collections::HashMap<String, Option<String>>,
+            std::collections::HashMap<String, bool>
+        ) = {
             let conn = self.conn.lock().unwrap();
-            let mut stmt = conn.prepare("SELECT id, parent_id FROM nodes WHERE embedding IS NOT NULL")?;
+            let mut stmt = conn.prepare("SELECT id, parent_id, is_item FROM nodes WHERE embedding IS NOT NULL")?;
             let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, bool>(2)?
+                ))
             })?;
-            rows.filter_map(|r| r.ok()).collect()
+            let mut parents = std::collections::HashMap::new();
+            let mut items = std::collections::HashMap::new();
+            for row in rows.filter_map(|r| r.ok()) {
+                parents.insert(row.0.clone(), row.1);
+                items.insert(row.0, row.2);
+            }
+            (parents, items)
         };
 
         let now = chrono::Utc::now().timestamp_millis();
         let mut edges_created = 0;
         const SIBLING_BONUS: f32 = 0.2;
+        const CATEGORY_THRESHOLD_REDUCTION: f32 = 0.2;
 
         // For each node, find most similar nodes and create edges
         for (i, (node_id, embedding)) in nodes_with_embeddings.iter().enumerate() {
             let node_parent = parent_map.get(node_id).and_then(|p| p.clone());
+            let node_is_item = *is_item_map.get(node_id).unwrap_or(&true);
 
             // Compute similarities with all other nodes, applying sibling bonus
-            let mut similarities: Vec<(&String, f32, f32)> = nodes_with_embeddings
+            let mut similarities: Vec<(&String, f32, f32, bool)> = nodes_with_embeddings
                 .iter()
                 .skip(i + 1)  // Only compare with nodes after this one (avoid duplicates)
                 .map(|(other_id, other_emb)| {
                     let raw_sim = cosine_similarity(embedding, other_emb);
                     let other_parent = parent_map.get(other_id).and_then(|p| p.clone());
+                    let other_is_item = *is_item_map.get(other_id).unwrap_or(&true);
 
                     // Boost score if same parent (siblings will be visible together)
                     let is_sibling = node_parent.is_some() && node_parent == other_parent;
                     let boosted_sim = if is_sibling { raw_sim + SIBLING_BONUS } else { raw_sim };
 
-                    (other_id, raw_sim, boosted_sim)
+                    // Use lower threshold for category-to-category edges
+                    let is_category_edge = !node_is_item && !other_is_item;
+
+                    (other_id, raw_sim, boosted_sim, is_category_edge)
                 })
-                .filter(|(_, raw_sim, _)| *raw_sim >= min_similarity)  // Filter on raw similarity
+                .filter(|(_, raw_sim, _, is_category_edge)| {
+                    let effective_threshold = if *is_category_edge {
+                        min_similarity - CATEGORY_THRESHOLD_REDUCTION
+                    } else {
+                        min_similarity
+                    };
+                    *raw_sim >= effective_threshold
+                })
                 .collect();
 
             // Sort by boosted similarity descending and take top N
@@ -1585,7 +1612,7 @@ impl Database {
             similarities.truncate(max_edges_per_node);
 
             // Create edges (store raw similarity as weight, not boosted)
-            for (other_id, raw_similarity, _) in similarities {
+            for (other_id, raw_similarity, _, _) in similarities {
                 let edge_id = format!("semantic-{}-{}", node_id, other_id);
 
                 // Check if edge already exists

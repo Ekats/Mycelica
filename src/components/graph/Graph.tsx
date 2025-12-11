@@ -34,7 +34,21 @@ interface AiProgressEvent {
   newTitle: string;
   status: 'processing' | 'success' | 'error' | 'complete';
   errorMessage?: string;
+  elapsedSecs?: number;
+  estimateSecs?: number;
+  remainingSecs?: number;
 }
+
+// Format seconds to human readable string
+const formatTime = (secs: number): string => {
+  if (secs < 60) return `${Math.round(secs)}s`;
+  const mins = Math.floor(secs / 60);
+  const remainSecs = Math.round(secs % 60);
+  if (mins < 60) return `${mins}m ${remainSecs}s`;
+  const hours = Math.floor(mins / 60);
+  const remainMins = mins % 60;
+  return `${hours}h ${remainMins}m`;
+};
 
 interface GraphProps {
   width: number;
@@ -100,11 +114,14 @@ export function Graph({ width, height }: GraphProps) {
     breadcrumbs,
     setCurrentDepth,
     setMaxDepth,
+    openLeaf,
   } = useGraphStore();
   const [hoveredNode, setHoveredNode] = useState<GraphNode | null>(null);
   const [zoomLevel, setZoomLevel] = useState(1);
   const [devLogs, setDevLogs] = useState<DevConsoleLog[]>([]);
   const [showDevConsole, setShowDevConsole] = useState(true);
+  const [showPanels, setShowPanels] = useState(true); // Hamburger menu toggle for all panels
+  const [showDetails, setShowDetails] = useState(true); // Toggle for details panel
   const [isClustering, setIsClustering] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isBuildingHierarchy, setIsBuildingHierarchy] = useState(false);
@@ -132,6 +149,14 @@ export function Graph({ width, height }: GraphProps) {
     zenModeNodeIdRef.current = nodeId;
     setZenModeNodeId(nodeId);
   };
+
+  // AI Progress indicator state
+  const [aiProgress, setAiProgress] = useState<{
+    current: number;
+    total: number;
+    remainingSecs?: number;
+    status: 'idle' | 'processing' | 'complete';
+  }>({ current: 0, total: 0, status: 'idle' });
 
   // Load learned emoji mappings on mount
   useEffect(() => {
@@ -295,15 +320,25 @@ export function Graph({ width, height }: GraphProps) {
     setIsResizing(true);
   }, []);
 
+  // Track if console is at bottom (when details panel is active)
+  const consoleAtBottom = showDetails && similarNodesMap.size > 0;
+
   useEffect(() => {
     if (!isResizing) return;
 
     const handleMouseMove = (e: MouseEvent) => {
       // Console is positioned from right edge, so width increases as mouse moves left
       const newWidth = Math.max(280, Math.min(800, window.innerWidth - e.clientX - 16));
-      // Height increases as mouse moves down
-      const newHeight = Math.max(200, Math.min(600, e.clientY - 56)); // 56 = top offset
-      setConsoleSize({ width: newWidth, height: newHeight });
+
+      if (consoleAtBottom) {
+        // At bottom: resize from top-left, height increases as mouse moves up
+        const newHeight = Math.max(200, Math.min(600, window.innerHeight - e.clientY - 16));
+        setConsoleSize({ width: newWidth, height: newHeight });
+      } else {
+        // At top: resize from bottom-left, height increases as mouse moves down
+        const newHeight = Math.max(200, Math.min(600, e.clientY - 56)); // 56 = top offset
+        setConsoleSize({ width: newWidth, height: newHeight });
+      }
     };
 
     const handleMouseUp = () => {
@@ -317,7 +352,7 @@ export function Graph({ width, height }: GraphProps) {
       document.removeEventListener('mousemove', handleMouseMove);
       document.removeEventListener('mouseup', handleMouseUp);
     };
-  }, [isResizing]);
+  }, [isResizing, consoleAtBottom]);
 
   // Details panel resize handling
   useEffect(() => {
@@ -347,16 +382,27 @@ export function Graph({ width, height }: GraphProps) {
   // Listen for AI progress events
   useEffect(() => {
     const unlisten = listen<AiProgressEvent>('ai-progress', (event) => {
-      const { current, total, nodeTitle, newTitle, status, errorMessage } = event.payload;
+      const { current, total, nodeTitle, newTitle, status, errorMessage, elapsedSecs, remainingSecs } = event.payload;
 
-      if (status === 'processing') {
-        devLog('info', `[${current}/${total}] Processing: ${nodeTitle}`);
-      } else if (status === 'success') {
-        devLog('info', `[${current}/${total}] Done: "${nodeTitle}" → "${newTitle}"`);
-      } else if (status === 'error') {
-        devLog('error', `[${current}/${total}] Failed: ${nodeTitle}${errorMessage ? ` - ${errorMessage}` : ''}`);
+      // Update floating progress indicator
+      if (status === 'processing' || status === 'success') {
+        setAiProgress({ current, total, remainingSecs, status: 'processing' });
       } else if (status === 'complete') {
-        devLog('info', `AI processing complete (${total} nodes)`);
+        setAiProgress({ current: total, total, status: 'complete' });
+        // Hide after 3 seconds
+        setTimeout(() => setAiProgress(prev => prev.status === 'complete' ? { ...prev, status: 'idle' } : prev), 3000);
+      }
+
+      // Log to console (simplified)
+      if (status === 'processing') {
+        devLog('info', `[${current}/${total}] Processing: ${nodeTitle.substring(0, 50)}...`);
+      } else if (status === 'success') {
+        devLog('info', `[${current}/${total}] ✓ "${newTitle.substring(0, 50)}..."`);
+      } else if (status === 'error') {
+        devLog('error', `[${current}/${total}] ✗ ${nodeTitle}${errorMessage ? ` - ${errorMessage}` : ''}`);
+      } else if (status === 'complete') {
+        const totalTimeStr = elapsedSecs !== undefined ? formatTime(elapsedSecs) : '';
+        devLog('info', `✓ AI complete: ${total} nodes${totalTimeStr ? ` in ${totalTimeStr}` : ''}`);
       }
     });
 
@@ -715,6 +761,41 @@ export function Graph({ width, height }: GraphProps) {
     // Create node lookup
     const nodeMap = new Map(graphNodes.map(n => [n.id, n]));
 
+    // Helper to get all 4 side centers of a node
+    const getSideCenters = (center: {x: number, y: number}, width: number, height: number) => {
+      const halfW = width / 2;
+      const halfH = height / 2;
+      return [
+        { x: center.x + halfW, y: center.y },  // right
+        { x: center.x - halfW, y: center.y },  // left
+        { x: center.x, y: center.y + halfH },  // bottom
+        { x: center.x, y: center.y - halfH },  // top
+      ];
+    };
+
+    // Find the pair of side centers (one from each node) that are closest to each other
+    const getEdgePoints = (centerA: {x: number, y: number}, centerB: {x: number, y: number}, width: number, height: number) => {
+      const sidesA = getSideCenters(centerA, width, height);
+      const sidesB = getSideCenters(centerB, width, height);
+
+      let bestA = sidesA[0];
+      let bestB = sidesB[0];
+      let minDist = Infinity;
+
+      for (const sideA of sidesA) {
+        for (const sideB of sidesB) {
+          const dist = Math.hypot(sideA.x - sideB.x, sideA.y - sideB.y);
+          if (dist < minDist) {
+            minDist = dist;
+            bestA = sideA;
+            bestB = sideB;
+          }
+        }
+      }
+
+      return { source: bestA, target: bestB };
+    };
+
     // Draw edges - store source/target data for zoom updates
     const linksGroup = container.append('g').attr('class', 'links');
 
@@ -738,6 +819,29 @@ export function Graph({ width, height }: GraphProps) {
     const weightRange = maxWeight - minWeight || 0.1; // Avoid division by zero
     devLog('info', `Edges in view: ${containsCount} contains, ${relatedCount} related (weights: ${(minWeight*100).toFixed(0)}%-${(maxWeight*100).toFixed(0)}%)`);
 
+    // Define arrow markers for edge endpoints
+    const defs = svg.append('defs');
+    edgeData.forEach((d, i) => {
+      const normalized = (d.weight - minWeight) / weightRange;
+      const hue = d.type === 'contains' ? 220 : normalized * 120;
+      const color = d.type === 'contains' ? '#6b7280' : `hsl(${hue}, 80%, 50%)`;
+      // Scale down arrow size for thicker connections (inverse of weight)
+      // Low weight (thin edge) → 5px arrow, High weight (thick edge) → 3px arrow
+      const arrowSize = d.type === 'contains' ? 4 : 5 - normalized * 2;
+
+      defs.append('marker')
+        .attr('id', `arrow-${i}`)
+        .attr('viewBox', '0 -5 10 10')
+        .attr('refX', 8)  // Offset back from endpoint to appear just before the dot
+        .attr('refY', 0)
+        .attr('markerWidth', arrowSize)
+        .attr('markerHeight', arrowSize)
+        .attr('orient', 'auto')
+        .append('path')
+        .attr('d', 'M0,-5L10,0L0,5')
+        .attr('fill', color);
+    });
+
     const edgePaths = linksGroup.selectAll('path')
       .data(edgeData)
       .join('path')
@@ -760,11 +864,39 @@ export function Graph({ width, height }: GraphProps) {
         return 2 + normalized * 14;
       })
       .attr('d', d => {
-        const dx = d.target.x - d.source.x;
-        const dy = d.target.y - d.source.y;
+        // Find closest pair of side centers between the two nodes
+        const points = getEdgePoints(d.source, d.target, noteWidth, noteHeight);
+
+        const dx = points.target.x - points.source.x;
+        const dy = points.target.y - points.source.y;
         const dr = Math.sqrt(dx * dx + dy * dy) * 1.5; // Larger radius = less curve
-        return `M${d.source.x},${d.source.y} A${dr},${dr} 0 0,1 ${d.target.x},${d.target.y}`;
+        return `M${points.source.x},${points.source.y} A${dr},${dr} 0 0,1 ${points.target.x},${points.target.y}`;
+      })
+      .each(function(d) {
+        // Store endpoint coordinates for dot rendering
+        const points = getEdgePoints(d.source, d.target, noteWidth, noteHeight);
+        (d as any).sourcePoint = points.source;
+        (d as any).targetPoint = points.target;
       });
+
+    // Add connection point dots at both endpoints
+    const connectionDots = linksGroup.selectAll('circle.connection-dot')
+      .data(edgeData.flatMap(d => {
+        const points = getEdgePoints(d.source, d.target, noteWidth, noteHeight);
+        const normalized = (d.weight - minWeight) / weightRange;
+        const hue = d.type === 'contains' ? 220 : normalized * 120;
+        const color = d.type === 'contains' ? '#6b7280' : `hsl(${hue}, 80%, 50%)`;
+        return [
+          { x: points.source.x, y: points.source.y, color, edge: d, isSource: true },
+          { x: points.target.x, y: points.target.y, color, edge: d, isSource: false }
+        ];
+      }))
+      .join('circle')
+      .attr('class', 'connection-dot')
+      .attr('cx', d => d.x)
+      .attr('cy', d => d.y)
+      .attr('r', 12)
+      .attr('fill', d => d.color);
 
     // ==================== UNIFIED NODE RENDERING ====================
     // All nodes use the same card style - clean "cute api"
@@ -1019,11 +1151,12 @@ export function Graph({ width, height }: GraphProps) {
       })
       .on('dblclick', function(event, d) {
         event.stopPropagation();
-        if (d.childCount > 0 && !d.isItem) {
+        if (d.isItem) {
+          devLog('info', `Opening item "${d.displayTitle}" in Leaf mode`);
+          openLeaf(d.id);
+        } else if (d.childCount > 0) {
           devLog('info', `Drilling into "${d.displayTitle}" (depth ${d.depth} → ${d.depth + 1})`);
           navigateToNode(d);
-        } else if (d.isItem) {
-          devLog('info', `Opening item "${d.displayTitle}" (would open in Leaf mode)`);
         }
       })
       .on('mouseenter', (_, d) => setHoveredNode(d))
@@ -1042,11 +1175,12 @@ export function Graph({ width, height }: GraphProps) {
       })
       .on('dblclick', function(event, d) {
         event.stopPropagation();
-        if (d.childCount > 0 && !d.isItem) {
+        if (d.isItem) {
+          devLog('info', `Opening item "${d.displayTitle}" in Leaf mode`);
+          openLeaf(d.id);
+        } else if (d.childCount > 0) {
           devLog('info', `Drilling into "${d.displayTitle}" (depth ${d.depth} → ${d.depth + 1})`);
           navigateToNode(d);
-        } else if (d.isItem) {
-          devLog('info', `Opening item "${d.displayTitle}" (would open in Leaf mode)`);
         }
       })
       .on('mouseenter', (_, d) => setHoveredNode(d))
@@ -1098,15 +1232,31 @@ export function Graph({ width, height }: GraphProps) {
           );
 
           // Update edge positions to match node scaling
+          const scaledWidth = noteWidth * cardScale;
+          const scaledHeight = noteHeight * cardScale;
           edgePaths.attr('d', d => {
-            const sx = d.source.x * positionScale;
-            const sy = d.source.y * positionScale;
-            const tx = d.target.x * positionScale;
-            const ty = d.target.y * positionScale;
-            const dx = tx - sx;
-            const dy = ty - sy;
+            // Find closest pair of side centers between the two nodes
+            const scaledSource = { x: d.source.x * positionScale, y: d.source.y * positionScale };
+            const scaledTarget = { x: d.target.x * positionScale, y: d.target.y * positionScale };
+            const points = getEdgePoints(scaledSource, scaledTarget, scaledWidth, scaledHeight);
+
+            const dx = points.target.x - points.source.x;
+            const dy = points.target.y - points.source.y;
             const dr = Math.sqrt(dx * dx + dy * dy) * 1.5;
-            return `M${sx},${sy} A${dr},${dr} 0 0,1 ${tx},${ty}`;
+            return `M${points.source.x},${points.source.y} A${dr},${dr} 0 0,1 ${points.target.x},${points.target.y}`;
+          });
+
+          // Update connection dots (both endpoints)
+          connectionDots.each(function(d: any) {
+            const edge = d.edge;
+            if (!edge) return;
+
+            const scaledSource = { x: edge.source.x * positionScale, y: edge.source.y * positionScale };
+            const scaledTarget = { x: edge.target.x * positionScale, y: edge.target.y * positionScale };
+            const points = getEdgePoints(scaledSource, scaledTarget, scaledWidth, scaledHeight);
+            const point = d.isSource ? points.source : points.target;
+
+            d3.select(this).attr('cx', point.x).attr('cy', point.y);
           });
 
         } else {
@@ -1125,15 +1275,31 @@ export function Graph({ width, height }: GraphProps) {
           );
 
           // Update edge positions for bubble mode too
+          const scaledDotSize = dotSize * bubbleScale;
+          const bubbleDiameter = scaledDotSize * 2;
           edgePaths.attr('d', d => {
-            const sx = d.source.x * positionScale;
-            const sy = d.source.y * positionScale;
-            const tx = d.target.x * positionScale;
-            const ty = d.target.y * positionScale;
-            const dx = tx - sx;
-            const dy = ty - sy;
+            // Find closest pair of side centers between the two nodes
+            const scaledSource = { x: d.source.x * positionScale, y: d.source.y * positionScale };
+            const scaledTarget = { x: d.target.x * positionScale, y: d.target.y * positionScale };
+            const points = getEdgePoints(scaledSource, scaledTarget, bubbleDiameter, bubbleDiameter);
+
+            const dx = points.target.x - points.source.x;
+            const dy = points.target.y - points.source.y;
             const dr = Math.sqrt(dx * dx + dy * dy) * 1.5;
-            return `M${sx},${sy} A${dr},${dr} 0 0,1 ${tx},${ty}`;
+            return `M${points.source.x},${points.source.y} A${dr},${dr} 0 0,1 ${points.target.x},${points.target.y}`;
+          });
+
+          // Update connection dots for bubble mode (both endpoints)
+          connectionDots.each(function(d: any) {
+            const edge = d.edge;
+            if (!edge) return;
+
+            const scaledSource = { x: edge.source.x * positionScale, y: edge.source.y * positionScale };
+            const scaledTarget = { x: edge.target.x * positionScale, y: edge.target.y * positionScale };
+            const points = getEdgePoints(scaledSource, scaledTarget, bubbleDiameter, bubbleDiameter);
+            const point = d.isSource ? points.source : points.target;
+
+            d3.select(this).attr('cx', point.x).attr('cy', point.y);
           });
         }
 
@@ -1326,7 +1492,7 @@ export function Graph({ width, height }: GraphProps) {
       )}
 
       {/* Similar nodes panel - resizable */}
-      {similarNodesMap.size > 0 && (
+      {showPanels && showDetails && similarNodesMap.size > 0 && (
         <div
           className="absolute top-16 right-4 bg-gray-800/95 backdrop-blur-sm text-white rounded-lg shadow-xl border border-gray-700 z-30 overflow-hidden flex flex-col"
           style={{ width: detailsPanelSize.width, height: detailsPanelSize.height }}
@@ -1433,7 +1599,26 @@ export function Graph({ width, height }: GraphProps) {
                     <>
                       {displayNodes.map((similar) => {
                         const similarNode = nodes.get(similar.id);
-                        const isInSameView = similarNode?.parentId === sourceParent;
+                        // Check if in same view: similar node's parent matches current view's parent
+                        const isInSameView = similarNode?.parentId === currentParentId ||
+                          (similarNode?.parentId === sourceParent && sourceParent !== undefined);
+                        // Build hierarchy path (including Universe)
+                        const getHierarchyPath = (nodeId: string): { name: string; isUniverse: boolean }[] => {
+                          const path: { name: string; isUniverse: boolean }[] = [];
+                          let current = nodes.get(nodeId);
+                          while (current?.parentId) {
+                            const parent = nodes.get(current.parentId);
+                            if (parent) {
+                              path.unshift({
+                                name: parent.isUniverse ? '🌌' : (parent.aiTitle || parent.title || 'Untitled'),
+                                isUniverse: parent.isUniverse || false
+                              });
+                            }
+                            current = parent;
+                          }
+                          return path;
+                        };
+                        const hierarchyPath = getHierarchyPath(similar.id);
                         return (
                           <button
                             key={similar.id}
@@ -1444,7 +1629,7 @@ export function Graph({ width, height }: GraphProps) {
                                 devLog('info', `Jumped to similar node: ${similar.title}`);
                               }
                             }}
-                            className="w-full px-3 py-2 text-left hover:bg-gray-700/50 transition-colors"
+                            className="w-full px-3 py-2 text-left hover:bg-gray-700/50 transition-colors cursor-pointer"
                             title={similar.title}
                           >
                             <div className="flex items-center justify-between gap-2">
@@ -1463,6 +1648,27 @@ export function Graph({ width, height }: GraphProps) {
                                 {(similar.similarity * 100).toFixed(0)}%
                               </span>
                             </div>
+                            {hierarchyPath.length > 0 && (
+                              <div className="text-xs truncate mt-0.5 pl-5">
+                                {(() => {
+                                  // Get source node's hierarchy to compare
+                                  const sourceHierarchy = getHierarchyPath(sourceId);
+                                  return hierarchyPath.map((segment, idx) => {
+                                    const isShared = idx < sourceHierarchy.length && sourceHierarchy[idx].name === segment.name;
+                                    // Universe gets special purple color
+                                    const colorClass = segment.isUniverse
+                                      ? 'text-purple-400'
+                                      : isShared ? 'text-amber-400/70' : 'text-gray-400';
+                                    return (
+                                      <span key={idx}>
+                                        {idx > 0 && <span className="text-gray-600"> › </span>}
+                                        <span className={colorClass}>{segment.name}</span>
+                                      </span>
+                                    );
+                                  });
+                                })()}
+                              </div>
+                            )}
                           </button>
                         );
                       })}
@@ -1550,18 +1756,116 @@ export function Graph({ width, height }: GraphProps) {
         Scroll to zoom - Click and drag to pan
       </div>
 
-      {/* Dev Console Toggle */}
-      <button
-        onClick={() => setShowDevConsole(!showDevConsole)}
-        className="absolute top-4 right-4 bg-gray-800/90 hover:bg-gray-700/90 backdrop-blur-sm rounded-lg px-3 py-2 text-xs text-gray-400 hover:text-white transition-colors"
-      >
-        {showDevConsole ? 'Hide' : 'Show'} Console
-      </button>
+      {/* AI Progress floating indicator */}
+      {aiProgress.status !== 'idle' && (
+        <div className="absolute bottom-16 right-4 bg-gray-900/95 backdrop-blur-sm rounded-lg border border-gray-700 px-4 py-3 z-40 min-w-48">
+          <div className="flex items-center gap-3">
+            {aiProgress.status === 'processing' && (
+              <div className="w-4 h-4 border-2 border-purple-400 border-t-transparent rounded-full animate-spin" />
+            )}
+            {aiProgress.status === 'complete' && (
+              <span className="text-green-400">✓</span>
+            )}
+            <div className="flex-1">
+              <div className="text-sm text-white font-medium">
+                {aiProgress.status === 'complete' ? 'Complete' : 'Processing AI'}
+              </div>
+              <div className="text-xs text-gray-400">
+                {aiProgress.current}/{aiProgress.total} nodes
+                {aiProgress.total > 0 && (
+                  <span className="ml-2 text-amber-400">
+                    {((aiProgress.current / aiProgress.total) * 100).toFixed(0)}%
+                  </span>
+                )}
+              </div>
+              {aiProgress.remainingSecs !== undefined && aiProgress.remainingSecs > 0 && (
+                <div className="text-xs text-gray-500 mt-0.5">
+                  ~{formatTime(aiProgress.remainingSecs)} remaining
+                </div>
+              )}
+            </div>
+          </div>
+          {/* Progress bar */}
+          {aiProgress.total > 0 && (
+            <div className="mt-2 h-1.5 bg-gray-700 rounded-full overflow-hidden">
+              <div
+                className={`h-full transition-all duration-300 ${
+                  aiProgress.status === 'complete' ? 'bg-green-500' : 'bg-purple-500'
+                }`}
+                style={{ width: `${(aiProgress.current / aiProgress.total) * 100}%` }}
+              />
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Hamburger Menu */}
+      <div className="absolute top-4 right-4 z-40 flex items-center gap-2">
+        {showPanels && (
+          <div className="flex items-center gap-2 bg-gray-800/90 backdrop-blur-sm rounded-lg px-2 py-1">
+            <button
+              onClick={async () => {
+                if (showDetails && similarNodesMap.size > 0) {
+                  // Hide details
+                  setShowDetails(false);
+                } else {
+                  // Show details - fetch most recent node from sidebar
+                  try {
+                    const recentNodes = await invoke<Node[]>('get_recent_nodes', { limit: 1 });
+                    if (recentNodes.length > 0) {
+                      const recentNode = recentNodes[0];
+                      // Fetch similar nodes for the most recent node
+                      fetchSimilarNodes(recentNode.id);
+                      setShowDetails(true);
+                    }
+                  } catch (err) {
+                    console.error('Failed to load recent node:', err);
+                  }
+                }
+              }}
+              className={`px-3 py-1.5 text-xs rounded transition-colors ${
+                showDetails && similarNodesMap.size > 0
+                  ? 'bg-amber-500/30 text-amber-300'
+                  : 'text-gray-400 hover:text-white hover:bg-gray-700'
+              }`}
+            >
+              Details
+            </button>
+            <button
+              onClick={() => setShowDevConsole(!showDevConsole)}
+              className={`px-3 py-1.5 text-xs rounded transition-colors ${
+                showDevConsole
+                  ? 'bg-amber-500/30 text-amber-300'
+                  : 'text-gray-400 hover:text-white hover:bg-gray-700'
+              }`}
+            >
+              Console
+            </button>
+          </div>
+        )}
+        <button
+          onClick={() => setShowPanels(!showPanels)}
+          className="bg-gray-800/90 hover:bg-gray-700/90 backdrop-blur-sm rounded-lg p-2 text-gray-400 hover:text-white transition-colors"
+          title={showPanels ? 'Hide menu' : 'Show menu'}
+        >
+          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            {showPanels ? (
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+            ) : (
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+            )}
+          </svg>
+        </button>
+      </div>
 
       {/* Dev Console */}
-      {showDevConsole && (
+      {showPanels && showDevConsole && (
         <div
-          className="absolute top-14 right-4 bg-gray-900/95 backdrop-blur-sm rounded-lg border border-gray-700 overflow-hidden flex flex-col"
+          className={`absolute bg-gray-900/95 backdrop-blur-sm rounded-lg border border-gray-700 overflow-hidden flex flex-col ${
+            showDetails && similarNodesMap.size > 0
+              ? 'bottom-4 right-4'
+              : 'top-14 right-4'
+          }`}
           style={{ width: consoleSize.width, height: consoleSize.height }}
         >
           <div className="px-3 py-2 bg-gray-800/80 border-b border-gray-700 flex items-center justify-between flex-shrink-0">
@@ -1610,14 +1914,22 @@ export function Graph({ width, height }: GraphProps) {
               </button>
             </div>
           </div>
-          {/* Resize handle - bottom-left corner */}
+          {/* Resize handle - top-left when at bottom, bottom-left when at top */}
           <div
             onMouseDown={handleResizeStart}
-            className={`absolute bottom-0 left-0 w-4 h-4 cursor-sw-resize group ${isResizing ? 'bg-amber-500/30' : ''}`}
+            className={`absolute w-4 h-4 group ${isResizing ? 'bg-amber-500/30' : ''} ${
+              consoleAtBottom
+                ? 'top-0 left-0 cursor-nw-resize'
+                : 'bottom-0 left-0 cursor-sw-resize'
+            }`}
             title="Drag to resize"
           >
             <svg
-              className="w-3 h-3 absolute bottom-0.5 left-0.5 text-gray-500 group-hover:text-amber-400 transition-colors"
+              className={`w-3 h-3 absolute text-gray-500 group-hover:text-amber-400 transition-colors ${
+                consoleAtBottom
+                  ? 'top-0.5 left-0.5 rotate-90'
+                  : 'bottom-0.5 left-0.5'
+              }`}
               viewBox="0 0 12 12"
               fill="currentColor"
             >

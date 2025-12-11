@@ -140,6 +140,9 @@ pub struct AiProgressEvent {
     pub emoji: Option<String>,
     pub status: String, // "processing", "success", "error", "complete"
     pub error_message: Option<String>,
+    pub elapsed_secs: Option<f64>,      // Time elapsed so far
+    pub estimate_secs: Option<f64>,     // Estimated total time
+    pub remaining_secs: Option<f64>,    // Estimated time remaining
 }
 
 #[derive(Clone, Serialize)]
@@ -151,6 +154,8 @@ pub struct HierarchyLogEvent {
 
 #[tauri::command]
 pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result<ProcessingResult, String> {
+    use std::time::Instant;
+
     println!("process_nodes called, checking API key availability...");
 
     if !ai_client::is_available() {
@@ -168,6 +173,9 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
     let mut errors = Vec::new();
     let mut current = 0;
 
+    let start_time = Instant::now();
+    let mut avg_time_per_node: Option<f64> = None;
+
     for node in unprocessed {
         current += 1;
         let content = node.content.as_deref().unwrap_or("");
@@ -176,6 +184,18 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
         if content.is_empty() {
             continue;
         }
+
+        // Calculate time estimates
+        let elapsed = start_time.elapsed().as_secs_f64();
+        let (estimate, remaining) = if current > 1 {
+            let avg = elapsed / (current - 1) as f64;
+            avg_time_per_node = Some(avg);
+            let est = avg * total as f64;
+            let rem = avg * (total - current + 1) as f64;
+            (Some(est), Some(rem))
+        } else {
+            (None, None)
+        };
 
         // Emit processing event
         let _ = app.emit("ai-progress", AiProgressEvent {
@@ -186,6 +206,9 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
             emoji: None,
             status: "processing".to_string(),
             error_message: None,
+            elapsed_secs: Some(elapsed),
+            estimate_secs: estimate,
+            remaining_secs: remaining,
         });
 
         match ai_client::analyze_node(&node.title, content).await {
@@ -202,6 +225,7 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
                     let err_msg = format!("DB save failed: {}", e);
                     errors.push(format!("Failed to save node {}: {}", node.id, e));
                     failed += 1;
+                    let elapsed_now = start_time.elapsed().as_secs_f64();
                     let _ = app.emit("ai-progress", AiProgressEvent {
                         current,
                         total,
@@ -210,6 +234,9 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
                         emoji: None,
                         status: "error".to_string(),
                         error_message: Some(err_msg),
+                        elapsed_secs: Some(elapsed_now),
+                        estimate_secs: estimate,
+                        remaining_secs: remaining,
                     });
                 } else {
                     processed += 1;
@@ -231,6 +258,8 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
                         }
                     }
 
+                    let elapsed_now = start_time.elapsed().as_secs_f64();
+                    let remaining_now = avg_time_per_node.map(|avg| avg * (total - current) as f64);
                     let _ = app.emit("ai-progress", AiProgressEvent {
                         current,
                         total,
@@ -239,6 +268,9 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
                         emoji: Some(result.emoji),
                         status: "success".to_string(),
                         error_message: None,
+                        elapsed_secs: Some(elapsed_now),
+                        estimate_secs: estimate,
+                        remaining_secs: remaining_now,
                     });
                 }
             }
@@ -246,6 +278,7 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
                 let err_msg = e.clone();
                 errors.push(format!("AI error for node {}: {}", node.id, e));
                 failed += 1;
+                let elapsed_now = start_time.elapsed().as_secs_f64();
                 let _ = app.emit("ai-progress", AiProgressEvent {
                     current,
                     total,
@@ -254,12 +287,16 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
                     emoji: None,
                     status: "error".to_string(),
                     error_message: Some(err_msg),
+                    elapsed_secs: Some(elapsed_now),
+                    estimate_secs: estimate,
+                    remaining_secs: remaining,
                 });
             }
         }
     }
 
     // Emit completion event
+    let final_elapsed = start_time.elapsed().as_secs_f64();
     let _ = app.emit("ai-progress", AiProgressEvent {
         current: total,
         total,
@@ -268,6 +305,9 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
         emoji: None,
         status: "complete".to_string(),
         error_message: None,
+        elapsed_secs: Some(final_elapsed),
+        estimate_secs: Some(final_elapsed),
+        remaining_secs: Some(0.0),
     });
 
     Ok(ProcessingResult {
@@ -592,4 +632,17 @@ pub fn save_openai_api_key(key: String) -> Result<(), String> {
 #[tauri::command]
 pub fn clear_openai_api_key() -> Result<(), String> {
     settings::set_openai_api_key(String::new())
+}
+
+// ==================== Leaf View Commands ====================
+
+/// Get the full content of a node for Leaf view rendering
+#[tauri::command]
+pub fn get_leaf_content(state: State<AppState>, node_id: String) -> Result<String, String> {
+    let node = state.db.get_node(&node_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Node {} not found", node_id))?;
+
+    // Return content, falling back to empty string
+    Ok(node.content.unwrap_or_default())
 }

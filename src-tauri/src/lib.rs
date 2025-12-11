@@ -33,6 +33,8 @@ use commands::{
     get_similar_nodes, get_embedding_status,
     // OpenAI API key commands
     get_openai_api_key_status, save_openai_api_key, clear_openai_api_key,
+    // Leaf view commands
+    get_leaf_content,
 };
 use db::Database;
 use std::sync::Arc;
@@ -130,6 +132,8 @@ pub fn run() {
             get_openai_api_key_status,
             save_openai_api_key,
             clear_openai_api_key,
+            // Leaf view
+            get_leaf_content,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

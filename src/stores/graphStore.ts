@@ -1,6 +1,9 @@
 import { create } from 'zustand';
 import type { Node, Edge, Viewport } from '../types/graph';
 
+// View mode: graph for navigation, leaf for content reading
+type ViewMode = 'graph' | 'leaf';
+
 // Navigation breadcrumb entry
 interface BreadcrumbEntry {
   id: string;
@@ -18,6 +21,10 @@ interface GraphState {
   edges: Map<string, Edge>;
   viewport: Viewport;
   activeNodeId: string | null;
+
+  // View mode state
+  viewMode: ViewMode;              // 'graph' or 'leaf'
+  leafNodeId: string | null;       // Node ID being viewed in leaf mode
 
   // Navigation state for drill-down
   currentDepth: number;             // Current hierarchy depth being viewed
@@ -39,6 +46,10 @@ interface GraphState {
   setViewport: (viewport: Viewport) => void;
   setActiveNode: (id: string | null) => void;
 
+  // View mode actions
+  openLeaf: (nodeId: string) => void;  // Open item in leaf mode
+  closeLeaf: () => void;               // Return to graph mode
+
   // Navigation actions
   setVisibleNodes: (nodes: Node[]) => void;
   setMaxDepth: (depth: number) => void;
@@ -54,6 +65,10 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   edges: new Map(),
   viewport: { x: 0, y: 0, zoom: 1 },
   activeNodeId: null,
+
+  // View mode state - start in graph mode
+  viewMode: 'graph',
+  leafNodeId: null,
 
   // Navigation state - start at Universe (depth 0)
   currentDepth: 0,
@@ -108,6 +123,18 @@ export const useGraphStore = create<GraphState>((set, get) => ({
 
   setViewport: (viewport) => set({ viewport }),
   setActiveNode: (activeNodeId) => set({ activeNodeId }),
+
+  // View mode actions
+  openLeaf: (nodeId) => set({
+    viewMode: 'leaf',
+    leafNodeId: nodeId,
+    activeNodeId: nodeId,
+  }),
+
+  closeLeaf: () => set({
+    viewMode: 'graph',
+    leafNodeId: null,
+  }),
 
   // Navigation actions
   setVisibleNodes: (visibleNodes) => set({ visibleNodes }),

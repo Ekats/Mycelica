@@ -1,6 +1,6 @@
 //! Import pipeline for external data sources.
 //!
-//! Creates individual message nodes with conversation context tracking.
+//! Creates exchange nodes (human + assistant paired) for better clustering.
 
 use crate::db::{Database, Node, NodeType, Position};
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,7 @@ pub struct ClaudeMessage {
 #[serde(rename_all = "camelCase")]
 pub struct ImportResult {
     pub conversations_imported: usize,
-    pub messages_imported: usize,
+    pub exchanges_imported: usize,  // Renamed: human+assistant pairs
     pub skipped: usize,
     pub errors: Vec<String>,
 }
@@ -50,34 +50,29 @@ fn parse_timestamp(ts: &str) -> i64 {
         })
 }
 
-/// Truncate message to create a title
-fn truncate_message_title(text: &str, sender: &str) -> String {
-    let prefix = if sender == "human" { "Human" } else { "Claude" };
-    let clean_text = text.trim();
-    let preview: String = clean_text.chars().take(50).collect();
-    let suffix = if clean_text.len() > 50 { "..." } else { "" };
-    format!("{}: {}{}", prefix, preview, suffix)
+/// Create title from human question (first line, truncated)
+fn create_exchange_title(human_text: &str) -> String {
+    let clean_text = human_text.trim();
+    // Take first line or first 60 chars
+    let first_line = clean_text.lines().next().unwrap_or(clean_text);
+    let preview: String = first_line.chars().take(60).collect();
+    let suffix = if first_line.len() > 60 { "..." } else { "" };
+    format!("{}{}", preview, suffix)
 }
 
 /// Import Claude conversations from JSON string.
 ///
-/// Creates:
-/// 1. One container node per conversation (is_item = false)
-/// 2. Individual message nodes for each message (is_item = true)
+/// Creates exchange nodes: each human message paired with its assistant response.
+/// This keeps related Q&A together for better clustering.
 ///
-/// Messages get conversation_id and sequence_index for context reconstruction.
+/// Format: "Human: {question}\n\nAssistant: {response}"
 pub fn import_claude_conversations(db: &Database, json_content: &str) -> Result<ImportResult, String> {
     let conversations: Vec<ClaudeConversation> = serde_json::from_str(json_content)
         .map_err(|e| format!("Failed to parse conversations JSON: {}", e))?;
 
-    let _now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-
     let mut result = ImportResult {
         conversations_imported: 0,
-        messages_imported: 0,
+        exchanges_imported: 0,
         skipped: 0,
         errors: Vec::new(),
     };
@@ -105,7 +100,9 @@ pub fn import_claude_conversations(db: &Database, json_content: &str) -> Result<
             .map(|ts| parse_timestamp(ts))
             .unwrap_or(created_at);
 
-        let message_count = conv.chat_messages.len();
+        // Pair messages: human + assistant = one exchange
+        let exchanges = pair_messages(&conv.chat_messages);
+        let exchange_count = exchanges.len();
 
         // 1. Create conversation container node (is_item = false)
         let container = Node {
@@ -113,7 +110,7 @@ pub fn import_claude_conversations(db: &Database, json_content: &str) -> Result<
             node_type: NodeType::Context,
             title: conv.name.clone().unwrap_or_else(|| "Untitled".to_string()),
             url: None,
-            content: Some(format!("{} messages", message_count)),
+            content: Some(format!("{} exchanges", exchange_count)),
             position: Position { x, y },
             created_at,
             updated_at,
@@ -123,7 +120,7 @@ pub fn import_claude_conversations(db: &Database, json_content: &str) -> Result<
             is_item: false, // Container, not a leaf - won't be clustered
             is_universe: false,
             parent_id: None, // Will be set by hierarchy builder
-            child_count: message_count as i32,
+            child_count: exchange_count as i32,
             ai_title: None,
             summary: None,
             tags: None,
@@ -142,39 +139,39 @@ pub fn import_claude_conversations(db: &Database, json_content: &str) -> Result<
 
         result.conversations_imported += 1;
 
-        // 2. Create individual message nodes
-        let msg_radius = 80.0;
+        // 2. Create exchange nodes (paired human + assistant)
+        let exchange_radius = 80.0;
 
-        for (index, msg) in conv.chat_messages.into_iter().enumerate() {
-            let msg_id = format!("{}-msg-{}", conv_id, index);
+        for (index, exchange) in exchanges.into_iter().enumerate() {
+            let exchange_id = format!("{}-ex-{}", conv_id, index);
 
-            // Position messages around their conversation container
-            let msg_angle = (2.0 * std::f64::consts::PI * index as f64) / message_count.max(1) as f64;
-            let msg_x = x + msg_radius * msg_angle.cos();
-            let msg_y = y + msg_radius * msg_angle.sin();
+            // Position exchanges around their conversation container
+            let ex_angle = (2.0 * std::f64::consts::PI * index as f64) / exchange_count.max(1) as f64;
+            let ex_x = x + exchange_radius * ex_angle.cos();
+            let ex_y = y + exchange_radius * ex_angle.sin();
 
-            let msg_created = parse_timestamp(&msg.created_at);
+            let ex_created = exchange.created_at;
 
-            let msg_node = Node {
-                id: msg_id.clone(),
+            let exchange_node = Node {
+                id: exchange_id.clone(),
                 node_type: NodeType::Thought,
-                title: truncate_message_title(&msg.text, &msg.sender),
+                title: exchange.title,
                 url: None,
-                content: Some(msg.text),
-                position: Position { x: msg_x, y: msg_y },
-                created_at: msg_created,
-                updated_at: msg_created,
+                content: Some(exchange.content),
+                position: Position { x: ex_x, y: ex_y },
+                created_at: ex_created,
+                updated_at: ex_created,
                 cluster_id: None,
                 cluster_label: None,
                 depth: 0, // Will be set by hierarchy builder
                 is_item: true, // This IS a leaf - will be clustered
                 is_universe: false,
-                parent_id: Some(conv_id.clone()), // Structural parent = conversation container
+                parent_id: None, // Will be set by hierarchy builder (not conversation container)
                 child_count: 0,
                 ai_title: None,
                 summary: None,
                 tags: None,
-                emoji: if msg.sender == "human" { Some("👤".to_string()) } else { Some("🤖".to_string()) },
+                emoji: Some("💬".to_string()), // Conversation emoji for exchanges
                 is_processed: false,
                 conversation_id: Some(conv_id.clone()), // Links to parent conversation
                 sequence_index: Some(index as i32), // Order in conversation
@@ -182,16 +179,64 @@ pub fn import_claude_conversations(db: &Database, json_content: &str) -> Result<
                 last_accessed_at: None,
             };
 
-            if let Err(e) = db.insert_node(&msg_node) {
-                result.errors.push(format!("Failed to insert message {}: {}", msg_id, e));
+            if let Err(e) = db.insert_node(&exchange_node) {
+                result.errors.push(format!("Failed to insert exchange {}: {}", exchange_id, e));
                 continue;
             }
 
-            result.messages_imported += 1;
+            result.exchanges_imported += 1;
         }
     }
 
     Ok(result)
+}
+
+/// Paired exchange: human question + assistant response
+struct Exchange {
+    title: String,
+    content: String,
+    created_at: i64,
+}
+
+/// Pair consecutive human + assistant messages into exchanges
+fn pair_messages(messages: &[ClaudeMessage]) -> Vec<Exchange> {
+    let mut exchanges = Vec::new();
+    let mut i = 0;
+
+    while i < messages.len() {
+        let msg = &messages[i];
+
+        if msg.sender == "human" {
+            let human_text = msg.text.clone();
+            let human_time = parse_timestamp(&msg.created_at);
+
+            // Look for following assistant response
+            let assistant_text = if i + 1 < messages.len() && messages[i + 1].sender == "assistant" {
+                i += 1; // Consume the assistant message
+                messages[i].text.clone()
+            } else {
+                // Human message without response (rare)
+                String::from("*No response*")
+            };
+
+            exchanges.push(Exchange {
+                title: create_exchange_title(&human_text),
+                content: format!("Human: {}\n\nAssistant: {}", human_text, assistant_text),
+                created_at: human_time,
+            });
+        } else {
+            // Orphan assistant message (no preceding human) - include it solo
+            exchanges.push(Exchange {
+                title: create_exchange_title(&msg.text),
+                content: format!("Assistant: {}", msg.text),
+                created_at: parse_timestamp(&msg.created_at),
+            });
+        }
+
+        i += 1;
+    }
+
+    exchanges
 }
 
 #[cfg(test)]
@@ -199,15 +244,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_truncate_message_title() {
+    fn test_create_exchange_title() {
         assert_eq!(
-            truncate_message_title("Hello world", "human"),
-            "Human: Hello world"
+            create_exchange_title("Hello world"),
+            "Hello world"
         );
 
+        // 70 chars - gets truncated to 60 + "..."
+        let long_msg = "This is a very long message that should be truncated after sixty chars";
+        let result = create_exchange_title(long_msg);
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 63); // 60 chars + "..."
+
+        // Multi-line: uses first line
         assert_eq!(
-            truncate_message_title("This is a very long message that should be truncated after fifty characters", "assistant"),
-            "Claude: This is a very long message that should be truncat..."
+            create_exchange_title("First line\nSecond line"),
+            "First line"
         );
     }
 
@@ -216,5 +268,42 @@ mod tests {
         let ts = "2024-01-01T00:00:00.000Z";
         let result = parse_timestamp(ts);
         assert!(result > 0);
+    }
+
+    #[test]
+    fn test_pair_messages() {
+        let messages = vec![
+            ClaudeMessage {
+                uuid: "1".to_string(),
+                sender: "human".to_string(),
+                text: "Hello".to_string(),
+                created_at: "2024-01-01T00:00:00.000Z".to_string(),
+            },
+            ClaudeMessage {
+                uuid: "2".to_string(),
+                sender: "assistant".to_string(),
+                text: "Hi there!".to_string(),
+                created_at: "2024-01-01T00:00:01.000Z".to_string(),
+            },
+            ClaudeMessage {
+                uuid: "3".to_string(),
+                sender: "human".to_string(),
+                text: "How are you?".to_string(),
+                created_at: "2024-01-01T00:00:02.000Z".to_string(),
+            },
+            ClaudeMessage {
+                uuid: "4".to_string(),
+                sender: "assistant".to_string(),
+                text: "I'm doing well!".to_string(),
+                created_at: "2024-01-01T00:00:03.000Z".to_string(),
+            },
+        ];
+
+        let exchanges = pair_messages(&messages);
+        assert_eq!(exchanges.len(), 2);
+        assert_eq!(exchanges[0].title, "Hello");
+        assert!(exchanges[0].content.contains("Human: Hello"));
+        assert!(exchanges[0].content.contains("Assistant: Hi there!"));
+        assert_eq!(exchanges[1].title, "How are you?");
     }
 }

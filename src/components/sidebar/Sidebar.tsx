@@ -14,7 +14,7 @@ interface ApiKeyStatus {
 type SidebarTab = 'pinned' | 'search';
 
 export function Sidebar() {
-  const { nodes, activeNodeId, setActiveNode } = useGraphStore();
+  const { nodes, activeNodeId, setActiveNode, navigateToRoot, navigateToNode } = useGraphStore();
   const [activeTab, setActiveTab] = useState<SidebarTab>('pinned');
   const [searchQuery, setSearchQuery] = useState('');
   const [showSettings, setShowSettings] = useState(false);
@@ -170,9 +170,13 @@ export function Sidebar() {
   };
 
   const handleNodeClick = useCallback((nodeId: string) => {
-    setActiveNode(nodeId);
+    const node = nodes.get(nodeId);
+    if (node) {
+      navigateToNode(node);
+      setActiveNode(nodeId);
+    }
     // touch_node is handled by the useEffect on activeNodeId
-  }, [setActiveNode]);
+  }, [nodes, navigateToNode, setActiveNode]);
 
   const handleTogglePin = useCallback(async (nodeId: string, currentlyPinned: boolean) => {
     try {
@@ -329,21 +333,49 @@ export function Sidebar() {
       {/* Node list */}
       <div className="flex-1 overflow-y-auto p-2">
         {/* Pinned tab */}
-        {activeTab === 'pinned' && (
-          <>
-            {pinnedNodes.length > 0 ? (
-              <div className="space-y-1">
-                {pinnedNodes.map(node => renderNodeItem(node, true))}
-              </div>
-            ) : (
-              <div className="p-8 text-center text-gray-500">
-                <Pin className="w-8 h-8 mx-auto mb-2 opacity-50" />
-                <p className="text-sm">No pinned nodes</p>
-                <p className="text-xs mt-1">Pin nodes for quick access</p>
-              </div>
-            )}
-          </>
-        )}
+        {activeTab === 'pinned' && (() => {
+          // Find Universe node
+          const universeNode = Array.from(nodes.values()).find(n => n.isUniverse);
+          // User-pinned nodes (excluding Universe)
+          const userPinnedNodes = pinnedNodes.filter(n => !n.isUniverse);
+
+          return (
+            <>
+              {/* Universe - always shown at top */}
+              {universeNode && (
+                <div className="mb-2">
+                  <div
+                    className={`group flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-colors cursor-pointer ${
+                      activeNodeId === universeNode.id
+                        ? 'bg-purple-500/20 text-purple-300'
+                        : 'text-gray-300 hover:bg-gray-700/50'
+                    }`}
+                    onClick={() => {
+                      navigateToRoot();
+                      setActiveNode(universeNode.id);
+                    }}
+                  >
+                    <span className="text-lg">🌌</span>
+                    <span className="flex-1 truncate font-medium">Universe</span>
+                  </div>
+                </div>
+              )}
+
+              {/* User pinned nodes */}
+              {userPinnedNodes.length > 0 ? (
+                <div className="space-y-1">
+                  {userPinnedNodes.map(node => renderNodeItem(node, true))}
+                </div>
+              ) : (
+                <div className="p-8 text-center text-gray-500">
+                  <Pin className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                  <p className="text-sm">No pinned nodes</p>
+                  <p className="text-xs mt-1">Pin nodes for quick access</p>
+                </div>
+              )}
+            </>
+          );
+        })()}
 
         {/* Search tab */}
         {activeTab === 'search' && (
@@ -397,12 +429,18 @@ export function Sidebar() {
         </button>
         {recentExpanded && (
           <div className="px-2 pb-2 max-h-60 overflow-y-auto">
-            {recentNodes.filter(n => n.id !== activeNodeId).length > 0 ? (
+            {recentNodes.length > 0 ? (
               <div className="space-y-0.5">
-                {recentNodes.filter(n => n.id !== activeNodeId).slice(0, 10).map(node => (
+                {recentNodes.slice(0, 10).map(node => {
+                  const isActive = node.id === activeNodeId;
+                  return (
                   <div
                     key={node.id}
-                    className="group flex items-center gap-1 px-2 py-1.5 rounded text-xs transition-colors text-gray-400 hover:text-gray-200 hover:bg-gray-700/30"
+                    className={`group flex items-center gap-1 px-2 py-1.5 rounded text-xs transition-colors ${
+                      isActive
+                        ? 'bg-amber-500/20 text-amber-300'
+                        : 'text-gray-400 hover:text-gray-200 hover:bg-gray-700/30'
+                    }`}
                   >
                     <button
                       onClick={() => handleNodeClick(node.id)}
@@ -443,7 +481,8 @@ export function Sidebar() {
                       </button>
                     </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             ) : (
               <div className="px-2 py-3 text-xs text-gray-500 text-center">

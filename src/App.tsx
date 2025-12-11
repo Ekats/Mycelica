@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState, Component, ErrorInfo, ReactNode } from 'react';
 import { Graph } from './components/graph/Graph';
+import { LeafView } from './components/leaf/LeafView';
 import { Sidebar } from './components/sidebar/Sidebar';
 import { useGraph } from './hooks/useGraph';
+import { useGraphStore } from './stores/graphStore';
 import './App.css';
 
 // Error boundary to catch React errors
@@ -56,6 +58,7 @@ function App() {
   const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
   const [loading, setLoading] = useState(true);
   const { nodes, edges } = useGraph();
+  const { viewMode, leafNodeId, closeLeaf } = useGraphStore();
 
   useEffect(() => {
     // Skip if still loading (container not in DOM yet)
@@ -121,7 +124,11 @@ function App() {
     <div className="h-screen w-screen flex bg-gray-900">
       <Sidebar />
       <main ref={containerRef} className="flex-1 relative overflow-hidden">
-        <Graph width={dimensions.width} height={dimensions.height} />
+        {viewMode === 'leaf' && leafNodeId ? (
+          <LeafView nodeId={leafNodeId} onBack={closeLeaf} />
+        ) : (
+          <Graph width={dimensions.width} height={dimensions.height} />
+        )}
       </main>
     </div>
   );

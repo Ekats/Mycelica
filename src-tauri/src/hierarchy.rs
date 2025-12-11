@@ -15,6 +15,7 @@ use crate::ai_client::{self, TopicInfo};
 use crate::settings;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 
 /// Log event for frontend dev console
@@ -22,6 +23,29 @@ use tauri::{AppHandle, Emitter};
 pub struct HierarchyLogEvent {
     pub message: String,
     pub level: String,
+}
+
+/// Progress event for AI operations (reuses the same format as process_nodes)
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiProgressEvent {
+    pub current: usize,
+    pub total: usize,
+    pub node_title: String,
+    pub new_title: String,
+    pub emoji: Option<String>,
+    pub status: String, // "processing", "success", "error", "complete"
+    pub error_message: Option<String>,
+    pub elapsed_secs: Option<f64>,
+    pub estimate_secs: Option<f64>,
+    pub remaining_secs: Option<f64>,
+}
+
+/// Emit progress event
+fn emit_progress(app: Option<&AppHandle>, event: AiProgressEvent) {
+    if let Some(app) = app {
+        let _ = app.emit("ai-progress", event);
+    }
 }
 
 /// Emit a log to the frontend dev console (if app handle available)
@@ -704,29 +728,42 @@ fn increment_subtree_depth(db: &Database, node_id: &str) -> Result<(), String> {
 /// 2. Build initial hierarchy (flat topics under Universe)
 /// 3. Recursively group any level with >15 children until navigable
 pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Option<&AppHandle>) -> Result<FullHierarchyResult, String> {
+    emit_log(app, "info", "═══════════════════════════════════════════════════════════");
+    emit_log(app, "info", "Starting Full Hierarchy Build");
+    emit_log(app, "info", "═══════════════════════════════════════════════════════════");
+
     // Step 1: Optionally run clustering
+    emit_log(app, "info", "");
+    emit_log(app, "info", "▶ STEP 1/4: Clustering items into topics");
+    emit_log(app, "info", "───────────────────────────────────────────────────────────");
     let clustering_result = if run_clustering && ai_client::is_available() {
-        emit_log(app, "info", "Step 1: Running AI clustering on items...");
+        emit_log(app, "info", "Running AI clustering on items...");
         let result = crate::clustering::run_clustering(db, true).await?;
-        emit_log(app, "info", &format!("Clustering complete: {} items in {} clusters", result.items_assigned, result.clusters_created));
+        emit_log(app, "info", &format!("✓ Clustering complete: {} items → {} clusters", result.items_assigned, result.clusters_created));
         Some(result)
     } else {
-        emit_log(app, "info", "Step 1: Skipping clustering (already done or AI not available)");
+        emit_log(app, "info", "Skipping (already done or AI not available)");
         None
     };
 
     // Step 2: Build initial hierarchy
-    emit_log(app, "info", "Step 2: Building initial hierarchy from clustered items...");
+    emit_log(app, "info", "");
+    emit_log(app, "info", "▶ STEP 2/4: Building initial hierarchy structure");
+    emit_log(app, "info", "───────────────────────────────────────────────────────────");
+    emit_log(app, "info", "Creating Universe and topic nodes from clusters...");
     let hierarchy_result = build_hierarchy(db)?;
+    emit_log(app, "info", &format!("✓ Created {} intermediate nodes, organized {} items", hierarchy_result.intermediate_nodes_created, hierarchy_result.items_organized));
 
     // Step 3: Recursively group levels with too many children
-    emit_log(app, "info", "Step 3: Recursively grouping levels with >15 children...");
+    emit_log(app, "info", "");
+    emit_log(app, "info", "▶ STEP 3/4: Recursive grouping (target: 8-15 children per level)");
+    emit_log(app, "info", "───────────────────────────────────────────────────────────");
     let mut grouping_iterations = 0;
     let max_iterations = 10; // Safety limit
 
     loop {
         if grouping_iterations >= max_iterations {
-            emit_log(app, "warn", &format!("Hit max grouping iterations ({})", max_iterations));
+            emit_log(app, "warn", &format!("⚠ Hit max grouping iterations ({})", max_iterations));
             break;
         }
 
@@ -735,14 +772,14 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
 
         match node_to_group {
             Some(node_id) => {
-                emit_log(app, "info", &format!("Grouping children of: {}", node_id));
+                emit_log(app, "info", &format!("  Iteration {}: Grouping children of {}", grouping_iterations + 1, node_id));
                 let grouped = cluster_hierarchy_level(db, &node_id, app).await?;
                 if grouped {
                     grouping_iterations += 1;
                 }
             }
             None => {
-                emit_log(app, "info", "All levels have ≤15 children, hierarchy is navigable");
+                emit_log(app, "info", &format!("✓ Hierarchy is navigable after {} grouping iterations", grouping_iterations));
                 break;
             }
         }
@@ -750,10 +787,13 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
 
     // Recalculate final depth
     let final_max_depth = db.get_max_depth().map_err(|e| e.to_string())?;
+    emit_log(app, "info", &format!("  Final hierarchy depth: {}", final_max_depth));
 
     // Step 4: Generate embeddings for ALL nodes that need them (if OpenAI key available)
+    emit_log(app, "info", "");
+    emit_log(app, "info", "▶ STEP 4/4: Generating embeddings for semantic search");
+    emit_log(app, "info", "───────────────────────────────────────────────────────────");
     let (embeddings_generated, embeddings_skipped) = if settings::has_openai_api_key() {
-        emit_log(app, "info", "Step 4: Generating embeddings for all nodes...");
         let nodes_needing_embeddings = db.get_nodes_needing_embeddings().map_err(|e| e.to_string())?;
         let total_needing = nodes_needing_embeddings.len();
 
@@ -764,12 +804,38 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
             emit_log(app, "info", &format!("Generating embeddings for {} nodes...", total_needing));
             let mut generated = 0;
             let mut skipped = 0;
+            let start_time = Instant::now();
 
             for (i, node) in nodes_needing_embeddings.iter().enumerate() {
-                // Build text from ai_title + summary
+                let current = i + 1;
                 let title = node.ai_title.as_deref().unwrap_or(&node.title);
                 let summary = node.summary.as_deref().unwrap_or("");
                 let embed_text = format!("{} {}", title, summary);
+
+                // Calculate time estimates
+                let elapsed = start_time.elapsed().as_secs_f64();
+                let (estimate, remaining) = if current > 1 {
+                    let avg = elapsed / (current - 1) as f64;
+                    let est = avg * total_needing as f64;
+                    let rem = avg * (total_needing - current + 1) as f64;
+                    (Some(est), Some(rem))
+                } else {
+                    (None, None)
+                };
+
+                // Emit processing event
+                emit_progress(app, AiProgressEvent {
+                    current,
+                    total: total_needing,
+                    node_title: title.to_string(),
+                    new_title: "Generating embedding...".to_string(),
+                    emoji: None,
+                    status: "processing".to_string(),
+                    error_message: None,
+                    elapsed_secs: Some(elapsed),
+                    estimate_secs: estimate,
+                    remaining_secs: remaining,
+                });
 
                 match ai_client::generate_embedding(&embed_text).await {
                     Ok(embedding) => {
@@ -778,8 +844,22 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
                             skipped += 1;
                         } else {
                             generated += 1;
+                            // Emit success event
+                            let elapsed_now = start_time.elapsed().as_secs_f64();
+                            emit_progress(app, AiProgressEvent {
+                                current,
+                                total: total_needing,
+                                node_title: title.to_string(),
+                                new_title: "Embedding generated".to_string(),
+                                emoji: Some("✓".to_string()),
+                                status: "success".to_string(),
+                                error_message: None,
+                                elapsed_secs: Some(elapsed_now),
+                                estimate_secs: estimate,
+                                remaining_secs: remaining,
+                            });
                             if (i + 1) % 10 == 0 || i + 1 == total_needing {
-                                emit_log(app, "info", &format!("Embeddings: {}/{} complete", i + 1, total_needing));
+                                emit_log(app, "info", &format!("  Progress: {}/{} embeddings", i + 1, total_needing));
                             }
                         }
                     }
@@ -790,29 +870,46 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
                 }
             }
 
-            emit_log(app, "info", &format!("Embeddings complete: {} generated, {} skipped", generated, skipped));
+            // Emit complete event
+            let total_elapsed = start_time.elapsed().as_secs_f64();
+            emit_progress(app, AiProgressEvent {
+                current: total_needing,
+                total: total_needing,
+                node_title: String::new(),
+                new_title: format!("{} embeddings generated", generated),
+                emoji: Some("✓".to_string()),
+                status: "complete".to_string(),
+                error_message: None,
+                elapsed_secs: Some(total_elapsed),
+                estimate_secs: Some(total_elapsed),
+                remaining_secs: Some(0.0),
+            });
+
+            emit_log(app, "info", &format!("✓ Embeddings complete: {} generated, {} skipped", generated, skipped));
             (generated, skipped)
         }
     } else {
-        emit_log(app, "info", "Step 4: Skipping embeddings (OpenAI API key not set)");
+        emit_log(app, "info", "Skipping (OpenAI API key not set)");
         (0, 0)
     };
 
     // Step 5: Create semantic edges based on embedding similarity
+    // (This is a bonus step, not numbered in the main 4)
     let semantic_edges_created = if embeddings_generated > 0 || db.get_nodes_with_embeddings().map(|v| v.len()).unwrap_or(0) > 1 {
-        emit_log(app, "info", "Step 5: Creating semantic edges from embeddings...");
+        emit_log(app, "info", "");
+        emit_log(app, "info", "Creating semantic edges from embeddings...");
 
         // Delete old AI-generated semantic edges first
         if let Ok(deleted) = db.delete_semantic_edges() {
             if deleted > 0 {
-                emit_log(app, "info", &format!("Cleared {} old semantic edges", deleted));
+                emit_log(app, "info", &format!("  Cleared {} old semantic edges", deleted));
             }
         }
 
         // Create new edges: min 50% similarity, max 5 edges per node
         match db.create_semantic_edges(0.5, 5) {
             Ok(created) => {
-                emit_log(app, "info", &format!("Created {} semantic edges", created));
+                emit_log(app, "info", &format!("✓ Created {} semantic edges", created));
                 created
             }
             Err(e) => {
@@ -821,11 +918,16 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
             }
         }
     } else {
-        emit_log(app, "info", "Step 5: Skipping semantic edges (no embeddings)");
         0
     };
 
-    emit_log(app, "info", &format!("Full hierarchy complete: {} grouping iterations, max depth = {}, {} semantic edges", grouping_iterations, final_max_depth, semantic_edges_created));
+    emit_log(app, "info", "");
+    emit_log(app, "info", "═══════════════════════════════════════════════════════════");
+    emit_log(app, "info", "✓ HIERARCHY BUILD COMPLETE");
+    emit_log(app, "info", &format!("  • {} grouping iterations", grouping_iterations));
+    emit_log(app, "info", &format!("  • {} hierarchy levels (depth 0-{})", final_max_depth + 1, final_max_depth));
+    emit_log(app, "info", &format!("  • {} semantic edges", semantic_edges_created));
+    emit_log(app, "info", "═══════════════════════════════════════════════════════════");
 
     Ok(FullHierarchyResult {
         clustering_result,
