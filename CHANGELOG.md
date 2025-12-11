@@ -2,6 +2,37 @@
 
 All notable changes to Mycelica will be documented in this file.
 
+## [0.3.0] - 2025-12-11
+
+### AI Progress Indicator
+- Floating progress panel in bottom-right during AI operations
+- Shows current/total nodes with percentage
+- Time remaining estimate with smart formatting (s/m/h)
+- Progress bar that turns green on completion
+- Auto-hides 3 seconds after completion
+- Works for both "Process AI" and "Full Rebuild" (embedding step)
+
+### Conversation Rendering (LeafView)
+- Document-style layout instead of chat bubbles
+- Section headers: "You" (amber) and "Claude" (gray) with underlines
+- Auto-formatting: commands and paths wrapped in code blocks
+- Code blocks: dark gray-950 background, green text, rounded borders
+- Full markdown rendering with prose styling
+- Removed excessive centering for better readability
+
+### Import Pipeline
+- Exchange pairing: human + assistant messages combined into single nodes
+- Format: `Human: {question}\n\nAssistant: {response}`
+- Conversation filtering by title (e.g., "mycelica" only)
+- Exclude list for specific conversation UUIDs
+- Python import script at `scripts/import_conversations.py`
+
+### Hierarchy Build Logging
+- Clear step headers with visual separators (═══, ───)
+- Step numbering: STEP 1/4, STEP 2/4, etc.
+- Time estimates during embedding generation
+- Completion summary with iteration counts
+
 ## [0.2.0] - 2025-12-11
 
 ### Similar Nodes Panel
