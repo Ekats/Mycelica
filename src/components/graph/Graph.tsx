@@ -656,9 +656,11 @@ export function Graph({ width, height }: GraphProps) {
     // IMPORTANCE-BASED TIERED LAYOUT (per pyspiral.md spec)
     // ==========================================================================
 
-    // Ring capacity: Ring 0 = 1, Ring N = 6 * N
+    // Ring capacity: Ring 0 = 1, Ring 1 = 4, Ring N = 6 * N
     const getNodesPerRing = (ring: number): number => {
-      return ring === 0 ? 1 : 6 * ring;
+      if (ring === 0) return 1;
+      if (ring === 1) return 4;
+      return 6 * ring;
     };
 
     // Ring radius: based on noteHeight + spacing
