@@ -1,0 +1,170 @@
+//! Application settings storage
+//!
+//! Stores configuration like API keys in a JSON file in the app data directory.
+
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
+use std::sync::RwLock;
+
+/// Global settings instance
+static SETTINGS: RwLock<Option<Settings>> = RwLock::new(None);
+
+/// Path to config file (set during init)
+static CONFIG_PATH: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Settings {
+    #[serde(default)]
+    pub anthropic_api_key: Option<String>,
+    #[serde(default)]
+    pub openai_api_key: Option<String>,
+}
+
+impl Settings {
+    /// Load settings from disk or create default
+    fn load(path: &PathBuf) -> Self {
+        if path.exists() {
+            match fs::read_to_string(path) {
+                Ok(content) => {
+                    serde_json::from_str(&content).unwrap_or_default()
+                }
+                Err(_) => Settings::default(),
+            }
+        } else {
+            Settings::default()
+        }
+    }
+
+    /// Save settings to disk
+    fn save(&self, path: &PathBuf) -> Result<(), String> {
+        let content = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("Failed to serialize settings: {}", e))?;
+
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create config directory: {}", e))?;
+        }
+
+        fs::write(path, content)
+            .map_err(|e| format!("Failed to write settings: {}", e))?;
+
+        Ok(())
+    }
+}
+
+/// Initialize settings with the app data directory
+pub fn init(app_data_dir: PathBuf) {
+    let config_path = app_data_dir.join("settings.json");
+    let settings = Settings::load(&config_path);
+
+    println!("Settings loaded from: {:?}", config_path);
+
+    *CONFIG_PATH.write().unwrap() = Some(config_path);
+    *SETTINGS.write().unwrap() = Some(settings);
+}
+
+/// Get the current API key (checks env var first, then stored setting)
+pub fn get_api_key() -> Option<String> {
+    // Environment variable takes precedence
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        if !key.is_empty() {
+            return Some(key);
+        }
+    }
+
+    // Fall back to stored setting
+    let guard = SETTINGS.read().ok()?;
+    let settings = guard.as_ref()?;
+    settings.anthropic_api_key.clone()
+}
+
+/// Check if API key is available
+pub fn has_api_key() -> bool {
+    get_api_key().map(|k| !k.is_empty()).unwrap_or(false)
+}
+
+/// Set and save the API key
+pub fn set_api_key(key: String) -> Result<(), String> {
+    let mut settings_guard = SETTINGS.write()
+        .map_err(|_| "Failed to acquire settings lock")?;
+
+    let settings = settings_guard.get_or_insert_with(Settings::default);
+    settings.anthropic_api_key = if key.is_empty() { None } else { Some(key) };
+
+    // Save to disk
+    let config_path = CONFIG_PATH.read()
+        .map_err(|_| "Failed to acquire config path lock")?
+        .clone()
+        .ok_or("Settings not initialized")?;
+
+    settings.save(&config_path)?;
+
+    println!("API key saved to settings");
+    Ok(())
+}
+
+/// Get masked API key for display (shows first/last 4 chars)
+pub fn get_masked_api_key() -> Option<String> {
+    get_api_key().map(|key| {
+        if key.len() > 12 {
+            format!("{}...{}", &key[..8], &key[key.len()-4..])
+        } else {
+            "*".repeat(key.len())
+        }
+    })
+}
+
+// ==================== OpenAI API Key (for embeddings) ====================
+
+/// Get the OpenAI API key (checks env var first, then stored setting)
+pub fn get_openai_api_key() -> Option<String> {
+    // Environment variable takes precedence
+    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+        if !key.is_empty() {
+            return Some(key);
+        }
+    }
+
+    // Fall back to stored setting
+    let guard = SETTINGS.read().ok()?;
+    let settings = guard.as_ref()?;
+    settings.openai_api_key.clone()
+}
+
+/// Check if OpenAI API key is available
+pub fn has_openai_api_key() -> bool {
+    get_openai_api_key().map(|k| !k.is_empty()).unwrap_or(false)
+}
+
+/// Set and save the OpenAI API key
+pub fn set_openai_api_key(key: String) -> Result<(), String> {
+    let mut settings_guard = SETTINGS.write()
+        .map_err(|_| "Failed to acquire settings lock")?;
+
+    let settings = settings_guard.get_or_insert_with(Settings::default);
+    settings.openai_api_key = if key.is_empty() { None } else { Some(key) };
+
+    // Save to disk
+    let config_path = CONFIG_PATH.read()
+        .map_err(|_| "Failed to acquire config path lock")?
+        .clone()
+        .ok_or("Settings not initialized")?;
+
+    settings.save(&config_path)?;
+
+    println!("OpenAI API key saved to settings");
+    Ok(())
+}
+
+/// Get masked OpenAI API key for display (shows first/last 4 chars)
+pub fn get_masked_openai_api_key() -> Option<String> {
+    get_openai_api_key().map(|key| {
+        if key.len() > 12 {
+            format!("{}...{}", &key[..8], &key[key.len()-4..])
+        } else {
+            "*".repeat(key.len())
+        }
+    })
+}
