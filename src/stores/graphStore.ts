@@ -5,7 +5,12 @@ import type { Node, Edge, Viewport } from '../types/graph';
 interface BreadcrumbEntry {
   id: string;
   title: string;
+  emoji?: string;
   depth: number;
+  isJump?: boolean;  // True if navigated via "similar nodes" jump
+  jumpFromId?: string;  // Source node ID that we jumped from
+  jumpFromTitle?: string;  // Source node title for display
+  jumpFromEmoji?: string;  // Source node emoji for display
 }
 
 interface GraphState {
@@ -41,6 +46,7 @@ interface GraphState {
   navigateToNode: (node: Node) => void;  // Drill down into a node
   navigateBack: () => BreadcrumbEntry | null;  // Go back one level
   navigateToRoot: () => void;  // Go back to Universe (depth 0)
+  jumpToNode: (node: Node, fromNode?: Node) => void;  // Jump to any node (from similar nodes)
 }
 
 export const useGraphStore = create<GraphState>((set, get) => ({
@@ -125,6 +131,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     const newBreadcrumb: BreadcrumbEntry = {
       id: node.id,
       title: node.aiTitle || node.title,
+      emoji: node.emoji,
       depth: node.depth,
     };
 
@@ -166,5 +173,41 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     currentParentId: null,
     breadcrumbs: [],
     visibleNodes: [],
+  }),
+
+  jumpToNode: (node, fromNode) => set((state) => {
+    // Jump to any node - replaces last breadcrumb if it was a jump, otherwise adds
+    // Navigate to the node's parent so we see the node in context
+    const targetParentId = node.parentId || null;
+    const targetDepth = node.depth;
+
+    // Create jump breadcrumb showing where we jumped to
+    const jumpBreadcrumb: BreadcrumbEntry = {
+      id: node.id,
+      title: node.aiTitle || node.title,
+      emoji: node.emoji,
+      depth: targetDepth,
+      isJump: true,
+      jumpFromId: fromNode?.id,
+      jumpFromTitle: fromNode?.aiTitle || fromNode?.title,
+      jumpFromEmoji: fromNode?.emoji,
+    };
+
+    // If the last breadcrumb was a jump, replace it (continuing from same similar panel)
+    // Otherwise, add new jump breadcrumb
+    let newBreadcrumbs: BreadcrumbEntry[];
+    if (state.breadcrumbs.length > 0 && state.breadcrumbs[state.breadcrumbs.length - 1].isJump) {
+      newBreadcrumbs = [...state.breadcrumbs.slice(0, -1), jumpBreadcrumb];
+    } else {
+      newBreadcrumbs = [...state.breadcrumbs, jumpBreadcrumb];
+    }
+
+    return {
+      currentDepth: targetDepth,
+      currentParentId: targetParentId,
+      breadcrumbs: newBreadcrumbs,
+      visibleNodes: [],
+      activeNodeId: node.id,  // Highlight the jumped-to node
+    };
   }),
 }));

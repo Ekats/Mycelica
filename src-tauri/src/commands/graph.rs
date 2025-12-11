@@ -490,6 +490,12 @@ pub fn get_recent_nodes(state: State<AppState>, limit: Option<i32>) -> Result<Ve
     state.db.get_recent_nodes(limit.unwrap_or(15)).map_err(|e| e.to_string())
 }
 
+/// Remove a node from recents (clear last_accessed_at)
+#[tauri::command]
+pub fn clear_recent(state: State<AppState>, node_id: String) -> Result<(), String> {
+    state.db.clear_recent(&node_id).map_err(|e| e.to_string())
+}
+
 // ==================== Semantic Similarity Commands ====================
 
 /// Similar node result with similarity score
@@ -510,8 +516,10 @@ pub fn get_similar_nodes(
     state: State<AppState>,
     node_id: String,
     top_n: Option<usize>,
+    min_similarity: Option<f32>,
 ) -> Result<Vec<SimilarNode>, String> {
     let top_n = top_n.unwrap_or(10);
+    let min_similarity = min_similarity.unwrap_or(0.0);
 
     // Get the target node's embedding
     let target_embedding = state.db.get_node_embedding(&node_id)
@@ -527,7 +535,7 @@ pub fn get_similar_nodes(
     }
 
     // Find similar nodes
-    let similar = similarity::find_similar(&target_embedding, &all_embeddings, &node_id, top_n);
+    let similar = similarity::find_similar(&target_embedding, &all_embeddings, &node_id, top_n, min_similarity);
 
     // Fetch full node data for results
     let mut results: Vec<SimilarNode> = Vec::new();

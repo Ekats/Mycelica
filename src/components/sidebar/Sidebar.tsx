@@ -14,7 +14,7 @@ interface ApiKeyStatus {
 type SidebarTab = 'pinned' | 'search';
 
 export function Sidebar() {
-  const { nodes, edges, activeNodeId, setActiveNode } = useGraphStore();
+  const { nodes, activeNodeId, setActiveNode } = useGraphStore();
   const [activeTab, setActiveTab] = useState<SidebarTab>('pinned');
   const [searchQuery, setSearchQuery] = useState('');
   const [showSettings, setShowSettings] = useState(false);
@@ -184,8 +184,6 @@ export function Sidebar() {
     }
   }, []);
 
-  const activeNode = activeNodeId ? nodes.get(activeNodeId) : null;
-
   // Filter nodes by search query (only when search tab is active)
   const searchResults = activeTab === 'search' && searchQuery
     ? Array.from(nodes.values()).filter(node => {
@@ -197,17 +195,6 @@ export function Sidebar() {
           node.summary?.toLowerCase().includes(query)
         );
       })
-    : [];
-
-  // Get connected nodes for active node
-  const connectedNodes = activeNodeId
-    ? Array.from(edges.values())
-        .filter(e => e.source === activeNodeId || e.target === activeNodeId)
-        .map(e => {
-          const otherId = e.source === activeNodeId ? e.target : e.source;
-          return nodes.get(otherId);
-        })
-        .filter(Boolean)
     : [];
 
   // Render a single node item
@@ -413,14 +400,49 @@ export function Sidebar() {
             {recentNodes.filter(n => n.id !== activeNodeId).length > 0 ? (
               <div className="space-y-0.5">
                 {recentNodes.filter(n => n.id !== activeNodeId).slice(0, 10).map(node => (
-                  <button
+                  <div
                     key={node.id}
-                    onClick={() => handleNodeClick(node.id)}
-                    className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs transition-colors text-gray-400 hover:text-gray-200 hover:bg-gray-700/30"
+                    className="group flex items-center gap-1 px-2 py-1.5 rounded text-xs transition-colors text-gray-400 hover:text-gray-200 hover:bg-gray-700/30"
                   >
-                    <span>{getNodeEmoji(node)}</span>
-                    <span className="truncate">{node.aiTitle || node.title}</span>
-                  </button>
+                    <button
+                      onClick={() => handleNodeClick(node.id)}
+                      className="flex-1 flex items-center gap-2 text-left truncate"
+                    >
+                      <span>{getNodeEmoji(node)}</span>
+                      <span className="truncate">{node.aiTitle || node.title}</span>
+                    </button>
+                    <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleTogglePin(node.id, node.isPinned);
+                        }}
+                        className={`p-1 rounded transition-colors ${
+                          pinnedIds.has(node.id)
+                            ? 'text-amber-400 hover:text-amber-300'
+                            : 'text-gray-500 hover:text-gray-300'
+                        }`}
+                        title={pinnedIds.has(node.id) ? 'Unpin' : 'Pin'}
+                      >
+                        {pinnedIds.has(node.id) ? <PinOff className="w-3 h-3" /> : <Pin className="w-3 h-3" />}
+                      </button>
+                      <button
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          try {
+                            await invoke('clear_recent', { nodeId: node.id });
+                            setRecentNodes(prev => prev.filter(n => n.id !== node.id));
+                          } catch (err) {
+                            console.error('Failed to remove from recents:', err);
+                          }
+                        }}
+                        className="p-1 text-gray-500 hover:text-red-400 rounded transition-colors"
+                        title="Remove from recents"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </div>
+                  </div>
                 ))}
               </div>
             ) : (
@@ -431,92 +453,6 @@ export function Sidebar() {
           </div>
         )}
       </div>
-
-      {/* Active node details panel */}
-      {activeNode && (
-        <div className="border-t border-gray-700/50 bg-gray-800 max-h-80 overflow-y-auto">
-          <div className="p-4">
-            {/* Header with close button */}
-            <div className="flex items-start justify-between gap-2 mb-3">
-              <div className="flex-1 min-w-0">
-                <h3 className="text-sm font-semibold text-white leading-tight">
-                  <span className="mr-1.5">{getNodeEmoji(activeNode)}</span>
-                  {activeNode.aiTitle || activeNode.title}
-                </h3>
-              </div>
-              <div className="flex items-center gap-1">
-                <button
-                  onClick={() => handleTogglePin(activeNode.id, activeNode.isPinned)}
-                  className={`p-1 rounded transition-colors ${
-                    activeNode.isPinned
-                      ? 'text-amber-400 hover:text-amber-300'
-                      : 'text-gray-500 hover:text-gray-300'
-                  }`}
-                  title={activeNode.isPinned ? 'Unpin' : 'Pin'}
-                >
-                  {activeNode.isPinned ? <PinOff className="w-4 h-4" /> : <Pin className="w-4 h-4" />}
-                </button>
-                <button
-                  onClick={() => setActiveNode(null)}
-                  className="p-1 text-gray-500 hover:text-gray-300 rounded hover:bg-gray-700/50"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-            </div>
-
-            {/* Metadata */}
-            <div className="text-xs text-gray-400 mb-3">
-              {new Date(activeNode.createdAt).toLocaleDateString()} at{' '}
-              {new Date(activeNode.createdAt).toLocaleTimeString()}
-            </div>
-
-            {/* Content preview */}
-            {(activeNode.summary || activeNode.content) && (
-              <div className="text-sm text-gray-300 mb-3 p-2 bg-gray-900/50 rounded border border-gray-700/50 max-h-32 overflow-y-auto">
-                {activeNode.summary || activeNode.content}
-              </div>
-            )}
-
-            {/* URL */}
-            {activeNode.url && (
-              <a
-                href={activeNode.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1 text-xs text-amber-400 hover:text-amber-300 hover:underline mb-3"
-              >
-                Open in Claude <ChevronRight className="w-3 h-3" />
-              </a>
-            )}
-
-            {/* Connected nodes */}
-            {connectedNodes.length > 0 && (
-              <div className="mt-3 pt-3 border-t border-gray-700/50">
-                <div className="text-xs font-medium text-gray-400 mb-2">
-                  Connected ({connectedNodes.length})
-                </div>
-                <div className="space-y-1">
-                  {connectedNodes.slice(0, 5).map((node) => node && (
-                    <button
-                      key={node.id}
-                      onClick={() => handleNodeClick(node.id)}
-                      className="w-full text-left text-xs text-gray-300 hover:text-amber-300 truncate py-1 px-2 rounded hover:bg-gray-700/50"
-                    >
-                      → {node.aiTitle || node.title}
-                    </button>
-                  ))}
-                  {connectedNodes.length > 5 && (
-                    <div className="text-xs text-gray-500 pl-2">
-                      +{connectedNodes.length - 5} more...
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
 
       {/* Settings panel */}
       {showSettings && (

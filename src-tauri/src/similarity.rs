@@ -27,6 +27,7 @@ pub fn find_similar(
     all_embeddings: &[(String, Vec<f32>)],
     exclude_id: &str,
     top_n: usize,
+    min_similarity: f32,
 ) -> Vec<(String, f32)> {
     let mut similarities: Vec<(String, f32)> = all_embeddings
         .iter()
@@ -35,6 +36,7 @@ pub fn find_similar(
             let sim = cosine_similarity(target_embedding, emb);
             (id.clone(), sim)
         })
+        .filter(|(_, sim)| *sim >= min_similarity)
         .collect();
 
     // Sort by similarity descending
@@ -83,7 +85,7 @@ mod tests {
             ("d".to_string(), vec![-1.0, 0.0, 0.0]),   // opposite
         ];
 
-        let similar = find_similar(&target, &embeddings, "a", 2);
+        let similar = find_similar(&target, &embeddings, "a", 2, 0.0);
         assert_eq!(similar.len(), 2);
         assert_eq!(similar[0].0, "b"); // Most similar after excluding "a"
     }
@@ -92,7 +94,7 @@ mod tests {
     fn test_find_similar_empty() {
         let target = vec![1.0, 0.0, 0.0];
         let embeddings: Vec<(String, Vec<f32>)> = vec![];
-        let similar = find_similar(&target, &embeddings, "x", 5);
+        let similar = find_similar(&target, &embeddings, "x", 5, 0.0);
         assert!(similar.is_empty());
     }
 }

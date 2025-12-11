@@ -28,7 +28,7 @@ use commands::{
     // Import commands
     import_claude_conversations,
     // Quick access commands (Sidebar)
-    set_node_pinned, touch_node, get_pinned_nodes, get_recent_nodes,
+    set_node_pinned, touch_node, get_pinned_nodes, get_recent_nodes, clear_recent,
     // Semantic similarity commands
     get_similar_nodes, get_embedding_status,
     // OpenAI API key commands
@@ -122,6 +122,7 @@ pub fn run() {
             touch_node,
             get_pinned_nodes,
             get_recent_nodes,
+            clear_recent,
             // Semantic similarity
             get_similar_nodes,
             get_embedding_status,

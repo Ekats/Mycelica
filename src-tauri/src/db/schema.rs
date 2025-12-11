@@ -1373,6 +1373,16 @@ impl Database {
         Ok(())
     }
 
+    /// Clear last accessed timestamp for a node (remove from recents)
+    pub fn clear_recent(&self, node_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE nodes SET last_accessed_at = NULL WHERE id = ?1",
+            params![node_id],
+        )?;
+        Ok(())
+    }
+
     /// Get pinned nodes (for Sidebar Pinned tab)
     pub fn get_pinned_nodes(&self) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
