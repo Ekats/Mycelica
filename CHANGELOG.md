@@ -2,6 +2,42 @@
 
 All notable changes to Mycelica will be documented in this file.
 
+## [0.2.0] - 2025-12-11
+
+### Similar Nodes Panel
+- Made scrollable with more items displayed
+- Added green dot markers for nodes in same view
+- Color gradient for similarity percentages (red→yellow→green)
+- Jump navigation with breadcrumb tracking
+- Panel made resizable with drag handle
+
+### Edge Rendering
+- Made edges thicker and more direct (curve radius 0.4→1.5)
+- Thickness varies by semantic similarity weight (2-16px)
+- Color gradient from red (low) to green (high similarity)
+- Normalized weights based on min/max in current view
+- Added weight field to TypeScript Edge interface
+
+### Zen Mode
+- New ☯ button (48x48px) in bottom-right of node cards
+- Click to fade other nodes/edges by relevance
+- Connected nodes fade based on edge weight
+- Unconnected nodes fade to 15% opacity
+- Click another node to switch zen focus, empty space to exit
+
+### Node Card Styling
+- Card height increased: 240px→320px
+- Synopsis background with rgba(0,0,0,0.2)
+- Text clipped to exactly 5 lines (no partial line visible)
+- Nested div approach: outer for background, inner for text clipping
+- Title clipped to 2 lines with -webkit-line-clamp
+- Titlebar height: 72px→80px with more padding
+- Summary text: 18px→20px, medium bold (font-weight: 500)
+- Title text: 20px→22px
+- Footer text: 14px→16px
+- Font family: Inter, SF Pro Display, system fallbacks
+- Title vertically centered in titlebar using flexbox
+
 ## [0.1.0] - 2025-11-23
 
 ### Added
