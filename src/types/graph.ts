@@ -81,6 +81,7 @@ export interface Edge {
   target: string;
   type: EdgeType;
   label?: string;
+  weight?: number;  // Semantic similarity (0.0 to 1.0)
   createdAt: number;
 }
 

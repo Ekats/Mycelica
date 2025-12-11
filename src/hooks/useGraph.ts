@@ -52,6 +52,7 @@ interface BackendEdge {
   target: string;
   type: string;  // Rust uses #[serde(rename = "type")]
   label: string | null;
+  weight: number | null;  // Semantic similarity (0.0 to 1.0)
   createdAt: number;  // Rust uses #[serde(rename = "createdAt")]
 }
 
@@ -102,6 +103,7 @@ function mapBackendEdge(e: BackendEdge): Edge {
     target: e.target,
     type: e.type as Edge['type'],
     label: e.label ?? undefined,
+    weight: e.weight ?? undefined,
     createdAt: e.createdAt,
   };
 }

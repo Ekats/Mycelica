@@ -124,6 +124,14 @@ export function Graph({ width, height }: GraphProps) {
     setStackNodesState(value);
   };
   const SIMILAR_INITIAL_COUNT = 10;
+  const [detailsPanelSize, setDetailsPanelSize] = useState({ width: 400, height: 400 });
+  const [isResizingDetails, setIsResizingDetails] = useState(false);
+  const [zenModeNodeId, setZenModeNodeId] = useState<string | null>(null); // Node ID for zen mode focus
+  const zenModeNodeIdRef = useRef<string | null>(null);
+  const setZenMode = (nodeId: string | null) => {
+    zenModeNodeIdRef.current = nodeId;
+    setZenModeNodeId(nodeId);
+  };
 
   // Load learned emoji mappings on mount
   useEffect(() => {
@@ -310,6 +318,31 @@ export function Graph({ width, height }: GraphProps) {
       document.removeEventListener('mouseup', handleMouseUp);
     };
   }, [isResizing]);
+
+  // Details panel resize handling
+  useEffect(() => {
+    if (!isResizingDetails) return;
+
+    const handleMouseMove = (e: MouseEvent) => {
+      // Panel is positioned from right edge, so width increases as mouse moves left
+      const newWidth = Math.max(300, Math.min(800, window.innerWidth - e.clientX - 16));
+      // Height increases as mouse moves down
+      const newHeight = Math.max(300, Math.min(window.innerHeight - 100, e.clientY - 64)); // 64 = top offset
+      setDetailsPanelSize({ width: newWidth, height: newHeight });
+    };
+
+    const handleMouseUp = () => {
+      setIsResizingDetails(false);
+    };
+
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [isResizingDetails]);
 
   // Listen for AI progress events
   useEffect(() => {
@@ -524,7 +557,7 @@ export function Graph({ width, height }: GraphProps) {
 
     // Card dimensions at 100% zoom (unified for all nodes)
     const noteWidth = 320;
-    const noteHeight = 240;
+    const noteHeight = 320;
 
     // Spacing between nodes (in graph units)
     const nodeSpacing = 300;
@@ -686,26 +719,50 @@ export function Graph({ width, height }: GraphProps) {
     const linksGroup = container.append('g').attr('class', 'links');
 
     // Build edge data with resolved coordinates
-    const edgeData: Array<{source: GraphNode, target: GraphNode, type: string}> = [];
+    const edgeData: Array<{source: GraphNode, target: GraphNode, type: string, weight: number}> = [];
+    let containsCount = 0, relatedCount = 0;
     edges.forEach(edge => {
       const source = nodeMap.get(edge.source);
       const target = nodeMap.get(edge.target);
       if (source && target) {
-        edgeData.push({ source, target, type: edge.type });
+        edgeData.push({ source, target, type: edge.type, weight: edge.weight ?? 0.5 });
+        if (edge.type === 'contains') containsCount++;
+        else relatedCount++;
       }
     });
+
+    // Calculate min/max weights for normalization (only for related edges)
+    const relatedWeights = edgeData.filter(e => e.type !== 'contains').map(e => e.weight);
+    const minWeight = relatedWeights.length > 0 ? Math.min(...relatedWeights) : 0;
+    const maxWeight = relatedWeights.length > 0 ? Math.max(...relatedWeights) : 1;
+    const weightRange = maxWeight - minWeight || 0.1; // Avoid division by zero
+    devLog('info', `Edges in view: ${containsCount} contains, ${relatedCount} related (weights: ${(minWeight*100).toFixed(0)}%-${(maxWeight*100).toFixed(0)}%)`);
 
     const edgePaths = linksGroup.selectAll('path')
       .data(edgeData)
       .join('path')
       .attr('fill', 'none')
-      .attr('stroke', d => d.type === 'contains' ? '#6b7280' : '#ef4444')
-      .attr('stroke-opacity', d => d.type === 'contains' ? 0.3 : 0.5)
-      .attr('stroke-width', d => d.type === 'contains' ? 1.5 : 2)
+      .attr('stroke', d => {
+        if (d.type === 'contains') return '#6b7280';
+        // Normalize weight to 0-1 range based on actual min/max in view
+        const normalized = (d.weight - minWeight) / weightRange;
+        // Color from red (low) to green (high similarity)
+        const hue = normalized * 120; // 0=red, 60=yellow, 120=green
+        return `hsl(${hue}, 80%, 50%)`;
+      })
+      .attr('stroke-opacity', d => d.type === 'contains' ? 0.5 : 0.7)
+      .attr('stroke-width', d => {
+        // Base thickness + weight-based scaling
+        if (d.type === 'contains') return 3;
+        // Normalize and use exponential scaling
+        const normalized = (d.weight - minWeight) / weightRange;
+        // 0% (min) → 2px, 100% (max) → 16px
+        return 2 + normalized * 14;
+      })
       .attr('d', d => {
         const dx = d.target.x - d.source.x;
         const dy = d.target.y - d.source.y;
-        const dr = Math.sqrt(dx * dx + dy * dy) * 0.4;
+        const dr = Math.sqrt(dx * dx + dy * dy) * 1.5; // Larger radius = less curve
         return `M${d.source.x},${d.source.y} A${dr},${dr} 0 0,1 ${d.target.x},${d.target.y}`;
       });
 
@@ -743,16 +800,16 @@ export function Graph({ width, height }: GraphProps) {
       .attr('stroke', d => d.id === activeNodeId ? '#fbbf24' : 'rgba(255,255,255,0.15)')
       .attr('stroke-width', d => d.id === activeNodeId ? 2 : 1);
 
-    // Titlebar - darker area at top (72px for 2 lines of text + emoji)
+    // Titlebar - darker area at top (80px for 2 lines of text + emoji + padding)
     // First rect: full width, rounded top corners match card
     cardGroups.append('rect')
       .attr('width', noteWidth)
-      .attr('height', 72)
+      .attr('height', 80)
       .attr('rx', 6)
       .attr('fill', 'rgba(0,0,0,0.4)');
     // Second rect: fills in bottom corners of titlebar
     cardGroups.append('rect')
-      .attr('y', 62)
+      .attr('y', 70)
       .attr('width', noteWidth)
       .attr('height', 10)
       .attr('fill', 'rgba(0,0,0,0.4)');
@@ -760,49 +817,121 @@ export function Graph({ width, height }: GraphProps) {
     // Large emoji spanning titlebar height
     cardGroups.append('text')
       .attr('x', 14)
-      .attr('y', 48)
+      .attr('y', 52)
       .attr('font-size', '42px')
       .text(d => d.displayEmoji);
 
-    // Title - foreignObject for natural wrapping (2 lines), centered horizontally
+    // Nice font for all card text
+    const cardFont = "'Inter', 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif";
+
+    // Title - foreignObject for natural wrapping (2 lines), centered horizontally and vertically
     cardGroups.append('foreignObject')
-      .attr('x', 62)
-      .attr('y', 10)
-      .attr('width', noteWidth - 76)
-      .attr('height', 56)
+      .attr('x', 58)
+      .attr('y', 0)
+      .attr('width', noteWidth - 68)
+      .attr('height', 80)
       .append('xhtml:div')
-      .style('font-size', '20px')
+      .style('font-family', cardFont)
+      .style('font-size', '22px')
       .style('font-weight', '600')
       .style('color', '#ffffff')
       .style('line-height', '1.3')
-      .style('overflow', 'hidden')
-      .style('word-wrap', 'break-word')
       .style('text-align', 'center')
-      .text(d => d.displayTitle);
+      .style('height', '80px')
+      .style('display', 'flex')
+      .style('align-items', 'center')
+      .style('justify-content', 'center')
+      .html(d => {
+        const title = d.displayTitle || '';
+        return `<div style="display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;">${title}</div>`;
+      });
 
-    // Synopsis - foreignObject for natural wrapping
+    // Synopsis area - foreignObject with background built into the div (no separate rect)
+    const synopsisHeight = noteHeight - 148; // From titlebar (80px) to near zen button
     cardGroups.append('foreignObject')
-      .attr('x', 14)
-      .attr('y', 78)
-      .attr('width', noteWidth - 28)
-      .attr('height', noteHeight - 112)
+      .attr('x', 0)
+      .attr('y', 80)
+      .attr('width', noteWidth)
+      .attr('height', synopsisHeight)
       .append('xhtml:div')
-      .style('font-size', '18px')
+      .style('background', 'rgba(0,0,0,0.2)')
+      .style('width', '100%')
+      .style('height', '100%')
+      .style('padding', '4px 14px')
+      .style('box-sizing', 'border-box')
+      .style('font-family', cardFont)
+      .style('font-size', '20px')
+      .style('font-weight', '500')
       .style('color', '#ffffff')
-      .style('line-height', '1.4')
+      .style('line-height', '1.5')
       .style('overflow', 'hidden')
-      .style('word-wrap', 'break-word')
-      .text(d => d.displayContent || '');
+      .html(d => {
+        if (!d.displayContent) return '';
+        const items = d.displayContent.split(', ').filter(s => s.trim()).slice(0, 5);
+        const bullets = items.map(item => `<div>• ${item}</div>`).join('');
+        return `<div style="max-height: 150px; overflow: hidden; line-height: 1.5;">${bullets}</div>`;
+      });
 
     // Footer info
     cardGroups.append('text')
       .attr('x', 14)
       .attr('y', noteHeight - 16)
-      .attr('font-size', '22px')
+      .attr('font-family', cardFont)
+      .attr('font-size', '16px')
       .attr('fill', 'rgba(255,255,255,0.5)')
       .text(d => d.childCount > 0 ? `${d.childCount} items` : new Date(d.createdAt).toLocaleDateString());
 
-    
+    // Helper to reset zen mode
+    const resetZenMode = () => {
+      setZenMode(null);
+      cardGroups.style('opacity', 1);
+      dotGroups.style('opacity', 1);
+      edgePaths.style('opacity', null);
+    };
+
+    // Zen mode button (bottom right of card)
+    // Position: 32px from right and bottom edges
+    const zenButtons = cardGroups.append('g')
+      .attr('class', 'zen-button')
+      .attr('transform', `translate(${noteWidth - 32}, ${noteHeight - 32})`)
+      .attr('cursor', 'pointer')
+      .on('mouseenter', function() {
+        d3.select(this).select('rect')
+          .attr('fill', 'rgba(139,92,246,0.9)'); // Purple highlight
+      })
+      .on('mouseleave', function() {
+        d3.select(this).select('rect')
+          .attr('fill', 'rgba(0,0,0,0.6)');
+      })
+      .on('click', function(event, d) {
+        event.stopPropagation();
+        const currentZen = zenModeNodeIdRef.current;
+        if (currentZen === d.id) {
+          // Toggle off
+          resetZenMode();
+        } else {
+          // Enable zen mode for this node
+          applyZenMode(d.id);
+        }
+      });
+
+    zenButtons.append('rect')
+      .attr('x', -24)
+      .attr('y', -24)
+      .attr('width', 48)
+      .attr('height', 48)
+      .attr('rx', 10)
+      .attr('fill', 'rgba(0,0,0,0.6)')
+      .attr('stroke', 'rgba(255,255,255,0.5)')
+      .attr('stroke-width', 2);
+
+    zenButtons.append('text')
+      .attr('text-anchor', 'middle')
+      .attr('dy', '0.35em')
+      .attr('font-size', '38px')
+      .attr('fill', '#fff')
+      .text('☯');
+
     // Unified bubble rendering for ALL nodes (low zoom)
     const dotGroups = dotsGroup.selectAll('g.node-dot')
       .data(graphNodes)
@@ -836,6 +965,41 @@ export function Graph({ width, height }: GraphProps) {
     // Start with cards shown, dots hidden
     dotsGroup.style('display', 'none');
 
+    // Helper to apply zen mode for a node
+    const applyZenMode = (nodeId: string) => {
+      setZenMode(nodeId);
+      // Build relevance map from edges
+      const relevanceMap = new Map<string, number>();
+      relevanceMap.set(nodeId, 1.0); // Self is always 1.0
+      edgeData.forEach(edge => {
+        if (edge.source.id === nodeId) {
+          const existing = relevanceMap.get(edge.target.id) || 0;
+          relevanceMap.set(edge.target.id, Math.max(existing, edge.weight));
+        } else if (edge.target.id === nodeId) {
+          const existing = relevanceMap.get(edge.source.id) || 0;
+          relevanceMap.set(edge.source.id, Math.max(existing, edge.weight));
+        }
+      });
+      // Fade nodes by relevance
+      cardGroups.style('opacity', (n: GraphNode) => {
+        const relevance = relevanceMap.get(n.id);
+        if (relevance === undefined) return 0.15; // Unconnected
+        return 0.3 + relevance * 0.7; // 0.3 to 1.0 based on weight
+      });
+      dotGroups.style('opacity', (n: GraphNode) => {
+        const relevance = relevanceMap.get(n.id);
+        if (relevance === undefined) return 0.15;
+        return 0.3 + relevance * 0.7;
+      });
+      // Fade edges by relevance to selected node
+      edgePaths.style('opacity', (e: {source: GraphNode, target: GraphNode, weight: number}) => {
+        if (e.source.id === nodeId || e.target.id === nodeId) {
+          return 0.5 + e.weight * 0.5; // Connected edges: 0.5 to 1.0
+        }
+        return 0.05; // Unconnected edges nearly invisible
+      });
+    };
+
     // Unified interactions
     cardGroups
       .on('click', function(event, d) {
@@ -848,6 +1012,10 @@ export function Graph({ width, height }: GraphProps) {
         d3.select(this).select('.card-bg')
           .attr('stroke', '#fbbf24')
           .attr('stroke-width', 2);
+        // If zen mode is active, switch to the new node
+        if (zenModeNodeIdRef.current && zenModeNodeIdRef.current !== d.id) {
+          applyZenMode(d.id);
+        }
       })
       .on('dblclick', function(event, d) {
         event.stopPropagation();
@@ -867,6 +1035,10 @@ export function Graph({ width, height }: GraphProps) {
         event.stopPropagation();
         setActiveNode(d.id);
         fetchSimilarNodes(d.id);
+        // If zen mode is active, switch to the new node
+        if (zenModeNodeIdRef.current && zenModeNodeIdRef.current !== d.id) {
+          applyZenMode(d.id);
+        }
       })
       .on('dblclick', function(event, d) {
         event.stopPropagation();
@@ -933,7 +1105,7 @@ export function Graph({ width, height }: GraphProps) {
             const ty = d.target.y * positionScale;
             const dx = tx - sx;
             const dy = ty - sy;
-            const dr = Math.sqrt(dx * dx + dy * dy) * 0.4;
+            const dr = Math.sqrt(dx * dx + dy * dy) * 1.5;
             return `M${sx},${sy} A${dr},${dr} 0 0,1 ${tx},${ty}`;
           });
 
@@ -960,7 +1132,7 @@ export function Graph({ width, height }: GraphProps) {
             const ty = d.target.y * positionScale;
             const dx = tx - sx;
             const dy = ty - sy;
-            const dr = Math.sqrt(dx * dx + dy * dy) * 0.4;
+            const dr = Math.sqrt(dx * dx + dy * dy) * 1.5;
             return `M${sx},${sy} A${dr},${dr} 0 0,1 ${tx},${ty}`;
           });
         }
@@ -977,6 +1149,10 @@ export function Graph({ width, height }: GraphProps) {
       cardsGroup.selectAll('.card-bg')
         .attr('stroke', 'rgba(255,255,255,0.15)')
         .attr('stroke-width', 1);
+      // Reset zen mode
+      if (zenModeNodeIdRef.current) {
+        resetZenMode();
+      }
     });
 
     // Fit to view
@@ -1149,11 +1325,14 @@ export function Graph({ width, height }: GraphProps) {
         </div>
       )}
 
-      {/* Similar nodes panel */}
+      {/* Similar nodes panel - resizable */}
       {similarNodesMap.size > 0 && (
-        <div className={`absolute top-16 right-4 bg-gray-800/95 backdrop-blur-sm text-white rounded-lg shadow-xl border border-gray-700 z-30 w-[400px] ${expandedSimilar.size > 0 ? 'min-h-[500px]' : 'min-h-[400px]'}`}>
+        <div
+          className="absolute top-16 right-4 bg-gray-800/95 backdrop-blur-sm text-white rounded-lg shadow-xl border border-gray-700 z-30 overflow-hidden flex flex-col"
+          style={{ width: detailsPanelSize.width, height: detailsPanelSize.height }}
+        >
           {/* Panel header with stack toggle */}
-          <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between">
+          <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between flex-shrink-0">
             <span className="text-xs font-medium text-gray-400">Node Details</span>
             <div className="flex items-center gap-2">
               <button
@@ -1175,7 +1354,7 @@ export function Graph({ width, height }: GraphProps) {
               </button>
             </div>
           </div>
-          <div className={`overflow-y-auto ${expandedSimilar.size > 0 ? 'max-h-[600px]' : 'max-h-[360px]'}`}>
+          <div className="overflow-y-auto flex-1">
             {Array.from(similarNodesMap.entries()).map(([sourceId, similarNodes]) => {
               const sourceNode = nodes.get(sourceId);
               const sourceParent = sourceNode?.parentId;
@@ -1270,7 +1449,11 @@ export function Graph({ width, height }: GraphProps) {
                           >
                             <div className="flex items-center justify-between gap-2">
                               <span className="text-sm truncate">
-                                {isInSameView && <span className="text-green-400 mr-1" title="In current view">●</span>}
+                                {isInSameView ? (
+                                  <span className="text-green-400 mr-1" title="In current view">●</span>
+                                ) : (
+                                  <span className="mr-1 inline-block w-[1em]"></span>
+                                )}
                                 {similar.emoji || '📄'} {similar.title}
                               </span>
                               <span
@@ -1308,6 +1491,23 @@ export function Graph({ width, height }: GraphProps) {
                 </div>
               );
             })}
+          </div>
+          {/* Resize handle - bottom-left corner */}
+          <div
+            onMouseDown={(e) => {
+              e.preventDefault();
+              setIsResizingDetails(true);
+            }}
+            className={`absolute bottom-0 left-0 w-4 h-4 cursor-sw-resize group ${isResizingDetails ? 'bg-amber-500/30' : ''}`}
+            title="Drag to resize"
+          >
+            <svg
+              className="w-3 h-3 absolute bottom-0.5 left-0.5 text-gray-500 group-hover:text-amber-400 transition-colors"
+              viewBox="0 0 12 12"
+              fill="currentColor"
+            >
+              <path d="M0 12L12 0v3L3 12H0zm0-5l7-7v3L3 10v2H0V7z" />
+            </svg>
           </div>
         </div>
       )}
