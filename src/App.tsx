@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, Component, ErrorInfo, ReactNode } from 're
 import { Graph } from './components/graph/Graph';
 import { LeafView } from './components/leaf/LeafView';
 import { Sidebar } from './components/sidebar/Sidebar';
+import { SettingsPanel } from './components/settings/SettingsPanel';
 import { useGraph } from './hooks/useGraph';
 import { useGraphStore } from './stores/graphStore';
 import './App.css';
@@ -57,7 +58,8 @@ function App() {
   const containerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
   const [loading, setLoading] = useState(true);
-  const { nodes, edges } = useGraph();
+  const [showSettings, setShowSettings] = useState(false);
+  const { nodes, edges, reload } = useGraph();
   const { viewMode, leafNodeId, closeLeaf } = useGraphStore();
 
   useEffect(() => {
@@ -122,7 +124,7 @@ function App() {
 
   return (
     <div className="h-screen w-screen flex bg-gray-900">
-      <Sidebar />
+      <Sidebar onOpenSettings={() => setShowSettings(true)} />
       <main ref={containerRef} className="flex-1 relative overflow-hidden">
         {viewMode === 'leaf' && leafNodeId ? (
           <LeafView nodeId={leafNodeId} onBack={closeLeaf} />
@@ -130,6 +132,11 @@ function App() {
           <Graph width={dimensions.width} height={dimensions.height} />
         )}
       </main>
+      <SettingsPanel
+        open={showSettings}
+        onClose={() => setShowSettings(false)}
+        onDataChanged={reload}
+      />
     </div>
   );
 }

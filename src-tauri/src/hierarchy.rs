@@ -13,10 +13,12 @@
 use crate::db::{Database, Node, NodeType, Position};
 use crate::ai_client::{self, TopicInfo};
 use crate::settings;
+use crate::commands::is_rebuild_cancelled;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
+use tokio::time::{timeout, Duration};
 
 /// Log event for frontend dev console
 #[derive(Clone, Serialize)]
@@ -64,6 +66,62 @@ fn emit_log(app: Option<&AppHandle>, level: &str, message: &str) {
             level: level.to_string(),
         });
     }
+}
+
+/// Compute topic centroids from their child items' embeddings
+///
+/// During hierarchy grouping (Step 3), topic nodes don't have embeddings yet
+/// (those are generated in Step 4). But their child items DO have embeddings
+/// from the Process AI step. This function computes topic "centroids" by
+/// averaging the embeddings of each topic's child items.
+fn compute_topic_centroids_from_items(
+    db: &Database,
+    topic_nodes: &[Node],
+) -> Vec<(String, Vec<f32>)> {
+    let mut centroids: Vec<(String, Vec<f32>)> = Vec::new();
+
+    for topic in topic_nodes {
+        // Get children of this topic (items)
+        let children = match db.get_children(&topic.id) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        if children.is_empty() {
+            continue;
+        }
+
+        // Collect embeddings from children
+        let mut embeddings: Vec<Vec<f32>> = Vec::new();
+        for child in &children {
+            if let Ok(Some(emb)) = db.get_node_embedding(&child.id) {
+                embeddings.push(emb);
+            }
+        }
+
+        if embeddings.is_empty() {
+            continue;
+        }
+
+        // Compute centroid (element-wise average)
+        let dim = embeddings[0].len();
+        let mut centroid = vec![0.0f32; dim];
+        for emb in &embeddings {
+            for (i, val) in emb.iter().enumerate() {
+                if i < dim {
+                    centroid[i] += val;
+                }
+            }
+        }
+        let count = embeddings.len() as f32;
+        for val in &mut centroid {
+            *val /= count;
+        }
+
+        centroids.push((topic.id.clone(), centroid));
+    }
+
+    centroids
 }
 
 /// Maximum children per node before we need to group them
@@ -504,10 +562,142 @@ pub struct FullHierarchyResult {
     pub embeddings_skipped: usize,
 }
 
+/// Maximum children to send in a single AI grouping request
+/// Larger batches risk JSON truncation in AI response
+const BATCH_SIZE_FOR_GROUPING: usize = 150;
+
+/// Threshold above which we split into batches
+const BATCH_THRESHOLD: usize = 200;
+
+/// Process topics in batches and merge results
+///
+/// For large datasets (>200 topics), this:
+/// 1. Splits topics into chunks of 150
+/// 2. Calls AI grouping for each chunk
+/// 3. Merges similar categories across batches (fuzzy name matching)
+/// 4. Returns unified groupings
+async fn group_topics_in_batches(
+    topics: &[TopicInfo],
+    context: &ai_client::GroupingContext,
+    app: Option<&AppHandle>,
+) -> Result<Vec<ai_client::CategoryGrouping>, String> {
+    let batch_count = (topics.len() + BATCH_SIZE_FOR_GROUPING - 1) / BATCH_SIZE_FOR_GROUPING;
+    emit_log(app, "info", &format!("Splitting {} topics into {} batches of ~{}",
+             topics.len(), batch_count, BATCH_SIZE_FOR_GROUPING));
+
+    let mut all_groupings: Vec<ai_client::CategoryGrouping> = Vec::new();
+
+    for (batch_idx, batch) in topics.chunks(BATCH_SIZE_FOR_GROUPING).enumerate() {
+        emit_log(app, "info", &format!("  Processing batch {}/{} ({} topics)",
+                 batch_idx + 1, batch_count, batch.len()));
+
+        // For subsequent batches, include existing category names as hints
+        let mut batch_context = context.clone();
+        if !all_groupings.is_empty() {
+            let existing_names: Vec<String> = all_groupings.iter()
+                .map(|g| g.name.clone())
+                .collect();
+            batch_context.sibling_names.extend(existing_names);
+        }
+
+        match timeout(
+            Duration::from_secs(120),
+            ai_client::group_topics_into_categories(batch, &batch_context)
+        ).await {
+            Ok(Ok(batch_groupings)) => {
+                emit_log(app, "info", &format!("    Batch {} returned {} categories",
+                         batch_idx + 1, batch_groupings.len()));
+
+                // Merge with existing groupings
+                for new_grouping in batch_groupings {
+                    // Try to find existing category with similar name
+                    if let Some(existing) = find_similar_category(&mut all_groupings, &new_grouping.name) {
+                        // Merge children into existing category
+                        existing.children.extend(new_grouping.children);
+                        emit_log(app, "debug", &format!("    Merged '{}' into existing '{}'",
+                                 new_grouping.name, existing.name));
+                    } else {
+                        // Add as new category
+                        all_groupings.push(new_grouping);
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                emit_log(app, "error", &format!("    Batch {} failed: {}", batch_idx + 1, e));
+                // Continue with other batches rather than failing entirely
+            }
+            Err(_) => {
+                emit_log(app, "error", &format!("    Batch {} timed out after 120s", batch_idx + 1));
+                // Continue with other batches rather than failing entirely
+            }
+        }
+    }
+
+    emit_log(app, "info", &format!("Batch processing complete: {} total categories", all_groupings.len()));
+    Ok(all_groupings)
+}
+
+/// Find a category with a similar name (case-insensitive, handles minor variations)
+fn find_similar_category<'a>(
+    categories: &'a mut [ai_client::CategoryGrouping],
+    name: &str,
+) -> Option<&'a mut ai_client::CategoryGrouping> {
+    let name_lower = name.to_lowercase();
+    let name_normalized = normalize_category_name(&name_lower);
+
+    for cat in categories.iter_mut() {
+        let cat_lower = cat.name.to_lowercase();
+        let cat_normalized = normalize_category_name(&cat_lower);
+
+        // Exact match (case-insensitive)
+        if cat_lower == name_lower {
+            return Some(cat);
+        }
+
+        // Normalized match (ignores minor word differences)
+        if cat_normalized == name_normalized {
+            return Some(cat);
+        }
+
+        // One contains the other (for cases like "Programming" vs "Programming & Development")
+        if cat_lower.contains(&name_lower) || name_lower.contains(&cat_lower) {
+            // Only merge if they share significant overlap (at least 60% of shorter name)
+            let shorter = cat_lower.len().min(name_lower.len());
+            let common = common_prefix_len(&cat_lower, &name_lower);
+            if common as f64 / shorter as f64 > 0.6 {
+                return Some(cat);
+            }
+        }
+    }
+
+    None
+}
+
+/// Normalize a category name for comparison
+/// Removes common filler words and punctuation
+fn normalize_category_name(name: &str) -> String {
+    let stopwords = ["and", "the", "of", "&", "-", "related", "topics", "items"];
+    name.split_whitespace()
+        .filter(|word| !stopwords.contains(&word.to_lowercase().as_str()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Calculate length of common prefix between two strings
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.chars()
+        .zip(b.chars())
+        .take_while(|(ac, bc)| ac == bc)
+        .count()
+}
+
 /// Cluster children of a specific parent into 8-15 groups using AI
 ///
 /// If parent has <= MAX_CHILDREN_PER_LEVEL children, returns Ok(false) - no grouping needed.
 /// Otherwise, creates new intermediate nodes and reparents children.
+///
+/// For large datasets (>200 children), splits into batches of 150, calls AI for each,
+/// then merges similar categories across batches to prevent fragmentation.
 pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option<&AppHandle>) -> Result<bool, String> {
     // Get children of this parent
     let children = db.get_children(parent_id).map_err(|e| e.to_string())?;
@@ -545,20 +735,6 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
     // 4. Collect all existing category names (forbidden for reuse)
     let forbidden_names = db.get_all_category_names().map_err(|e| e.to_string())?;
 
-    // 5. Build context
-    let context = ai_client::GroupingContext {
-        parent_name: parent_node.cluster_label.clone().unwrap_or_else(|| parent_node.title.clone()),
-        parent_description: parent_node.summary.clone(),
-        hierarchy_path: hierarchy_path.clone(),
-        current_depth: parent_node.depth,
-        sibling_names: sibling_names.clone(),
-        forbidden_names: forbidden_names.clone(),
-    };
-
-    emit_log(app, "info", &format!("Context: parent='{}', depth={}, path={:?}, {} siblings, {} forbidden",
-             context.parent_name, context.current_depth,
-             hierarchy_path, sibling_names.len(), forbidden_names.len()));
-
     // Build topic info for AI
     let topics: Vec<TopicInfo> = children
         .iter()
@@ -572,8 +748,59 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
         })
         .collect();
 
-    // Get AI to group topics (with context)
-    let groupings = ai_client::group_topics_into_categories(&topics, &context).await?;
+    // 5. Detect embedding-based project clusters using topic centroids
+    // Topic nodes don't have embeddings yet (generated in Step 4), but their
+    // child items do. Compute centroids from item embeddings.
+    let topic_centroids = compute_topic_centroids_from_items(db, &children);
+
+    let mandatory_clusters = if topic_centroids.len() >= 4 {
+        emit_log(app, "info", &format!("Detecting project clusters from {} topics (centroids from child items)", topic_centroids.len()));
+        let clusters = ai_client::detect_project_clusters_from_embeddings(db, &topics, &topic_centroids, 4, 0.60);
+        if !clusters.is_empty() {
+            emit_log(app, "info", &format!("Found {} project clusters: {:?}",
+                clusters.len(),
+                clusters.iter().map(|c| format!("{}({} topics)", c.name, c.topic_ids.len())).collect::<Vec<_>>()
+            ));
+        }
+        clusters
+    } else {
+        emit_log(app, "info", &format!("Only {} topics have centroids (need 4+), skipping project cluster detection", topic_centroids.len()));
+        vec![]
+    };
+
+    // 6. Build context with mandatory clusters
+    let context = ai_client::GroupingContext {
+        parent_name: parent_node.cluster_label.clone().unwrap_or_else(|| parent_node.title.clone()),
+        parent_description: parent_node.summary.clone(),
+        hierarchy_path: hierarchy_path.clone(),
+        current_depth: parent_node.depth,
+        sibling_names: sibling_names.clone(),
+        forbidden_names: forbidden_names.clone(),
+        mandatory_clusters,
+    };
+
+    emit_log(app, "info", &format!("Context: parent='{}', depth={}, path={:?}, {} siblings, {} forbidden, {} mandatory clusters",
+             context.parent_name, context.current_depth,
+             hierarchy_path, sibling_names.len(), forbidden_names.len(), context.mandatory_clusters.len()));
+
+    // Get AI to group topics - use batching for large datasets
+    // Both paths have 120s timeout to prevent hanging
+    let groupings = if topics.len() > BATCH_THRESHOLD {
+        emit_log(app, "info", &format!("Large dataset ({} topics) - using batch processing", topics.len()));
+        group_topics_in_batches(&topics, &context, app).await?
+    } else {
+        match timeout(
+            Duration::from_secs(120),
+            ai_client::group_topics_into_categories(&topics, &context)
+        ).await {
+            Ok(Ok(g)) => g,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                emit_log(app, "error", &format!("AI grouping timed out for {} after 120s", parent_id));
+                return Ok(false); // Signal failure, will be added to failed_nodes
+            }
+        }
+    };
 
     if groupings.is_empty() {
         return Err("AI returned no groupings".to_string());
@@ -600,12 +827,18 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
         label_to_children.entry(label).or_default().push(child);
     }
 
-    // Create intermediate nodes and reparent children
-    let mut categories_created = 0;
-    let now = std::time::SystemTime::now()
+    // Generate unique timestamp suffix to avoid ID collisions across iterations
+    let timestamp_suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_millis() as i64;
+        .as_millis();
+
+    // Create intermediate nodes and reparent children
+    let mut categories_created = 0;
+    let now = timestamp_suffix as i64;
+
+    // Collect all children that need depth updates for batch processing
+    let mut all_children_to_update: Vec<String> = Vec::new();
 
     for (idx, grouping) in groupings.iter().enumerate() {
         // Find ALL child nodes matching this grouping's labels
@@ -619,8 +852,8 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
             continue;
         }
 
-        // Create intermediate node
-        let category_id = format!("{}-cat-{}", parent_id, idx);
+        // Create intermediate node with unique ID (timestamp prevents collision across iterations)
+        let category_id = format!("{}-cat-{}-{}", parent_id, timestamp_suffix, idx);
 
         let category_node = Node {
             id: category_id.clone(),
@@ -652,12 +885,17 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
         db.insert_node(&category_node).map_err(|e| e.to_string())?;
         categories_created += 1;
 
-        // Reparent children to this category
+        // Reparent children to this category and collect for batch depth update
         for child in matching_children {
             db.update_parent(&child.id, &category_id).map_err(|e| e.to_string())?;
-            // Increment depth of child and all its descendants
-            increment_subtree_depth(db, &child.id)?;
+            all_children_to_update.push(child.id.clone());
         }
+    }
+
+    // Batch update depths for all reparented children in ONE query
+    if !all_children_to_update.is_empty() {
+        emit_log(app, "info", &format!("Updating depths for {} reparented nodes...", all_children_to_update.len()));
+        db.increment_multiple_subtrees_depth(&all_children_to_update).map_err(|e| e.to_string())?;
     }
 
     // Update parent's child count
@@ -665,6 +903,30 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
         .map_err(|e| e.to_string())?;
 
     emit_log(app, "info", &format!("Created {} intermediate categories under {}", categories_created, parent_id));
+
+    // Detect pathological grouping - if grouping didn't actually split children meaningfully
+    let original_child_count = children.len();
+    let reparented_count = all_children_to_update.len();
+
+    if categories_created <= 1 {
+        // Only created 0 or 1 categories - grouping failed to split
+        emit_log(app, "warn", &format!(
+            "Pathological grouping detected for {}: {} children → {} categories. AI labels didn't match topic labels.",
+            parent_id, original_child_count, categories_created
+        ));
+        // Return false to signal grouping didn't meaningfully reduce children
+        // This prevents infinite recursion
+        return Ok(false);
+    }
+
+    if reparented_count < original_child_count / 2 {
+        // Less than half the children were matched - most fell through
+        emit_log(app, "warn", &format!(
+            "Grouping mostly failed for {}: only {}/{} children were categorized. Stopping recursion.",
+            parent_id, reparented_count, original_child_count
+        ));
+        return Ok(false);
+    }
 
     Ok(true)
 }
@@ -702,23 +964,10 @@ pub fn build_hierarchy_path(db: &Database, node_id: &str) -> Result<Vec<String>,
     Ok(path)
 }
 
-/// Increment depth of a node and all its descendants
+/// Increment depth of a node and all its descendants by 1
+/// Uses a single SQL statement with recursive CTE to avoid lock issues
 fn increment_subtree_depth(db: &Database, node_id: &str) -> Result<(), String> {
-    let node = db.get_node(node_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Node {} not found", node_id))?;
-
-    // Update this node's depth
-    db.update_node_hierarchy(node_id, node.parent_id.as_deref(), node.depth + 1)
-        .map_err(|e| e.to_string())?;
-
-    // Recursively update children
-    let children = db.get_children(node_id).map_err(|e| e.to_string())?;
-    for child in children {
-        increment_subtree_depth(db, &child.id)?;
-    }
-
-    Ok(())
+    db.increment_subtree_depth(node_id).map_err(|e| e.to_string())
 }
 
 /// Build full navigable hierarchy with recursive grouping
@@ -734,7 +983,7 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
 
     // Step 1: Optionally run clustering
     emit_log(app, "info", "");
-    emit_log(app, "info", "▶ STEP 1/4: Clustering items into topics");
+    emit_log(app, "info", "▶ STEP 1/5: Clustering items into topics");
     emit_log(app, "info", "───────────────────────────────────────────────────────────");
     let clustering_result = if run_clustering && ai_client::is_available() {
         emit_log(app, "info", "Running AI clustering on items...");
@@ -748,50 +997,226 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
 
     // Step 2: Build initial hierarchy
     emit_log(app, "info", "");
-    emit_log(app, "info", "▶ STEP 2/4: Building initial hierarchy structure");
+    emit_log(app, "info", "▶ STEP 2/5: Building initial hierarchy structure");
     emit_log(app, "info", "───────────────────────────────────────────────────────────");
     emit_log(app, "info", "Creating Universe and topic nodes from clusters...");
     let hierarchy_result = build_hierarchy(db)?;
     emit_log(app, "info", &format!("✓ Created {} intermediate nodes, organized {} items", hierarchy_result.intermediate_nodes_created, hierarchy_result.items_organized));
 
-    // Step 3: Recursively group levels with too many children
+    // Step 3: Detect and create project umbrellas
     emit_log(app, "info", "");
-    emit_log(app, "info", "▶ STEP 3/4: Recursive grouping (target: 8-15 children per level)");
+    emit_log(app, "info", "▶ STEP 3/5: Creating project umbrella categories");
+    emit_log(app, "info", "───────────────────────────────────────────────────────────");
+    emit_log(app, "info", "Scanning item titles for major project names...");
+
+    let major_projects = ai_client::detect_major_projects_globally(db);
+    let mut project_umbrellas_created = 0;
+
+    if major_projects.is_empty() {
+        emit_log(app, "info", "No major projects detected (need 2%+ of items, min 20)");
+    } else {
+        emit_log(app, "info", &format!("Found {} major projects:", major_projects.len()));
+        for project in &major_projects {
+            emit_log(app, "info", &format!("  • {} ({} items, {:.1}%)", project.name, project.item_count, project.percentage));
+        }
+
+        // Get universe node
+        let universe = db.get_universe().map_err(|e| e.to_string())?
+            .ok_or("No universe node found")?;
+
+        for project in &major_projects {
+            // Find parent topics of items containing this project name
+            let mut topic_ids_to_move: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+            for item_id in &project.item_ids {
+                if let Ok(Some(item)) = db.get_node(item_id) {
+                    if let Some(parent_id) = &item.parent_id {
+                        // Only move topics (non-items) that are direct children of universe
+                        if let Ok(Some(parent)) = db.get_node(parent_id) {
+                            if !parent.is_item && parent.parent_id.as_ref() == Some(&universe.id) {
+                                topic_ids_to_move.insert(parent_id.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            if topic_ids_to_move.is_empty() {
+                emit_log(app, "info", &format!("  Skipping '{}': no eligible topics to move", project.name));
+                continue;
+            }
+
+            // Create project umbrella node under universe
+            let umbrella_id = format!("project-{}", project.name.to_lowercase().replace(' ', "-"));
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            let umbrella = crate::db::Node {
+                id: umbrella_id.clone(),
+                node_type: crate::db::NodeType::Thought,
+                title: project.name.clone(),
+                url: None,
+                content: None,
+                position: crate::db::Position { x: 0.0, y: 0.0 },
+                created_at: now,
+                updated_at: now,
+                cluster_id: None,
+                cluster_label: Some(project.name.clone()),
+                depth: 1,
+                is_item: false,
+                is_universe: false,
+                parent_id: Some(universe.id.clone()),
+                child_count: topic_ids_to_move.len() as i32,
+                ai_title: Some(project.name.clone()),
+                summary: Some(format!("Project umbrella for {} ({} items)", project.name, project.item_count)),
+                tags: None,
+                emoji: Some("📦".to_string()),
+                is_processed: true,
+                conversation_id: None,
+                sequence_index: None,
+                is_pinned: false,
+                last_accessed_at: None,
+            };
+
+            // Insert umbrella node
+            if let Err(e) = db.insert_node(&umbrella) {
+                emit_log(app, "warn", &format!("  Failed to create umbrella for '{}': {}", project.name, e));
+                continue;
+            }
+
+            // Reparent topics under the umbrella
+            let mut moved_count = 0;
+            for topic_id in &topic_ids_to_move {
+                if let Err(e) = db.update_node_parent(topic_id, &umbrella_id) {
+                    emit_log(app, "warn", &format!("    Failed to move topic {}: {}", topic_id, e));
+                } else {
+                    // Update depth of moved topic and its subtree
+                    if let Err(e) = db.increment_subtree_depth_by(topic_id, 1) {
+                        emit_log(app, "warn", &format!("    Failed to update depth for {}: {}", topic_id, e));
+                    }
+                    moved_count += 1;
+                }
+            }
+
+            emit_log(app, "info", &format!("  ✓ Created '{}' umbrella with {} topics", project.name, moved_count));
+            project_umbrellas_created += 1;
+        }
+    }
+
+    if project_umbrellas_created > 0 {
+        emit_log(app, "info", &format!("✓ Created {} project umbrella categories", project_umbrellas_created));
+    }
+
+    // Step 4: Recursively group levels with too many children
+    emit_log(app, "info", "");
+    emit_log(app, "info", "▶ STEP 4/5: Recursive grouping (target: 8-15 children per level)");
     emit_log(app, "info", "───────────────────────────────────────────────────────────");
     let mut grouping_iterations = 0;
-    let max_iterations = 10; // Safety limit
+    let max_iterations = 50; // Safety limit
+    let mut failed_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let grouping_start = std::time::Instant::now();
+
+    // Emit initial progress for Step 3
+    emit_progress(app, AiProgressEvent {
+        current: 0,
+        total: 0, // Unknown upfront
+        node_title: "Starting hierarchy grouping...".to_string(),
+        new_title: "Analyzing structure".to_string(),
+        emoji: Some("🔄".to_string()),
+        status: "processing".to_string(),
+        error_message: None,
+        elapsed_secs: Some(0.0),
+        estimate_secs: None,
+        remaining_secs: None,
+    });
 
     loop {
+        // Check for cancellation
+        if is_rebuild_cancelled() {
+            emit_log(app, "warn", "[Hierarchy] Cancelled by user during grouping");
+            return Err("Hierarchy build cancelled by user".to_string());
+        }
+
         if grouping_iterations >= max_iterations {
             emit_log(app, "warn", &format!("⚠ Hit max grouping iterations ({})", max_iterations));
             break;
         }
 
-        // Find a node that needs grouping (has >15 children)
-        let node_to_group = find_node_needing_grouping(db, app)?;
+        // Find a node that needs grouping (has >15 children), excluding failed nodes
+        let node_to_group = find_node_needing_grouping_excluding(db, app, &failed_nodes)?;
 
         match node_to_group {
             Some(node_id) => {
+                // Get node name for progress display
+                let node_name = db.get_node(&node_id)
+                    .ok()
+                    .flatten()
+                    .map(|n| n.cluster_label.unwrap_or(n.title))
+                    .unwrap_or_else(|| node_id.clone());
+
+                let elapsed = grouping_start.elapsed().as_secs_f64();
+
+                // Emit progress event for this iteration
+                emit_progress(app, AiProgressEvent {
+                    current: grouping_iterations + 1,
+                    total: grouping_iterations + 2, // Show as "N of N+1" to indicate ongoing
+                    node_title: format!("Grouping: {}", node_name),
+                    new_title: "AI organizing into categories...".to_string(),
+                    emoji: Some("🧠".to_string()),
+                    status: "processing".to_string(),
+                    error_message: None,
+                    elapsed_secs: Some(elapsed),
+                    estimate_secs: None,
+                    remaining_secs: None,
+                });
+
                 emit_log(app, "info", &format!("  Iteration {}: Grouping children of {}", grouping_iterations + 1, node_id));
                 let grouped = cluster_hierarchy_level(db, &node_id, app).await?;
                 if grouped {
                     grouping_iterations += 1;
+                } else {
+                    // Grouping failed (pathological case) - skip this node in future iterations
+                    emit_log(app, "warn", &format!("  Marking {} as ungroupable", node_id));
+                    failed_nodes.insert(node_id);
                 }
             }
             None => {
-                emit_log(app, "info", &format!("✓ Hierarchy is navigable after {} grouping iterations", grouping_iterations));
+                if failed_nodes.is_empty() {
+                    emit_log(app, "info", &format!("✓ Hierarchy is navigable after {} grouping iterations", grouping_iterations));
+                } else {
+                    emit_log(app, "warn", &format!(
+                        "✓ Hierarchy grouping complete after {} iterations ({} nodes couldn't be grouped)",
+                        grouping_iterations, failed_nodes.len()
+                    ));
+                }
                 break;
             }
         }
     }
 
+    // Emit completion for Step 3
+    let grouping_elapsed = grouping_start.elapsed().as_secs_f64();
+    emit_progress(app, AiProgressEvent {
+        current: grouping_iterations,
+        total: grouping_iterations,
+        node_title: "Hierarchy grouping".to_string(),
+        new_title: format!("{} levels organized", grouping_iterations),
+        emoji: Some("✓".to_string()),
+        status: if grouping_iterations > 0 { "success".to_string() } else { "complete".to_string() },
+        error_message: None,
+        elapsed_secs: Some(grouping_elapsed),
+        estimate_secs: Some(grouping_elapsed),
+        remaining_secs: Some(0.0),
+    });
+
     // Recalculate final depth
     let final_max_depth = db.get_max_depth().map_err(|e| e.to_string())?;
     emit_log(app, "info", &format!("  Final hierarchy depth: {}", final_max_depth));
 
-    // Step 4: Generate embeddings for ALL nodes that need them (if OpenAI key available)
+    // Step 5: Generate embeddings for ALL nodes that need them (if OpenAI key available)
     emit_log(app, "info", "");
-    emit_log(app, "info", "▶ STEP 4/4: Generating embeddings for semantic search");
+    emit_log(app, "info", "▶ STEP 5/5: Generating embeddings for semantic search");
     emit_log(app, "info", "───────────────────────────────────────────────────────────");
     let (embeddings_generated, embeddings_skipped) = if settings::has_openai_api_key() {
         let nodes_needing_embeddings = db.get_nodes_needing_embeddings().map_err(|e| e.to_string())?;
@@ -946,7 +1371,12 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
 
 /// Find a node that has >15 children and needs grouping
 /// Prioritizes nodes closer to Universe (lower depth) for top-down grouping
-fn find_node_needing_grouping(db: &Database, app: Option<&AppHandle>) -> Result<Option<String>, String> {
+/// Excludes nodes in the `skip_nodes` set (nodes that failed grouping)
+fn find_node_needing_grouping_excluding(
+    db: &Database,
+    app: Option<&AppHandle>,
+    skip_nodes: &std::collections::HashSet<String>,
+) -> Result<Option<String>, String> {
     // Start from Universe and work down using BFS (proper queue with remove(0))
     let universe = db.get_universe().map_err(|e| e.to_string())?;
 
@@ -958,6 +1388,17 @@ fn find_node_needing_grouping(db: &Database, app: Option<&AppHandle>) -> Result<
             // BFS: remove from front (FIFO) to prioritize shallower nodes
             let (node_id, depth) = queue.remove(0);
             nodes_checked += 1;
+
+            // Skip nodes that failed grouping (pathological case)
+            if skip_nodes.contains(&node_id) {
+                let children = db.get_children(&node_id).map_err(|e| e.to_string())?;
+                for child in children {
+                    if !child.is_item {
+                        queue.push((child.id, depth + 1));
+                    }
+                }
+                continue;
+            }
 
             let children = db.get_children(&node_id).map_err(|e| e.to_string())?;
             let child_count = children.len();

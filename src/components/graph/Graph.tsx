@@ -5,7 +5,17 @@ import { listen } from '@tauri-apps/api/event';
 import { useGraphStore } from '../../stores/graphStore';
 import type { Node } from '../../types/graph';
 import { getEmojiForNode, initLearnedMappings } from '../../utils/emojiMatcher';
-import { ChevronRight } from 'lucide-react';
+import { ChevronRight, AlertTriangle, X } from 'lucide-react';
+
+// Confirmation dialog types
+type ConfirmAction = 'processAi' | 'cluster' | 'buildHierarchy' | null;
+
+interface ConfirmConfig {
+  title: string;
+  message: string;
+  confirmText: string;
+  variant: 'danger' | 'warning' | 'info';
+}
 
 // Dynamic level naming based on distance from items
 const getLevelName = (depth: number, maxDepth: number): { name: string; emoji: string } => {
@@ -125,9 +135,15 @@ export function Graph({ width, height }: GraphProps) {
   const [isClustering, setIsClustering] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isBuildingHierarchy, setIsBuildingHierarchy] = useState(false);
+  const [rebuildQueued, setRebuildQueued] = useState(false);
+  const rebuildQueuedRef = useRef(false);
+  const [cancelRequested, setCancelRequested] = useState<'ai' | 'rebuild' | null>(null);
+  const fullRebuildRef = useRef<() => Promise<void>>();
+  const processingStartTimeRef = useRef<number>(0);
+  const rebuildStartTimeRef = useRef<number>(0);
   const [autoScroll, setAutoScroll] = useState(true);
   const [hierarchyBuilt, setHierarchyBuilt] = useState(false);
-  const [consoleSize, setConsoleSize] = useState({ width: 384, height: 320 }); // w-96 = 384px
+  const [consoleSize, setConsoleSize] = useState({ width: 450, height: 400 }); // Larger for hierarchy output
   const [isResizing, setIsResizing] = useState(false);
 
   // Similar nodes state
@@ -136,6 +152,7 @@ export function Graph({ width, height }: GraphProps) {
   const [expandedSimilar, setExpandedSimilar] = useState<Set<string>>(new Set());
   const [collapsedSimilar, setCollapsedSimilar] = useState<Set<string>>(new Set());
   const [stackNodes, setStackNodesState] = useState(false); // Toggle to stack multiple node panels
+  const [confirmAction, setConfirmAction] = useState<ConfirmAction>(null); // Confirmation dialog state
   const setStackNodes = (value: boolean) => {
     stackNodesRef.current = value;
     setStackNodesState(value);
@@ -157,6 +174,41 @@ export function Graph({ width, height }: GraphProps) {
     remainingSecs?: number;
     status: 'idle' | 'processing' | 'complete';
   }>({ current: 0, total: 0, status: 'idle' });
+
+  // Confirmation dialog configs
+  const confirmConfigs: Record<NonNullable<ConfirmAction>, ConfirmConfig> = {
+    processAi: {
+      title: 'Process AI',
+      message: 'This will use AI to generate titles, summaries, and embeddings for all unprocessed items. This can take a long time for large databases and uses API credits.',
+      confirmText: 'Start Processing',
+      variant: 'warning',
+    },
+    cluster: {
+      title: 'Cluster Items',
+      message: 'This will assign all items to topic clusters using AI. Existing cluster assignments will be replaced. This uses API credits.',
+      confirmText: 'Run Clustering',
+      variant: 'warning',
+    },
+    buildHierarchy: {
+      title: 'Build Hierarchy',
+      message: 'This will rebuild the navigation structure (Universe → Topics → Items). All intermediate levels will be recreated. This uses API credits for grouping.',
+      confirmText: 'Build Hierarchy',
+      variant: 'warning',
+    },
+  };
+
+  const handleConfirmAction = useCallback(async () => {
+    const action = confirmAction;
+    setConfirmAction(null);
+
+    if (action === 'processAi') {
+      runProcessing();
+    } else if (action === 'cluster') {
+      runClustering();
+    } else if (action === 'buildHierarchy') {
+      buildHierarchy();
+    }
+  }, [confirmAction]);
 
   // Load learned emoji mappings on mount
   useEffect(() => {
@@ -191,14 +243,14 @@ export function Graph({ width, height }: GraphProps) {
       const { message, level } = event.payload;
       const type = level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'info';
       const time = new Date().toLocaleTimeString();
-      setDevLogs(prev => [...prev.slice(-50), { time, type, message: `[Hierarchy] ${message}` }]);
+      setDevLogs(prev => [...prev.slice(-2000), { time, type, message: `[Hierarchy] ${message}` }]);
     });
     return () => { unlisten.then(f => f()); };
   }, []);
 
   const devLog = useCallback((type: 'info' | 'warn' | 'error', message: string) => {
     const time = new Date().toLocaleTimeString();
-    setDevLogs(prev => [...prev.slice(-50), { time, type, message }]);
+    setDevLogs(prev => [...prev.slice(-2000), { time, type, message }]);
     if (type === 'error') console.error(`[Graph] ${message}`);
     else if (type === 'warn') console.warn(`[Graph] ${message}`);
     else console.log(`[Graph] ${message}`);
@@ -430,19 +482,50 @@ export function Graph({ width, height }: GraphProps) {
   // Run AI processing on nodes
   const runProcessing = useCallback(async () => {
     setIsProcessing(true);
+    setCancelRequested(null);
+    processingStartTimeRef.current = Date.now();
     devLog('info', 'Starting AI processing...');
     try {
-      const result = await invoke<{ processed: number; failed: number; errors: string[] }>('process_nodes');
-      devLog('info', `Processing complete: ${result.processed} processed, ${result.failed} failed`);
+      const result = await invoke<{ processed: number; failed: number; errors: string[]; cancelled: boolean }>('process_nodes');
+      const elapsedSecs = (Date.now() - processingStartTimeRef.current) / 1000;
+
+      if (result.cancelled) {
+        devLog('warn', `Processing cancelled after ${result.processed} nodes (took ${formatTime(elapsedSecs)})`);
+      } else {
+        devLog('info', `Processing complete: ${result.processed} processed, ${result.failed} failed (took ${formatTime(elapsedSecs)})`);
+      }
+
+      // Always save processing time - even cancelled runs save work to DB
+      if (result.processed > 0) {
+        try {
+          await invoke('add_ai_processing_time', { elapsedSecs });
+        } catch (e) {
+          devLog('warn', `Failed to save processing time: ${e}`);
+        }
+      }
+
       if (result.errors.length > 0) {
         result.errors.forEach(e => devLog('error', e));
       }
-      // Reload to get updated AI fields
-      window.location.reload();
+      setIsProcessing(false);
+
+      // Check if rebuild was queued (use ref to get current value)
+      if (rebuildQueuedRef.current) {
+        console.log('[QUEUE] AI processing finished - starting queued Full Rebuild');
+        devLog('info', 'Queued Full Rebuild starting...');
+        setRebuildQueued(false);
+        rebuildQueuedRef.current = false;
+        // Don't reload yet - let fullRebuild handle it
+        setTimeout(() => fullRebuildRef.current?.(), 500);
+      } else {
+        // Reload to get updated AI fields
+        window.location.reload();
+      }
     } catch (error) {
       devLog('error', `Processing failed: ${error}`);
-    } finally {
       setIsProcessing(false);
+      setRebuildQueued(false);
+      rebuildQueuedRef.current = false;
     }
   }, [devLog]);
 
@@ -507,7 +590,18 @@ export function Graph({ width, height }: GraphProps) {
   // Full rebuild: cluster + hierarchy in one shot
   const [isFullRebuilding, setIsFullRebuilding] = useState(false);
   const fullRebuild = useCallback(async () => {
+    // If AI processing is running, queue the rebuild instead
+    if (isProcessing) {
+      setRebuildQueued(true);
+      rebuildQueuedRef.current = true;
+      console.log('[QUEUE] Full Rebuild queued - waiting for AI processing to complete');
+      devLog('info', 'Full Rebuild queued (will run after AI processing completes)');
+      return;
+    }
+
     setIsFullRebuilding(true);
+    setCancelRequested(null);
+    rebuildStartTimeRef.current = Date.now();
     devLog('info', '=== FULL REBUILD: Clustering + Hierarchy + AI Grouping ===');
     try {
       const result = await invoke<{
@@ -517,10 +611,19 @@ export function Graph({ width, height }: GraphProps) {
         groupingIterations: number;
       }>('build_full_hierarchy', { runClustering: true });
 
+      const elapsedSecs = (Date.now() - rebuildStartTimeRef.current) / 1000;
+
       if (result.clusteringResult) {
         devLog('info', `Clustering: ${result.clusteringResult.itemsAssigned} items → ${result.clusteringResult.clustersCreated} clusters`);
       }
-      devLog('info', `Hierarchy: ${result.levelsCreated} levels, ${result.groupingIterations} AI grouping iterations`);
+      devLog('info', `Hierarchy: ${result.levelsCreated} levels, ${result.groupingIterations} AI grouping iterations (took ${formatTime(elapsedSecs)})`);
+
+      // Save rebuild time to persistent stats
+      try {
+        await invoke('add_rebuild_time', { elapsedSecs });
+      } catch (e) {
+        devLog('warn', `Failed to save rebuild time: ${e}`);
+      }
 
       setHierarchyBuilt(true);
       setMaxDepth(result.hierarchyResult.maxDepth);
@@ -532,7 +635,10 @@ export function Graph({ width, height }: GraphProps) {
       devLog('error', `Full rebuild FAILED: ${JSON.stringify(error)}`);
       setIsFullRebuilding(false);
     }
-  }, [devLog, setMaxDepth]);
+  }, [devLog, setMaxDepth, isProcessing]);
+
+  // Keep ref updated
+  fullRebuildRef.current = fullRebuild;
 
   // List all nodes in current view
   const listCurrentNodes = useCallback(() => {
@@ -568,6 +674,67 @@ export function Graph({ width, height }: GraphProps) {
     });
     devLog('info', `=== END NODE LIST ===`);
   }, [nodes, currentParentId, currentDepth, devLog]);
+
+  // List full hierarchy tree (up to maxDisplayDepth levels)
+  const listHierarchy = useCallback(async () => {
+    const maxDisplayDepth = 2; // Cut off after this many levels from universe
+    devLog('info', `=== HIERARCHY TREE (max ${maxDisplayDepth} levels) ===`);
+
+    try {
+      // Get universe node
+      const universe = await invoke<Node | null>('get_universe');
+      if (!universe) {
+        devLog('warn', 'No universe node found');
+        return;
+      }
+
+      // Recursive function to print tree
+      const printNode = async (nodeId: string, depth: number, prefix: string, _isLast: boolean) => {
+        if (depth > maxDisplayDepth) return;
+
+        const children = await invoke<Node[]>('get_children', { parentId: nodeId });
+        const sortedChildren = [...children].sort((a, b) => (b.childCount || 0) - (a.childCount || 0));
+
+        for (let i = 0; i < sortedChildren.length; i++) {
+          const child = sortedChildren[i];
+          const isLastChild = i === sortedChildren.length - 1;
+          const connector = isLastChild ? '└── ' : '├── ';
+          const emoji = child.emoji || (child.isItem ? '📄' : '📁');
+          const title = child.clusterLabel || child.aiTitle || child.title || 'Untitled';
+          const childCount = child.childCount || 0;
+          const itemTag = child.isItem ? ' [ITEM]' : '';
+          const countTag = childCount > 0 ? ` (${childCount})` : '';
+
+          // Truncate title if too long
+          const maxTitleLen = 40;
+          const displayTitle = title.length > maxTitleLen ? title.slice(0, maxTitleLen - 3) + '...' : title;
+
+          devLog('info', `${prefix}${connector}${emoji} ${displayTitle}${countTag}${itemTag}`);
+
+          // Recurse if not at max depth and has children
+          if (depth < maxDisplayDepth && childCount > 0 && !child.isItem) {
+            const newPrefix = prefix + (isLastChild ? '    ' : '│   ');
+            await printNode(child.id, depth + 1, newPrefix, isLastChild);
+          } else if (depth === maxDisplayDepth && childCount > 0) {
+            // Show truncation indicator
+            const truncPrefix = prefix + (isLastChild ? '    ' : '│   ');
+            devLog('info', `${truncPrefix}└── ... (${childCount} more)`);
+          }
+        }
+      };
+
+      // Print universe as root
+      const universeTitle = universe.clusterLabel || universe.aiTitle || universe.title || 'Universe';
+      devLog('info', `🌌 ${universeTitle} (root)`);
+
+      // Print children
+      await printNode(universe.id, 1, '', true);
+
+      devLog('info', `=== END HIERARCHY ===`);
+    } catch (error) {
+      devLog('error', `Failed to list hierarchy: ${error}`);
+    }
+  }, [devLog]);
 
   useEffect(() => {
     if (!svgRef.current || nodes.size === 0) return;
@@ -1735,23 +1902,69 @@ export function Graph({ width, height }: GraphProps) {
         <span className="text-gray-500">|</span>
         <span className="text-amber-400">Zoom: {(zoomLevel * 100).toFixed(0)}%</span>
         <span className="text-gray-500">|</span>
-        {/* Workflow buttons: Process AI (per-item) | Full Rebuild (clustering + hierarchy) */}
-        <button
-          onClick={runProcessing}
-          disabled={isProcessing}
-          className="bg-purple-600 hover:bg-purple-500 disabled:bg-gray-600 disabled:cursor-wait px-3 py-1 rounded text-white text-xs font-medium transition-colors"
-          title="AI generates titles, summaries & embeddings for items"
-        >
-          {isProcessing ? 'Processing...' : 'Process AI'}
-        </button>
-        <button
-          onClick={fullRebuild}
-          disabled={isFullRebuilding || isBuildingHierarchy}
-          className="bg-green-600 hover:bg-green-500 disabled:bg-gray-600 disabled:cursor-wait px-3 py-1 rounded text-white text-xs font-medium transition-colors"
-          title="Cluster items + Build hierarchy with recursive AI grouping"
-        >
-          {isFullRebuilding ? 'Rebuilding...' : 'Full Rebuild'}
-        </button>
+        {/* Workflow buttons: Process AI | Cluster | Build Hierarchy */}
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => setConfirmAction('processAi')}
+            disabled={isProcessing}
+            className="bg-purple-600 hover:bg-purple-500 disabled:bg-purple-800 disabled:cursor-wait px-3 py-1 rounded-l text-white text-xs font-medium transition-colors"
+            title="AI generates titles, summaries & embeddings for items"
+          >
+            {isProcessing ? 'Processing...' : 'Process AI'}
+          </button>
+          {isProcessing && (
+            <button
+              onClick={async () => {
+                // Clear queue first so the callback doesn't trigger rebuild
+                setRebuildQueued(false);
+                rebuildQueuedRef.current = false;
+                await invoke('cancel_processing');
+                setIsProcessing(false);
+                setAiProgress({ current: 0, total: 0, status: 'idle' });
+                console.log('[Cancel] AI processing cancelled (queue cleared)');
+                devLog('info', 'AI processing cancelled');
+              }}
+              className="bg-red-600 hover:bg-red-500 px-2 py-1 rounded-r text-white text-xs font-medium transition-colors"
+              title="Cancel AI processing"
+            >
+              ✕
+            </button>
+          )}
+        </div>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => setConfirmAction('cluster')}
+            disabled={isClustering || isFullRebuilding}
+            className="bg-blue-600 hover:bg-blue-500 disabled:bg-blue-800 disabled:cursor-wait px-3 py-1 rounded text-white text-xs font-medium transition-colors"
+            title="Assign items to topic clusters using AI"
+          >
+            {isClustering ? 'Clustering...' : 'Cluster'}
+          </button>
+        </div>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => setConfirmAction('buildHierarchy')}
+            disabled={isBuildingHierarchy || isFullRebuilding}
+            className="bg-green-600 hover:bg-green-500 disabled:bg-green-800 disabled:cursor-wait px-3 py-1 rounded-l text-white text-xs font-medium transition-colors"
+            title="Build navigation hierarchy from clusters"
+          >
+            {isBuildingHierarchy ? 'Building...' : 'Hierarchy'}
+          </button>
+          {isBuildingHierarchy && (
+            <button
+              onClick={async () => {
+                await invoke('cancel_rebuild');
+                setIsBuildingHierarchy(false);
+                console.log('[Cancel] Hierarchy build cancelled');
+                devLog('info', 'Hierarchy build cancelled');
+              }}
+              className="bg-red-600 hover:bg-red-500 px-2 py-1 rounded-r text-white text-xs font-medium transition-colors"
+              title="Cancel hierarchy build"
+            >
+              ✕
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="absolute bottom-4 right-4 bg-gray-800/80 backdrop-blur-sm rounded-lg px-3 py-2 text-xs text-gray-400">
@@ -1786,6 +1999,24 @@ export function Graph({ width, height }: GraphProps) {
                 </div>
               )}
             </div>
+            {aiProgress.status === 'processing' && (
+              <button
+                onClick={async () => {
+                  // Clear queue first so the callback doesn't trigger rebuild
+                  setRebuildQueued(false);
+                  rebuildQueuedRef.current = false;
+                  await invoke('cancel_processing');
+                  setIsProcessing(false);
+                  setAiProgress({ current: 0, total: 0, status: 'idle' });
+                  console.log('[Cancel] AI processing cancelled (queue cleared)');
+                  devLog('info', 'AI processing cancelled');
+                }}
+                className="text-gray-400 hover:text-red-400 transition-colors p-1"
+                title="Cancel AI processing"
+              >
+                ✕
+              </button>
+            )}
           </div>
           {/* Progress bar */}
           {aiProgress.total > 0 && (
@@ -1899,7 +2130,14 @@ export function Graph({ width, height }: GraphProps) {
                 className="text-blue-400 hover:text-blue-300 transition-colors"
                 title="List all nodes in current view"
               >
-                List Nodes
+                Nodes
+              </button>
+              <button
+                onClick={listHierarchy}
+                className="text-purple-400 hover:text-purple-300 transition-colors"
+                title="List full hierarchy tree (up to 4 levels)"
+              >
+                Tree
               </button>
               <button
                 onClick={() => setAutoScroll(!autoScroll)}
@@ -1937,6 +2175,53 @@ export function Graph({ width, height }: GraphProps) {
             >
               <path d="M0 12L12 0v3L3 12H0zm0-5l7-7v3L3 10v2H0V7z" />
             </svg>
+          </div>
+        </div>
+      )}
+
+      {/* Confirmation Dialog */}
+      {confirmAction && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center">
+          <div
+            className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+            onClick={() => setConfirmAction(null)}
+          />
+          <div className="relative bg-gray-800 rounded-lg border border-gray-700 shadow-xl max-w-md w-full mx-4 p-6">
+            <button
+              onClick={() => setConfirmAction(null)}
+              className="absolute top-4 right-4 p-1 text-gray-400 hover:text-white rounded transition-colors"
+            >
+              <X className="w-5 h-5" />
+            </button>
+            <div className="flex items-start gap-4 mb-4">
+              <div className={`p-2 rounded-full bg-gray-700/50 ${
+                confirmConfigs[confirmAction].variant === 'danger' ? 'text-red-400' :
+                confirmConfigs[confirmAction].variant === 'warning' ? 'text-amber-400' : 'text-blue-400'
+              }`}>
+                <AlertTriangle className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="text-lg font-semibold text-white">{confirmConfigs[confirmAction].title}</h3>
+                <p className="mt-2 text-sm text-gray-300">{confirmConfigs[confirmAction].message}</p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-3 mt-6">
+              <button
+                onClick={() => setConfirmAction(null)}
+                className="px-4 py-2 text-sm font-medium text-gray-300 bg-gray-700 hover:bg-gray-600 rounded-lg transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleConfirmAction}
+                className={`px-4 py-2 text-sm font-medium rounded-lg transition-colors ${
+                  confirmConfigs[confirmAction].variant === 'danger' ? 'bg-red-600 hover:bg-red-700' :
+                  confirmConfigs[confirmAction].variant === 'warning' ? 'bg-amber-600 hover:bg-amber-700' : 'bg-blue-600 hover:bg-blue-700'
+                } text-white`}
+              >
+                {confirmConfigs[confirmAction].confirmText}
+              </button>
+            </div>
           </div>
         </div>
       )}

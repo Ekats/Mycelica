@@ -5,20 +5,26 @@ use super::models::{Node, Edge, NodeType, EdgeType, Position};
 
 pub struct Database {
     conn: Mutex<Connection>,
+    path: String,
 }
 
 impl Database {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        let db = Database { conn: Mutex::new(conn) };
+        let path_str = path.as_ref().to_string_lossy().to_string();
+        let conn = Connection::open(&path)?;
+        let db = Database { conn: Mutex::new(conn), path: path_str };
         db.init()?;
         Ok(db)
+    }
+
+    pub fn get_path(&self) -> String {
+        self.path.clone()
     }
 
     #[allow(dead_code)]
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let db = Database { conn: Mutex::new(conn) };
+        let db = Database { conn: Mutex::new(conn), path: ":memory:".to_string() };
         db.init()?;
         Ok(db)
     }
@@ -1359,6 +1365,39 @@ impl Database {
         Ok(())
     }
 
+    /// Update a node's parent_id (reparent a node)
+    pub fn update_node_parent(&self, node_id: &str, new_parent_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        conn.execute(
+            "UPDATE nodes SET parent_id = ?2, updated_at = ?3 WHERE id = ?1",
+            params![node_id, new_parent_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Increment depth of a node and all its descendants by a given amount
+    pub fn increment_subtree_depth_by(&self, root_id: &str, increment: i32) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+
+        // Use recursive CTE to find all descendants and update their depth
+        conn.execute(
+            "WITH RECURSIVE descendants(id) AS (
+                SELECT ?1
+                UNION ALL
+                SELECT n.id FROM nodes n
+                JOIN descendants d ON n.parent_id = d.id
+            )
+            UPDATE nodes SET depth = depth + ?2
+            WHERE id IN (SELECT id FROM descendants)",
+            params![root_id, increment],
+        )?;
+        Ok(())
+    }
+
     /// Update last accessed timestamp for a node
     pub fn touch_node(&self, node_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -1656,6 +1695,459 @@ impl Database {
             [],
         )?;
         Ok(deleted)
+    }
+
+    // ==================== Settings Panel Operations ====================
+
+    /// Delete all nodes
+    pub fn delete_all_nodes(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute("DELETE FROM nodes", [])?;
+        Ok(deleted)
+    }
+
+    /// Delete all edges
+    pub fn delete_all_edges(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute("DELETE FROM edges", [])?;
+        Ok(deleted)
+    }
+
+    /// Reset AI processing flag (mark all items as unprocessed)
+    pub fn reset_ai_processing(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE nodes SET is_processed = 0, ai_title = NULL, summary = NULL, tags = NULL, emoji = NULL WHERE is_item = 1",
+            [],
+        )?;
+        Ok(updated)
+    }
+
+    /// Clear all embeddings
+    pub fn clear_all_embeddings(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE nodes SET embedding = NULL",
+            [],
+        )?;
+        Ok(updated)
+    }
+
+    /// Get database stats for settings panel
+    pub fn get_stats(&self) -> Result<(usize, usize, usize, usize)> {
+        let conn = self.conn.lock().unwrap();
+        let total_nodes: usize = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
+        let total_items: usize = conn.query_row("SELECT COUNT(*) FROM nodes WHERE is_item = 1", [], |r| r.get(0))?;
+        let processed: usize = conn.query_row("SELECT COUNT(*) FROM nodes WHERE is_processed = 1", [], |r| r.get(0))?;
+        let with_embeddings: usize = conn.query_row("SELECT COUNT(*) FROM nodes WHERE embedding IS NOT NULL", [], |r| r.get(0))?;
+        Ok((total_nodes, total_items, processed, with_embeddings))
+    }
+
+    // ==================== Hierarchy Flattening Operations ====================
+
+    /// Flatten empty passthrough levels in the hierarchy
+    /// Finds nodes that are single-child intermediate nodes (like "Uncategorized and Related")
+    /// and reparents their children directly to grandparent, then deletes the empty node
+    /// Returns the number of nodes flattened
+    pub fn flatten_empty_levels(&self) -> Result<usize> {
+        let mut flattened_count = 0;
+
+        // Find passthrough nodes: non-item, non-universe nodes that have exactly 1 child
+        // or nodes with "Uncategorized" in the title that are intermediate pass-throughs
+        // Process deepest first to avoid orphaning nodes
+        let passthrough_nodes: Vec<(String, Option<String>)> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT n.id, n.parent_id
+                 FROM nodes n
+                 WHERE n.is_item = 0
+                   AND n.is_universe = 0
+                   AND (
+                     n.child_count = 1
+                     OR n.title LIKE '%Uncategorized%'
+                     OR n.cluster_label LIKE '%Uncategorized%'
+                   )
+                 ORDER BY n.depth DESC"
+            )?;
+
+            let results: Vec<(String, Option<String>)> = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?.filter_map(|r| r.ok()).collect();
+            results
+        };
+
+        println!("[Flatten] Found {} potential passthrough nodes", passthrough_nodes.len());
+
+        for (node_id, grandparent_id) in passthrough_nodes {
+            let conn = self.conn.lock().unwrap();
+
+            // Get the children of this node
+            let children: Vec<String> = {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM nodes WHERE parent_id = ?1"
+                )?;
+                let results: Vec<String> = stmt.query_map(params![&node_id], |row| row.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                results
+            };
+
+            // Skip if no children (would make no difference)
+            if children.is_empty() {
+                continue;
+            }
+
+            // Skip if node has more than 1 child and doesn't have "Uncategorized" in name
+            // (we only auto-flatten single-child nodes or explicitly named uncategorized ones)
+            if children.len() > 1 {
+                let has_uncategorized: bool = conn.query_row(
+                    "SELECT (title LIKE '%Uncategorized%' OR cluster_label LIKE '%Uncategorized%') FROM nodes WHERE id = ?1",
+                    params![&node_id],
+                    |row| row.get(0),
+                ).unwrap_or(false);
+
+                if !has_uncategorized {
+                    continue;
+                }
+            }
+
+            println!("[Flatten] Flattening node '{}' with {} children", node_id, children.len());
+
+            // Reparent all children to grandparent
+            for child_id in &children {
+                conn.execute(
+                    "UPDATE nodes SET parent_id = ?2 WHERE id = ?1",
+                    params![child_id, &grandparent_id],
+                )?;
+            }
+
+            // Delete the passthrough node
+            conn.execute("DELETE FROM nodes WHERE id = ?1", params![&node_id])?;
+
+            // Update grandparent's child count if it exists
+            if let Some(ref gp_id) = grandparent_id {
+                let new_count: i32 = conn.query_row(
+                    "SELECT COUNT(*) FROM nodes WHERE parent_id = ?1",
+                    params![gp_id],
+                    |row| row.get(0),
+                ).unwrap_or(0);
+
+                conn.execute(
+                    "UPDATE nodes SET child_count = ?2 WHERE id = ?1",
+                    params![gp_id, new_count],
+                )?;
+            }
+
+            flattened_count += 1;
+        }
+
+        // Recalculate depths for all affected nodes
+        if flattened_count > 0 {
+            self.update_all_depths()?;
+        }
+
+        println!("[Flatten] Flattened {} passthrough nodes", flattened_count);
+        Ok(flattened_count)
+    }
+
+    /// Recalculate depth for all nodes based on parent relationships
+    fn update_all_depths(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+
+        // Set universe to depth 0
+        conn.execute(
+            "UPDATE nodes SET depth = 0 WHERE is_universe = 1",
+            [],
+        )?;
+
+        // Use recursive update starting from universe
+        conn.execute_batch(
+            "WITH RECURSIVE depth_calc(id, depth) AS (
+                SELECT id, 0 FROM nodes WHERE is_universe = 1
+                UNION ALL
+                SELECT n.id, d.depth + 1
+                FROM nodes n
+                JOIN depth_calc d ON n.parent_id = d.id
+            )
+            UPDATE nodes SET depth = (
+                SELECT depth FROM depth_calc WHERE depth_calc.id = nodes.id
+            )
+            WHERE id IN (SELECT id FROM depth_calc)"
+        )?;
+
+        Ok(())
+    }
+
+    // ==================== Tidy Database Operations ====================
+
+    /// Flatten single-child chains: reparent child to grandparent, delete middle node
+    /// Loops until no single-child chains remain. Returns total nodes removed.
+    pub fn flatten_single_child_chains(&self) -> Result<usize> {
+        let mut total_flattened = 0;
+
+        loop {
+            let conn = self.conn.lock().unwrap();
+
+            // Find non-item, non-universe nodes with exactly 1 child
+            let single_child_nodes: Vec<(String, Option<String>, i32)> = {
+                let mut stmt = conn.prepare(
+                    "SELECT n.id, n.parent_id, n.depth
+                     FROM nodes n
+                     WHERE n.is_item = 0
+                       AND n.is_universe = 0
+                       AND n.child_count = 1
+                     ORDER BY n.depth DESC"
+                )?;
+                let results: Vec<_> = stmt.query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?.filter_map(|r| r.ok()).collect();
+                results
+            };
+
+            if single_child_nodes.is_empty() {
+                break;
+            }
+
+            for (node_id, grandparent_id, _depth) in &single_child_nodes {
+                // Get the single child
+                let child_id: Option<String> = conn.query_row(
+                    "SELECT id FROM nodes WHERE parent_id = ?1 LIMIT 1",
+                    params![node_id],
+                    |row| row.get(0),
+                ).ok();
+
+                if let Some(child_id) = child_id {
+                    // Reparent child to grandparent
+                    conn.execute(
+                        "UPDATE nodes SET parent_id = ?2 WHERE id = ?1",
+                        params![&child_id, grandparent_id],
+                    )?;
+
+                    // Delete the middle node
+                    conn.execute("DELETE FROM nodes WHERE id = ?1", params![node_id])?;
+
+                    // Update grandparent's child count
+                    if let Some(gp_id) = grandparent_id {
+                        let new_count: i32 = conn.query_row(
+                            "SELECT COUNT(*) FROM nodes WHERE parent_id = ?1",
+                            params![gp_id],
+                            |row| row.get(0),
+                        ).unwrap_or(0);
+                        conn.execute(
+                            "UPDATE nodes SET child_count = ?2 WHERE id = ?1",
+                            params![gp_id, new_count],
+                        )?;
+                    }
+
+                    total_flattened += 1;
+                }
+            }
+        }
+
+        // Fix depths after flattening
+        if total_flattened > 0 {
+            drop(self.conn.lock()); // Release lock before calling update_all_depths
+            self.update_all_depths()?;
+        }
+
+        println!("[Tidy] Flattened {} single-child chains", total_flattened);
+        Ok(total_flattened)
+    }
+
+    /// Remove empty category nodes (non-item, non-universe with 0 children)
+    pub fn remove_empty_categories(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.execute(
+            "DELETE FROM nodes WHERE is_item = 0 AND is_universe = 0 AND child_count = 0",
+            [],
+        )?;
+        println!("[Tidy] Removed {} empty categories", count);
+        Ok(count)
+    }
+
+    /// Fix all child_count fields by actually counting children
+    pub fn fix_all_child_counts(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+
+        // Find all mismatches
+        let mismatches: Vec<(String, i32, i32)> = {
+            let mut stmt = conn.prepare(
+                "SELECT n.id, n.child_count,
+                        (SELECT COUNT(*) FROM nodes c WHERE c.parent_id = n.id) as actual
+                 FROM nodes n
+                 WHERE n.child_count != (SELECT COUNT(*) FROM nodes c WHERE c.parent_id = n.id)"
+            )?;
+            let results: Vec<_> = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?.filter_map(|r| r.ok()).collect();
+            results
+        };
+
+        let count = mismatches.len();
+
+        for (node_id, _old, actual) in &mismatches {
+            conn.execute(
+                "UPDATE nodes SET child_count = ?2 WHERE id = ?1",
+                params![node_id, actual],
+            )?;
+        }
+
+        println!("[Tidy] Fixed {} child counts", count);
+        Ok(count)
+    }
+
+    /// Fix all depths via BFS from Universe. Returns count of nodes with wrong depth.
+    pub fn fix_all_depths(&self) -> Result<usize> {
+        // First, count how many have wrong depth
+        let wrong_count: usize = {
+            let conn = self.conn.lock().unwrap();
+
+            // Build correct depths via CTE and count mismatches
+            let count: i32 = conn.query_row(
+                "WITH RECURSIVE depth_calc(id, correct_depth) AS (
+                    SELECT id, 0 FROM nodes WHERE is_universe = 1
+                    UNION ALL
+                    SELECT n.id, d.correct_depth + 1
+                    FROM nodes n
+                    JOIN depth_calc d ON n.parent_id = d.id
+                )
+                SELECT COUNT(*) FROM nodes n
+                JOIN depth_calc d ON n.id = d.id
+                WHERE n.depth != d.correct_depth",
+                [],
+                |row| row.get(0),
+            ).unwrap_or(0);
+            count as usize
+        };
+
+        if wrong_count > 0 {
+            self.update_all_depths()?;
+        }
+
+        println!("[Tidy] Fixed {} node depths", wrong_count);
+        Ok(wrong_count)
+    }
+
+    /// Reparent orphan nodes (parent_id points to non-existent node) to Universe
+    pub fn reparent_orphans(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+
+        // Find universe id
+        let universe_id: Option<String> = conn.query_row(
+            "SELECT id FROM nodes WHERE is_universe = 1",
+            [],
+            |row| row.get(0),
+        ).ok();
+
+        let universe_id = match universe_id {
+            Some(id) => id,
+            None => {
+                println!("[Tidy] No universe node found, skipping orphan reparenting");
+                return Ok(0);
+            }
+        };
+
+        // Find and reparent orphans
+        let count = conn.execute(
+            "UPDATE nodes
+             SET parent_id = ?1
+             WHERE parent_id IS NOT NULL
+               AND parent_id NOT IN (SELECT id FROM nodes)
+               AND is_universe = 0",
+            params![&universe_id],
+        )?;
+
+        println!("[Tidy] Reparented {} orphan nodes to Universe", count);
+        Ok(count)
+    }
+
+    /// Delete edges where source or target node doesn't exist
+    pub fn prune_dead_edges(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.execute(
+            "DELETE FROM edges
+             WHERE source_id NOT IN (SELECT id FROM nodes)
+                OR target_id NOT IN (SELECT id FROM nodes)",
+            [],
+        )?;
+        println!("[Tidy] Pruned {} dead edges", count);
+        Ok(count)
+    }
+
+    /// Remove duplicate edges (same source, target, type), keep oldest
+    pub fn deduplicate_edges(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+
+        // Find and delete duplicates, keeping the one with minimum rowid
+        let count = conn.execute(
+            "DELETE FROM edges
+             WHERE rowid NOT IN (
+                 SELECT MIN(rowid)
+                 FROM edges
+                 GROUP BY source_id, target_id, type
+             )",
+            [],
+        )?;
+
+        println!("[Tidy] Removed {} duplicate edges", count);
+        Ok(count)
+    }
+
+    /// Increment depth of a node and all its descendants by 1
+    /// Uses recursive CTE to do it in a single query (avoids lock issues)
+    pub fn increment_subtree_depth(&self, node_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+
+        // Use recursive CTE to find all descendants and increment their depth
+        conn.execute(
+            "WITH RECURSIVE subtree(id) AS (
+                SELECT ?1
+                UNION ALL
+                SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+            )
+            UPDATE nodes SET depth = depth + 1 WHERE id IN (SELECT id FROM subtree)",
+            params![node_id],
+        )?;
+
+        Ok(())
+    }
+
+    /// Increment depth of multiple subtrees by 1 in a SINGLE query
+    /// Much more efficient than calling increment_subtree_depth multiple times
+    pub fn increment_multiple_subtrees_depth(&self, root_ids: &[String]) -> Result<()> {
+        if root_ids.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.conn.lock().unwrap();
+
+        // Build a single recursive CTE that finds all nodes in ANY of the subtrees
+        // Using a temp table approach for the root IDs
+        let placeholders: Vec<String> = root_ids.iter().enumerate()
+            .map(|(i, _)| format!("(?{})", i + 1))
+            .collect();
+        let placeholders_str = placeholders.join(", ");
+
+        let sql = format!(
+            "WITH RECURSIVE
+             roots(id) AS (VALUES {}),
+             subtree(id) AS (
+                SELECT id FROM roots
+                UNION ALL
+                SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+             )
+             UPDATE nodes SET depth = depth + 1 WHERE id IN (SELECT id FROM subtree)",
+            placeholders_str
+        );
+
+        // Convert root_ids to params
+        let params: Vec<&dyn rusqlite::ToSql> = root_ids.iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+
+        conn.execute(&sql, params.as_slice())?;
+
+        Ok(())
     }
 }
 

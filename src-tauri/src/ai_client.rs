@@ -33,6 +33,13 @@ struct AnthropicRequest {
 #[derive(Debug, Deserialize)]
 struct AnthropicResponse {
     content: Vec<ContentBlock>,
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicUsage {
+    input_tokens: u64,
+    output_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,9 +61,14 @@ fn get_api_key() -> Option<String> {
 pub async fn analyze_node(raw_title: &str, content: &str) -> Result<AiAnalysisResult, String> {
     let api_key = get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
 
-    // Truncate content for API efficiency
+    // Truncate content for API efficiency (find safe UTF-8 boundary)
     let content_preview = if content.len() > 3000 {
-        &content[..3000]
+        // Find a safe char boundary at or before 3000
+        let mut end = 3000;
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        &content[..end]
     } else {
         content
     };
@@ -113,6 +125,11 @@ Respond ONLY with valid JSON, no markdown:
         .json()
         .await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    // Track token usage
+    if let Some(usage) = &api_response.usage {
+        let _ = settings::add_anthropic_tokens(usage.input_tokens, usage.output_tokens);
+    }
 
     let text = api_response
         .content
@@ -269,7 +286,11 @@ pub async fn cluster_items_with_ai(
                     item.tags.as_deref().unwrap_or("none"))
             } else {
                 let content_preview = if item.content.len() > 800 {
-                    format!("{}...", &item.content[..800])
+                    let mut end = 800;
+                    while end > 0 && !item.content.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}...", &item.content[..end])
                 } else {
                     item.content.clone()
                 };
@@ -337,6 +358,11 @@ Return ONLY valid JSON array, no markdown:
         .json()
         .await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    // Track token usage
+    if let Some(usage) = &api_response.usage {
+        let _ = settings::add_anthropic_tokens(usage.input_tokens, usage.output_tokens);
+    }
 
     let text = api_response
         .content
@@ -422,7 +448,11 @@ pub async fn cluster_items_with_ai_multipath(
             } else {
                 // Not processed - use truncated raw content
                 let content_preview = if item.content.len() > 800 {
-                    format!("{}...", &item.content[..800])
+                    let mut end = 800;
+                    while end > 0 && !item.content.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}...", &item.content[..end])
                 } else {
                     item.content.clone()
                 };
@@ -504,6 +534,11 @@ Return ONLY valid JSON array, no markdown:
         .json()
         .await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    // Track token usage
+    if let Some(usage) = &api_response.usage {
+        let _ = settings::add_anthropic_tokens(usage.input_tokens, usage.output_tokens);
+    }
 
     let text = api_response
         .content
@@ -592,6 +627,8 @@ pub struct GroupingContext {
     /// All names already used in hierarchy (informational only - same name allowed in different branches)
     #[allow(dead_code)]
     pub forbidden_names: Vec<String>,
+    /// Embedding-detected clusters that MUST be kept together as umbrella categories
+    pub mandatory_clusters: Vec<DetectedProjectCluster>,
 }
 
 /// Detect likely project/product names from topic labels
@@ -650,8 +687,508 @@ fn is_common_word(word: &str) -> bool {
         "About", "With", "From", "Into", "Over", "Under", "Between",
         "Discussion", "Conversation", "Chat", "Talk", "Help", "Question",
         "Code", "Debug", "Error", "Issue", "Bug", "Feature", "Update",
+        "Project", "Development", "Implementation", "Design", "Architecture",
+        "System", "Application", "Service", "Module", "Component",
+        "Claude", "Assistant", "User", "Human", "Model", "API",
     ];
     common.iter().any(|c| c.eq_ignore_ascii_case(word))
+}
+
+/// A major project detected from global item title frequency
+#[derive(Debug, Clone)]
+pub struct MajorProject {
+    /// Project name (proper noun)
+    pub name: String,
+    /// Number of items containing this name
+    pub item_count: usize,
+    /// Percentage of total items
+    pub percentage: f32,
+    /// Item IDs containing this project name
+    pub item_ids: Vec<String>,
+}
+
+/// Detect major projects from global proper noun frequency in item titles
+///
+/// Scans ALL items' ai_title fields for proper nouns (capitalized, 3+ chars).
+/// Returns nouns appearing in 2%+ of items (min 20 occurrences).
+/// Filters out "title-starter" words that appear >70% as first word (e.g., "Strategy", "Analysis").
+/// These represent major projects that should become umbrella categories.
+pub fn detect_major_projects_globally(db: &crate::db::Database) -> Vec<MajorProject> {
+    use std::collections::HashMap;
+
+    // Track noun statistics including position
+    #[derive(Default)]
+    struct NounStats {
+        item_ids: Vec<String>,
+        first_word_count: usize,
+        total_count: usize,
+    }
+
+    // Get all items
+    let items = match db.get_items() {
+        Ok(items) => items,
+        Err(e) => {
+            eprintln!("[MajorProjects] Failed to get items: {}", e);
+            return vec![];
+        }
+    };
+
+    if items.is_empty() {
+        return vec![];
+    }
+
+    let total_items = items.len();
+
+    // Count proper nouns across all item titles, tracking position
+    let mut noun_stats: HashMap<String, NounStats> = HashMap::new();
+
+    for item in &items {
+        // Use ai_title if available, fallback to title
+        let title = item.ai_title.as_ref().unwrap_or(&item.title);
+
+        // Also check cluster_label for additional signal
+        let texts = if let Some(label) = &item.cluster_label {
+            vec![title.as_str(), label.as_str()]
+        } else {
+            vec![title.as_str()]
+        };
+
+        // Track which nouns we've seen in THIS item (avoid double counting)
+        let mut seen_in_item: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for text in texts {
+            let words: Vec<&str> = text.split_whitespace().collect();
+            for (pos, word) in words.iter().enumerate() {
+                // Clean punctuation
+                let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+
+                // Must be proper noun: capitalized, 3+ chars, not common
+                if word.len() >= 3
+                    && word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                    && !is_common_word(word)
+                    && !seen_in_item.contains(word)
+                {
+                    seen_in_item.insert(word.to_string());
+                    let stats = noun_stats.entry(word.to_string()).or_default();
+                    stats.item_ids.push(item.id.clone());
+                    stats.total_count += 1;
+                    if pos == 0 {
+                        stats.first_word_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Filter to nouns appearing in 2%+ of items (min 20 occurrences)
+    // Also filter out title-starters (>70% appear as first word)
+    let min_percentage = 0.02;
+    let min_occurrences = 20;
+    let threshold = ((total_items as f64 * min_percentage).ceil() as usize).max(min_occurrences);
+
+    let mut projects: Vec<MajorProject> = Vec::new();
+
+    // Check if word has generic noun suffix (not a project name)
+    fn is_generic_noun_suffix(word: &str) -> bool {
+        let lower = word.to_lowercase();
+        lower.ends_with("tion") ||  // Configuration, Communication
+        lower.ends_with("ment") ||  // Management, Development
+        lower.ends_with("ness") ||  // Awareness
+        lower.ends_with("ity") ||   // Complexity, Activity
+        lower.ends_with("ence") ||  // Experience, Reference
+        lower.ends_with("ance") ||  // Performance, Guidance
+        lower.ends_with("ing") ||   // Processing, Debugging, Mapping
+        lower.ends_with("ics") ||   // Techniques, Graphics
+        lower.ends_with("sis") ||   // Analysis
+        lower.ends_with("egy")      // Strategy
+    }
+
+    for (name, stats) in noun_stats {
+        if stats.item_ids.len() < threshold {
+            continue;
+        }
+
+        // Filter out generic noun suffixes (not project names)
+        if is_generic_noun_suffix(&name) {
+            eprintln!("[MajorProjects] Filtered '{}' (generic noun suffix, {} items)",
+                name, stats.item_ids.len());
+            continue;
+        }
+
+        // Filter out title-starters: words that appear >75% as first word
+        let first_word_ratio = stats.first_word_count as f32 / stats.total_count as f32;
+        if first_word_ratio > 0.75 {
+            eprintln!("[MajorProjects] Filtered '{}' ({:.0}% first-word, {} items)",
+                name, first_word_ratio * 100.0, stats.item_ids.len());
+            continue;
+        }
+
+        let item_count = stats.item_ids.len();
+        let percentage = (item_count as f32 / total_items as f32) * 100.0;
+        projects.push(MajorProject {
+            name,
+            item_count,
+            percentage,
+            item_ids: stats.item_ids,
+        });
+    }
+
+    // Sort by item count descending
+    projects.sort_by(|a, b| b.item_count.cmp(&a.item_count));
+
+    projects
+}
+
+/// Detect project clusters from topic embeddings using pairwise cosine similarity
+///
+/// Finds tight clusters of semantically related topics that should be grouped together.
+/// Uses greedy expansion: start with highly-connected seeds, expand to all topics
+/// that have high similarity to ALL current cluster members.
+///
+/// For naming, extracts proper nouns from BOTH topic labels AND item titles under
+/// those topics (where project names like "Mycelica" actually appear).
+pub fn detect_project_clusters_from_embeddings(
+    db: &crate::db::Database,
+    topics: &[TopicInfo],
+    embeddings: &[(String, Vec<f32>)],
+    min_cluster_size: usize,
+    min_avg_similarity: f32,
+) -> Vec<DetectedProjectCluster> {
+    use crate::similarity::cosine_similarity;
+    use std::collections::{HashMap, HashSet};
+
+    if topics.len() < min_cluster_size {
+        return vec![];
+    }
+
+    // Build embedding lookup
+    let embedding_map: HashMap<&str, &Vec<f32>> = embeddings
+        .iter()
+        .map(|(id, emb)| (id.as_str(), emb))
+        .collect();
+
+    // Filter to topics that have embeddings
+    let topics_with_emb: Vec<&TopicInfo> = topics
+        .iter()
+        .filter(|t| embedding_map.contains_key(t.id.as_str()))
+        .collect();
+
+    if topics_with_emb.len() < min_cluster_size {
+        return vec![];
+    }
+
+    // Compute pairwise similarities
+    let n = topics_with_emb.len();
+    let mut similarities: Vec<Vec<f32>> = vec![vec![0.0; n]; n];
+
+    for i in 0..n {
+        similarities[i][i] = 1.0;
+        for j in (i + 1)..n {
+            let emb_i = embedding_map.get(topics_with_emb[i].id.as_str()).unwrap();
+            let emb_j = embedding_map.get(topics_with_emb[j].id.as_str()).unwrap();
+            let sim = cosine_similarity(emb_i, emb_j);
+            similarities[i][j] = sim;
+            similarities[j][i] = sim;
+        }
+    }
+
+    // Find tight clusters using greedy expansion
+    let mut used: HashSet<usize> = HashSet::new();
+    let mut clusters: Vec<DetectedProjectCluster> = vec![];
+
+    // Sort topics by how many high-similarity neighbors they have (connectivity)
+    let mut connectivity: Vec<(usize, usize)> = (0..n)
+        .map(|i| {
+            let count = (0..n)
+                .filter(|&j| i != j && similarities[i][j] >= min_avg_similarity)
+                .count();
+            (i, count)
+        })
+        .collect();
+    connectivity.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Expansion tolerance: allow slightly lower similarity when expanding
+    let expansion_threshold = min_avg_similarity - 0.10;
+
+    for (seed_idx, _) in connectivity {
+        if used.contains(&seed_idx) {
+            continue;
+        }
+
+        // Find all topics with high similarity to seed
+        let mut cluster_indices: Vec<usize> = vec![seed_idx];
+
+        for j in 0..n {
+            if j != seed_idx && !used.contains(&j) {
+                // Check similarity to ALL current cluster members
+                let all_similar = cluster_indices
+                    .iter()
+                    .all(|&k| similarities[j][k] >= expansion_threshold);
+
+                if all_similar {
+                    cluster_indices.push(j);
+                }
+            }
+        }
+
+        // Only keep if cluster is large enough
+        if cluster_indices.len() >= min_cluster_size {
+            // Calculate actual average similarity
+            let mut total_sim = 0.0;
+            let mut pairs = 0;
+            for i in 0..cluster_indices.len() {
+                for j in (i + 1)..cluster_indices.len() {
+                    total_sim += similarities[cluster_indices[i]][cluster_indices[j]];
+                    pairs += 1;
+                }
+            }
+            let avg_sim = if pairs > 0 {
+                total_sim / pairs as f32
+            } else {
+                0.0
+            };
+
+            if avg_sim >= min_avg_similarity {
+                // Mark as used
+                for &idx in &cluster_indices {
+                    used.insert(idx);
+                }
+
+                // Extract topic info
+                let topic_ids: Vec<String> = cluster_indices
+                    .iter()
+                    .map(|&i| topics_with_emb[i].id.clone())
+                    .collect();
+                let topic_labels: Vec<String> = cluster_indices
+                    .iter()
+                    .map(|&i| topics_with_emb[i].label.clone())
+                    .collect();
+
+                // Get item titles from topics in this cluster (where project names actually appear)
+                let item_titles = collect_item_titles_from_topics(db, &topic_ids);
+
+                // Extract proper nouns from BOTH topic labels AND item titles
+                let proper_nouns = extract_proper_nouns_from_texts(&topic_labels, &item_titles);
+                let name = generate_cluster_name(&topic_labels, &item_titles, &proper_nouns);
+
+                clusters.push(DetectedProjectCluster {
+                    name,
+                    topic_ids,
+                    topic_labels,
+                    avg_similarity: avg_sim,
+                });
+            }
+        }
+    }
+
+    clusters
+}
+
+/// Collect item titles from topics (items are children of topics where is_item=true)
+fn collect_item_titles_from_topics(db: &crate::db::Database, topic_ids: &[String]) -> Vec<String> {
+    let mut titles = Vec::new();
+
+    for topic_id in topic_ids {
+        if let Ok(children) = db.get_children(topic_id) {
+            for child in children {
+                if child.is_item {
+                    // Prefer ai_title, fallback to title
+                    let title = child.ai_title.unwrap_or(child.title);
+                    titles.push(title);
+                }
+            }
+        }
+    }
+
+    titles
+}
+
+/// Extract proper nouns appearing in 50%+ of labels (legacy, for backward compat)
+#[allow(dead_code)]
+fn extract_proper_nouns_from_labels(labels: &[String]) -> Vec<String> {
+    use std::collections::HashMap;
+
+    let mut noun_counts: HashMap<String, usize> = HashMap::new();
+
+    for label in labels {
+        for word in label.split_whitespace() {
+            // Must start with uppercase, be 3+ chars, not be a common word
+            if word.len() >= 3
+                && word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                && !is_common_word(word)
+            {
+                *noun_counts.entry(word.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Return nouns appearing in 50%+ of labels
+    let threshold = (labels.len() as f64 * 0.5).ceil() as usize;
+    let mut nouns: Vec<String> = noun_counts
+        .into_iter()
+        .filter(|(_, count)| *count >= threshold.max(2)) // At least 2 occurrences
+        .map(|(noun, _)| noun)
+        .collect();
+
+    nouns.sort();
+    nouns
+}
+
+/// Extract proper nouns from both topic labels AND item titles
+/// Uses lower threshold for items (15%, min 3) since project names may only appear in some items
+fn extract_proper_nouns_from_texts(topic_labels: &[String], item_titles: &[String]) -> Vec<String> {
+    use std::collections::HashMap;
+
+    let mut noun_counts: HashMap<String, usize> = HashMap::new();
+    let total_texts = topic_labels.len() + item_titles.len();
+
+    // Count proper nouns from topic labels (weight higher since more relevant)
+    for label in topic_labels {
+        for word in label.split_whitespace() {
+            let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+            if word.len() >= 3
+                && word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                && !is_common_word(word)
+            {
+                // Topic labels get 3x weight
+                *noun_counts.entry(word.to_string()).or_insert(0) += 3;
+            }
+        }
+    }
+
+    // Count proper nouns from item titles
+    for title in item_titles {
+        for word in title.split_whitespace() {
+            let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+            if word.len() >= 3
+                && word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                && !is_common_word(word)
+            {
+                *noun_counts.entry(word.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Lower threshold: 15% of total texts, minimum 3 occurrences
+    // For 50 items, threshold = max(7.5, 3) = 7.5 → 8 occurrences needed
+    let threshold = ((total_texts as f64 * 0.15).ceil() as usize).max(3);
+
+    let mut nouns: Vec<(String, usize)> = noun_counts
+        .into_iter()
+        .filter(|(_, count)| *count >= threshold)
+        .collect();
+
+    // Sort by frequency descending
+    nouns.sort_by(|a, b| b.1.cmp(&a.1));
+    nouns.into_iter().map(|(noun, _)| noun).collect()
+}
+
+/// Generate cluster name from labels and proper nouns (legacy, for backward compat)
+#[allow(dead_code)]
+fn generate_cluster_name_from_labels(labels: &[String], proper_nouns: &[String]) -> String {
+    // If we found a dominant proper noun, use it
+    if let Some(noun) = proper_nouns.first() {
+        return noun.clone();
+    }
+
+    // Otherwise, find common theme words
+    let common_words = find_common_words_in_labels(labels);
+    if !common_words.is_empty() {
+        return common_words.into_iter().take(2).collect::<Vec<_>>().join(" ");
+    }
+
+    "Related Topics".to_string()
+}
+
+/// Generate cluster name from topic labels, item titles, and extracted proper nouns
+/// Prioritizes: proper nouns > common keywords > first significant word from items
+fn generate_cluster_name(
+    topic_labels: &[String],
+    item_titles: &[String],
+    proper_nouns: &[String],
+) -> String {
+    // Priority 1: Use dominant proper noun if found
+    if let Some(noun) = proper_nouns.first() {
+        return noun.clone();
+    }
+
+    // Priority 2: Find common theme words from topic labels
+    let common_words = find_common_words_in_labels(topic_labels);
+    if !common_words.is_empty() {
+        let name = common_words.into_iter().take(2).collect::<Vec<_>>().join(" ");
+        if !name.is_empty() {
+            return name;
+        }
+    }
+
+    // Priority 3: Find common keywords from item titles
+    let item_keywords = find_common_words_in_labels(item_titles);
+    if !item_keywords.is_empty() {
+        let name = item_keywords.into_iter().take(2).collect::<Vec<_>>().join(" ");
+        if !name.is_empty() {
+            return name;
+        }
+    }
+
+    // Priority 4: Use first significant capitalized word from any item title
+    for title in item_titles.iter().chain(topic_labels.iter()) {
+        for word in title.split_whitespace() {
+            let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+            if word.len() >= 4
+                && word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                && !is_common_word(word)
+            {
+                return format!("{} Group", word);
+            }
+        }
+    }
+
+    // Final fallback: Use topic count as identifier (avoids generic "Related Topics")
+    format!("Cluster ({})", topic_labels.len())
+}
+
+/// Find common words across labels (excluding stopwords)
+fn find_common_words_in_labels(labels: &[String]) -> Vec<String> {
+    use std::collections::HashMap;
+
+    let stopwords = [
+        "the", "a", "an", "and", "or", "in", "of", "to", "for", "with", "on", "at", "by", "from",
+        "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do", "does",
+        "did", "will", "would", "could", "should", "may", "might", "must", "shall", "can",
+        "this", "that", "these", "those", "it", "its", "as", "if", "then", "than", "so",
+    ];
+    let mut word_counts: HashMap<String, usize> = HashMap::new();
+
+    for label in labels {
+        for word in label.to_lowercase().split_whitespace() {
+            // Clean punctuation
+            let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+            if word.len() > 3 && !stopwords.contains(&word) {
+                *word_counts.entry(word.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let threshold = (labels.len() as f64 * 0.4).ceil() as usize;
+    let mut words: Vec<(String, usize)> = word_counts
+        .into_iter()
+        .filter(|(_, count)| *count >= threshold.max(2))
+        .collect();
+
+    words.sort_by(|a, b| b.1.cmp(&a.1));
+    words
+        .into_iter()
+        .map(|(w, _)| capitalize_first_char(&w))
+        .collect()
+}
+
+/// Capitalize first character of a string
+fn capitalize_first_char(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+    }
 }
 
 /// Topic info for grouping (label + item count)
@@ -661,6 +1198,19 @@ pub struct TopicInfo {
     pub id: String,
     pub label: String,
     pub item_count: i32,
+}
+
+/// A project cluster detected from embedding similarity
+#[derive(Debug, Clone)]
+pub struct DetectedProjectCluster {
+    /// Cluster name (from proper noun extraction or keywords)
+    pub name: String,
+    /// Topic IDs belonging to this cluster
+    pub topic_ids: Vec<String>,
+    /// Topic labels (for prompt inclusion)
+    pub topic_labels: Vec<String>,
+    /// Average pairwise similarity within cluster
+    pub avg_similarity: f32,
 }
 
 /// Result of topic grouping - a parent category with its children
@@ -685,7 +1235,7 @@ pub async fn group_topics_into_categories(
         return Ok(vec![]);
     }
 
-    // Detect project names from topic labels
+    // Detect project names from topic labels (heuristic-based)
     let detected_projects = detect_project_names(topics);
     let projects_hint = if detected_projects.is_empty() {
         String::new()
@@ -693,6 +1243,54 @@ pub async fn group_topics_into_categories(
         format!(
             "\nDETECTED PROJECT/PRODUCT NAMES (use as categories): {}",
             detected_projects.join(", ")
+        )
+    };
+
+    // Build mandatory clusters section (embedding-based detection)
+    let mandatory_section = if context.mandatory_clusters.is_empty() {
+        String::new()
+    } else {
+        let clusters_text: Vec<String> = context
+            .mandatory_clusters
+            .iter()
+            .map(|c| {
+                let topics_preview: String = c
+                    .topic_labels
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let more = if c.topic_labels.len() > 5 {
+                    format!(", ... (+{} more)", c.topic_labels.len() - 5)
+                } else {
+                    String::new()
+                };
+                format!(
+                    "- \"{}\" ({} topics, {:.0}% cohesion): {}{}",
+                    c.name,
+                    c.topic_ids.len(),
+                    c.avg_similarity * 100.0,
+                    topics_preview,
+                    more
+                )
+            })
+            .collect();
+
+        format!(
+            r#"
+
+MANDATORY PROJECT CLUSTERS (CRITICAL - these topics MUST stay together):
+{}
+
+RULES FOR MANDATORY CLUSTERS:
+- Create a category for each mandatory cluster using its suggested name (or similar)
+- ALL topics listed in a mandatory cluster MUST be assigned to that single category
+- Do NOT split mandatory cluster topics across different categories
+- Do NOT merge multiple mandatory clusters into one category
+- These clusters were detected via semantic similarity - trust them
+"#,
+            clusters_text.join("\n")
         )
     };
 
@@ -732,7 +1330,7 @@ CURRENT POSITION IN HIERARCHY:
 {parent_desc_section}
 
 EXISTING SIBLINGS (do not duplicate these names): {siblings}
-{projects_hint}
+{projects_hint}{mandatory_section}
 
 YOUR TASK:
 Create 5-12 SUB-CATEGORIES for the {count} topics listed below.
@@ -782,6 +1380,7 @@ Return ONLY valid JSON, no markdown:
         parent_desc_section = parent_desc_section,
         siblings = siblings_str,
         projects_hint = projects_hint,
+        mandatory_section = mandatory_section,
         count = topics.len(),
         topics_section = topics_section
     );
@@ -819,6 +1418,11 @@ Return ONLY valid JSON, no markdown:
         .await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
 
+    // Track token usage
+    if let Some(usage) = &api_response.usage {
+        let _ = settings::add_anthropic_tokens(usage.input_tokens, usage.output_tokens);
+    }
+
     let text = api_response
         .content
         .first()
@@ -826,6 +1430,120 @@ Return ONLY valid JSON, no markdown:
         .unwrap_or_default();
 
     parse_category_groupings(&text, topics)
+}
+
+/// Group categories into 4-8 uber-categories with SINGLE WORD ALL-CAPS names
+/// Used for consolidating Universe's direct children into high-level domains
+pub async fn group_into_uber_categories(
+    categories: &[TopicInfo],
+) -> Result<Vec<CategoryGrouping>, String> {
+    let api_key = get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
+
+    if categories.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Build categories list for prompt
+    let categories_section = categories
+        .iter()
+        .map(|c| format!("- \"{}\" ({} items)", c.label, c.item_count))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let prompt = format!(
+        r#"You are consolidating a knowledge graph's top-level categories into uber-categories.
+
+CURRENT CATEGORIES ({count} total):
+{categories_section}
+
+YOUR TASK:
+Group these into 4-8 UBER-CATEGORIES with SINGLE WORD, ALL-CAPS names.
+
+STRICT RULES:
+
+1. NAMES MUST BE:
+   - Single word ONLY (no spaces, no hyphens)
+   - ALL CAPS
+   - Abstract/conceptual domains
+   - Examples: TECH, LIFE, MIND, WORK, CREATE, SCIENCE, SYSTEM, BUILD, LEARN, META
+
+2. TARGET 4-8 CATEGORIES:
+   - Minimum 4 uber-categories
+   - Maximum 8 uber-categories
+   - Each should contain 1-4 of the input categories
+
+3. SEMANTIC GROUPING:
+   - TECH: Programming, Software, AI, Systems, Architecture
+   - LIFE: Personal, Health, Relationships, Daily life
+   - MIND: Psychology, Philosophy, Consciousness, Learning
+   - WORK: Career, Business, Productivity, Projects
+   - CREATE: Art, Writing, Music, Design, Creative projects
+   - SCIENCE: Research, Biology, Physics, Data
+   - BUILD: Engineering, Construction, Making things
+   - META: Self-reference, Organization, Tools
+
+4. NO GENERIC CATCH-ALLS:
+   - FORBIDDEN: OTHER, MISC, GENERAL, VARIOUS
+   - Every category MUST fit somewhere meaningful
+
+Return ONLY valid JSON, no markdown:
+{{
+  "categories": [
+    {{
+      "name": "TECH",
+      "description": "Technology and software",
+      "children": ["Software Engineering", "AI Research", "System Design"]
+    }}
+  ]
+}}
+"#,
+        count = categories.len(),
+        categories_section = categories_section
+    );
+
+    let request = AnthropicRequest {
+        model: "claude-sonnet-4-20250514".to_string(),
+        max_tokens: 2000,
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: prompt,
+        }],
+    };
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("API error {}: {}", status, body));
+    }
+
+    let api_response: AnthropicResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    // Track token usage
+    if let Some(usage) = &api_response.usage {
+        let _ = settings::add_anthropic_tokens(usage.input_tokens, usage.output_tokens);
+    }
+
+    let text = api_response
+        .content
+        .first()
+        .map(|c| c.text.clone())
+        .unwrap_or_default();
+
+    parse_category_groupings(&text, categories)
 }
 
 /// Check if a category name is a generic catch-all that should be renamed
@@ -872,7 +1590,11 @@ fn generate_meaningful_name(children: &[String], index: usize) -> String {
     // Strategy 3: First child name truncated (last resort)
     if let Some(first_child) = children.first() {
         let short_name = if first_child.len() > 25 {
-            format!("{}...", &first_child[..22])
+            let mut end = 22;
+            while end > 0 && !first_child.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}...", &first_child[..end])
         } else {
             first_child.clone()
         };
@@ -910,8 +1632,12 @@ fn find_common_theme(children: &[String]) -> Option<String> {
     candidates.sort_by(|a, b| b.1.cmp(&a.1));
 
     if let Some((word, _)) = candidates.first() {
-        // Capitalize first letter
-        let capitalized = format!("{}{}", word[..1].to_uppercase(), &word[1..]);
+        // Capitalize first letter (safe for UTF-8)
+        let mut chars = word.chars();
+        let capitalized = match chars.next() {
+            Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str()),
+            None => word.clone(),
+        };
         return Some(format!("{} Discussions", capitalized));
     }
 
@@ -1040,6 +1766,12 @@ struct OpenAiEmbeddingRequest {
 #[derive(Debug, Deserialize)]
 struct OpenAiEmbeddingResponse {
     data: Vec<EmbeddingData>,
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiUsage {
+    total_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1060,7 +1792,11 @@ pub async fn generate_embedding(text: &str) -> Result<Vec<f32>, String> {
 
     // Truncate text if too long (roughly 8000 tokens ≈ 32000 chars)
     let text_to_embed = if text.len() > 30000 {
-        &text[..30000]
+        let mut end = 30000;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &text[..end]
     } else {
         text
     };
@@ -1090,6 +1826,11 @@ pub async fn generate_embedding(text: &str) -> Result<Vec<f32>, String> {
         .json()
         .await
         .map_err(|e| format!("Failed to parse embedding response: {}", e))?;
+
+    // Track token usage
+    if let Some(usage) = &api_response.usage {
+        let _ = settings::add_openai_tokens(usage.total_tokens);
+    }
 
     api_response.data
         .into_iter()

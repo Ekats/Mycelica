@@ -91,7 +91,7 @@ def main():
     }
 
     # Only include conversations with "mycelica" in title (case insensitive)
-    FILTER_MYCELICA = True
+    FILTER_MYCELICA = False  # Import all conversations
 
     conversations = [c for c in conversations if c.get('uuid') not in EXCLUDE_IDS]
 

@@ -7,7 +7,12 @@ use crate::similarity;
 use crate::settings;
 use tauri::{State, AppHandle, Emitter};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
+
+// Global cancellation flags
+static CANCEL_PROCESSING: AtomicBool = AtomicBool::new(false);
+pub static CANCEL_REBUILD: AtomicBool = AtomicBool::new(false);
 
 pub struct AppState {
     pub db: Arc<Database>,
@@ -21,6 +26,30 @@ pub fn get_nodes(state: State<AppState>) -> Result<Vec<Node>, String> {
 #[tauri::command]
 pub fn get_node(state: State<AppState>, id: String) -> Result<Option<Node>, String> {
     state.db.get_node(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn cancel_processing() -> Result<(), String> {
+    println!("[Cancel] AI Processing cancel requested");
+    CANCEL_PROCESSING.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn cancel_rebuild() -> Result<(), String> {
+    println!("[Cancel] Rebuild/Clustering cancel requested");
+    CANCEL_REBUILD.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Check if rebuild was cancelled (for use in other modules)
+pub fn is_rebuild_cancelled() -> bool {
+    CANCEL_REBUILD.load(Ordering::SeqCst)
+}
+
+/// Reset rebuild cancel flag (call at start of rebuild)
+pub fn reset_rebuild_cancel() {
+    CANCEL_REBUILD.store(false, Ordering::SeqCst);
 }
 
 #[tauri::command]
@@ -128,6 +157,7 @@ pub struct ProcessingResult {
     pub processed: usize,
     pub failed: usize,
     pub errors: Vec<String>,
+    pub cancelled: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -156,17 +186,21 @@ pub struct HierarchyLogEvent {
 pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result<ProcessingResult, String> {
     use std::time::Instant;
 
-    println!("process_nodes called, checking API key availability...");
+    println!("═══════════════════════════════════════════════════════════");
+    println!("[AI Processing] Starting...");
+    println!("═══════════════════════════════════════════════════════════");
 
     if !ai_client::is_available() {
-        println!("API key not available!");
+        println!("[AI Processing] Error: API key not available!");
         return Err("ANTHROPIC_API_KEY not set".to_string());
     }
 
-    println!("API key is available, fetching unprocessed nodes...");
     let unprocessed = state.db.get_unprocessed_nodes().map_err(|e| e.to_string())?;
     let total = unprocessed.len();
-    println!("Found {} unprocessed nodes", total);
+    println!("[AI Processing] Found {} unprocessed nodes", total);
+
+    // Reset cancel flag at start
+    CANCEL_PROCESSING.store(false, Ordering::SeqCst);
 
     let mut processed = 0;
     let mut failed = 0;
@@ -177,6 +211,24 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
     let mut avg_time_per_node: Option<f64> = None;
 
     for node in unprocessed {
+        // Check for cancellation
+        if CANCEL_PROCESSING.load(Ordering::SeqCst) {
+            println!("[AI Processing] Cancelled by user after {} nodes", processed);
+            let _ = app.emit("ai-progress", AiProgressEvent {
+                current,
+                total,
+                node_title: "Cancelled".to_string(),
+                new_title: String::new(),
+                emoji: None,
+                status: "cancelled".to_string(),
+                error_message: Some("Cancelled by user".to_string()),
+                elapsed_secs: Some(start_time.elapsed().as_secs_f64()),
+                estimate_secs: None,
+                remaining_secs: None,
+            });
+            return Ok(ProcessingResult { processed, failed, errors, cancelled: true });
+        }
+
         current += 1;
         let content = node.content.as_deref().unwrap_or("");
 
@@ -297,6 +349,7 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
 
     // Emit completion event
     let final_elapsed = start_time.elapsed().as_secs_f64();
+    println!("[AI Processing] Complete: {} processed, {} failed ({:.1}s)", processed, failed, final_elapsed);
     let _ = app.emit("ai-progress", AiProgressEvent {
         current: total,
         total,
@@ -314,6 +367,7 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
         processed,
         failed,
         errors,
+        cancelled: false,
     })
 }
 
@@ -645,4 +699,349 @@ pub fn get_leaf_content(state: State<AppState>, node_id: String) -> Result<Strin
 
     // Return content, falling back to empty string
     Ok(node.content.unwrap_or_default())
+}
+
+// ==================== Settings Panel Commands ====================
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteResult {
+    pub nodes_deleted: usize,
+    pub edges_deleted: usize,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DbStats {
+    pub total_nodes: usize,
+    pub total_items: usize,
+    pub processed_items: usize,
+    pub items_with_embeddings: usize,
+}
+
+/// Delete all data (nodes + edges)
+#[tauri::command]
+pub fn delete_all_data(state: State<AppState>) -> Result<DeleteResult, String> {
+    let edges_deleted = state.db.delete_all_edges().map_err(|e| e.to_string())?;
+    let nodes_deleted = state.db.delete_all_nodes().map_err(|e| e.to_string())?;
+    Ok(DeleteResult { nodes_deleted, edges_deleted })
+}
+
+/// Reset AI processing flag on all items
+#[tauri::command]
+pub fn reset_ai_processing(state: State<AppState>) -> Result<usize, String> {
+    state.db.reset_ai_processing().map_err(|e| e.to_string())
+}
+
+/// Reset clustering flag on all items
+#[tauri::command]
+pub fn reset_clustering(state: State<AppState>) -> Result<usize, String> {
+    state.db.mark_all_items_need_clustering().map_err(|e| e.to_string())
+}
+
+/// Clear all embeddings
+#[tauri::command]
+pub fn clear_embeddings(state: State<AppState>) -> Result<usize, String> {
+    // Also delete semantic edges since they depend on embeddings
+    let _ = state.db.delete_semantic_edges();
+    state.db.clear_all_embeddings().map_err(|e| e.to_string())
+}
+
+/// Clear hierarchy (delete intermediate nodes, keep items)
+#[tauri::command]
+pub fn clear_hierarchy(state: State<AppState>) -> Result<usize, String> {
+    // Also clear parent_id on items
+    let _ = state.db.clear_item_parents();
+    state.db.delete_hierarchy_nodes().map_err(|e| e.to_string())
+}
+
+/// Flatten empty passthrough levels in hierarchy
+/// Removes single-child chains and "Uncategorized" passthrough nodes
+#[tauri::command]
+pub fn flatten_hierarchy(state: State<AppState>) -> Result<usize, String> {
+    state.db.flatten_empty_levels().map_err(|e| e.to_string())
+}
+
+/// Consolidate Universe's direct children into 4-8 uber-categories
+/// Creates new depth-1 nodes with single-word ALL-CAPS names (TECH, LIFE, MIND, etc.)
+#[tauri::command]
+pub async fn consolidate_root(state: State<'_, AppState>) -> Result<ConsolidateResult, String> {
+    use crate::ai_client::{self, TopicInfo};
+    use crate::db::{Node, NodeType, Position};
+
+    // Get Universe
+    let universe = state.db.get_universe()
+        .map_err(|e| e.to_string())?
+        .ok_or("No Universe node found")?;
+
+    // Get Universe's direct children
+    let children = state.db.get_children(&universe.id).map_err(|e| e.to_string())?;
+
+    if children.is_empty() {
+        return Err("Universe has no children to consolidate".to_string());
+    }
+
+    if children.len() <= 8 {
+        return Err(format!("Universe only has {} children - already consolidated enough", children.len()));
+    }
+
+    println!("[Consolidate] Grouping {} categories into uber-categories", children.len());
+
+    // Build topic info for AI
+    let categories: Vec<TopicInfo> = children
+        .iter()
+        .map(|child| TopicInfo {
+            id: child.id.clone(),
+            label: child.cluster_label
+                .clone()
+                .or_else(|| child.ai_title.clone())
+                .unwrap_or_else(|| child.title.clone()),
+            item_count: child.child_count.max(1),
+        })
+        .collect();
+
+    // Call AI to group into uber-categories
+    let groupings = ai_client::group_into_uber_categories(&categories).await?;
+
+    if groupings.is_empty() {
+        return Err("AI returned no uber-categories".to_string());
+    }
+
+    println!("[Consolidate] AI created {} uber-categories", groupings.len());
+
+    // Create map from label -> child nodes
+    let mut label_to_children: std::collections::HashMap<String, Vec<&Node>> = std::collections::HashMap::new();
+    for child in &children {
+        let label = child.cluster_label
+            .as_ref()
+            .or(child.ai_title.as_ref())
+            .unwrap_or(&child.title)
+            .clone();
+        label_to_children.entry(label).or_default().push(child);
+    }
+
+    // Generate timestamp for unique IDs
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let now = timestamp as i64;
+
+    let mut uber_categories_created = 0;
+    let mut children_reparented = 0;
+    let mut all_children_to_update: Vec<String> = Vec::new();
+
+    for (idx, grouping) in groupings.iter().enumerate() {
+        // Find matching children
+        let matching_children: Vec<&Node> = grouping.children
+            .iter()
+            .flat_map(|label| label_to_children.get(label).cloned().unwrap_or_default())
+            .collect();
+
+        if matching_children.is_empty() {
+            println!("[Consolidate] Warning: '{}' has no matching children", grouping.name);
+            continue;
+        }
+
+        if matching_children.len() < 2 {
+            println!("[Consolidate] Skipping '{}' - only {} child (need 2+)", grouping.name, matching_children.len());
+            continue;
+        }
+
+        // Create uber-category node
+        let uber_id = format!("uber-{}-{}", timestamp, idx);
+
+        let uber_node = Node {
+            id: uber_id.clone(),
+            node_type: NodeType::Cluster,
+            title: grouping.name.clone(),
+            url: None,
+            content: grouping.description.clone(),
+            position: Position { x: 0.0, y: 0.0 },
+            created_at: now,
+            updated_at: now,
+            cluster_id: None,
+            cluster_label: Some(grouping.name.clone()),
+            depth: 1,
+            is_item: false,
+            is_universe: false,
+            parent_id: Some(universe.id.clone()),
+            child_count: matching_children.len() as i32,
+            ai_title: None,
+            summary: grouping.description.clone(),
+            tags: None,
+            emoji: None,
+            is_processed: false,
+            conversation_id: None,
+            sequence_index: None,
+            is_pinned: false,
+            last_accessed_at: None,
+        };
+
+        state.db.insert_node(&uber_node).map_err(|e| e.to_string())?;
+        uber_categories_created += 1;
+
+        // Reparent children to this uber-category
+        for child in &matching_children {
+            state.db.update_parent(&child.id, &uber_id).map_err(|e| e.to_string())?;
+            all_children_to_update.push(child.id.clone());
+            children_reparented += 1;
+        }
+
+        println!("[Consolidate] Created '{}' with {} children", grouping.name, matching_children.len());
+    }
+
+    // Batch update depths
+    if !all_children_to_update.is_empty() {
+        println!("[Consolidate] Updating depths for {} reparented nodes...", all_children_to_update.len());
+        state.db.increment_multiple_subtrees_depth(&all_children_to_update).map_err(|e| e.to_string())?;
+    }
+
+    // Update Universe's child count
+    state.db.update_child_count(&universe.id, uber_categories_created)
+        .map_err(|e| e.to_string())?;
+
+    println!("[Consolidate] Complete: {} uber-categories, {} children reparented",
+             uber_categories_created, children_reparented);
+
+    Ok(ConsolidateResult {
+        uber_categories_created,
+        children_reparented,
+    })
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsolidateResult {
+    pub uber_categories_created: i32,
+    pub children_reparented: i32,
+}
+
+// ==================== Tidy Database Command ====================
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TidyReport {
+    pub chains_flattened: usize,
+    pub empties_removed: usize,
+    pub child_counts_fixed: usize,
+    pub depths_fixed: usize,
+    pub orphans_reparented: usize,
+    pub dead_edges_pruned: usize,
+    pub duplicate_edges_removed: usize,
+    pub duration_ms: u64,
+}
+
+/// Run safe, fast cleanup operations on the database
+/// - Flatten single-child chains
+/// - Remove empty categories
+/// - Fix child counts and depths
+/// - Reparent orphans
+/// - Prune dead edges
+/// - Deduplicate edges
+#[tauri::command]
+pub fn tidy_database(state: State<AppState>) -> Result<TidyReport, String> {
+    use std::time::Instant;
+
+    println!("[Tidy] Starting database tidy...");
+    let start = Instant::now();
+    let db = &state.db;
+
+    // Run operations in order
+    let chains_flattened = db.flatten_single_child_chains().map_err(|e| e.to_string())?;
+    println!("[Tidy] Flattened {} single-child chains", chains_flattened);
+
+    let empties_removed = db.remove_empty_categories().map_err(|e| e.to_string())?;
+    println!("[Tidy] Removed {} empty categories", empties_removed);
+
+    let child_counts_fixed = db.fix_all_child_counts().map_err(|e| e.to_string())?;
+    println!("[Tidy] Fixed {} child counts", child_counts_fixed);
+
+    let depths_fixed = db.fix_all_depths().map_err(|e| e.to_string())?;
+    println!("[Tidy] Fixed {} depths", depths_fixed);
+
+    let orphans_reparented = db.reparent_orphans().map_err(|e| e.to_string())?;
+    println!("[Tidy] Reparented {} orphans", orphans_reparented);
+
+    let dead_edges_pruned = db.prune_dead_edges().map_err(|e| e.to_string())?;
+    println!("[Tidy] Pruned {} dead edges", dead_edges_pruned);
+
+    let duplicate_edges_removed = db.deduplicate_edges().map_err(|e| e.to_string())?;
+    println!("[Tidy] Removed {} duplicate edges", duplicate_edges_removed);
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    println!("[Tidy] Complete in {}ms", duration_ms);
+
+    Ok(TidyReport {
+        chains_flattened,
+        empties_removed,
+        child_counts_fixed,
+        depths_fixed,
+        orphans_reparented,
+        dead_edges_pruned,
+        duplicate_edges_removed,
+        duration_ms,
+    })
+}
+
+/// Get database stats for settings panel
+#[tauri::command]
+pub fn get_db_stats(state: State<AppState>) -> Result<DbStats, String> {
+    let (total_nodes, total_items, processed_items, items_with_embeddings) =
+        state.db.get_stats().map_err(|e| e.to_string())?;
+    Ok(DbStats {
+        total_nodes,
+        total_items,
+        processed_items,
+        items_with_embeddings,
+    })
+}
+
+/// Get current database path
+#[tauri::command]
+pub fn get_db_path(state: State<AppState>) -> Result<String, String> {
+    Ok(state.db.get_path())
+}
+
+/// Switch to a different database file
+#[tauri::command]
+pub fn switch_database(app: AppHandle, state: State<AppState>, db_path: String) -> Result<DbStats, String> {
+    use std::path::PathBuf;
+    use crate::db::Database;
+    use crate::hierarchy;
+
+    let path = PathBuf::from(&db_path);
+    if !path.exists() {
+        return Err(format!("Database file not found: {}", db_path));
+    }
+
+    // Create new database connection
+    let new_db = Database::new(&path).map_err(|e| e.to_string())?;
+
+    // Auto-build hierarchy if no Universe exists
+    if new_db.get_universe().ok().flatten().is_none() {
+        if let Err(e) = hierarchy::build_hierarchy(&new_db) {
+            eprintln!("Failed to build hierarchy for new database: {}", e);
+        }
+    }
+
+    // Replace the database in the app state
+    // Note: This is a bit hacky - we're replacing the Arc's inner value
+    // In a real app, you'd want proper state management
+    let arc_db = std::sync::Arc::new(new_db);
+
+    // Get stats before returning
+    let (total_nodes, total_items, processed_items, items_with_embeddings) =
+        arc_db.get_stats().map_err(|e| e.to_string())?;
+
+    // Update the managed state - we need to use interior mutability
+    // For now, we'll just return success and require app restart
+    // TODO: Proper hot-swap would require RwLock around the Database
+
+    Ok(DbStats {
+        total_nodes,
+        total_items,
+        processed_items,
+        items_with_embeddings,
+    })
 }

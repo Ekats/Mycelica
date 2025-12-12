@@ -15,7 +15,7 @@ use commands::{
     // Clustering commands
     run_clustering, recluster_all, get_clustering_status,
     // AI processing commands
-    process_nodes, get_ai_status,
+    process_nodes, get_ai_status, cancel_processing, cancel_rebuild,
     get_api_key_status, save_api_key, clear_api_key,
     get_learned_emojis, save_learned_emoji,
     // Hierarchy commands
@@ -35,6 +35,11 @@ use commands::{
     get_openai_api_key_status, save_openai_api_key, clear_openai_api_key,
     // Leaf view commands
     get_leaf_content,
+    // Settings panel commands
+    delete_all_data, reset_ai_processing, reset_clustering, clear_embeddings, clear_hierarchy, flatten_hierarchy, consolidate_root, get_db_stats,
+    get_db_path, switch_database, tidy_database,
+    // Processing stats commands
+    get_processing_stats, add_ai_processing_time, add_rebuild_time,
 };
 use db::Database;
 use std::sync::Arc;
@@ -44,6 +49,8 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .setup(|app| {
             // Get app data directory for settings
             let app_data_dir = app.path().app_data_dir()
@@ -96,6 +103,8 @@ pub fn run() {
             // AI processing
             process_nodes,
             get_ai_status,
+            cancel_processing,
+            cancel_rebuild,
             get_api_key_status,
             save_api_key,
             clear_api_key,
@@ -134,6 +143,22 @@ pub fn run() {
             clear_openai_api_key,
             // Leaf view
             get_leaf_content,
+            // Settings panel
+            delete_all_data,
+            reset_ai_processing,
+            reset_clustering,
+            clear_embeddings,
+            clear_hierarchy,
+            flatten_hierarchy,
+            consolidate_root,
+            tidy_database,
+            get_db_stats,
+            get_db_path,
+            switch_database,
+            // Processing stats
+            get_processing_stats,
+            add_ai_processing_time,
+            add_rebuild_time,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

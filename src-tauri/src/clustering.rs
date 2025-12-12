@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use crate::db::{Database, Node, Edge, EdgeType};
 use crate::ai_client::{self, ClusterItem, ExistingCluster, MultiClusterAssignment};
+use crate::commands::{is_rebuild_cancelled, reset_rebuild_cancel};
 use serde::Serialize;
 
 /// Result of clustering operation
@@ -337,6 +338,9 @@ const AI_BATCH_SIZE: usize = 15;
 /// Run clustering on items that need it
 /// Uses AI when available, falls back to TF-IDF
 pub async fn run_clustering(db: &Database, use_ai: bool) -> Result<ClusteringResult, String> {
+    // Reset cancel flag at start
+    reset_rebuild_cancel();
+
     // Get items needing clustering
     let items = db.get_items_needing_clustering().map_err(|e| e.to_string())?;
 
@@ -350,7 +354,7 @@ pub async fn run_clustering(db: &Database, use_ai: bool) -> Result<ClusteringRes
         });
     }
 
-    println!("Clustering {} items", items.len());
+    println!("[Clustering] Starting for {} items", items.len());
 
     // Check if AI is available and requested
     let ai_available = use_ai && ai_client::is_available();
@@ -381,7 +385,13 @@ async fn cluster_with_ai(db: &Database, items: &[Node]) -> Result<ClusteringResu
 
     // Process in batches
     for (batch_idx, batch) in items.chunks(AI_BATCH_SIZE).enumerate() {
-        println!("Processing batch {} ({} items)", batch_idx + 1, batch.len());
+        // Check for cancellation
+        if is_rebuild_cancelled() {
+            println!("[Clustering] Cancelled by user after {} batches", batch_idx);
+            return Err("Clustering cancelled by user".to_string());
+        }
+
+        println!("[Clustering] Processing batch {} ({} items)", batch_idx + 1, batch.len());
 
         // Convert to ClusterItem format (include AI-processed fields if available)
         let cluster_items: Vec<ClusterItem> = batch

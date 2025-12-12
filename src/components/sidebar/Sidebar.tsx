@@ -1,33 +1,20 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Search, X, ChevronRight, ChevronDown, Settings, Key, Check, AlertCircle, Pin, Clock, PinOff } from 'lucide-react';
+import { Search, X, ChevronRight, ChevronDown, Settings, Pin, Clock, PinOff } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { useGraphStore } from '../../stores/graphStore';
 import { getEmojiForNode, initLearnedMappings } from '../../utils/emojiMatcher';
 import type { Node } from '../../types/graph';
 
-interface ApiKeyStatus {
-  hasKey: boolean;
-  maskedKey: string | null;
-  source: string;
-}
-
 type SidebarTab = 'pinned' | 'search';
 
-export function Sidebar() {
+interface SidebarProps {
+  onOpenSettings?: () => void;
+}
+
+export function Sidebar({ onOpenSettings }: SidebarProps) {
   const { nodes, activeNodeId, setActiveNode, navigateToRoot, navigateToNode } = useGraphStore();
   const [activeTab, setActiveTab] = useState<SidebarTab>('pinned');
   const [searchQuery, setSearchQuery] = useState('');
-  const [showSettings, setShowSettings] = useState(false);
-  const [apiKeyStatus, setApiKeyStatus] = useState<ApiKeyStatus | null>(null);
-  const [apiKeyInput, setApiKeyInput] = useState('');
-  const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState<string | null>(null);
-
-  // OpenAI API key state
-  const [openaiKeyStatus, setOpenaiKeyStatus] = useState<string | null>(null); // masked key or null
-  const [openaiKeyInput, setOpenaiKeyInput] = useState('');
-  const [savingOpenai, setSavingOpenai] = useState(false);
-  const [openaiSaveError, setOpenaiSaveError] = useState<string | null>(null);
 
   // Quick access state
   const [recentNodes, setRecentNodes] = useState<Node[]>([]);
@@ -35,10 +22,8 @@ export function Sidebar() {
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(new Set());
   const [recentExpanded, setRecentExpanded] = useState(true); // Will adjust after pinnedNodes load
 
-  // Load API key status and learned emojis on mount
+  // Load learned emojis on mount
   useEffect(() => {
-    loadApiKeyStatus();
-    loadOpenaiKeyStatus();
     loadLearnedEmojis();
   }, []);
 
@@ -56,24 +41,6 @@ export function Sidebar() {
         .catch(console.error);
     }
   }, [activeNodeId]);
-
-  const loadApiKeyStatus = async () => {
-    try {
-      const status = await invoke<ApiKeyStatus>('get_api_key_status');
-      setApiKeyStatus(status);
-    } catch (err) {
-      console.error('Failed to load API key status:', err);
-    }
-  };
-
-  const loadOpenaiKeyStatus = async () => {
-    try {
-      const maskedKey = await invoke<string | null>('get_openai_api_key_status');
-      setOpenaiKeyStatus(maskedKey);
-    } catch (err) {
-      console.error('Failed to load OpenAI API key status:', err);
-    }
-  };
 
   const loadLearnedEmojis = async () => {
     try {
@@ -115,58 +82,6 @@ export function Sidebar() {
       tags: node.tags,
       content: node.content
     });
-  };
-
-  const handleSaveApiKey = async () => {
-    if (!apiKeyInput.trim()) return;
-
-    setSaving(true);
-    setSaveError(null);
-
-    try {
-      await invoke('save_api_key', { key: apiKeyInput.trim() });
-      await loadApiKeyStatus();
-      setApiKeyInput('');
-    } catch (err) {
-      setSaveError(err as string);
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const handleClearApiKey = async () => {
-    try {
-      await invoke('clear_api_key');
-      await loadApiKeyStatus();
-    } catch (err) {
-      console.error('Failed to clear API key:', err);
-    }
-  };
-
-  const handleSaveOpenaiKey = async () => {
-    if (!openaiKeyInput.trim()) return;
-
-    setSavingOpenai(true);
-    setOpenaiSaveError(null);
-
-    try {
-      await invoke('save_openai_api_key', { key: openaiKeyInput.trim() });
-      await loadOpenaiKeyStatus();
-      setOpenaiKeyInput('');
-    } catch (err) {
-      setOpenaiSaveError(err as string);
-    } finally {
-      setSavingOpenai(false);
-    }
-  };
-
-  const handleClearOpenaiKey = async () => {
-    try {
-      await invoke('clear_openai_api_key');
-      await loadOpenaiKeyStatus();
-    } catch (err) {
-      console.error('Failed to clear OpenAI API key:', err);
-    }
   };
 
   const handleNodeClick = useCallback((nodeId: string) => {
@@ -261,12 +176,8 @@ export function Sidebar() {
             <h1 className="text-lg font-semibold text-white">Mycelica</h1>
           </div>
           <button
-            onClick={() => setShowSettings(!showSettings)}
-            className={`p-2 rounded-lg transition-colors ${
-              showSettings
-                ? 'bg-amber-500/20 text-amber-400'
-                : 'text-gray-400 hover:text-gray-200 hover:bg-gray-700/50'
-            }`}
+            onClick={onOpenSettings}
+            className="p-2 rounded-lg transition-colors text-gray-400 hover:text-gray-200 hover:bg-gray-700/50"
             title="Settings"
           >
             <Settings className="w-4 h-4" />
@@ -493,169 +404,6 @@ export function Sidebar() {
         )}
       </div>
 
-      {/* Settings panel */}
-      {showSettings && (
-        <div className="border-t border-gray-700/50 bg-gray-800/95 p-4">
-          <div className="flex items-center gap-2 mb-3">
-            <Key className="w-4 h-4 text-gray-400" />
-            <span className="text-sm font-medium text-gray-200">Anthropic API Key</span>
-          </div>
-
-          {/* Status indicator */}
-          {apiKeyStatus && (
-            <div className={`flex items-center gap-2 mb-3 text-xs ${
-              apiKeyStatus.hasKey ? 'text-green-400' : 'text-amber-400'
-            }`}>
-              {apiKeyStatus.hasKey ? (
-                <>
-                  <Check className="w-3 h-3" />
-                  <span>
-                    Key configured
-                    {apiKeyStatus.source === 'env' && ' (from environment)'}
-                  </span>
-                </>
-              ) : (
-                <>
-                  <AlertCircle className="w-3 h-3" />
-                  <span>No API key set</span>
-                </>
-              )}
-            </div>
-          )}
-
-          {/* Show masked key if set */}
-          {apiKeyStatus?.maskedKey && (
-            <div className="mb-3 px-2 py-1 bg-gray-900/50 rounded text-xs text-gray-400 font-mono">
-              {apiKeyStatus.maskedKey}
-            </div>
-          )}
-
-          {/* API key input */}
-          <div className="space-y-2">
-            <input
-              type="password"
-              placeholder="sk-ant-api03-..."
-              value={apiKeyInput}
-              onChange={(e) => setApiKeyInput(e.target.value)}
-              className="w-full px-3 py-2 bg-gray-900/50 border border-gray-700/50 rounded text-sm text-white placeholder-gray-500 focus:border-amber-500/50 focus:ring-1 focus:ring-amber-500/20 focus:outline-none"
-            />
-
-            {saveError && (
-              <p className="text-xs text-red-400">{saveError}</p>
-            )}
-
-            <div className="flex gap-2">
-              <button
-                onClick={handleSaveApiKey}
-                disabled={saving || !apiKeyInput.trim()}
-                className="flex-1 px-3 py-1.5 bg-amber-500/20 text-amber-200 rounded text-sm font-medium hover:bg-amber-500/30 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-              >
-                {saving ? 'Saving...' : 'Save Key'}
-              </button>
-
-              {apiKeyStatus?.hasKey && apiKeyStatus.source !== 'env' && (
-                <button
-                  onClick={handleClearApiKey}
-                  className="px-3 py-1.5 bg-red-500/20 text-red-300 rounded text-sm font-medium hover:bg-red-500/30 transition-colors"
-                >
-                  Clear
-                </button>
-              )}
-            </div>
-          </div>
-
-          <p className="mt-3 text-xs text-gray-500">
-            Get your API key from{' '}
-            <a
-              href="https://console.anthropic.com/settings/keys"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-amber-400 hover:underline"
-            >
-              console.anthropic.com
-            </a>
-          </p>
-
-          {/* OpenAI API Key Section */}
-          <div className="mt-6 pt-4 border-t border-gray-700/50">
-            <div className="flex items-center gap-2 mb-3">
-              <Key className="w-4 h-4 text-gray-400" />
-              <span className="text-sm font-medium text-gray-200">OpenAI API Key</span>
-              <span className="text-xs text-gray-500">(for embeddings)</span>
-            </div>
-
-            {/* Status indicator */}
-            <div className={`flex items-center gap-2 mb-3 text-xs ${
-              openaiKeyStatus ? 'text-green-400' : 'text-gray-500'
-            }`}>
-              {openaiKeyStatus ? (
-                <>
-                  <Check className="w-3 h-3" />
-                  <span>Key configured</span>
-                </>
-              ) : (
-                <>
-                  <AlertCircle className="w-3 h-3" />
-                  <span>Optional - enables semantic similarity</span>
-                </>
-              )}
-            </div>
-
-            {/* Show masked key if set */}
-            {openaiKeyStatus && (
-              <div className="mb-3 px-2 py-1 bg-gray-900/50 rounded text-xs text-gray-400 font-mono">
-                {openaiKeyStatus}
-              </div>
-            )}
-
-            {/* OpenAI API key input */}
-            <div className="space-y-2">
-              <input
-                type="password"
-                placeholder="sk-..."
-                value={openaiKeyInput}
-                onChange={(e) => setOpenaiKeyInput(e.target.value)}
-                className="w-full px-3 py-2 bg-gray-900/50 border border-gray-700/50 rounded text-sm text-white placeholder-gray-500 focus:border-amber-500/50 focus:ring-1 focus:ring-amber-500/20 focus:outline-none"
-              />
-
-              {openaiSaveError && (
-                <p className="text-xs text-red-400">{openaiSaveError}</p>
-              )}
-
-              <div className="flex gap-2">
-                <button
-                  onClick={handleSaveOpenaiKey}
-                  disabled={savingOpenai || !openaiKeyInput.trim()}
-                  className="flex-1 px-3 py-1.5 bg-amber-500/20 text-amber-200 rounded text-sm font-medium hover:bg-amber-500/30 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                >
-                  {savingOpenai ? 'Saving...' : 'Save Key'}
-                </button>
-
-                {openaiKeyStatus && (
-                  <button
-                    onClick={handleClearOpenaiKey}
-                    className="px-3 py-1.5 bg-red-500/20 text-red-300 rounded text-sm font-medium hover:bg-red-500/30 transition-colors"
-                  >
-                    Clear
-                  </button>
-                )}
-              </div>
-            </div>
-
-            <p className="mt-3 text-xs text-gray-500">
-              Get your API key from{' '}
-              <a
-                href="https://platform.openai.com/api-keys"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-amber-400 hover:underline"
-              >
-                platform.openai.com
-              </a>
-            </p>
-          </div>
-        </div>
-      )}
     </aside>
   );
 }

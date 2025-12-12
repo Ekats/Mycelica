@@ -14,11 +14,35 @@ static SETTINGS: RwLock<Option<Settings>> = RwLock::new(None);
 static CONFIG_PATH: RwLock<Option<PathBuf>> = RwLock::new(None);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProcessingStats {
+    #[serde(default)]
+    pub total_ai_processing_secs: f64,
+    #[serde(default)]
+    pub total_rebuild_secs: f64,
+    #[serde(default)]
+    pub last_ai_processing_secs: f64,
+    #[serde(default)]
+    pub last_rebuild_secs: f64,
+    #[serde(default)]
+    pub ai_processing_runs: u32,
+    #[serde(default)]
+    pub rebuild_runs: u32,
+    #[serde(default)]
+    pub total_anthropic_input_tokens: u64,
+    #[serde(default)]
+    pub total_anthropic_output_tokens: u64,
+    #[serde(default)]
+    pub total_openai_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
     #[serde(default)]
     pub anthropic_api_key: Option<String>,
     #[serde(default)]
     pub openai_api_key: Option<String>,
+    #[serde(default)]
+    pub processing_stats: ProcessingStats,
 }
 
 impl Settings {
@@ -167,4 +191,104 @@ pub fn get_masked_openai_api_key() -> Option<String> {
             "*".repeat(key.len())
         }
     })
+}
+
+// ==================== Processing Stats ====================
+
+/// Get processing stats
+pub fn get_processing_stats() -> ProcessingStats {
+    let guard = SETTINGS.read().ok();
+    guard
+        .as_ref()
+        .and_then(|g| g.as_ref())
+        .map(|s| s.processing_stats.clone())
+        .unwrap_or_default()
+}
+
+/// Add AI processing time (additive)
+pub fn add_ai_processing_time(elapsed_secs: f64) -> Result<(), String> {
+    let mut settings_guard = SETTINGS.write()
+        .map_err(|_| "Failed to acquire settings lock")?;
+
+    let settings = settings_guard.get_or_insert_with(Settings::default);
+    settings.processing_stats.total_ai_processing_secs += elapsed_secs;
+    settings.processing_stats.last_ai_processing_secs = elapsed_secs;
+    settings.processing_stats.ai_processing_runs += 1;
+
+    // Save to disk
+    let config_path = CONFIG_PATH.read()
+        .map_err(|_| "Failed to acquire config path lock")?
+        .clone()
+        .ok_or("Settings not initialized")?;
+
+    settings.save(&config_path)?;
+
+    println!("AI processing time saved: {:.1}s (total: {:.1}s, runs: {})",
+        elapsed_secs,
+        settings.processing_stats.total_ai_processing_secs,
+        settings.processing_stats.ai_processing_runs);
+    Ok(())
+}
+
+/// Set rebuild time (replaces previous - rebuild replaces hierarchy each time)
+pub fn add_rebuild_time(elapsed_secs: f64) -> Result<(), String> {
+    let mut settings_guard = SETTINGS.write()
+        .map_err(|_| "Failed to acquire settings lock")?;
+
+    let settings = settings_guard.get_or_insert_with(Settings::default);
+
+    // Rebuild replaces hierarchy, so replace time instead of adding
+    settings.processing_stats.total_rebuild_secs = elapsed_secs;
+    settings.processing_stats.last_rebuild_secs = elapsed_secs;
+    settings.processing_stats.rebuild_runs += 1;
+
+    // Save to disk
+    let config_path = CONFIG_PATH.read()
+        .map_err(|_| "Failed to acquire config path lock")?
+        .clone()
+        .ok_or("Settings not initialized")?;
+
+    settings.save(&config_path)?;
+
+    println!("Rebuild time saved: {:.1}s (runs: {})",
+        elapsed_secs,
+        settings.processing_stats.rebuild_runs);
+    Ok(())
+}
+
+/// Add Anthropic API token usage
+pub fn add_anthropic_tokens(input_tokens: u64, output_tokens: u64) -> Result<(), String> {
+    let mut settings_guard = SETTINGS.write()
+        .map_err(|_| "Failed to acquire settings lock")?;
+
+    let settings = settings_guard.get_or_insert_with(Settings::default);
+    settings.processing_stats.total_anthropic_input_tokens += input_tokens;
+    settings.processing_stats.total_anthropic_output_tokens += output_tokens;
+
+    // Save to disk
+    let config_path = CONFIG_PATH.read()
+        .map_err(|_| "Failed to acquire config path lock")?
+        .clone()
+        .ok_or("Settings not initialized")?;
+
+    settings.save(&config_path)?;
+    Ok(())
+}
+
+/// Add OpenAI API token usage
+pub fn add_openai_tokens(tokens: u64) -> Result<(), String> {
+    let mut settings_guard = SETTINGS.write()
+        .map_err(|_| "Failed to acquire settings lock")?;
+
+    let settings = settings_guard.get_or_insert_with(Settings::default);
+    settings.processing_stats.total_openai_tokens += tokens;
+
+    // Save to disk
+    let config_path = CONFIG_PATH.read()
+        .map_err(|_| "Failed to acquire config path lock")?
+        .clone()
+        .ok_or("Settings not initialized")?;
+
+    settings.save(&config_path)?;
+    Ok(())
 }
