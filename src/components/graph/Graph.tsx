@@ -95,10 +95,17 @@ const generateClusterColor = (clusterId: number): string => {
   return `hsl(${hue}, 55%, 35%)`;
 };
 
-// Direct connection color: red→green matching edge colors exactly
+// Direct connection color: red→yellow→blue→cyan matching edge colors
+// Skips green for colorblind accessibility
 const getDirectConnectionColor = (weight: number): string => {
-  // weight 0-1 maps to hue 0-120 (red→green), same as edges
-  const hue = weight * 120;
+  let hue: number;
+  if (weight < 0.5) {
+    // First half: red (0°) → yellow (60°)
+    hue = weight * 2 * 60;
+  } else {
+    // Second half: blue (210°) → cyan (180°)
+    hue = 210 - (weight - 0.5) * 2 * 30;
+  }
   return `hsl(${hue}, 80%, 40%)`; // Match edge saturation (80%), slightly darker
 };
 
@@ -173,6 +180,7 @@ export function Graph({ width, height }: GraphProps) {
   const [isClustering, setIsClustering] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isBuildingHierarchy, setIsBuildingHierarchy] = useState(false);
+  const [isUpdatingDates, setIsUpdatingDates] = useState(false);
   const [rebuildQueued, setRebuildQueued] = useState(false);
   const rebuildQueuedRef = useRef(false);
   const [cancelRequested, setCancelRequested] = useState<'ai' | 'rebuild' | null>(null);
@@ -702,6 +710,22 @@ export function Graph({ width, height }: GraphProps) {
   // Keep ref updated
   fullRebuildRef.current = fullRebuild;
 
+  // Update latest dates for all groups (fast, no AI)
+  const handleUpdateDates = useCallback(async () => {
+    setIsUpdatingDates(true);
+    devLog('info', 'Propagating latest dates from leaves to groups...');
+    try {
+      await invoke('propagate_latest_dates');
+      devLog('info', '✓ Latest dates propagated to all nodes');
+      devLog('info', 'Reloading in 1 second...');
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      window.location.reload();
+    } catch (err) {
+      devLog('error', `Failed to update dates: ${err}`);
+      setIsUpdatingDates(false);
+    }
+  }, [devLog]);
+
   // List all nodes in current view
   const listCurrentNodes = useCallback(() => {
     const allNodes = Array.from(nodes.values());
@@ -1148,11 +1172,24 @@ export function Graph({ width, height }: GraphProps) {
     };
 
     // Define arrow markers for edge endpoints
+    // Edge color: red (low weight) → yellow → blue → cyan (high weight)
+    // Skips green for colorblind accessibility
+    const getEdgeColor = (normalized: number): string => {
+      let hue: number;
+      if (normalized < 0.5) {
+        // First half: red (0°) → yellow (60°)
+        hue = normalized * 2 * 60;
+      } else {
+        // Second half: blue (210°) → cyan (180°)
+        hue = 210 - (normalized - 0.5) * 2 * 30;
+      }
+      return `hsl(${hue}, 80%, 50%)`;
+    };
+
     const defs = svg.append('defs');
     edgeData.forEach((d, i) => {
       const normalized = (d.weight - minWeight) / weightRange;
-      const hue = d.type === 'contains' ? 220 : normalized * 120;
-      const color = d.type === 'contains' ? '#6b7280' : `hsl(${hue}, 80%, 50%)`;
+      const color = d.type === 'contains' ? '#6b7280' : getEdgeColor(normalized);
       // Scale down arrow size for thicker connections (inverse of weight)
       // Low weight (thin edge) → 5px arrow, High weight (thick edge) → 3px arrow
       const arrowSize = d.type === 'contains' ? 4 : 5 - normalized * 2;
@@ -1176,11 +1213,8 @@ export function Graph({ width, height }: GraphProps) {
       .attr('fill', 'none')
       .attr('stroke', d => {
         if (d.type === 'contains') return '#6b7280';
-        // Normalize weight to 0-1 range based on actual min/max in view
         const normalized = (d.weight - minWeight) / weightRange;
-        // Color from red (low) to green (high similarity)
-        const hue = normalized * 120; // 0=red, 60=yellow, 120=green
-        return `hsl(${hue}, 80%, 50%)`;
+        return getEdgeColor(normalized);
       })
       .attr('stroke-opacity', d => d.type === 'contains' ? 0.5 : 0.7)
       .attr('stroke-width', d => {
@@ -1236,6 +1270,31 @@ export function Graph({ width, height }: GraphProps) {
 
     // ==================== UNIFIED NODE RENDERING ====================
     // All nodes use the same card style - clean "cute api"
+
+    // Calculate date range for items (for gradient coloring)
+    const itemNodes = graphNodes.filter(d => d.childCount === 0);
+    const itemDates = itemNodes.map(d => new Date(d.createdAt).getTime());
+    const minDate = itemDates.length > 0 ? Math.min(...itemDates) : 0;
+    const maxDate = itemDates.length > 0 ? Math.max(...itemDates) : 0;
+    const dateRange = maxDate - minDate || 1; // Avoid division by zero
+
+    // Date to color: red (oldest) → orange → yellow → blue → cyan (newest)
+    // Skips green for colorblind accessibility
+    const getDateColor = (dateStr: string): string => {
+      const timestamp = new Date(dateStr).getTime();
+      const t = (timestamp - minDate) / dateRange; // 0 = oldest, 1 = newest
+
+      // Piecewise hue: 0→60° (red→yellow) then jump to 200→180° (blue→cyan)
+      let hue: number;
+      if (t < 0.5) {
+        // First half: red (0°) → yellow (60°)
+        hue = t * 2 * 60;
+      } else {
+        // Second half: blue (210°) → cyan (180°)
+        hue = 210 - (t - 0.5) * 2 * 30;
+      }
+      return `hsl(${hue}, 75%, 65%)`;
+    };
 
     const cardsGroup = container.append('g').attr('class', 'cards');
     const dotsGroup = container.append('g').attr('class', 'dots');
@@ -1433,15 +1492,59 @@ export function Graph({ width, height }: GraphProps) {
       .text('NOTE');
 
     // Footer info (line 2 for items, only line for topics)
+    // Items get date-colored text (red=oldest, cyan=newest)
+    // Groups get latestChildDate coloring if available
+
+    // Background rect for footer text (added before text so it renders behind)
+    cardGroups.append('rect')
+      .attr('class', 'footer-bg')
+      .attr('x', 8)
+      .attr('y', noteHeight - 34)
+      .attr('width', noteWidth - 16)
+      .attr('height', 26)
+      .attr('rx', 4)
+      .attr('ry', 4)
+      .attr('fill', 'rgba(0, 0, 0, 0.5)');
+
+    // Left side: item count (for groups) or date (for items)
     cardGroups.append('text')
+      .attr('class', 'footer-left')
       .attr('x', 14)
       .attr('y', noteHeight - 16)
       .attr('font-family', cardFont)
-      .attr('font-size', '16px')
-      .attr('fill', 'rgba(255,255,255,0.5)')
+      .attr('font-size', '17px')
+      .attr('fill', d => {
+        if (d.childCount > 0) {
+          return 'rgba(255,255,255,0.7)';
+        }
+        return getDateColor(d.createdAt);
+      })
       .text(d => {
-        if (d.childCount > 0) return `${d.childCount} items`;
+        if (d.childCount > 0) {
+          return `${d.childCount} items`;
+        }
         return new Date(d.createdAt).toLocaleDateString();
+      });
+
+    // Right side: latest date (for groups only)
+    cardGroups.append('text')
+      .attr('class', 'footer-right')
+      .attr('x', noteWidth - 14)
+      .attr('y', noteHeight - 16)
+      .attr('text-anchor', 'end')
+      .attr('font-family', cardFont)
+      .attr('font-size', '17px')
+      .attr('fill', d => {
+        if (d.childCount > 0 && d.latestChildDate) {
+          return getDateColor(d.latestChildDate);
+        }
+        return 'transparent';
+      })
+      .text(d => {
+        if (d.childCount > 0 && d.latestChildDate) {
+          return `Latest: ${new Date(d.latestChildDate).toLocaleDateString()}`;
+        }
+        return '';
       });
 
     // Zen mode removed - hover/selection now handles connection highlighting
@@ -1916,12 +2019,10 @@ export function Graph({ width, height }: GraphProps) {
           return 0.3;
         };
 
-        // D3 updates directly
-        dotGroups.transition().duration(150)
-          .style('opacity', (n: GraphNode) => getClickOpacity(n));
+        // D3 updates directly (instant, no transitions)
+        dotGroups.style('opacity', (n: GraphNode) => getClickOpacity(n));
 
         dotsGroup.selectAll('.dot-main')
-          .transition().duration(150)
           .attr('fill', function(this: SVGCircleElement) {
             const parentEl = this.parentNode as Element;
             if (!parentEl) return '#374151';
@@ -1941,8 +2042,7 @@ export function Graph({ width, height }: GraphProps) {
             return data.id === d.id ? 3 : 0;
           });
 
-        cardGroups.transition().duration(150)
-          .style('opacity', (n: GraphNode) => getClickOpacity(n));
+        cardGroups.style('opacity', (n: GraphNode) => getClickOpacity(n));
 
         // THEN update React state
         // setActiveNode(d.id); // TEMP: testing if React re-render is bottleneck
@@ -2720,6 +2820,31 @@ export function Graph({ width, height }: GraphProps) {
               ✕
             </button>
           )}
+        </div>
+        <button
+          onClick={handleUpdateDates}
+          disabled={isUpdatingDates}
+          className="bg-cyan-600 hover:bg-cyan-500 disabled:bg-cyan-800 disabled:cursor-wait px-3 py-1 rounded text-white text-xs font-medium transition-colors"
+          title="Update latest dates for all groups (fast, no AI)"
+        >
+          {isUpdatingDates ? 'Updating...' : '📅 Dates'}
+        </button>
+      </div>
+
+      {/* Color legend */}
+      <div className="absolute bottom-16 right-4 bg-gray-800/90 backdrop-blur-sm rounded-lg px-3 py-2 text-xs text-gray-300">
+        <div className="flex items-center gap-2 mb-1">
+          <span className="text-gray-400">Age / Similarity:</span>
+        </div>
+        <div className="flex items-center gap-1">
+          <span style={{ color: 'hsl(0, 75%, 65%)' }}>Old/Weak</span>
+          <div
+            className="h-4 w-24 rounded"
+            style={{
+              background: 'linear-gradient(to right, hsl(0, 75%, 65%), hsl(60, 75%, 65%), hsl(210, 75%, 65%), hsl(180, 75%, 65%))'
+            }}
+          />
+          <span style={{ color: 'hsl(180, 75%, 65%)' }}>New/Strong</span>
         </div>
       </div>
 

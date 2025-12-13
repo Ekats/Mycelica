@@ -130,6 +130,7 @@ pub fn import_claude_conversations(db: &Database, json_content: &str) -> Result<
             sequence_index: None,
             is_pinned: false,
             last_accessed_at: None,
+            latest_child_date: None,
         };
 
         if let Err(e) = db.insert_node(&container) {
@@ -177,6 +178,7 @@ pub fn import_claude_conversations(db: &Database, json_content: &str) -> Result<
                 sequence_index: Some(index as i32), // Order in conversation
                 is_pinned: false,
                 last_accessed_at: None,
+                latest_child_date: None,
             };
 
             if let Err(e) = db.insert_node(&exchange_node) {

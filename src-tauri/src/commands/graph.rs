@@ -459,6 +459,15 @@ pub fn get_children_flat(state: State<AppState>, parent_id: String) -> Result<Ve
     hierarchy::get_children_skip_single_chain(&state.db, &parent_id)
 }
 
+/// Propagate latest_child_date from leaves up through the hierarchy
+///
+/// Fast operation (~seconds) - no AI or embeddings involved.
+/// Leaves get their created_at, groups get MAX of their children's latest_child_date.
+#[tauri::command]
+pub fn propagate_latest_dates(state: State<AppState>) -> Result<(), String> {
+    state.db.propagate_latest_dates().map_err(|e| e.to_string())
+}
+
 // ==================== Multi-Path Association Commands ====================
 
 /// Get all category associations for an item (via BelongsTo edges)
@@ -876,6 +885,7 @@ pub async fn consolidate_root(state: State<'_, AppState>) -> Result<ConsolidateR
             sequence_index: None,
             is_pinned: false,
             last_accessed_at: None,
+            latest_child_date: None,
         };
 
         state.db.insert_node(&uber_node).map_err(|e| e.to_string())?;

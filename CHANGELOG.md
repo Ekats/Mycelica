@@ -2,6 +2,26 @@
 
 All notable changes to Mycelica will be documented in this file.
 
+## [0.4.0] - 2025-12-13
+
+### Date-Based Coloring
+- Node dates colored with gradient: red (oldest) → yellow → blue → cyan (newest)
+- Skips green for colorblind accessibility
+- Edge connection lines use same gradient based on similarity weight
+- Color legend in bottom-right shows "Age / Similarity" scale
+
+### Latest Child Date Propagation
+- New `latestChildDate` field on nodes
+- Bottom-up propagation: leaves use `createdAt`, groups bubble up MAX from children
+- "📅 Dates" button to manually propagate (fast, no AI)
+- Auto-runs as Step 6 of "Full Rebuild"
+- Groups now show "X items · Latest: date" with date colored by recency
+
+### Node Footer Improvements
+- Split footer: item count on left, latest date on right (for groups)
+- Semi-transparent background behind footer text for readability
+- Items show creation date (colored), groups show child count + latest date
+
 ## [0.3.0] - 2025-12-11
 
 ### AI Progress Indicator

@@ -120,6 +120,10 @@ pub struct Node {
     pub is_pinned: bool,                  // User-pinned favorite
     #[serde(rename = "lastAccessedAt")]
     pub last_accessed_at: Option<i64>,    // For recency tracking in sidebar
+
+    // Hierarchy date propagation
+    #[serde(rename = "latestChildDate")]
+    pub latest_child_date: Option<i64>,   // MAX(children's created_at), bubbled up from leaves
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

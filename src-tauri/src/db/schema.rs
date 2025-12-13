@@ -64,7 +64,9 @@ impl Database {
                 sequence_index INTEGER,  -- Order within conversation (0-based)
                 -- Quick access fields (for Sidebar)
                 is_pinned INTEGER NOT NULL DEFAULT 0,
-                last_accessed_at INTEGER
+                last_accessed_at INTEGER,
+                -- Hierarchy date propagation
+                latest_child_date INTEGER  -- MAX(children's created_at), bubbled up
             );
 
             -- Learned emoji mappings from AI
@@ -301,6 +303,18 @@ impl Database {
             eprintln!("Migration: Added embedding column to nodes for semantic similarity");
         }
 
+        // Migration: Add latest_child_date column for hierarchy date propagation
+        let has_latest_child_date: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('nodes') WHERE name = 'latest_child_date'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !has_latest_child_date {
+            conn.execute("ALTER TABLE nodes ADD COLUMN latest_child_date INTEGER", [])?;
+            eprintln!("Migration: Added latest_child_date column to nodes for hierarchy date propagation");
+        }
+
         // Create indexes for dynamic hierarchy columns (after migrations ensure columns exist)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_depth ON nodes(depth)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_is_item ON nodes(is_item)", [])?;
@@ -398,11 +412,12 @@ impl Database {
             sequence_index: row.get(22)?,
             is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
             last_accessed_at: row.get(24)?,
+            latest_child_date: row.get(25)?,
         })
     }
 
     /// Standard SELECT columns for nodes (excludes embedding - use dedicated functions)
-    const NODE_COLUMNS: &'static str = "id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at";
+    const NODE_COLUMNS: &'static str = "id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date";
 
     pub fn get_all_nodes(&self) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
@@ -573,6 +588,7 @@ impl Database {
                 sequence_index: row.get(22)?,
                 is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
                 last_accessed_at: row.get(24)?,
+                latest_child_date: row.get(25)?,
             })
         })?.collect::<Result<Vec<_>>>()?;
 
@@ -604,7 +620,7 @@ impl Database {
     pub fn get_unprocessed_nodes(&self) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, embedding
+            "SELECT id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date
              FROM nodes WHERE is_item = 1 AND (is_processed = 0 OR is_processed IS NULL) ORDER BY created_at DESC"
         )?;
 
@@ -634,6 +650,7 @@ impl Database {
                 sequence_index: row.get(22)?,
                 is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
                 last_accessed_at: row.get(24)?,
+                latest_child_date: row.get(25)?,
             })
         })?.collect::<Result<Vec<_>>>()?;
 
@@ -670,7 +687,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, type, title, url, content, position_x, position_y, created_at, updated_at,
-                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, embedding
+                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date
              FROM nodes WHERE depth = ?1 ORDER BY child_count DESC, title"
         )?;
 
@@ -700,6 +717,7 @@ impl Database {
                 sequence_index: row.get(22)?,
                 is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
                 last_accessed_at: row.get(24)?,
+                latest_child_date: row.get(25)?,
             })
         })?.collect::<Result<Vec<_>>>()?;
 
@@ -711,7 +729,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, type, title, url, content, position_x, position_y, created_at, updated_at,
-                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, embedding
+                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date
              FROM nodes WHERE parent_id = ?1 ORDER BY child_count DESC, title"
         )?;
 
@@ -741,6 +759,7 @@ impl Database {
                 sequence_index: row.get(22)?,
                 is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
                 last_accessed_at: row.get(24)?,
+                latest_child_date: row.get(25)?,
             })
         })?.collect::<Result<Vec<_>>>()?;
 
@@ -752,7 +771,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, type, title, url, content, position_x, position_y, created_at, updated_at,
-                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, embedding
+                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date
              FROM nodes WHERE is_universe = 1 LIMIT 1"
         )?;
 
@@ -783,6 +802,7 @@ impl Database {
                 sequence_index: row.get(22)?,
                 is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
                 last_accessed_at: row.get(24)?,
+                latest_child_date: row.get(25)?,
             }))
         } else {
             Ok(None)
@@ -794,7 +814,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, type, title, url, content, position_x, position_y, created_at, updated_at,
-                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, embedding
+                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date
              FROM nodes WHERE is_item = 1 ORDER BY created_at DESC"
         )?;
 
@@ -824,6 +844,7 @@ impl Database {
                 sequence_index: row.get(22)?,
                 is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
                 last_accessed_at: row.get(24)?,
+                latest_child_date: row.get(25)?,
             })
         })?.collect::<Result<Vec<_>>>()?;
 
@@ -918,7 +939,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, type, title, url, content, position_x, position_y, created_at, updated_at,
-                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, embedding
+                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date
              FROM nodes WHERE is_item = 1 AND needs_clustering = 1 ORDER BY created_at DESC"
         )?;
 
@@ -948,6 +969,7 @@ impl Database {
                 sequence_index: row.get(22)?,
                 is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
                 last_accessed_at: row.get(24)?,
+                latest_child_date: row.get(25)?,
             })
         })?.collect::<Result<Vec<_>>>()?;
 
@@ -1167,6 +1189,7 @@ impl Database {
                 sequence_index: row.get(22)?,
                 is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
                 last_accessed_at: row.get(24)?,
+                latest_child_date: row.get(25)?,
             })
         })?.collect::<Result<Vec<_>>>()?;
 
@@ -1295,6 +1318,7 @@ impl Database {
             sequence_index: None,
             is_pinned: false,
             last_accessed_at: None,
+            latest_child_date: None,
         };
 
         self.insert_node(&node)
@@ -1317,7 +1341,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, type, title, url, content, position_x, position_y, created_at, updated_at,
-                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, embedding
+                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date
              FROM nodes WHERE conversation_id = ?1 ORDER BY sequence_index ASC"
         )?;
 
@@ -1347,10 +1371,58 @@ impl Database {
                 sequence_index: row.get(22)?,
                 is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
                 last_accessed_at: row.get(24)?,
+                latest_child_date: row.get(25)?,
             })
         })?.collect::<Result<Vec<_>>>()?;
 
         Ok(nodes)
+    }
+
+    // ==================== Date Propagation Operations ====================
+
+    /// Propagate latest_child_date from leaves up through the hierarchy
+    /// Processes bottom-up: deepest nodes first, bubbles up to Universe
+    /// Leaves (child_count = 0): latest_child_date = created_at
+    /// Groups (child_count > 0): latest_child_date = MAX(children's latest_child_date)
+    pub fn propagate_latest_dates(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+
+        // Get max depth in hierarchy
+        let max_depth: i32 = conn.query_row(
+            "SELECT COALESCE(MAX(depth), 0) FROM nodes",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        println!("Propagating latest dates from depth {} up to 0...", max_depth);
+
+        // Process bottom-up (deepest first)
+        for depth in (0..=max_depth).rev() {
+            // For leaves (child_count = 0): set latest_child_date = created_at
+            let leaves_updated = conn.execute(
+                "UPDATE nodes SET latest_child_date = created_at
+                 WHERE depth = ?1 AND child_count = 0",
+                params![depth],
+            )?;
+
+            // For groups (child_count > 0): set to MAX of children's latest_child_date
+            let groups_updated = conn.execute(
+                "UPDATE nodes SET latest_child_date = (
+                    SELECT MAX(c.latest_child_date)
+                    FROM nodes c
+                    WHERE c.parent_id = nodes.id
+                 )
+                 WHERE depth = ?1 AND child_count > 0",
+                params![depth],
+            )?;
+
+            if leaves_updated > 0 || groups_updated > 0 {
+                println!("  Depth {}: {} leaves, {} groups updated", depth, leaves_updated, groups_updated);
+            }
+        }
+
+        println!("✓ Latest dates propagated to all nodes");
+        Ok(())
     }
 
     // ==================== Quick Access Operations (Sidebar) ====================
@@ -1427,7 +1499,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, type, title, url, content, position_x, position_y, created_at, updated_at,
-                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, embedding
+                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date
              FROM nodes WHERE is_pinned = 1 ORDER BY last_accessed_at DESC"
         )?;
 
@@ -1457,6 +1529,7 @@ impl Database {
                 sequence_index: row.get(22)?,
                 is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
                 last_accessed_at: row.get(24)?,
+                latest_child_date: row.get(25)?,
             })
         })?.collect::<Result<Vec<_>>>()?;
 
@@ -1468,7 +1541,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, type, title, url, content, position_x, position_y, created_at, updated_at,
-                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, embedding
+                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date
              FROM nodes WHERE last_accessed_at IS NOT NULL ORDER BY last_accessed_at DESC LIMIT ?1"
         )?;
 
@@ -1498,6 +1571,7 @@ impl Database {
                 sequence_index: row.get(22)?,
                 is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
                 last_accessed_at: row.get(24)?,
+                latest_child_date: row.get(25)?,
             })
         })?.collect::<Result<Vec<_>>>()?;
 

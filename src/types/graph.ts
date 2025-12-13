@@ -74,6 +74,9 @@ export interface Node {
   isPinned: boolean;        // User-pinned favorite
   lastAccessedAt?: number;  // For recency tracking in sidebar
 
+  // --- Hierarchy date propagation ---
+  latestChildDate?: number; // MAX(children's created_at), bubbled up from leaves
+
   // --- Conversation context (for message Leafs) ---
   conversationId?: string;  // ID of parent conversation this message belongs to
   sequenceIndex?: number;   // Position in original conversation (0, 1, 2...)

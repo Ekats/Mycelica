@@ -44,6 +44,8 @@ interface BackendNode {
   // Quick access fields
   isPinned: boolean;  // Rust uses #[serde(rename = "isPinned")]
   lastAccessedAt: number | null;  // Rust uses #[serde(rename = "lastAccessedAt")]
+  // Hierarchy date propagation
+  latestChildDate: number | null;  // Rust uses #[serde(rename = "latestChildDate")]
 }
 
 interface BackendEdge {
@@ -93,6 +95,8 @@ function mapBackendNode(n: BackendNode): Node {
     // Quick access fields
     isPinned: n.isPinned ?? false,
     lastAccessedAt: n.lastAccessedAt ?? undefined,
+    // Hierarchy date propagation
+    latestChildDate: n.latestChildDate ?? undefined,
   };
 }
 

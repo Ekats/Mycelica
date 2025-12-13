@@ -310,6 +310,7 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
             sequence_index: None,
             is_pinned: false,
             last_accessed_at: None,
+            latest_child_date: None,
         };
 
         db.insert_node(&topic_node).map_err(|e| e.to_string())?;
@@ -484,6 +485,7 @@ fn create_parent_level(
             sequence_index: None,
             is_pinned: false,
             last_accessed_at: None,
+            latest_child_date: None,
         };
 
         db.insert_node(&parent_node).map_err(|e| e.to_string())?;
@@ -539,6 +541,7 @@ fn create_universe(db: &Database, child_ids: &[String]) -> Result<String, String
         sequence_index: None,
         is_pinned: false,
         last_accessed_at: None,
+        latest_child_date: None,
     };
 
     db.insert_node(&universe_node).map_err(|e| e.to_string())?;
@@ -880,6 +883,7 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
             sequence_index: None,
             is_pinned: false,
             last_accessed_at: None,
+            latest_child_date: None,
         };
 
         db.insert_node(&category_node).map_err(|e| e.to_string())?;
@@ -1077,6 +1081,7 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
                 sequence_index: None,
                 is_pinned: false,
                 last_accessed_at: None,
+                latest_child_date: None,
             };
 
             // Insert umbrella node
@@ -1345,6 +1350,20 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
     } else {
         0
     };
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 6: Propagate latest dates from leaves up through hierarchy
+    // ═══════════════════════════════════════════════════════════════════════════
+    emit_log(app, "info", "");
+    emit_log(app, "info", "═══════════════════════════════════════════════════════════");
+    emit_log(app, "info", "STEP 6: PROPAGATING LATEST DATES");
+    emit_log(app, "info", "───────────────────────────────────────────────────────────");
+
+    if let Err(e) = db.propagate_latest_dates() {
+        emit_log(app, "warn", &format!("  Failed to propagate dates: {}", e));
+    } else {
+        emit_log(app, "info", "  ✓ Latest dates propagated to all nodes");
+    }
 
     emit_log(app, "info", "");
     emit_log(app, "info", "═══════════════════════════════════════════════════════════");

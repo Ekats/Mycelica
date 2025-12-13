@@ -21,6 +21,7 @@ use commands::{
     // Hierarchy commands
     get_nodes_at_depth, get_children, get_universe, get_items, get_max_depth,
     build_hierarchy, build_full_hierarchy, cluster_hierarchy_level, get_children_flat,
+    propagate_latest_dates,
     // Multi-path association commands
     get_item_associations, get_related_items, get_category_items,
     // Conversation context commands
@@ -120,6 +121,7 @@ pub fn run() {
             build_hierarchy,
             build_full_hierarchy,
             cluster_hierarchy_level,
+            propagate_latest_dates,
             // Multi-path associations
             get_item_associations,
             get_related_items,
