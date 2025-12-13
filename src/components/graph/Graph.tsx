@@ -6,6 +6,7 @@ import { useGraphStore } from '../../stores/graphStore';
 import type { Node } from '../../types/graph';
 import { getEmojiForNode, initLearnedMappings } from '../../utils/emojiMatcher';
 import { ChevronRight, AlertTriangle, X } from 'lucide-react';
+import { SimilarNodesPanel, SimilarNodesLoading } from './SimilarNodesPanel';
 
 // Confirmation dialog types
 type ConfirmAction = 'processAi' | 'cluster' | 'buildHierarchy' | null;
@@ -94,6 +95,33 @@ const generateClusterColor = (clusterId: number): string => {
   return `hsl(${hue}, 55%, 35%)`;
 };
 
+// Direct connection color: red→green matching edge colors exactly
+const getDirectConnectionColor = (weight: number): string => {
+  // weight 0-1 maps to hue 0-120 (red→green), same as edges
+  const hue = weight * 120;
+  return `hsl(${hue}, 80%, 40%)`; // Match edge saturation (80%), slightly darker
+};
+
+// Chain connection color: darker red tint for indirect connections
+const getChainConnectionColor = (hopDistance: number): string => {
+  // Further = darker/more faded red
+  const lightness = Math.max(25, 35 - hopDistance * 3); // 35% → 25% as distance increases
+  return `hsl(0, 60%, ${lightness}%)`; // Red hue, moderate saturation
+};
+
+// getUnconnectedColor removed - using getMutedClusterColor for unconnected nodes
+
+// Calculate structural depth for shadow stacking
+// Items: 0 (no stack, just subtle shadow)
+// Topics: 1-4 (violet base + 0-3 cluster shadows)
+const getStructuralDepth = (childCount: number, isItem: boolean): number => {
+  if (isItem) return 0;
+  if (childCount >= 16) return 4;  // violet + 3 cluster
+  if (childCount >= 6) return 3;   // violet + 2 cluster
+  if (childCount >= 2) return 2;   // violet + 1 cluster
+  return 1;  // just violet (all topics)
+};
+
 // Simple hash function to generate consistent number from string
 const hashString = (str: string): number => {
   let hash = 0;
@@ -109,6 +137,16 @@ export function Graph({ width, height }: GraphProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const consoleRef = useRef<HTMLDivElement>(null);
   const stackNodesRef = useRef(false);
+  // Refs for selection state - accessible by event handlers
+  const activeNodeIdRef = useRef<string | null>(null);
+  const connectionMapRef = useRef<Map<string, {weight: number, distance: number}>>(new Map());
+  // Refs for batched logging (prevents re-render loops when devLog called in render path)
+  const logQueueRef = useRef<Array<{time: string, type: 'info' | 'warn' | 'error', message: string}>>([]);
+  const flushScheduledRef = useRef(false);
+  // Ref to skip activeNodeId useEffect when click handler already did D3 update
+  const clickHandledRef = useRef(false);
+  // Ref to track last click time (to avoid deselecting during double-click)
+  const lastClickTimeRef = useRef(0);
   const {
     nodes,
     edges,
@@ -149,23 +187,21 @@ export function Graph({ width, height }: GraphProps) {
   // Similar nodes state
   const [similarNodesMap, setSimilarNodesMap] = useState<Map<string, SimilarNode[]>>(new Map());
   const [loadingSimilar, setLoadingSimilar] = useState<Set<string>>(new Set());
-  const [expandedSimilar, setExpandedSimilar] = useState<Set<string>>(new Set());
-  const [collapsedSimilar, setCollapsedSimilar] = useState<Set<string>>(new Set());
   const [stackNodes, setStackNodesState] = useState(false); // Toggle to stack multiple node panels
   const [confirmAction, setConfirmAction] = useState<ConfirmAction>(null); // Confirmation dialog state
   const setStackNodes = (value: boolean) => {
     stackNodesRef.current = value;
     setStackNodesState(value);
   };
-  const SIMILAR_INITIAL_COUNT = 10;
   const [detailsPanelSize, setDetailsPanelSize] = useState({ width: 400, height: 400 });
   const [isResizingDetails, setIsResizingDetails] = useState(false);
-  const [zenModeNodeId, setZenModeNodeId] = useState<string | null>(null); // Node ID for zen mode focus
-  const zenModeNodeIdRef = useRef<string | null>(null);
-  const setZenMode = (nodeId: string | null) => {
-    zenModeNodeIdRef.current = nodeId;
-    setZenModeNodeId(nodeId);
-  };
+  // Zen mode removed - hover/selection now handles connection highlighting
+  // const [zenModeNodeId, setZenModeNodeId] = useState<string | null>(null);
+  // const zenModeNodeIdRef = useRef<string | null>(null);
+  // const setZenMode = (nodeId: string | null) => {
+  //   zenModeNodeIdRef.current = nodeId;
+  //   setZenModeNodeId(nodeId);
+  // };
 
   // AI Progress indicator state
   const [aiProgress, setAiProgress] = useState<{
@@ -250,13 +286,31 @@ export function Graph({ width, height }: GraphProps) {
 
   const devLog = useCallback((type: 'info' | 'warn' | 'error', message: string) => {
     const time = new Date().toLocaleTimeString();
-    setDevLogs(prev => [...prev.slice(-2000), { time, type, message }]);
+
+    // Add to queue (no state update = no re-render)
+    logQueueRef.current.push({ time, type, message });
+
+    // Schedule a flush if not already scheduled
+    if (!flushScheduledRef.current) {
+      flushScheduledRef.current = true;
+      // Flush after current execution stack clears
+      setTimeout(() => {
+        flushScheduledRef.current = false;
+        const logs = logQueueRef.current;
+        logQueueRef.current = [];
+        if (logs.length > 0) {
+          setDevLogs(prev => [...prev.slice(-2000), ...logs]); // Single batch update
+        }
+      }, 0);
+    }
+
+    // Still log to browser console immediately for debugging
     if (type === 'error') console.error(`[Graph] ${message}`);
     else if (type === 'warn') console.warn(`[Graph] ${message}`);
     else console.log(`[Graph] ${message}`);
   }, []);
 
-  // Fetch similar nodes for a node
+  // Fetch similar nodes for a node - prioritize nodes in current view
   const fetchSimilarNodes = useCallback(async (nodeId: string) => {
     const isStacking = stackNodesRef.current;
 
@@ -281,13 +335,21 @@ export function Graph({ width, height }: GraphProps) {
 
     setLoadingSimilar(prev => new Set(prev).add(nodeId));
     try {
-      const similar = await invoke<SimilarNode[]>('get_similar_nodes', { nodeId, topN: 1000, minSimilarity: 0.25 });
+      // Fetch top 100 similar nodes (enough for practical use)
+      const similar = await invoke<SimilarNode[]>('get_similar_nodes', { nodeId, topN: 100, minSimilarity: 0.25 });
+
+      // Prioritize nodes in current view (ones you can see and click)
+      const currentViewNodeIds = new Set(nodes.keys());
+      const inView = similar.filter(s => currentViewNodeIds.has(s.id));
+      const elsewhere = similar.filter(s => !currentViewNodeIds.has(s.id));
+      const prioritized = [...inView, ...elsewhere];
+
       if (isStacking) {
-        setSimilarNodesMap(prev => new Map(prev).set(nodeId, similar));
+        setSimilarNodesMap(prev => new Map(prev).set(nodeId, prioritized));
       } else {
-        setSimilarNodesMap(new Map([[nodeId, similar]]));
+        setSimilarNodesMap(new Map([[nodeId, prioritized]]));
       }
-      devLog('info', `Found ${similar.length} similar nodes for ${nodeId}`);
+      devLog('info', `Found ${similar.length} similar nodes (${inView.length} in view)`);
     } catch (err) {
       devLog('warn', `No similar nodes: ${err}`);
     } finally {
@@ -297,7 +359,7 @@ export function Graph({ width, height }: GraphProps) {
         return next;
       });
     }
-  }, [similarNodesMap, devLog]);
+  }, [similarNodesMap, devLog, nodes]);
 
   // Auto-build hierarchy if we have items but no Universe
   useEffect(() => {
@@ -737,6 +799,7 @@ export function Graph({ width, height }: GraphProps) {
   }, [devLog]);
 
   useEffect(() => {
+    devLog('info', 'Main render useEffect running');
     if (!svgRef.current || nodes.size === 0) return;
 
     const svg = d3.select(svgRef.current);
@@ -823,16 +886,19 @@ export function Graph({ width, height }: GraphProps) {
     // IMPORTANCE-BASED TIERED LAYOUT (per pyspiral.md spec)
     // ==========================================================================
 
-    // Ring capacity: Ring 0 = 1, Ring 1 = 4, Ring N = 6 * N
+    // Ring capacity: Ring 0 = 0 (skip center), Ring 1 = 4, Ring N = 6 * N
     const getNodesPerRing = (ring: number): number => {
-      if (ring === 0) return 1;
+      // if (ring === 0) return 1; // Commented out - nothing in exact center
+      if (ring === 0) return 0;
       if (ring === 1) return 4;
       return 6 * ring;
     };
 
     // Ring radius: based on noteHeight + spacing
     const getRingRadius = (ring: number): number => {
-      return ring * (noteHeight + nodeSpacing * 1.5);
+      if (ring === 1) return (noteHeight + nodeSpacing * 1.5) * 0.7; // First ring closer together
+      // Outer rings: slightly reduced growth rate
+      return (noteHeight + nodeSpacing * 1.5) * (0.7 + (ring - 1) * 0.85);
     };
 
     // Golden angle for ring offset (prevents spoke alignment)
@@ -840,6 +906,10 @@ export function Graph({ width, height }: GraphProps) {
 
     // Ellipse aspect ratio for wide monitors
     const ellipseAspect = Math.min((width / height) * 0.9, 2.0);
+
+    // Angle restriction for outer rings - avoid top/bottom, favor left/right
+    const restrictionStartRing = 2; // Start restricting angles at this ring
+    const horizontalBandHalfAngle = Math.PI / 4.5; // ~40° - nodes placed within ±40° of horizontal (more vertical spread)
 
     // Center of unified layout
     const centerX = 0;
@@ -895,11 +965,30 @@ export function Graph({ width, height }: GraphProps) {
 
         for (let i = 0; i < nodesInThisRing; i++) {
           const node = tierNodes[nodeIndex];
-          const angle = ringStartAngle + (i / nodesInThisRing) * 2 * Math.PI;
 
-          // Apply ellipse aspect ratio
+          let angle: number;
+          if (ringIndex < restrictionStartRing) {
+            // Inner rings: full 360° distribution
+            angle = ringStartAngle + (i / nodesInThisRing) * 2 * Math.PI;
+          } else {
+            // Outer rings: restrict to horizontal bands (left and right sides)
+            // Map nodes to two bands: right side and left side, avoiding top/bottom
+            const progress = i / nodesInThisRing; // 0 to 1
+            if (progress < 0.5) {
+              // Right side: map 0-0.5 to -halfAngle to +halfAngle around 0°
+              angle = -horizontalBandHalfAngle + (progress * 2) * (2 * horizontalBandHalfAngle);
+            } else {
+              // Left side: map 0.5-1 to -halfAngle to +halfAngle around π
+              angle = Math.PI - horizontalBandHalfAngle + ((progress - 0.5) * 2) * (2 * horizontalBandHalfAngle);
+            }
+            // Small offset per ring to prevent perfect alignment (but don't rotate bands)
+            angle += (ringIndex % 4) * 0.1;
+          }
+
+          // Apply ellipse aspect ratio (ring 1 gets extra vertical stretch)
+          const verticalStretch = ringIndex === 1 ? 1.3 : 1.0;
           const x = centerX + ringRadius * ellipseAspect * Math.cos(angle);
-          const y = centerY + ringRadius * Math.sin(angle);
+          const y = centerY + ringRadius * verticalStretch * Math.sin(angle);
 
           const colorId = node.clusterId ?? hashString(node.id);
           graphNodes.push({
@@ -988,6 +1077,76 @@ export function Graph({ width, height }: GraphProps) {
     const weightRange = maxWeight - minWeight || 0.1; // Avoid division by zero
     devLog('info', `Edges in view: ${containsCount} contains, ${relatedCount} related (weights: ${(minWeight*100).toFixed(0)}%-${(maxWeight*100).toFixed(0)}%)`);
 
+    // Build connection map with BFS for multi-hop distances
+    const connectionMap = new Map<string, {weight: number, distance: number}>();
+    if (activeNodeId) {
+      // Build adjacency list from edges
+      const adjacency = new Map<string, Array<{nodeId: string, weight: number}>>();
+      edgeData.forEach(edge => {
+        const srcId = edge.source.id;
+        const tgtId = edge.target.id;
+        if (!adjacency.has(srcId)) adjacency.set(srcId, []);
+        if (!adjacency.has(tgtId)) adjacency.set(tgtId, []);
+        adjacency.get(srcId)!.push({nodeId: tgtId, weight: edge.weight});
+        adjacency.get(tgtId)!.push({nodeId: srcId, weight: edge.weight});
+      });
+
+      // BFS from activeNodeId
+      connectionMap.set(activeNodeId, {weight: 1.0, distance: 0});
+      const queue: Array<{id: string, dist: number}> = [{id: activeNodeId, dist: 0}];
+
+      while (queue.length > 0) {
+        const {id, dist} = queue.shift()!;
+        const neighbors = adjacency.get(id) || [];
+        for (const {nodeId, weight} of neighbors) {
+          if (!connectionMap.has(nodeId)) {
+            connectionMap.set(nodeId, {weight, distance: dist + 1});
+            queue.push({id: nodeId, dist: dist + 1});
+          }
+        }
+      }
+    }
+
+    // Helper to get muted cluster color (gray with hint of cluster hue)
+    const getMutedClusterColor = (d: GraphNode): string => {
+      if (d.renderClusterId < 0) return '#374151';
+      const hue = (d.renderClusterId * 137.508) % 360;
+      return `hsl(${hue}, 12%, 28%)`; // Very low saturation, dark
+    };
+
+    // Helper to get node color based on connection distance
+    const getNodeColor = (d: GraphNode): string => {
+      if (!activeNodeId) return getMutedClusterColor(d); // Muted cluster hint when nothing selected
+      if (d.id === activeNodeId) {
+        // Selected node shows its cluster color
+        return d.renderClusterId >= 0 ? generateClusterColor(d.renderClusterId) : '#4b5563';
+      }
+      const conn = connectionMap.get(d.id);
+      if (conn) {
+        if (conn.distance === 1) {
+          // Direct connection: red→green based on weight
+          return getDirectConnectionColor(conn.weight);
+        } else {
+          // Chain connection (2+ hops): darker red
+          return getChainConnectionColor(conn.distance);
+        }
+      }
+      return getMutedClusterColor(d); // Unconnected = muted cluster hint
+    };
+
+    // Helper to get node opacity based on connection distance
+    const getNodeOpacity = (d: GraphNode): number => {
+      if (!activeNodeId) return 1; // Full opacity when nothing selected
+      if (d.id === activeNodeId) return 1; // Selected = full
+      const conn = connectionMap.get(d.id);
+      if (conn) {
+        if (conn.distance === 1) return 1; // Direct = full
+        // Chain: slight fade based on distance (0.85 at 2 hops, 0.70 at 3, etc.)
+        return Math.max(0.5, 1 - conn.distance * 0.15);
+      }
+      return 0.3; // Unconnected = significant fade
+    };
+
     // Define arrow markers for edge endpoints
     const defs = svg.append('defs');
     edgeData.forEach((d, i) => {
@@ -1026,11 +1185,19 @@ export function Graph({ width, height }: GraphProps) {
       .attr('stroke-opacity', d => d.type === 'contains' ? 0.5 : 0.7)
       .attr('stroke-width', d => {
         // Base thickness + weight-based scaling
-        if (d.type === 'contains') return 3;
-        // Normalize and use exponential scaling
+        if (d.type === 'contains') return 6;
+        // Normalize weight to thickness
         const normalized = (d.weight - minWeight) / weightRange;
-        // 0% (min) → 2px, 100% (max) → 16px
-        return 2 + normalized * 14;
+        // 0% (min) → 6px, 100% (max) → 24px
+        return 6 + normalized * 18;
+      })
+      .attr('opacity', (e: {source: GraphNode, target: GraphNode}) => {
+        if (!activeNodeId) return 1;
+        if (e.source.id === activeNodeId || e.target.id === activeNodeId) return 0.9;
+        const srcConn = connectionMap.has(e.source.id);
+        const tgtConn = connectionMap.has(e.target.id);
+        if (srcConn && tgtConn) return 0.7;
+        return 0.15;
       })
       .attr('d', d => {
         // Find closest pair of side centers between the two nodes
@@ -1082,24 +1249,93 @@ export function Graph({ width, height }: GraphProps) {
       .attr('cursor', 'pointer')
       .attr('transform', d => `translate(${d.x - noteWidth/2}, ${d.y - noteHeight/2})`);
 
-    // Shadow
-    cardGroups.append('rect')
-      .attr('x', 3)
-      .attr('y', 3)
+    // === TOPIC SHADOWS (render order = z-order, first = bottom) ===
+
+    // Violet shadow FIRST (ALL topics) - offset = 7 * depth, peeks out at bottom
+    cardGroups.filter(d => getStructuralDepth(d.childCount, d.isItem) >= 1)
+      .append('rect')
+      .attr('class', 'shadow-violet')
+      .attr('x', d => 7 * getStructuralDepth(d.childCount, d.isItem))
+      .attr('y', d => 7 * getStructuralDepth(d.childCount, d.isItem))
       .attr('width', noteWidth)
       .attr('height', noteHeight)
       .attr('rx', 6)
-      .attr('fill', 'rgba(0,0,0,0.35)');
+      .attr('fill', '#5b21b6')
+      .attr('stroke', d => d.id === activeNodeId ? '#fbbf24' : 'rgba(255,255,255,0.2)')
+      .attr('stroke-width', d => d.id === activeNodeId ? 2 : 1);
 
-    // Card background - color by cluster
+    // Cluster shadow 3 - for 16+ children
+    cardGroups.filter(d => getStructuralDepth(d.childCount, d.isItem) >= 4)
+      .append('rect')
+      .attr('class', 'shadow-cluster')
+      .attr('x', 21)
+      .attr('y', 21)
+      .attr('width', noteWidth)
+      .attr('height', noteHeight)
+      .attr('rx', 6)
+      .attr('fill', d => {
+        const base = d.renderClusterId >= 0 ? generateClusterColor(d.renderClusterId) : '#374151';
+        return d3.color(base)?.darker(1.8)?.toString() || '#2a2a2a';
+      })
+      .attr('stroke', d => d.id === activeNodeId ? '#fbbf24' : 'rgba(255,255,255,0.15)')
+      .attr('stroke-width', d => d.id === activeNodeId ? 2 : 1);
+
+    // Cluster shadow 2 - for 6+ children
+    cardGroups.filter(d => getStructuralDepth(d.childCount, d.isItem) >= 3)
+      .append('rect')
+      .attr('class', 'shadow-cluster')
+      .attr('x', 14)
+      .attr('y', 14)
+      .attr('width', noteWidth)
+      .attr('height', noteHeight)
+      .attr('rx', 6)
+      .attr('fill', d => {
+        const base = d.renderClusterId >= 0 ? generateClusterColor(d.renderClusterId) : '#374151';
+        return d3.color(base)?.darker(1.4)?.toString() || '#333333';
+      })
+      .attr('stroke', d => d.id === activeNodeId ? '#fbbf24' : 'rgba(255,255,255,0.15)')
+      .attr('stroke-width', d => d.id === activeNodeId ? 2 : 1);
+
+    // Cluster shadow 1 - for 2+ children
+    cardGroups.filter(d => getStructuralDepth(d.childCount, d.isItem) >= 2)
+      .append('rect')
+      .attr('class', 'shadow-cluster')
+      .attr('x', 7)
+      .attr('y', 7)
+      .attr('width', noteWidth)
+      .attr('height', noteHeight)
+      .attr('rx', 6)
+      .attr('fill', d => {
+        const base = d.renderClusterId >= 0 ? generateClusterColor(d.renderClusterId) : '#374151';
+        return d3.color(base)?.darker(1.0)?.toString() || '#3d3d3d';
+      })
+      .attr('stroke', d => d.id === activeNodeId ? '#fbbf24' : 'rgba(255,255,255,0.15)')
+      .attr('stroke-width', d => d.id === activeNodeId ? 2 : 1);
+
+    // === ITEM SHADOW ===
+
+    // Subtle drop shadow for items only
+    cardGroups.filter(d => getStructuralDepth(d.childCount, d.isItem) === 0)
+      .append('rect')
+      .attr('x', 2)
+      .attr('y', 2)
+      .attr('width', noteWidth)
+      .attr('height', noteHeight)
+      .attr('rx', 6)
+      .attr('fill', 'rgba(0,0,0,0.3)');
+
+    // Card background - color by distance (if active) or cluster
     cardGroups.append('rect')
       .attr('class', 'card-bg')
       .attr('width', noteWidth)
       .attr('height', noteHeight)
       .attr('rx', 6)
-      .attr('fill', d => d.renderClusterId >= 0 ? generateClusterColor(d.renderClusterId) : '#374151')
+      .attr('fill', d => getNodeColor(d))
       .attr('stroke', d => d.id === activeNodeId ? '#fbbf24' : 'rgba(255,255,255,0.15)')
       .attr('stroke-width', d => d.id === activeNodeId ? 2 : 1);
+
+    // Apply opacity to entire card group (so shadows fade with card)
+    cardGroups.style('opacity', d => getNodeOpacity(d));
 
     // Titlebar - darker area at top (80px for 2 lines of text + emoji + padding)
     // First rect: full width, rounded top corners match card
@@ -1174,64 +1410,41 @@ export function Graph({ width, height }: GraphProps) {
       });
 
     // Footer info
+    // "NOTE" badge for items (background + text)
+    const noteBadges = cardGroups.filter(d => d.isItem && d.childCount === 0);
+
+    noteBadges.append('rect')
+      .attr('x', noteWidth / 2 - 36)
+      .attr('y', noteHeight - 34)
+      .attr('width', 72)
+      .attr('height', 26)
+      .attr('rx', 4)
+      .attr('fill', '#5b21b6');
+
+    noteBadges.append('text')
+      .attr('x', noteWidth / 2)
+      .attr('y', noteHeight - 15)
+      .attr('text-anchor', 'middle')
+      .attr('font-family', cardFont)
+      .attr('font-size', '18px')
+      .attr('font-weight', '700')
+      .attr('letter-spacing', '1.5px')
+      .attr('fill', '#ffffff')
+      .text('NOTE');
+
+    // Footer info (line 2 for items, only line for topics)
     cardGroups.append('text')
       .attr('x', 14)
       .attr('y', noteHeight - 16)
       .attr('font-family', cardFont)
       .attr('font-size', '16px')
       .attr('fill', 'rgba(255,255,255,0.5)')
-      .text(d => d.childCount > 0 ? `${d.childCount} items` : new Date(d.createdAt).toLocaleDateString());
-
-    // Helper to reset zen mode
-    const resetZenMode = () => {
-      setZenMode(null);
-      cardGroups.style('opacity', 1);
-      dotGroups.style('opacity', 1);
-      edgePaths.style('opacity', null);
-    };
-
-    // Zen mode button (bottom right of card)
-    // Position: 32px from right and bottom edges
-    const zenButtons = cardGroups.append('g')
-      .attr('class', 'zen-button')
-      .attr('transform', `translate(${noteWidth - 32}, ${noteHeight - 32})`)
-      .attr('cursor', 'pointer')
-      .on('mouseenter', function() {
-        d3.select(this).select('rect')
-          .attr('fill', 'rgba(139,92,246,0.9)'); // Purple highlight
-      })
-      .on('mouseleave', function() {
-        d3.select(this).select('rect')
-          .attr('fill', 'rgba(0,0,0,0.6)');
-      })
-      .on('click', function(event, d) {
-        event.stopPropagation();
-        const currentZen = zenModeNodeIdRef.current;
-        if (currentZen === d.id) {
-          // Toggle off
-          resetZenMode();
-        } else {
-          // Enable zen mode for this node
-          applyZenMode(d.id);
-        }
+      .text(d => {
+        if (d.childCount > 0) return `${d.childCount} items`;
+        return new Date(d.createdAt).toLocaleDateString();
       });
 
-    zenButtons.append('rect')
-      .attr('x', -24)
-      .attr('y', -24)
-      .attr('width', 48)
-      .attr('height', 48)
-      .attr('rx', 10)
-      .attr('fill', 'rgba(0,0,0,0.6)')
-      .attr('stroke', 'rgba(255,255,255,0.5)')
-      .attr('stroke-width', 2);
-
-    zenButtons.append('text')
-      .attr('text-anchor', 'middle')
-      .attr('dy', '0.35em')
-      .attr('font-size', '38px')
-      .attr('fill', '#fff')
-      .text('☯');
+    // Zen mode removed - hover/selection now handles connection highlighting
 
     // Unified bubble rendering for ALL nodes (low zoom)
     const dotGroups = dotsGroup.selectAll('g.node-dot')
@@ -1241,20 +1454,64 @@ export function Graph({ width, height }: GraphProps) {
       .attr('cursor', 'pointer')
       .attr('transform', d => `translate(${d.x}, ${d.y})`);
 
+    // === TOPIC BUBBLE SHADOWS (render order = z-order, first = bottom) ===
+
+    // Violet ring FIRST (ALL topics) - offset = 2 * depth, peeks out at bottom
+    dotGroups.filter(d => getStructuralDepth(d.childCount, d.isItem) >= 1)
+      .append('circle')
+      .attr('class', 'dot-violet')
+      .attr('cx', d => 2 * getStructuralDepth(d.childCount, d.isItem))
+      .attr('cy', d => 2 * getStructuralDepth(d.childCount, d.isItem))
+      .attr('r', dotSize + 2)
+      .attr('fill', 'none')
+      .attr('stroke', '#5b21b6')
+      .attr('stroke-width', 4);
+
+    // Cluster stack 2 - for 6+ children
+    dotGroups.filter(d => getStructuralDepth(d.childCount, d.isItem) >= 3)
+      .append('circle')
+      .attr('class', 'dot-stack-2')
+      .attr('cx', 6)
+      .attr('cy', 6)
+      .attr('r', dotSize - 2)
+      .attr('fill', d => {
+        const base = d.renderClusterId >= 0 ? generateClusterColor(d.renderClusterId) : '#374151';
+        return d3.color(base)?.darker(1.5)?.toString() || '#1a1a1a';
+      })
+      .attr('stroke', 'rgba(255,255,255,0.2)')
+      .attr('stroke-width', 1);
+
+    // Cluster stack 1 - for 2+ children
+    dotGroups.filter(d => getStructuralDepth(d.childCount, d.isItem) >= 2)
+      .append('circle')
+      .attr('class', 'dot-stack-1')
+      .attr('cx', 3)
+      .attr('cy', 3)
+      .attr('r', dotSize - 1)
+      .attr('fill', d => {
+        const base = d.renderClusterId >= 0 ? generateClusterColor(d.renderClusterId) : '#374151';
+        return d3.color(base)?.darker(0.8)?.toString() || '#252525';
+      })
+      .attr('stroke', 'rgba(255,255,255,0.2)')
+      .attr('stroke-width', 1);
+
     dotGroups.append('circle')
       .attr('class', 'dot-glow')
       .attr('r', dotSize + 4)
       .attr('fill', 'none')
-      .attr('stroke', d => d.renderClusterId >= 0 ? generateClusterColor(d.renderClusterId) : '#374151')
+      .attr('stroke', d => getNodeColor(d))
       .attr('stroke-width', 3)
       .attr('stroke-opacity', 0.3);
 
     dotGroups.append('circle')
       .attr('class', 'dot-main')
       .attr('r', dotSize)
-      .attr('fill', d => d.renderClusterId >= 0 ? generateClusterColor(d.renderClusterId) : '#374151')
+      .attr('fill', d => getNodeColor(d))
       .attr('stroke', d => d.id === activeNodeId ? '#fbbf24' : 'rgba(255,255,255,0.6)')
       .attr('stroke-width', d => d.id === activeNodeId ? 3 : 1.5);
+
+    // Apply opacity to entire dot group (so violet ring fades with dot)
+    dotGroups.style('opacity', d => getNodeOpacity(d));
 
     dotGroups.append('text')
       .attr('text-anchor', 'middle')
@@ -1266,57 +1523,206 @@ export function Graph({ width, height }: GraphProps) {
     // Start with cards shown, dots hidden
     dotsGroup.style('display', 'none');
 
-    // Helper to apply zen mode for a node
-    const applyZenMode = (nodeId: string) => {
-      setZenMode(nodeId);
-      // Build relevance map from edges
-      const relevanceMap = new Map<string, number>();
-      relevanceMap.set(nodeId, 1.0); // Self is always 1.0
-      edgeData.forEach(edge => {
-        if (edge.source.id === nodeId) {
-          const existing = relevanceMap.get(edge.target.id) || 0;
-          relevanceMap.set(edge.target.id, Math.max(existing, edge.weight));
-        } else if (edge.target.id === nodeId) {
-          const existing = relevanceMap.get(edge.source.id) || 0;
-          relevanceMap.set(edge.source.id, Math.max(existing, edge.weight));
-        }
-      });
-      // Fade nodes by relevance
-      cardGroups.style('opacity', (n: GraphNode) => {
-        const relevance = relevanceMap.get(n.id);
-        if (relevance === undefined) return 0.15; // Unconnected
-        return 0.3 + relevance * 0.7; // 0.3 to 1.0 based on weight
-      });
-      dotGroups.style('opacity', (n: GraphNode) => {
-        const relevance = relevanceMap.get(n.id);
-        if (relevance === undefined) return 0.15;
-        return 0.3 + relevance * 0.7;
-      });
-      // Fade edges by relevance to selected node
-      edgePaths.style('opacity', (e: {source: GraphNode, target: GraphNode, weight: number}) => {
-        if (e.source.id === nodeId || e.target.id === nodeId) {
-          return 0.5 + e.weight * 0.5; // Connected edges: 0.5 to 1.0
-        }
-        return 0.05; // Unconnected edges nearly invisible
-      });
-    };
+    // Zen mode applyZenMode removed - hover/selection handles this now
 
     // Unified interactions
     cardGroups
       .on('click', function(event, d) {
         event.stopPropagation();
-        setActiveNode(d.id);
-        fetchSimilarNodes(d.id);
-        cardsGroup.selectAll('.card-bg')
-          .attr('stroke', 'rgba(255,255,255,0.15)')
-          .attr('stroke-width', 1);
-        d3.select(this).select('.card-bg')
-          .attr('stroke', '#fbbf24')
-          .attr('stroke-width', 2);
-        // If zen mode is active, switch to the new node
-        if (zenModeNodeIdRef.current && zenModeNodeIdRef.current !== d.id) {
-          applyZenMode(d.id);
+        clickHandledRef.current = true; // Skip duplicate D3 work in activeNodeId useEffect
+
+        // If clicking the already-selected node, deselect (reset to default)
+        // But NOT if it's a quick reclick (likely part of double-click)
+        const now = Date.now();
+        const timeSinceLastClick = now - lastClickTimeRef.current;
+        lastClickTimeRef.current = now;
+
+        if (activeNodeIdRef.current === d.id) {
+          // Quick reclick (< 300ms) = likely double-click, don't deselect
+          if (timeSinceLastClick < 300) {
+            return;
+          }
+
+          activeNodeIdRef.current = null;
+          connectionMapRef.current = new Map();
+
+          // Reset everything to default state
+          cardGroups.style('opacity', 1);
+          dotGroups.style('opacity', 1);
+
+          cardsGroup.selectAll('.card-bg')
+            .attr('fill', (n: GraphNode) => getMutedClusterColor(n))
+            .attr('stroke', 'rgba(255,255,255,0.15)')
+            .attr('stroke-width', 1);
+
+          cardsGroup.selectAll('.shadow-violet')
+            .attr('stroke', 'rgba(255,255,255,0.2)')
+            .attr('stroke-width', 1);
+          cardsGroup.selectAll('.shadow-cluster')
+            .attr('stroke', 'rgba(255,255,255,0.15)')
+            .attr('stroke-width', 1);
+
+          dotsGroup.selectAll('.dot-main')
+            .attr('fill', (n: GraphNode) => getMutedClusterColor(n))
+            .attr('stroke', 'rgba(255,255,255,0.6)')
+            .attr('stroke-width', 1.5);
+
+          edgePaths.attr('opacity', 1);
+          edgePaths.each(function(e: {source: GraphNode, target: GraphNode, weight: number, type: string}) {
+            const el = d3.select(this);
+            const normalized = (e.weight - minWeight) / weightRange;
+            const originalWidth = e.type === 'contains' ? 6 : 6 + normalized * 18;
+            el.attr('stroke-width', originalWidth);
+          });
+
+          setSimilarNodesMap(new Map());
+          return;
         }
+
+        // Build connection map directly in click handler (same as hover pattern)
+        const clickConnectionMap = new Map<string, {weight: number, distance: number}>();
+        const adjacency = new Map<string, Array<{nodeId: string, weight: number}>>();
+        edgeData.forEach(edge => {
+          const srcId = edge.source.id;
+          const tgtId = edge.target.id;
+          if (!adjacency.has(srcId)) adjacency.set(srcId, []);
+          if (!adjacency.has(tgtId)) adjacency.set(tgtId, []);
+          adjacency.get(srcId)!.push({nodeId: tgtId, weight: edge.weight});
+          adjacency.get(tgtId)!.push({nodeId: srcId, weight: edge.weight});
+        });
+
+        clickConnectionMap.set(d.id, {weight: 1.0, distance: 0});
+        const queue: Array<{id: string, dist: number}> = [{id: d.id, dist: 0}];
+        while (queue.length > 0) {
+          const {id, dist} = queue.shift()!;
+          const neighbors = adjacency.get(id) || [];
+          for (const {nodeId, weight} of neighbors) {
+            if (!clickConnectionMap.has(nodeId)) {
+              clickConnectionMap.set(nodeId, {weight, distance: dist + 1});
+              queue.push({id: nodeId, dist: dist + 1});
+            }
+          }
+        }
+
+        // Update refs immediately for other handlers to use
+        activeNodeIdRef.current = d.id;
+        connectionMapRef.current = clickConnectionMap;
+
+        // Helper functions for this click (same logic as useEffect)
+        const getClickColor = (node: GraphNode): string => {
+          if (node.id === d.id) {
+            return node.renderClusterId >= 0 ? generateClusterColor(node.renderClusterId) : '#4b5563';
+          }
+          const conn = clickConnectionMap.get(node.id);
+          if (conn) {
+            if (conn.distance === 1) return getDirectConnectionColor(conn.weight);
+            return getChainConnectionColor(conn.distance);
+          }
+          // Muted cluster color for unconnected
+          if (node.renderClusterId < 0) return '#374151';
+          const hue = (node.renderClusterId * 137.508) % 360;
+          return `hsl(${hue}, 12%, 28%)`;
+        };
+
+        const getClickOpacity = (node: GraphNode): number => {
+          if (node.id === d.id) return 1;
+          const conn = clickConnectionMap.get(node.id);
+          if (conn) {
+            if (conn.distance === 1) return 1;
+            return Math.max(0.5, 1 - conn.distance * 0.15);
+          }
+          return 0.3;
+        };
+
+        // D3 updates directly in click handler (instant, no transitions)
+        cardGroups.style('opacity', (n: GraphNode) => getClickOpacity(n));
+
+        cardsGroup.selectAll('.card-bg')
+          .attr('fill', function(this: SVGRectElement) {
+            const parentEl = this.parentNode as Element;
+            if (!parentEl) return '#374151';
+            const data = d3.select<Element, GraphNode>(parentEl).datum();
+            return getClickColor(data);
+          })
+          .attr('stroke', function(this: SVGRectElement) {
+            const parentEl = this.parentNode as Element;
+            if (!parentEl) return 'rgba(255,255,255,0.15)';
+            const data = d3.select<Element, GraphNode>(parentEl).datum();
+            return data.id === d.id ? '#fbbf24' : 'rgba(255,255,255,0.15)';
+          })
+          .attr('stroke-width', function(this: SVGRectElement) {
+            const parentEl = this.parentNode as Element;
+            if (!parentEl) return 1;
+            const data = d3.select<Element, GraphNode>(parentEl).datum();
+            return data.id === d.id ? 2 : 1;
+          });
+
+        // Update shadow strokes for selection (instant)
+        cardsGroup.selectAll('.shadow-violet')
+          .attr('stroke', function(this: SVGRectElement) {
+            const parentEl = this.parentNode as Element;
+            if (!parentEl) return 'rgba(255,255,255,0.2)';
+            const data = d3.select<Element, GraphNode>(parentEl).datum();
+            return data.id === d.id ? '#fbbf24' : 'rgba(255,255,255,0.2)';
+          })
+          .attr('stroke-width', function(this: SVGRectElement) {
+            const parentEl = this.parentNode as Element;
+            if (!parentEl) return 1;
+            const data = d3.select<Element, GraphNode>(parentEl).datum();
+            return data.id === d.id ? 2 : 1;
+          });
+
+        cardsGroup.selectAll('.shadow-cluster')
+          .attr('stroke', function(this: SVGRectElement) {
+            const parentEl = this.parentNode as Element;
+            if (!parentEl) return 'rgba(255,255,255,0.15)';
+            const data = d3.select<Element, GraphNode>(parentEl).datum();
+            return data.id === d.id ? '#fbbf24' : 'rgba(255,255,255,0.15)';
+          })
+          .attr('stroke-width', function(this: SVGRectElement) {
+            const parentEl = this.parentNode as Element;
+            if (!parentEl) return 1;
+            const data = d3.select<Element, GraphNode>(parentEl).datum();
+            return data.id === d.id ? 2 : 1;
+          });
+
+        // Update dots too (instant)
+        dotGroups.style('opacity', (n: GraphNode) => getClickOpacity(n));
+
+        dotsGroup.selectAll('.dot-main')
+          .attr('fill', function(this: SVGCircleElement) {
+            const parentEl = this.parentNode as Element;
+            if (!parentEl) return '#374151';
+            const data = d3.select<Element, GraphNode>(parentEl).datum();
+            return getClickColor(data);
+          });
+
+        // Update edges - direct connections bright, chain dimmer, unconnected very dim
+        edgePaths.attr('opacity', (e: {source: GraphNode, target: GraphNode}) => {
+          if (e.source.id === d.id || e.target.id === d.id) return 0.9; // Direct connection
+          // Chain edge: both endpoints in connection map
+          const srcConn = clickConnectionMap.has(e.source.id);
+          const tgtConn = clickConnectionMap.has(e.target.id);
+          if (srcConn && tgtConn) return 0.3; // Chain - dimmer
+          return 0.08; // Unconnected - very dim
+        });
+
+        // Double width for direct connections
+        edgePaths.each(function(e: {source: GraphNode, target: GraphNode, weight: number, type: string}) {
+          const el = d3.select(this);
+          const normalized = (e.weight - minWeight) / weightRange;
+          const originalWidth = e.type === 'contains' ? 6 : 6 + normalized * 18;
+          if (e.source.id === d.id || e.target.id === d.id) {
+            el.attr('stroke-width', originalWidth * 2);
+          } else {
+            el.attr('stroke-width', originalWidth);
+          }
+        });
+
+        // THEN update React state for sidebar/other consumers
+        // setActiveNode(d.id); // TEMP: testing if React re-render is bottleneck
+        // Defer similar nodes fetch - don't block visual feedback
+        setTimeout(() => fetchSimilarNodes(d.id), 50);
       })
       .on('dblclick', function(event, d) {
         event.stopPropagation();
@@ -1325,22 +1731,223 @@ export function Graph({ width, height }: GraphProps) {
           openLeaf(d.id);
         } else if (d.childCount > 0) {
           devLog('info', `Drilling into "${d.displayTitle}" (depth ${d.depth} → ${d.depth + 1})`);
+          setActiveNode(null); // Clear selection when navigating
           navigateToNode(d);
         }
       })
-      .on('mouseenter', (_, d) => setHoveredNode(d))
-      .on('mouseleave', () => setHoveredNode(null));
+      .on('mouseenter', function(_, d) {
+        setHoveredNode(d);
+        // Color change (instant)
+        d3.select(this).select('.card-bg')
+          .attr('fill', d.renderClusterId >= 0 ? generateClusterColor(d.renderClusterId) : '#4b5563');
+        // Build connection map with BFS for multi-hop distances
+        const hoverConnectionMap = new Map<string, {weight: number, distance: number}>();
+        const adjacency = new Map<string, Array<{nodeId: string, weight: number}>>();
+        edgeData.forEach(edge => {
+          const srcId = edge.source.id;
+          const tgtId = edge.target.id;
+          if (!adjacency.has(srcId)) adjacency.set(srcId, []);
+          if (!adjacency.has(tgtId)) adjacency.set(tgtId, []);
+          adjacency.get(srcId)!.push({nodeId: tgtId, weight: edge.weight});
+          adjacency.get(tgtId)!.push({nodeId: srcId, weight: edge.weight});
+        });
+
+        hoverConnectionMap.set(d.id, {weight: 1.0, distance: 0});
+        const queue: Array<{id: string, dist: number}> = [{id: d.id, dist: 0}];
+        while (queue.length > 0) {
+          const {id, dist} = queue.shift()!;
+          const neighbors = adjacency.get(id) || [];
+          for (const {nodeId, weight} of neighbors) {
+            if (!hoverConnectionMap.has(nodeId)) {
+              hoverConnectionMap.set(nodeId, {weight, distance: dist + 1});
+              queue.push({id: nodeId, dist: dist + 1});
+            }
+          }
+        }
+
+        // Opacity: direct=bright, chain=visible, unconnected=dim
+        const getHoverOpacity = (n: GraphNode): number => {
+          const conn = hoverConnectionMap.get(n.id);
+          if (!conn) return 0.2; // Unconnected = most dim
+          if (conn.distance === 0) return 1; // Hovered node
+          if (conn.distance === 1) return 0.6 + conn.weight * 0.4; // Direct: 0.6-1.0
+          return 0.8; // Chain: consistently visible
+        };
+
+        // Instant updates (no transitions for testing)
+        cardGroups.style('opacity', (n: GraphNode) => getHoverOpacity(n));
+        dotGroups.style('opacity', (n: GraphNode) => getHoverOpacity(n));
+        // Reset ALL edges to original width
+        edgePaths.each(function(e: {source: GraphNode, target: GraphNode, weight: number, type: string}) {
+          const el = d3.select(this);
+          const normalized = (e.weight - minWeight) / weightRange;
+          const originalWidth = e.type === 'contains' ? 6 : 6 + normalized * 18;
+          el.attr('stroke-width', originalWidth);
+        });
+        // Set edge opacity
+        edgePaths.attr('opacity', (e: {source: GraphNode, target: GraphNode}) => {
+          if (e.source.id === d.id || e.target.id === d.id) return 0.9;
+          const srcConn = hoverConnectionMap.has(e.source.id);
+          const tgtConn = hoverConnectionMap.has(e.target.id);
+          if (srcConn && tgtConn) return 0.7;
+          return 0.15;
+        });
+        // Double connected edges for this card
+        edgePaths.filter((e: {source: GraphNode, target: GraphNode}) =>
+          e.source.id === d.id || e.target.id === d.id
+        ).each(function(e: {source: GraphNode, target: GraphNode, weight: number, type: string}) {
+          const el = d3.select(this);
+          const normalized = (e.weight - minWeight) / weightRange;
+          const originalWidth = e.type === 'contains' ? 6 : 6 + normalized * 18;
+          el.attr('stroke-width', originalWidth * 2);
+        });
+      })
+      .on('mouseleave', function(_, d) {
+        setHoveredNode(null);
+        // Color change back (instant)
+        d3.select(this).select('.card-bg')
+          .attr('fill', getNodeColor(d));
+
+        // Get current selection state from refs
+        const currentActiveId = activeNodeIdRef.current;
+        const currentConnMap = connectionMapRef.current;
+
+        // Reset node opacities based on selection state (instant)
+        if (currentActiveId) {
+          // Selection active: apply selection-based opacity
+          cardGroups.style('opacity', (n: GraphNode) => {
+            if (n.id === currentActiveId) return 1;
+            const conn = currentConnMap.get(n.id);
+            if (conn) {
+              if (conn.distance === 1) return 1;
+              return Math.max(0.5, 1 - conn.distance * 0.15);
+            }
+            return 0.3;
+          });
+          dotGroups.style('opacity', (n: GraphNode) => {
+            if (n.id === currentActiveId) return 1;
+            const conn = currentConnMap.get(n.id);
+            if (conn) {
+              if (conn.distance === 1) return 1;
+              return Math.max(0.5, 1 - conn.distance * 0.15);
+            }
+            return 0.3;
+          });
+          // Selection active: apply selection-based edge opacity
+          edgePaths.attr('opacity', (e: {source: GraphNode, target: GraphNode}) => {
+            if (e.source.id === currentActiveId || e.target.id === currentActiveId) return 0.9;
+            const srcConn = currentConnMap.has(e.source.id);
+            const tgtConn = currentConnMap.has(e.target.id);
+            if (srcConn && tgtConn) return 0.7;
+            return 0.15;
+          });
+        } else {
+          // No selection: reset to full opacity
+          cardGroups.style('opacity', 1);
+          dotGroups.style('opacity', 1);
+          edgePaths.attr('opacity', 1);
+        }
+
+        // Reset stroke-width to original (instant)
+        edgePaths.each(function(e: {source: GraphNode, target: GraphNode, weight: number, type: string}) {
+          const el = d3.select(this);
+          const normalized = (e.weight - minWeight) / weightRange;
+          const originalWidth = e.type === 'contains' ? 6 : 6 + normalized * 18;
+          el.attr('stroke-width', originalWidth);
+        });
+      });
 
     // Interactions for dots (same as cards but for bubble mode)
     dotGroups
       .on('click', function(event, d) {
         event.stopPropagation();
-        setActiveNode(d.id);
-        fetchSimilarNodes(d.id);
-        // If zen mode is active, switch to the new node
-        if (zenModeNodeIdRef.current && zenModeNodeIdRef.current !== d.id) {
-          applyZenMode(d.id);
+        clickHandledRef.current = true; // Skip duplicate D3 work in activeNodeId useEffect
+
+        // Build connection map directly in click handler (same pattern as cards)
+        const clickConnectionMap = new Map<string, {weight: number, distance: number}>();
+        const adjacency = new Map<string, Array<{nodeId: string, weight: number}>>();
+        edgeData.forEach(edge => {
+          const srcId = edge.source.id;
+          const tgtId = edge.target.id;
+          if (!adjacency.has(srcId)) adjacency.set(srcId, []);
+          if (!adjacency.has(tgtId)) adjacency.set(tgtId, []);
+          adjacency.get(srcId)!.push({nodeId: tgtId, weight: edge.weight});
+          adjacency.get(tgtId)!.push({nodeId: srcId, weight: edge.weight});
+        });
+        clickConnectionMap.set(d.id, {weight: 1.0, distance: 0});
+        const queue: Array<{id: string, dist: number}> = [{id: d.id, dist: 0}];
+        while (queue.length > 0) {
+          const {id, dist} = queue.shift()!;
+          const neighbors = adjacency.get(id) || [];
+          for (const {nodeId, weight} of neighbors) {
+            if (!clickConnectionMap.has(nodeId)) {
+              clickConnectionMap.set(nodeId, {weight, distance: dist + 1});
+              queue.push({id: nodeId, dist: dist + 1});
+            }
+          }
         }
+
+        // Update refs immediately
+        activeNodeIdRef.current = d.id;
+        connectionMapRef.current = clickConnectionMap;
+
+        // Helper functions
+        const getClickColor = (node: GraphNode): string => {
+          if (node.id === d.id) {
+            return node.renderClusterId >= 0 ? generateClusterColor(node.renderClusterId) : '#4b5563';
+          }
+          const conn = clickConnectionMap.get(node.id);
+          if (conn) {
+            if (conn.distance === 1) return getDirectConnectionColor(conn.weight);
+            return getChainConnectionColor(conn.distance);
+          }
+          if (node.renderClusterId < 0) return '#374151';
+          const hue = (node.renderClusterId * 137.508) % 360;
+          return `hsl(${hue}, 12%, 28%)`;
+        };
+
+        const getClickOpacity = (node: GraphNode): number => {
+          if (node.id === d.id) return 1;
+          const conn = clickConnectionMap.get(node.id);
+          if (conn) {
+            if (conn.distance === 1) return 1;
+            return Math.max(0.5, 1 - conn.distance * 0.15);
+          }
+          return 0.3;
+        };
+
+        // D3 updates directly
+        dotGroups.transition().duration(150)
+          .style('opacity', (n: GraphNode) => getClickOpacity(n));
+
+        dotsGroup.selectAll('.dot-main')
+          .transition().duration(150)
+          .attr('fill', function(this: SVGCircleElement) {
+            const parentEl = this.parentNode as Element;
+            if (!parentEl) return '#374151';
+            const data = d3.select<Element, GraphNode>(parentEl).datum();
+            return getClickColor(data);
+          })
+          .attr('stroke', function(this: SVGCircleElement) {
+            const parentEl = this.parentNode as Element;
+            if (!parentEl) return 'transparent';
+            const data = d3.select<Element, GraphNode>(parentEl).datum();
+            return data.id === d.id ? '#fbbf24' : 'transparent';
+          })
+          .attr('stroke-width', function(this: SVGCircleElement) {
+            const parentEl = this.parentNode as Element;
+            if (!parentEl) return 0;
+            const data = d3.select<Element, GraphNode>(parentEl).datum();
+            return data.id === d.id ? 3 : 0;
+          });
+
+        cardGroups.transition().duration(150)
+          .style('opacity', (n: GraphNode) => getClickOpacity(n));
+
+        // THEN update React state
+        // setActiveNode(d.id); // TEMP: testing if React re-render is bottleneck
+        // Defer similar nodes fetch - don't block visual feedback
+        setTimeout(() => fetchSimilarNodes(d.id), 50);
       })
       .on('dblclick', function(event, d) {
         event.stopPropagation();
@@ -1349,11 +1956,137 @@ export function Graph({ width, height }: GraphProps) {
           openLeaf(d.id);
         } else if (d.childCount > 0) {
           devLog('info', `Drilling into "${d.displayTitle}" (depth ${d.depth} → ${d.depth + 1})`);
+          setActiveNode(null); // Clear selection when navigating (keep this one)
           navigateToNode(d);
         }
       })
-      .on('mouseenter', (_, d) => setHoveredNode(d))
-      .on('mouseleave', () => setHoveredNode(null));
+      .on('mouseenter', function(_, d) {
+        setHoveredNode(d);
+        // Color transition
+        d3.select(this).select('.dot-main')
+          .transition().duration(200)
+          .attr('fill', d.renderClusterId >= 0 ? generateClusterColor(d.renderClusterId) : '#4b5563');
+        d3.select(this).select('.dot-glow')
+          .transition().duration(200)
+          .attr('stroke', d.renderClusterId >= 0 ? generateClusterColor(d.renderClusterId) : '#4b5563');
+        // Build connection map with BFS for multi-hop distances
+        const hoverConnectionMap = new Map<string, {weight: number, distance: number}>();
+        const adjacency = new Map<string, Array<{nodeId: string, weight: number}>>();
+        edgeData.forEach(edge => {
+          const srcId = edge.source.id;
+          const tgtId = edge.target.id;
+          if (!adjacency.has(srcId)) adjacency.set(srcId, []);
+          if (!adjacency.has(tgtId)) adjacency.set(tgtId, []);
+          adjacency.get(srcId)!.push({nodeId: tgtId, weight: edge.weight});
+          adjacency.get(tgtId)!.push({nodeId: srcId, weight: edge.weight});
+        });
+        hoverConnectionMap.set(d.id, {weight: 1.0, distance: 0});
+        const queue: Array<{id: string, dist: number}> = [{id: d.id, dist: 0}];
+        while (queue.length > 0) {
+          const {id, dist} = queue.shift()!;
+          const neighbors = adjacency.get(id) || [];
+          for (const {nodeId, weight} of neighbors) {
+            if (!hoverConnectionMap.has(nodeId)) {
+              hoverConnectionMap.set(nodeId, {weight, distance: dist + 1});
+              queue.push({id: nodeId, dist: dist + 1});
+            }
+          }
+        }
+        // Opacity: direct=bright, chain=visible, unconnected=dim
+        const getHoverOpacity = (n: GraphNode): number => {
+          const conn = hoverConnectionMap.get(n.id);
+          if (!conn) return 0.2; // Unconnected = most dim
+          if (conn.distance === 0) return 1; // Hovered node
+          if (conn.distance === 1) return 0.6 + conn.weight * 0.4; // Direct: 0.6-1.0
+          return 0.8; // Chain: consistently visible
+        };
+        cardGroups.transition().duration(1500).style('opacity', (n: GraphNode) => getHoverOpacity(n));
+        dotGroups.transition().duration(1500).style('opacity', (n: GraphNode) => getHoverOpacity(n));
+        // First: reset ALL edges to original width (interrupt any transitions)
+        edgePaths.interrupt().each(function(e: {source: GraphNode, target: GraphNode, weight: number, type: string}) {
+          const el = d3.select(this);
+          const normalized = (e.weight - minWeight) / weightRange;
+          const originalWidth = e.type === 'contains' ? 6 : 6 + normalized * 18;
+          el.attr('stroke-width', originalWidth);
+        });
+        // Then set edge opacity and width
+        edgePaths.transition().duration(1500)
+          .attr('opacity', (e: {source: GraphNode, target: GraphNode}) => {
+            if (e.source.id === d.id || e.target.id === d.id) return 0.9; // Direct
+            // Chain edge: both endpoints are in connection map
+            const srcConn = hoverConnectionMap.has(e.source.id);
+            const tgtConn = hoverConnectionMap.has(e.target.id);
+            if (srcConn && tgtConn) return 0.7; // Chain edge stays visible
+            return 0.15; // Unconnected edge fades
+          });
+        // Double connected edges for this dot
+        edgePaths.filter((e: {source: GraphNode, target: GraphNode}) =>
+          e.source.id === d.id || e.target.id === d.id
+        ).each(function(e: {source: GraphNode, target: GraphNode, weight: number, type: string}) {
+          const el = d3.select(this);
+          const normalized = (e.weight - minWeight) / weightRange;
+          const originalWidth = e.type === 'contains' ? 6 : 6 + normalized * 18;
+          el.transition().duration(150).attr('stroke-width', originalWidth * 2);
+        });
+      })
+      .on('mouseleave', function(_, d) {
+        setHoveredNode(null);
+        // Color transition back
+        d3.select(this).select('.dot-main')
+          .transition().duration(200)
+          .attr('fill', getNodeColor(d));
+        d3.select(this).select('.dot-glow')
+          .transition().duration(200)
+          .attr('stroke', getNodeColor(d));
+
+        // Get current selection state from refs
+        const currentActiveId = activeNodeIdRef.current;
+        const currentConnMap = connectionMapRef.current;
+
+        // Reset node opacities based on selection state
+        if (currentActiveId) {
+          // Selection active: apply selection-based opacity
+          cardGroups.transition().duration(300).style('opacity', (n: GraphNode) => {
+            if (n.id === currentActiveId) return 1;
+            const conn = currentConnMap.get(n.id);
+            if (conn) {
+              if (conn.distance === 1) return 1;
+              return Math.max(0.5, 1 - conn.distance * 0.15);
+            }
+            return 0.3;
+          });
+          dotGroups.transition().duration(300).style('opacity', (n: GraphNode) => {
+            if (n.id === currentActiveId) return 1;
+            const conn = currentConnMap.get(n.id);
+            if (conn) {
+              if (conn.distance === 1) return 1;
+              return Math.max(0.5, 1 - conn.distance * 0.15);
+            }
+            return 0.3;
+          });
+          // Selection active: apply selection-based edge opacity
+          edgePaths.transition().duration(150).attr('opacity', (e: {source: GraphNode, target: GraphNode}) => {
+            if (e.source.id === currentActiveId || e.target.id === currentActiveId) return 0.9;
+            const srcConn = currentConnMap.has(e.source.id);
+            const tgtConn = currentConnMap.has(e.target.id);
+            if (srcConn && tgtConn) return 0.7;
+            return 0.15;
+          });
+        } else {
+          // No selection: reset to full opacity
+          cardGroups.transition().duration(300).style('opacity', 1);
+          dotGroups.transition().duration(300).style('opacity', 1);
+          edgePaths.transition().duration(150).attr('opacity', 1);
+        }
+
+        // Reset stroke-width to original
+        edgePaths.each(function(e: {source: GraphNode, target: GraphNode, weight: number, type: string}) {
+          const el = d3.select(this);
+          const normalized = (e.weight - minWeight) / weightRange;
+          const originalWidth = e.type === 'contains' ? 6 : 6 + normalized * 18;
+          el.transition().duration(150).attr('stroke-width', originalWidth);
+        });
+      });
 
     // Track current zoom
     let currentScale = 1;
@@ -1368,6 +2101,16 @@ export function Graph({ width, height }: GraphProps) {
 
     const zoom = d3.zoom<SVGSVGElement, unknown>()
       .scaleExtent([minZoom, maxZoom])
+      .filter((event) => {
+        // Allow scroll wheel for zooming
+        if (event.type === 'wheel') return true;
+        // Prevent pan from starting on card/dot elements (so double-click works)
+        const target = event.target as Element;
+        if (target.closest('.card-group') || target.closest('.dot-group')) {
+          return false;
+        }
+        return true;
+      })
       .on('zoom', (event) => {
         const { k } = event.transform;
         currentScale = k;
@@ -1477,17 +2220,58 @@ export function Graph({ width, height }: GraphProps) {
 
     svg.call(zoom);
 
-    // Click to deselect
+    // Click to deselect - reset everything to default state
     svg.on('click', () => {
-      setActiveNode(null);
-      setSimilarNodesMap(new Map());
+      // Clear refs
+      activeNodeIdRef.current = null;
+      connectionMapRef.current = new Map();
+
+      // Reset card opacities
+      cardGroups.style('opacity', 1);
+      dotGroups.style('opacity', 1);
+
+      // Reset card-bg fills to muted cluster colors and strokes to default
       cardsGroup.selectAll('.card-bg')
+        .attr('fill', function(this: SVGRectElement) {
+          const parentEl = this.parentNode as Element;
+          if (!parentEl) return '#374151';
+          const data = d3.select<Element, GraphNode>(parentEl).datum();
+          return getMutedClusterColor(data);
+        })
         .attr('stroke', 'rgba(255,255,255,0.15)')
         .attr('stroke-width', 1);
-      // Reset zen mode
-      if (zenModeNodeIdRef.current) {
-        resetZenMode();
-      }
+
+      // Reset shadow strokes
+      cardsGroup.selectAll('.shadow-violet')
+        .attr('stroke', 'rgba(255,255,255,0.2)')
+        .attr('stroke-width', 1);
+      cardsGroup.selectAll('.shadow-cluster')
+        .attr('stroke', 'rgba(255,255,255,0.15)')
+        .attr('stroke-width', 1);
+
+      // Reset dots to muted colors
+      dotsGroup.selectAll('.dot-main')
+        .attr('fill', function(this: SVGCircleElement) {
+          const parentEl = this.parentNode as Element;
+          if (!parentEl) return '#374151';
+          const data = d3.select<Element, GraphNode>(parentEl).datum();
+          return getMutedClusterColor(data);
+        })
+        .attr('stroke', 'rgba(255,255,255,0.6)')
+        .attr('stroke-width', 1.5);
+
+      // Reset edge opacities and widths
+      edgePaths.attr('opacity', 1);
+      edgePaths.each(function(e: {source: GraphNode, target: GraphNode, weight: number, type: string}) {
+        const el = d3.select(this);
+        const normalized = (e.weight - minWeight) / weightRange;
+        const originalWidth = e.type === 'contains' ? 6 : 6 + normalized * 18;
+        el.attr('stroke-width', originalWidth);
+      });
+
+      // Clear React state
+      setActiveNode(null);
+      setSimilarNodesMap(new Map());
     });
 
     // Fit to view
@@ -1522,9 +2306,187 @@ export function Graph({ width, height }: GraphProps) {
       devLog('warn', 'No nodes to display at this depth');
     }
 
-  // Note: activeNodeId removed from deps to prevent re-render/zoom on click
+  // Note: activeNodeId removed from deps - color updates handled by separate useEffect below
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodes, edges, width, height, setActiveNode, devLog, getNodeEmoji, currentDepth, maxDepth, currentParentId, navigateToNode]);
+
+  // Update connection colors when activeNodeId changes (without full re-render)
+  useEffect(() => {
+    devLog('info', 'activeNodeId useEffect running');
+    if (!svgRef.current || nodes.size === 0) return;
+
+    // Skip if click handler already did the D3 update
+    if (clickHandledRef.current) {
+      clickHandledRef.current = false;
+      devLog('info', 'activeNodeId useEffect skipped (click handler did update)');
+      return;
+    }
+
+    const svg = d3.select(svgRef.current);
+
+    // Build connection map with BFS for multi-hop distances
+    const connectionMap = new Map<string, {weight: number, distance: number}>();
+    if (activeNodeId) {
+      // Build adjacency list from edges
+      const adjacency = new Map<string, Array<{nodeId: string, weight: number}>>();
+      edges.forEach(edge => {
+        const srcId = edge.source;
+        const tgtId = edge.target;
+        const w = edge.weight ?? 0.5;
+        if (!adjacency.has(srcId)) adjacency.set(srcId, []);
+        if (!adjacency.has(tgtId)) adjacency.set(tgtId, []);
+        adjacency.get(srcId)!.push({nodeId: tgtId, weight: w});
+        adjacency.get(tgtId)!.push({nodeId: srcId, weight: w});
+      });
+
+      // BFS from activeNodeId
+      connectionMap.set(activeNodeId, {weight: 1.0, distance: 0});
+      const queue: Array<{id: string, dist: number}> = [{id: activeNodeId, dist: 0}];
+
+      while (queue.length > 0) {
+        const {id, dist} = queue.shift()!;
+        const neighbors = adjacency.get(id) || [];
+        for (const {nodeId, weight} of neighbors) {
+          if (!connectionMap.has(nodeId)) {
+            connectionMap.set(nodeId, {weight, distance: dist + 1});
+            queue.push({id: nodeId, dist: dist + 1});
+          }
+        }
+      }
+    }
+
+    // Update refs for access by event handlers
+    activeNodeIdRef.current = activeNodeId;
+    connectionMapRef.current = connectionMap;
+
+    // Helper to get muted cluster color (gray with hint of cluster hue)
+    const getMutedColor = (data: GraphNode): string => {
+      if (data.renderClusterId < 0) return '#374151';
+      const hue = (data.renderClusterId * 137.508) % 360;
+      return `hsl(${hue}, 12%, 28%)`; // Very low saturation, dark
+    };
+
+    // Helper to get color from node data based on connection distance
+    const getColorFromData = (data: GraphNode | null): string => {
+      if (!data) return '#374151';
+      if (!activeNodeId) return getMutedColor(data); // Muted cluster hint when nothing selected
+      if (data.id === activeNodeId) {
+        // Selected node shows its cluster color
+        return data.renderClusterId >= 0 ? generateClusterColor(data.renderClusterId) : '#4b5563';
+      }
+      const conn = connectionMap.get(data.id);
+      if (conn) {
+        if (conn.distance === 1) {
+          // Direct connection: red→green based on weight
+          return getDirectConnectionColor(conn.weight);
+        } else {
+          // Chain connection (2+ hops): darker red
+          return getChainConnectionColor(conn.distance);
+        }
+      }
+      return getMutedColor(data); // Unconnected = muted cluster hint
+    };
+
+    // Helper to get opacity from node data based on connection distance
+    const getOpacityFromData = (data: GraphNode | null): number => {
+      if (!data) return 1;
+      if (!activeNodeId) return 1; // Full opacity when nothing selected
+      if (data.id === activeNodeId) return 1; // Selected = full
+      const conn = connectionMap.get(data.id);
+      if (conn) {
+        if (conn.distance === 1) return 1; // Direct = full
+        // Chain: slight fade based on distance
+        return Math.max(0.5, 1 - conn.distance * 0.15);
+      }
+      return 0.3; // Unconnected = significant fade
+    };
+
+    // Update card background colors and selection stroke (with transition for smooth feel)
+    svg.selectAll<SVGRectElement, GraphNode>('.card-bg')
+      .transition().duration(150)
+      .attr('fill', function(this: SVGRectElement) {
+        const parentEl = this.parentNode as Element;
+        if (!parentEl) return '#374151';
+        const data = d3.select<Element, GraphNode>(parentEl).datum();
+        return getColorFromData(data);
+      })
+      .attr('stroke', function(this: SVGRectElement) {
+        const parentEl = this.parentNode as Element;
+        if (!parentEl) return 'rgba(255,255,255,0.15)';
+        const data = d3.select<Element, GraphNode>(parentEl).datum();
+        return data.id === activeNodeId ? '#fbbf24' : 'rgba(255,255,255,0.15)';
+      })
+      .attr('stroke-width', function(this: SVGRectElement) {
+        const parentEl = this.parentNode as Element;
+        if (!parentEl) return 1;
+        const data = d3.select<Element, GraphNode>(parentEl).datum();
+        return data.id === activeNodeId ? 2 : 1;
+      });
+
+    // Update shadow strokes for selection
+    svg.selectAll<SVGRectElement, GraphNode>('.shadow-violet')
+      .transition().duration(150)
+      .attr('stroke', function(this: SVGRectElement) {
+        const parentEl = this.parentNode as Element;
+        if (!parentEl) return 'rgba(255,255,255,0.2)';
+        const data = d3.select<Element, GraphNode>(parentEl).datum();
+        return data.id === activeNodeId ? '#fbbf24' : 'rgba(255,255,255,0.2)';
+      })
+      .attr('stroke-width', function(this: SVGRectElement) {
+        const parentEl = this.parentNode as Element;
+        if (!parentEl) return 1;
+        const data = d3.select<Element, GraphNode>(parentEl).datum();
+        return data.id === activeNodeId ? 2 : 1;
+      });
+
+    svg.selectAll<SVGRectElement, GraphNode>('.shadow-cluster')
+      .transition().duration(150)
+      .attr('stroke', function(this: SVGRectElement) {
+        const parentEl = this.parentNode as Element;
+        if (!parentEl) return 'rgba(255,255,255,0.15)';
+        const data = d3.select<Element, GraphNode>(parentEl).datum();
+        return data.id === activeNodeId ? '#fbbf24' : 'rgba(255,255,255,0.15)';
+      })
+      .attr('stroke-width', function(this: SVGRectElement) {
+        const parentEl = this.parentNode as Element;
+        if (!parentEl) return 1;
+        const data = d3.select<Element, GraphNode>(parentEl).datum();
+        return data.id === activeNodeId ? 2 : 1;
+      });
+
+    // Update card group opacity (fades entire card including shadows)
+    svg.selectAll<SVGGElement, GraphNode>('g.card')
+      .transition().duration(150)
+      .style('opacity', (d: GraphNode) => getOpacityFromData(d));
+
+    // Update bubble glow colors
+    svg.selectAll<SVGCircleElement, GraphNode>('.dot-glow')
+      .transition().duration(150)
+      .attr('stroke', function(this: SVGCircleElement) {
+        const parentEl = this.parentNode as Element;
+        if (!parentEl) return '#374151';
+        const data = d3.select<Element, GraphNode>(parentEl).datum();
+        return getColorFromData(data);
+      });
+
+    // Update bubble main colors
+    svg.selectAll<SVGCircleElement, GraphNode>('.dot-main')
+      .transition().duration(150)
+      .attr('fill', function(this: SVGCircleElement) {
+        const parentEl = this.parentNode as Element;
+        if (!parentEl) return '#374151';
+        const data = d3.select<Element, GraphNode>(parentEl).datum();
+        return getColorFromData(data);
+      });
+
+    // Update dot group opacity (fades entire dot including violet ring)
+    svg.selectAll<SVGGElement, GraphNode>('g.dot')
+      .transition().duration(150)
+      .style('opacity', (d: GraphNode) => getOpacityFromData(d));
+
+    // Edge opacity is now applied at render time in main useEffect
+
+  }, [activeNodeId, nodes, edges]);
 
   const logColors = {
     info: 'text-blue-400',
@@ -1549,6 +2511,7 @@ export function Graph({ width, height }: GraphProps) {
           {/* Universe root - always shown */}
           <button
             onClick={() => {
+              setActiveNode(null); // Clear selection when navigating
               navigateToRoot();
               devLog('info', 'Navigated to Universe (root)');
             }}
@@ -1601,6 +2564,7 @@ export function Graph({ width, height }: GraphProps) {
                   // Ancestor: clickable
                   <button
                     onClick={() => {
+                      setActiveNode(null); // Clear selection when navigating
                       const stepsBack = breadcrumbs.length - index - 1;
                       for (let i = 0; i < stepsBack; i++) {
                         navigateBack();
@@ -1660,239 +2624,31 @@ export function Graph({ width, height }: GraphProps) {
         </div>
       )}
 
-      {/* Similar nodes panel - resizable */}
-      {showPanels && showDetails && similarNodesMap.size > 0 && (
-        <div
-          className="absolute top-16 right-4 bg-gray-800/95 backdrop-blur-sm text-white rounded-lg shadow-xl border border-gray-700 z-30 overflow-hidden flex flex-col"
-          style={{ width: detailsPanelSize.width, height: detailsPanelSize.height }}
-        >
-          {/* Panel header with stack toggle */}
-          <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between flex-shrink-0">
-            <span className="text-xs font-medium text-gray-400">Node Details</span>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setStackNodes(!stackNodes)}
-                className={`text-xs px-2 py-0.5 rounded transition-colors ${
-                  stackNodes
-                    ? 'bg-amber-500/30 text-amber-300'
-                    : 'bg-gray-700 text-gray-400 hover:text-gray-300'
-                }`}
-                title={stackNodes ? 'Stack mode: ON (click nodes to compare)' : 'Stack mode: OFF (single node view)'}
-              >
-                {stackNodes ? '📚 Stack' : '📄 Single'}
-              </button>
-              <button
-                onClick={() => setSimilarNodesMap(new Map())}
-                className="text-gray-500 hover:text-gray-300 text-xs"
-              >
-                ✕
-              </button>
-            </div>
-          </div>
-          <div className="overflow-y-auto flex-1">
-            {Array.from(similarNodesMap.entries()).map(([sourceId, similarNodes]) => {
-              const sourceNode = nodes.get(sourceId);
-              const sourceParent = sourceNode?.parentId;
-              const isExpanded = expandedSimilar.has(sourceId);
-              const displayNodes = isExpanded ? similarNodes : similarNodes.slice(0, SIMILAR_INITIAL_COUNT);
-              const hasMore = similarNodes.length > SIMILAR_INITIAL_COUNT;
-              return (
-                <div key={sourceId} className="border-b border-gray-700/50 last:border-0">
-                  {/* Source node details header */}
-                  <div className="p-4 bg-gray-700/40">
-                    <div className="flex items-start justify-between gap-2 mb-2">
-                      <h3 className="text-sm font-semibold text-white leading-tight">
-                        {sourceNode && <span className="mr-1.5">{getNodeEmoji(sourceNode)}</span>}
-                        {sourceNode?.aiTitle || sourceNode?.title || sourceId}
-                      </h3>
-                      <button
-                        onClick={() => setSimilarNodesMap(prev => {
-                          const next = new Map(prev);
-                          next.delete(sourceId);
-                          return next;
-                        })}
-                        className="text-gray-500 hover:text-gray-300 p-1"
-                      >
-                        <span className="text-xs">✕</span>
-                      </button>
-                    </div>
-                    {/* Metadata */}
-                    {sourceNode && (
-                      <div className="text-xs text-gray-400 mb-2">
-                        {new Date(sourceNode.createdAt).toLocaleDateString()} at{' '}
-                        {new Date(sourceNode.createdAt).toLocaleTimeString()}
-                      </div>
-                    )}
-                    {/* Summary */}
-                    {(sourceNode?.summary || sourceNode?.content) && (
-                      <div className="text-sm text-gray-300 mb-3 p-3 bg-gray-900/50 rounded border border-gray-700/50 max-h-48 overflow-y-auto">
-                        {(sourceNode.summary || sourceNode.content || '').split(', ').map((item, i) => (
-                          <div key={i} className="py-0.5">• {item}</div>
-                        ))}
-                      </div>
-                    )}
-                    {/* URL */}
-                    {sourceNode?.url && (
-                      <a
-                        href={sourceNode.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1 text-xs text-amber-400 hover:text-amber-300 hover:underline"
-                      >
-                        Open in Claude →
-                      </a>
-                    )}
-                  </div>
-
-                  {/* Similar nodes header - clickable to collapse */}
-                  <button
-                    onClick={() => setCollapsedSimilar(prev => {
-                      const next = new Set(prev);
-                      if (next.has(sourceId)) {
-                        next.delete(sourceId);
-                      } else {
-                        next.add(sourceId);
-                      }
-                      return next;
-                    })}
-                    className="w-full px-3 py-1.5 bg-gray-700/20 text-xs text-gray-400 border-t border-gray-700/50 flex items-center justify-between hover:bg-gray-700/40 transition-colors"
-                  >
-                    <span className="flex items-center gap-1">
-                      <span>{collapsedSimilar.has(sourceId) ? '▶' : '▼'}</span>
-                      <span>↔ Similar ({similarNodes.length})</span>
-                    </span>
-                  </button>
-
-                  {/* Similar nodes list - collapsible */}
-                  {!collapsedSimilar.has(sourceId) && (
-                    <>
-                      {displayNodes.map((similar) => {
-                        const similarNode = nodes.get(similar.id);
-                        // Check if in same view: similar node's parent matches current view's parent
-                        const isInSameView = similarNode?.parentId === currentParentId ||
-                          (similarNode?.parentId === sourceParent && sourceParent !== undefined);
-                        // Build hierarchy path (including Universe)
-                        const getHierarchyPath = (nodeId: string): { name: string; isUniverse: boolean }[] => {
-                          const path: { name: string; isUniverse: boolean }[] = [];
-                          let current = nodes.get(nodeId);
-                          while (current?.parentId) {
-                            const parent = nodes.get(current.parentId);
-                            if (parent) {
-                              path.unshift({
-                                name: parent.isUniverse ? '🌌' : (parent.aiTitle || parent.title || 'Untitled'),
-                                isUniverse: parent.isUniverse || false
-                              });
-                            }
-                            current = parent;
-                          }
-                          return path;
-                        };
-                        const hierarchyPath = getHierarchyPath(similar.id);
-                        return (
-                          <button
-                            key={similar.id}
-                            onClick={() => {
-                              const targetNode = nodes.get(similar.id);
-                              if (targetNode) {
-                                jumpToNode(targetNode, sourceNode);
-                                devLog('info', `Jumped to similar node: ${similar.title}`);
-                              }
-                            }}
-                            className="w-full px-3 py-2 text-left hover:bg-gray-700/50 transition-colors cursor-pointer"
-                            title={similar.title}
-                          >
-                            <div className="flex items-center justify-between gap-2">
-                              <span className="text-sm truncate">
-                                {isInSameView ? (
-                                  <span className="text-green-400 mr-1" title="In current view">●</span>
-                                ) : (
-                                  <span className="mr-1 inline-block w-[1em]"></span>
-                                )}
-                                {similar.emoji || '📄'} {similar.title}
-                              </span>
-                              <span
-                                className="text-xs shrink-0"
-                                style={{ color: `hsl(${similar.similarity * 120}, 70%, 50%)` }}
-                              >
-                                {(similar.similarity * 100).toFixed(0)}%
-                              </span>
-                            </div>
-                            {hierarchyPath.length > 0 && (
-                              <div className="text-xs truncate mt-0.5 pl-5">
-                                {(() => {
-                                  // Get source node's hierarchy to compare
-                                  const sourceHierarchy = getHierarchyPath(sourceId);
-                                  return hierarchyPath.map((segment, idx) => {
-                                    const isShared = idx < sourceHierarchy.length && sourceHierarchy[idx].name === segment.name;
-                                    // Universe gets special purple color
-                                    const colorClass = segment.isUniverse
-                                      ? 'text-purple-400'
-                                      : isShared ? 'text-amber-400/70' : 'text-gray-400';
-                                    return (
-                                      <span key={idx}>
-                                        {idx > 0 && <span className="text-gray-600"> › </span>}
-                                        <span className={colorClass}>{segment.name}</span>
-                                      </span>
-                                    );
-                                  });
-                                })()}
-                              </div>
-                            )}
-                          </button>
-                        );
-                      })}
-                      {hasMore && !isExpanded && (
-                        <button
-                          onClick={() => setExpandedSimilar(prev => new Set(prev).add(sourceId))}
-                          className="w-full px-3 py-2 text-left text-blue-400 hover:bg-gray-700/50 transition-colors text-sm"
-                        >
-                          Show more... ({similarNodes.length - SIMILAR_INITIAL_COUNT} remaining)
-                        </button>
-                      )}
-                      {hasMore && isExpanded && (
-                        <button
-                          onClick={() => setExpandedSimilar(prev => {
-                            const next = new Set(prev);
-                            next.delete(sourceId);
-                            return next;
-                          })}
-                          className="w-full px-3 py-2 text-left text-blue-400 hover:bg-gray-700/50 transition-colors text-sm"
-                        >
-                          Show less
-                        </button>
-                      )}
-                    </>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-          {/* Resize handle - bottom-left corner */}
-          <div
-            onMouseDown={(e) => {
-              e.preventDefault();
-              setIsResizingDetails(true);
-            }}
-            className={`absolute bottom-0 left-0 w-4 h-4 cursor-sw-resize group ${isResizingDetails ? 'bg-amber-500/30' : ''}`}
-            title="Drag to resize"
-          >
-            <svg
-              className="w-3 h-3 absolute bottom-0.5 left-0.5 text-gray-500 group-hover:text-amber-400 transition-colors"
-              viewBox="0 0 12 12"
-              fill="currentColor"
-            >
-              <path d="M0 12L12 0v3L3 12H0zm0-5l7-7v3L3 10v2H0V7z" />
-            </svg>
-          </div>
-        </div>
+      {/* Similar nodes panel - memoized for performance */}
+      {showPanels && showDetails && (
+        <SimilarNodesPanel
+          similarNodesMap={similarNodesMap}
+          nodes={nodes}
+          currentParentId={currentParentId}
+          stackNodes={stackNodes}
+          detailsPanelSize={detailsPanelSize}
+          isResizingDetails={isResizingDetails}
+          getNodeEmoji={getNodeEmoji}
+          onJumpToNode={jumpToNode}
+          onRemoveNode={(nodeId) => setSimilarNodesMap(prev => {
+            const next = new Map(prev);
+            next.delete(nodeId);
+            return next;
+          })}
+          onClearAll={() => setSimilarNodesMap(new Map())}
+          onToggleStack={() => setStackNodes(!stackNodes)}
+          onStartResize={() => setIsResizingDetails(true)}
+          devLog={devLog}
+        />
       )}
 
       {/* Loading indicator for similar nodes */}
-      {loadingSimilar.size > 0 && (
-        <div className="absolute top-20 right-4 bg-gray-800/95 backdrop-blur-sm text-white rounded-lg shadow-xl border border-gray-700 z-30 px-4 py-3">
-          <span className="text-xs text-gray-400">Loading similar nodes...</span>
-        </div>
-      )}
+      <SimilarNodesLoading loadingSimilar={loadingSimilar} />
 
       {/* Status bar */}
       <div className="absolute bottom-4 left-4 bg-gray-800/90 backdrop-blur-sm rounded-lg px-4 py-2 text-sm text-gray-300 flex items-center gap-4">

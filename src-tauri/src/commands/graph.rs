@@ -922,6 +922,7 @@ pub struct ConsolidateResult {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TidyReport {
+    pub same_name_merged: usize,
     pub chains_flattened: usize,
     pub empties_removed: usize,
     pub child_counts_fixed: usize,
@@ -933,46 +934,24 @@ pub struct TidyReport {
 }
 
 /// Run safe, fast cleanup operations on the database
-/// - Flatten single-child chains
-/// - Remove empty categories
-/// - Fix child counts and depths
-/// - Reparent orphans
-/// - Prune dead edges
-/// - Deduplicate edges
+/// Order: merge same-name → flatten chains → remove empties → fix counts/depths → orphans → edges
 #[tauri::command]
 pub fn tidy_database(state: State<AppState>) -> Result<TidyReport, String> {
-    use std::time::Instant;
-
-    println!("[Tidy] Starting database tidy...");
-    let start = Instant::now();
+    let start = std::time::Instant::now();
     let db = &state.db;
 
-    // Run operations in order
+    // Run operations in order (logging done in schema.rs)
+    let same_name_merged = db.merge_same_name_children().map_err(|e| e.to_string())?;
     let chains_flattened = db.flatten_single_child_chains().map_err(|e| e.to_string())?;
-    println!("[Tidy] Flattened {} single-child chains", chains_flattened);
-
     let empties_removed = db.remove_empty_categories().map_err(|e| e.to_string())?;
-    println!("[Tidy] Removed {} empty categories", empties_removed);
-
     let child_counts_fixed = db.fix_all_child_counts().map_err(|e| e.to_string())?;
-    println!("[Tidy] Fixed {} child counts", child_counts_fixed);
-
     let depths_fixed = db.fix_all_depths().map_err(|e| e.to_string())?;
-    println!("[Tidy] Fixed {} depths", depths_fixed);
-
     let orphans_reparented = db.reparent_orphans().map_err(|e| e.to_string())?;
-    println!("[Tidy] Reparented {} orphans", orphans_reparented);
-
     let dead_edges_pruned = db.prune_dead_edges().map_err(|e| e.to_string())?;
-    println!("[Tidy] Pruned {} dead edges", dead_edges_pruned);
-
     let duplicate_edges_removed = db.deduplicate_edges().map_err(|e| e.to_string())?;
-    println!("[Tidy] Removed {} duplicate edges", duplicate_edges_removed);
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-    println!("[Tidy] Complete in {}ms", duration_ms);
 
     Ok(TidyReport {
+        same_name_merged,
         chains_flattened,
         empties_removed,
         child_counts_fixed,
@@ -980,7 +959,7 @@ pub fn tidy_database(state: State<AppState>) -> Result<TidyReport, String> {
         orphans_reparented,
         dead_edges_pruned,
         duplicate_edges_removed,
-        duration_ms,
+        duration_ms: start.elapsed().as_millis() as u64,
     })
 }
 

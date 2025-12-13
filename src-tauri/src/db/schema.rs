@@ -1880,23 +1880,80 @@ impl Database {
 
     // ==================== Tidy Database Operations ====================
 
+    /// Merge children that have the same name as their parent
+    /// Example: "Consciousness" → "Consciousness" (7 children) becomes "Consciousness" (7 children)
+    pub fn merge_same_name_children(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+
+        // Find parent-child pairs where labels match (case-insensitive)
+        // Use COALESCE to check cluster_label, ai_title, title
+        let duplicates: Vec<(String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT p.id as parent_id, c.id as child_id
+                 FROM nodes p
+                 JOIN nodes c ON c.parent_id = p.id
+                 WHERE c.is_item = 0
+                   AND c.is_universe = 0
+                   AND LOWER(COALESCE(c.cluster_label, c.ai_title, c.title)) =
+                       LOWER(COALESCE(p.cluster_label, p.ai_title, p.title))"
+            )?;
+            let results: Vec<_> = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?.filter_map(|r| r.ok()).collect();
+            results
+        };
+
+        let count = duplicates.len();
+
+        for (parent_id, child_id) in &duplicates {
+            // Reparent all grandchildren to parent
+            conn.execute(
+                "UPDATE nodes SET parent_id = ?1 WHERE parent_id = ?2",
+                params![parent_id, child_id],
+            )?;
+
+            // Delete the redundant child
+            conn.execute("DELETE FROM nodes WHERE id = ?1", params![child_id])?;
+        }
+
+        // Fix child counts for affected parents
+        if count > 0 {
+            for (parent_id, _) in &duplicates {
+                let new_count: i32 = conn.query_row(
+                    "SELECT COUNT(*) FROM nodes WHERE parent_id = ?1",
+                    params![parent_id],
+                    |row| row.get(0),
+                ).unwrap_or(0);
+                conn.execute(
+                    "UPDATE nodes SET child_count = ?2 WHERE id = ?1",
+                    params![parent_id, new_count],
+                )?;
+            }
+        }
+
+        println!("[Tidy] Merged {} same-name children", count);
+        Ok(count)
+    }
+
     /// Flatten single-child chains: reparent child to grandparent, delete middle node
     /// Loops until no single-child chains remain. Returns total nodes removed.
+    /// Optimized with batching and transactions for performance.
     pub fn flatten_single_child_chains(&self) -> Result<usize> {
         let mut total_flattened = 0;
 
         loop {
             let conn = self.conn.lock().unwrap();
 
-            // Find non-item, non-universe nodes with exactly 1 child
-            let single_child_nodes: Vec<(String, Option<String>, i32)> = {
+            // Find ALL single-child chains in one query
+            // Returns: middle_node_id, grandparent_id, child_id
+            let chains: Vec<(String, Option<String>, String)> = {
                 let mut stmt = conn.prepare(
-                    "SELECT n.id, n.parent_id, n.depth
-                     FROM nodes n
-                     WHERE n.is_item = 0
-                       AND n.is_universe = 0
-                       AND n.child_count = 1
-                     ORDER BY n.depth DESC"
+                    "SELECT parent.id, parent.parent_id, child.id
+                     FROM nodes parent
+                     JOIN nodes child ON child.parent_id = parent.id
+                     WHERE parent.is_item = 0
+                       AND parent.is_universe = 0
+                       AND parent.child_count = 1"
                 )?;
                 let results: Vec<_> = stmt.query_map([], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -1904,50 +1961,31 @@ impl Database {
                 results
             };
 
-            if single_child_nodes.is_empty() {
+            if chains.is_empty() {
                 break;
             }
 
-            for (node_id, grandparent_id, _depth) in &single_child_nodes {
-                // Get the single child
-                let child_id: Option<String> = conn.query_row(
-                    "SELECT id FROM nodes WHERE parent_id = ?1 LIMIT 1",
-                    params![node_id],
-                    |row| row.get(0),
-                ).ok();
-
-                if let Some(child_id) = child_id {
-                    // Reparent child to grandparent
-                    conn.execute(
-                        "UPDATE nodes SET parent_id = ?2 WHERE id = ?1",
-                        params![&child_id, grandparent_id],
-                    )?;
-
-                    // Delete the middle node
-                    conn.execute("DELETE FROM nodes WHERE id = ?1", params![node_id])?;
-
-                    // Update grandparent's child count
-                    if let Some(gp_id) = grandparent_id {
-                        let new_count: i32 = conn.query_row(
-                            "SELECT COUNT(*) FROM nodes WHERE parent_id = ?1",
-                            params![gp_id],
-                            |row| row.get(0),
-                        ).unwrap_or(0);
-                        conn.execute(
-                            "UPDATE nodes SET child_count = ?2 WHERE id = ?1",
-                            params![gp_id, new_count],
-                        )?;
-                    }
-
-                    total_flattened += 1;
-                }
+            // Batch reparent: move each child to its grandparent
+            for (_middle_id, grandparent_id, child_id) in &chains {
+                conn.execute(
+                    "UPDATE nodes SET parent_id = ?2 WHERE id = ?1",
+                    params![child_id, grandparent_id],
+                )?;
             }
+
+            // Batch delete all middle nodes
+            for (middle_id, _, _) in &chains {
+                conn.execute("DELETE FROM nodes WHERE id = ?1", params![middle_id])?;
+            }
+
+            total_flattened += chains.len();
         }
 
-        // Fix depths after flattening
+        // Fix depths after all flattening
         if total_flattened > 0 {
             drop(self.conn.lock()); // Release lock before calling update_all_depths
             self.update_all_depths()?;
+            // Child counts will be fixed by fix_all_child_counts() later
         }
 
         println!("[Tidy] Flattened {} single-child chains", total_flattened);

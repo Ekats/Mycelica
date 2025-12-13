@@ -53,6 +53,7 @@ interface SettingsPanelProps {
 type ConfirmAction = 'deleteAll' | 'resetAi' | 'resetClustering' | 'clearEmbeddings' | 'clearHierarchy' | 'fullRebuild' | 'flattenHierarchy' | 'consolidateRoot' | 'tidyDatabase' | null;
 
 interface TidyReport {
+  sameNameMerged: number;
   chainsFlattened: number;
   emptiesRemoved: number;
   childCountsFixed: number;
@@ -364,13 +365,14 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     },
     tidyDatabase: {
       title: 'Tidy Database',
-      message: 'Run safe cleanup: flatten single-child chains, remove empties, fix counts/depths, reparent orphans, prune dead edges.',
+      message: 'Run safe cleanup: merge same-name nodes, flatten chains, remove empties, fix counts/depths, prune edges.',
       handler: async () => {
         setIsTidying(true);
         setOperationResult(null);
         try {
           const report = await invoke<TidyReport>('tidy_database');
           const parts: string[] = [];
+          if (report.sameNameMerged > 0) parts.push(`merged ${report.sameNameMerged} same-name`);
           if (report.chainsFlattened > 0) parts.push(`flattened ${report.chainsFlattened} chains`);
           if (report.emptiesRemoved > 0) parts.push(`removed ${report.emptiesRemoved} empties`);
           if (report.childCountsFixed > 0) parts.push(`fixed ${report.childCountsFixed} counts`);
