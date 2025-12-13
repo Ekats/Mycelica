@@ -11,7 +11,7 @@ But thinking is associative, not hierarchical. You don't file a thought — you 
 
 Mycelica makes connections explicit and discoverable.
 
-![hippo](https://media3.giphy.com/media/v1.Y2lkPTc5MGI3NjExbnV2NzBmNTRuY2pqdmdmbG5rNG5mMTc4c2J1ZGc4NGJnZmdoZ3pydyZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/jKBDIU9zZN5JXjbNjj/giphy.gif)
+https://github.com/user-attachments/assets/149d3241-1b93-4269-94c2-10edb9153db3
 
 ## Current State
 
