@@ -46,6 +46,9 @@ interface BackendNode {
   lastAccessedAt: number | null;  // Rust uses #[serde(rename = "lastAccessedAt")]
   // Hierarchy date propagation
   latestChildDate: number | null;  // Rust uses #[serde(rename = "latestChildDate")]
+  // Privacy filtering
+  isPrivate: boolean | null;  // Rust uses #[serde(rename = "isPrivate")]
+  privacyReason: string | null;  // Rust uses #[serde(rename = "privacyReason")]
 }
 
 interface BackendEdge {
@@ -97,6 +100,9 @@ function mapBackendNode(n: BackendNode): Node {
     lastAccessedAt: n.lastAccessedAt ?? undefined,
     // Hierarchy date propagation
     latestChildDate: n.latestChildDate ?? undefined,
+    // Privacy filtering
+    isPrivate: n.isPrivate ?? undefined,
+    privacyReason: n.privacyReason ?? undefined,
   };
 }
 

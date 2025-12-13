@@ -124,6 +124,12 @@ pub struct Node {
     // Hierarchy date propagation
     #[serde(rename = "latestChildDate")]
     pub latest_child_date: Option<i64>,   // MAX(children's created_at), bubbled up from leaves
+
+    // Privacy filtering
+    #[serde(rename = "isPrivate")]
+    pub is_private: Option<bool>,         // None = not scanned, Some(true) = private, Some(false) = safe
+    #[serde(rename = "privacyReason")]
+    pub privacy_reason: Option<String>,   // Why it was marked private (for review)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

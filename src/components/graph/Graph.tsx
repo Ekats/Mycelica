@@ -177,6 +177,7 @@ export function Graph({ width, height }: GraphProps) {
   const [showDevConsole, setShowDevConsole] = useState(true);
   const [showPanels, setShowPanels] = useState(true); // Hamburger menu toggle for all panels
   const [showDetails, setShowDetails] = useState(true); // Toggle for details panel
+  const [hidePrivate, setHidePrivate] = useState(false); // Privacy filter toggle
   const [isClustering, setIsClustering] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isBuildingHierarchy, setIsBuildingHierarchy] = useState(false);
@@ -837,6 +838,20 @@ export function Graph({ width, height }: GraphProps) {
     const universeNode = allNodes.find(n => n.isUniverse);
 
     const nodeArray = allNodes.filter(node => {
+      // Privacy filter: hide private nodes AND categories with no visible children
+      if (hidePrivate) {
+        // Hide explicitly private nodes
+        if (node.isPrivate === true) return false;
+
+        // For categories (non-items with children), check if they have any non-private children
+        // If ALL children are private, hide the category too
+        if (!node.isItem && node.childCount > 0) {
+          const children = allNodes.filter(n => n.parentId === node.id);
+          const hasVisibleChild = children.some(c => c.isPrivate !== true);
+          if (!hasVisibleChild && children.length > 0) return false;
+        }
+      }
+
       // If we have a specific parent, show its children
       if (currentParentId) {
         return node.parentId === currentParentId;
@@ -2408,7 +2423,7 @@ export function Graph({ width, height }: GraphProps) {
 
   // Note: activeNodeId removed from deps - color updates handled by separate useEffect below
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodes, edges, width, height, setActiveNode, devLog, getNodeEmoji, currentDepth, maxDepth, currentParentId, navigateToNode]);
+  }, [nodes, edges, width, height, setActiveNode, devLog, getNodeEmoji, currentDepth, maxDepth, currentParentId, navigateToNode, hidePrivate]);
 
   // Update connection colors when activeNodeId changes (without full re-render)
   useEffect(() => {
@@ -2954,6 +2969,17 @@ export function Graph({ width, height }: GraphProps) {
               }`}
             >
               Console
+            </button>
+            <button
+              onClick={() => setHidePrivate(!hidePrivate)}
+              className={`px-3 py-1.5 text-xs rounded transition-colors ${
+                hidePrivate
+                  ? 'bg-rose-500/30 text-rose-300'
+                  : 'text-gray-400 hover:text-white hover:bg-gray-700'
+              }`}
+              title={hidePrivate ? 'Show private nodes' : 'Hide private nodes'}
+            >
+              🔒
             </button>
           </div>
         )}

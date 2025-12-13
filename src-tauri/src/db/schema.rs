@@ -93,7 +93,12 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
             CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(type);
             CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
-            -- Note: indexes for depth, is_item, parent_id are created after migration
+
+            -- Hierarchy indexes for fast traversal with 4k+ nodes
+            CREATE INDEX IF NOT EXISTS idx_nodes_parent_id ON nodes(parent_id);
+            CREATE INDEX IF NOT EXISTS idx_nodes_depth ON nodes(depth);
+            CREATE INDEX IF NOT EXISTS idx_nodes_is_item ON nodes(is_item);
+            CREATE INDEX IF NOT EXISTS idx_nodes_cluster_id ON nodes(cluster_id);
 
             -- Full-text search
             CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
@@ -315,6 +320,19 @@ impl Database {
             eprintln!("Migration: Added latest_child_date column to nodes for hierarchy date propagation");
         }
 
+        // Migration: Add privacy filtering columns if they don't exist
+        let has_is_private: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('nodes') WHERE name = 'is_private'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !has_is_private {
+            conn.execute("ALTER TABLE nodes ADD COLUMN is_private INTEGER", [])?;
+            conn.execute("ALTER TABLE nodes ADD COLUMN privacy_reason TEXT", [])?;
+            eprintln!("Migration: Added is_private and privacy_reason columns for privacy filtering");
+        }
+
         // Create indexes for dynamic hierarchy columns (after migrations ensure columns exist)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_depth ON nodes(depth)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_is_item ON nodes(is_item)", [])?;
@@ -413,11 +431,13 @@ impl Database {
             is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
             last_accessed_at: row.get(24)?,
             latest_child_date: row.get(25)?,
+            is_private: row.get::<_, Option<i32>>(26)?.map(|v| v != 0),
+            privacy_reason: row.get(27)?,
         })
     }
 
     /// Standard SELECT columns for nodes (excludes embedding - use dedicated functions)
-    const NODE_COLUMNS: &'static str = "id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date";
+    const NODE_COLUMNS: &'static str = "id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date, is_private, privacy_reason";
 
     pub fn get_all_nodes(&self) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
@@ -472,6 +492,130 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM nodes WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    // Privacy operations
+    pub fn update_node_privacy(&self, node_id: &str, is_private: bool, reason: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE nodes SET is_private = ?2, privacy_reason = ?3 WHERE id = ?1",
+            params![node_id, is_private as i32, reason],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_items_needing_privacy_scan(&self) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE is_item = 1 AND is_private IS NULL ORDER BY created_at DESC",
+            Self::NODE_COLUMNS
+        ))?;
+        let nodes = stmt.query_map([], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
+        Ok(nodes)
+    }
+
+    pub fn get_privacy_stats(&self) -> Result<(usize, usize, usize, usize, usize)> {
+        let conn = self.conn.lock().unwrap();
+        let total: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 1",
+            [],
+            |r| r.get(0),
+        ).unwrap_or(0);
+        let scanned: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND is_private IS NOT NULL",
+            [],
+            |r| r.get(0),
+        ).unwrap_or(0);
+        let private: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND is_private = 1",
+            [],
+            |r| r.get(0),
+        ).unwrap_or(0);
+        let unscanned = total - scanned;
+        let safe = scanned - private;
+        Ok((total as usize, scanned as usize, unscanned as usize, private as usize, safe as usize))
+    }
+
+    /// Get category nodes (non-items with children) that need privacy scanning
+    /// These are topics/domains/galaxies - scanning them first allows bulk propagation
+    pub fn get_category_nodes_needing_privacy_scan(&self) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE is_item = 0 AND child_count > 0 AND is_private IS NULL ORDER BY depth ASC, child_count DESC",
+            Self::NODE_COLUMNS
+        ))?;
+        let nodes = stmt.query_map([], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
+        Ok(nodes)
+    }
+
+    /// Propagate privacy status to all descendants of a node
+    /// Uses iterative approach to mark all children, grandchildren, etc. as private
+    pub fn propagate_privacy_to_descendants(&self, node_id: &str, reason: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+
+        // Use recursive CTE to find all descendants
+        let count = conn.execute(
+            "UPDATE nodes SET is_private = 1, privacy_reason = ?2
+             WHERE id IN (
+                 WITH RECURSIVE descendants AS (
+                     SELECT id FROM nodes WHERE parent_id = ?1
+                     UNION ALL
+                     SELECT n.id FROM nodes n
+                     INNER JOIN descendants d ON n.parent_id = d.id
+                 )
+                 SELECT id FROM descendants
+             ) AND is_private IS NULL",
+            params![node_id, reason],
+        )?;
+
+        Ok(count)
+    }
+
+    /// Get privacy stats including category counts
+    pub fn get_privacy_stats_extended(&self) -> Result<(usize, usize, usize, usize, usize, usize, usize)> {
+        let conn = self.conn.lock().unwrap();
+
+        // Item stats
+        let total_items: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 1",
+            [],
+            |r| r.get(0),
+        ).unwrap_or(0);
+        let scanned_items: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND is_private IS NOT NULL",
+            [],
+            |r| r.get(0),
+        ).unwrap_or(0);
+        let private_items: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND is_private = 1",
+            [],
+            |r| r.get(0),
+        ).unwrap_or(0);
+
+        // Category stats (non-items with children)
+        let total_categories: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 0 AND child_count > 0",
+            [],
+            |r| r.get(0),
+        ).unwrap_or(0);
+        let scanned_categories: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 0 AND child_count > 0 AND is_private IS NOT NULL",
+            [],
+            |r| r.get(0),
+        ).unwrap_or(0);
+
+        let unscanned_items = total_items - scanned_items;
+        let safe_items = scanned_items - private_items;
+
+        Ok((
+            total_items as usize,
+            scanned_items as usize,
+            unscanned_items as usize,
+            private_items as usize,
+            safe_items as usize,
+            total_categories as usize,
+            scanned_categories as usize,
+        ))
     }
 
     // Edge operations
@@ -555,43 +699,14 @@ impl Database {
     pub fn search_nodes(&self, query: &str) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT n.id, n.type, n.title, n.url, n.content, n.position_x, n.position_y, n.created_at, n.updated_at, n.cluster_id, n.cluster_label, n.ai_title, n.summary, n.tags, n.emoji, n.is_processed, n.depth, n.is_item, n.is_universe, n.parent_id, n.child_count, n.conversation_id, n.sequence_index, n.is_pinned, n.last_accessed_at
+            "SELECT n.id, n.type, n.title, n.url, n.content, n.position_x, n.position_y, n.created_at, n.updated_at, n.cluster_id, n.cluster_label, n.ai_title, n.summary, n.tags, n.emoji, n.is_processed, n.depth, n.is_item, n.is_universe, n.parent_id, n.child_count, n.conversation_id, n.sequence_index, n.is_pinned, n.last_accessed_at, n.latest_child_date, n.is_private, n.privacy_reason
              FROM nodes n
              JOIN nodes_fts fts ON n.rowid = fts.rowid
              WHERE nodes_fts MATCH ?1
              ORDER BY rank"
         )?;
 
-        let nodes = stmt.query_map(params![query], |row| {
-            Ok(Node {
-                id: row.get(0)?,
-                node_type: NodeType::from_str(&row.get::<_, String>(1)?).unwrap_or(NodeType::Thought),
-                title: row.get(2)?,
-                url: row.get(3)?,
-                content: row.get(4)?,
-                position: Position { x: row.get(5)?, y: row.get(6)? },
-                created_at: row.get(7)?,
-                updated_at: row.get(8)?,
-                cluster_id: row.get(9)?,
-                cluster_label: row.get(10)?,
-                ai_title: row.get(11)?,
-                summary: row.get(12)?,
-                tags: row.get(13)?,
-                emoji: row.get(14)?,
-                is_processed: row.get::<_, i32>(15).unwrap_or(0) != 0,
-                depth: row.get::<_, i32>(16).unwrap_or(0),
-                is_item: row.get::<_, i32>(17).unwrap_or(0) != 0,
-                is_universe: row.get::<_, i32>(18).unwrap_or(0) != 0,
-                parent_id: row.get(19)?,
-                child_count: row.get::<_, i32>(20).unwrap_or(0),
-                conversation_id: row.get(21)?,
-                sequence_index: row.get(22)?,
-                is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
-                last_accessed_at: row.get(24)?,
-                latest_child_date: row.get(25)?,
-            })
-        })?.collect::<Result<Vec<_>>>()?;
-
+        let nodes = stmt.query_map(params![query], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
         Ok(nodes)
     }
 
@@ -619,41 +734,12 @@ impl Database {
     // Get items that haven't been processed by AI yet
     pub fn get_unprocessed_nodes(&self) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date
-             FROM nodes WHERE is_item = 1 AND (is_processed = 0 OR is_processed IS NULL) ORDER BY created_at DESC"
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE is_item = 1 AND (is_processed = 0 OR is_processed IS NULL) ORDER BY created_at DESC",
+            Self::NODE_COLUMNS
+        ))?;
 
-        let nodes = stmt.query_map([], |row| {
-            Ok(Node {
-                id: row.get(0)?,
-                node_type: NodeType::from_str(&row.get::<_, String>(1)?).unwrap_or(NodeType::Thought),
-                title: row.get(2)?,
-                url: row.get(3)?,
-                content: row.get(4)?,
-                position: Position { x: row.get(5)?, y: row.get(6)? },
-                created_at: row.get(7)?,
-                updated_at: row.get(8)?,
-                cluster_id: row.get(9)?,
-                cluster_label: row.get(10)?,
-                ai_title: row.get(11)?,
-                summary: row.get(12)?,
-                tags: row.get(13)?,
-                emoji: row.get(14)?,
-                is_processed: row.get::<_, i32>(15).unwrap_or(0) != 0,
-                depth: row.get::<_, i32>(16).unwrap_or(0),
-                is_item: row.get::<_, i32>(17).unwrap_or(0) != 0,
-                is_universe: row.get::<_, i32>(18).unwrap_or(0) != 0,
-                parent_id: row.get(19)?,
-                child_count: row.get::<_, i32>(20).unwrap_or(0),
-                conversation_id: row.get(21)?,
-                sequence_index: row.get(22)?,
-                is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
-                last_accessed_at: row.get(24)?,
-                latest_child_date: row.get(25)?,
-            })
-        })?.collect::<Result<Vec<_>>>()?;
-
+        let nodes = stmt.query_map([], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
         Ok(nodes)
     }
 
@@ -685,125 +771,38 @@ impl Database {
     /// Get all nodes at a specific depth
     pub fn get_nodes_at_depth(&self, depth: i32) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, type, title, url, content, position_x, position_y, created_at, updated_at,
-                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date
-             FROM nodes WHERE depth = ?1 ORDER BY child_count DESC, title"
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE depth = ?1 ORDER BY child_count DESC, title",
+            Self::NODE_COLUMNS
+        ))?;
 
-        let nodes = stmt.query_map(params![depth], |row| {
-            Ok(Node {
-                id: row.get(0)?,
-                node_type: NodeType::from_str(&row.get::<_, String>(1)?).unwrap_or(NodeType::Thought),
-                title: row.get(2)?,
-                url: row.get(3)?,
-                content: row.get(4)?,
-                position: Position { x: row.get(5)?, y: row.get(6)? },
-                created_at: row.get(7)?,
-                updated_at: row.get(8)?,
-                cluster_id: row.get(9)?,
-                cluster_label: row.get(10)?,
-                ai_title: row.get(11)?,
-                summary: row.get(12)?,
-                tags: row.get(13)?,
-                emoji: row.get(14)?,
-                is_processed: row.get::<_, i32>(15).unwrap_or(0) != 0,
-                depth: row.get::<_, i32>(16).unwrap_or(0),
-                is_item: row.get::<_, i32>(17).unwrap_or(0) != 0,
-                is_universe: row.get::<_, i32>(18).unwrap_or(0) != 0,
-                parent_id: row.get(19)?,
-                child_count: row.get::<_, i32>(20).unwrap_or(0),
-                conversation_id: row.get(21)?,
-                sequence_index: row.get(22)?,
-                is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
-                last_accessed_at: row.get(24)?,
-                latest_child_date: row.get(25)?,
-            })
-        })?.collect::<Result<Vec<_>>>()?;
-
+        let nodes = stmt.query_map(params![depth], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
         Ok(nodes)
     }
 
     /// Get children of a specific parent node
     pub fn get_children(&self, parent_id: &str) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, type, title, url, content, position_x, position_y, created_at, updated_at,
-                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date
-             FROM nodes WHERE parent_id = ?1 ORDER BY child_count DESC, title"
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE parent_id = ?1 ORDER BY child_count DESC, title",
+            Self::NODE_COLUMNS
+        ))?;
 
-        let nodes = stmt.query_map(params![parent_id], |row| {
-            Ok(Node {
-                id: row.get(0)?,
-                node_type: NodeType::from_str(&row.get::<_, String>(1)?).unwrap_or(NodeType::Thought),
-                title: row.get(2)?,
-                url: row.get(3)?,
-                content: row.get(4)?,
-                position: Position { x: row.get(5)?, y: row.get(6)? },
-                created_at: row.get(7)?,
-                updated_at: row.get(8)?,
-                cluster_id: row.get(9)?,
-                cluster_label: row.get(10)?,
-                ai_title: row.get(11)?,
-                summary: row.get(12)?,
-                tags: row.get(13)?,
-                emoji: row.get(14)?,
-                is_processed: row.get::<_, i32>(15).unwrap_or(0) != 0,
-                depth: row.get::<_, i32>(16).unwrap_or(0),
-                is_item: row.get::<_, i32>(17).unwrap_or(0) != 0,
-                is_universe: row.get::<_, i32>(18).unwrap_or(0) != 0,
-                parent_id: row.get(19)?,
-                child_count: row.get::<_, i32>(20).unwrap_or(0),
-                conversation_id: row.get(21)?,
-                sequence_index: row.get(22)?,
-                is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
-                last_accessed_at: row.get(24)?,
-                latest_child_date: row.get(25)?,
-            })
-        })?.collect::<Result<Vec<_>>>()?;
-
+        let nodes = stmt.query_map(params![parent_id], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
         Ok(nodes)
     }
 
     /// Get the Universe node (single root, is_universe = true)
     pub fn get_universe(&self) -> Result<Option<Node>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, type, title, url, content, position_x, position_y, created_at, updated_at,
-                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date
-             FROM nodes WHERE is_universe = 1 LIMIT 1"
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE is_universe = 1 LIMIT 1",
+            Self::NODE_COLUMNS
+        ))?;
 
         let mut rows = stmt.query([])?;
         if let Some(row) = rows.next()? {
-            Ok(Some(Node {
-                id: row.get(0)?,
-                node_type: NodeType::from_str(&row.get::<_, String>(1)?).unwrap_or(NodeType::Thought),
-                title: row.get(2)?,
-                url: row.get(3)?,
-                content: row.get(4)?,
-                position: Position { x: row.get(5)?, y: row.get(6)? },
-                created_at: row.get(7)?,
-                updated_at: row.get(8)?,
-                cluster_id: row.get(9)?,
-                cluster_label: row.get(10)?,
-                ai_title: row.get(11)?,
-                summary: row.get(12)?,
-                tags: row.get(13)?,
-                emoji: row.get(14)?,
-                is_processed: row.get::<_, i32>(15).unwrap_or(0) != 0,
-                depth: row.get::<_, i32>(16).unwrap_or(0),
-                is_item: row.get::<_, i32>(17).unwrap_or(0) != 0,
-                is_universe: row.get::<_, i32>(18).unwrap_or(0) != 0,
-                parent_id: row.get(19)?,
-                child_count: row.get::<_, i32>(20).unwrap_or(0),
-                conversation_id: row.get(21)?,
-                sequence_index: row.get(22)?,
-                is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
-                last_accessed_at: row.get(24)?,
-                latest_child_date: row.get(25)?,
-            }))
+            Ok(Some(Self::row_to_node(row)?))
         } else {
             Ok(None)
         }
@@ -812,42 +811,12 @@ impl Database {
     /// Get all items (is_item = true) - openable content
     pub fn get_items(&self) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, type, title, url, content, position_x, position_y, created_at, updated_at,
-                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date
-             FROM nodes WHERE is_item = 1 ORDER BY created_at DESC"
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE is_item = 1 ORDER BY created_at DESC",
+            Self::NODE_COLUMNS
+        ))?;
 
-        let nodes = stmt.query_map([], |row| {
-            Ok(Node {
-                id: row.get(0)?,
-                node_type: NodeType::from_str(&row.get::<_, String>(1)?).unwrap_or(NodeType::Thought),
-                title: row.get(2)?,
-                url: row.get(3)?,
-                content: row.get(4)?,
-                position: Position { x: row.get(5)?, y: row.get(6)? },
-                created_at: row.get(7)?,
-                updated_at: row.get(8)?,
-                cluster_id: row.get(9)?,
-                cluster_label: row.get(10)?,
-                ai_title: row.get(11)?,
-                summary: row.get(12)?,
-                tags: row.get(13)?,
-                emoji: row.get(14)?,
-                is_processed: row.get::<_, i32>(15).unwrap_or(0) != 0,
-                depth: row.get::<_, i32>(16).unwrap_or(0),
-                is_item: row.get::<_, i32>(17).unwrap_or(0) != 0,
-                is_universe: row.get::<_, i32>(18).unwrap_or(0) != 0,
-                parent_id: row.get(19)?,
-                child_count: row.get::<_, i32>(20).unwrap_or(0),
-                conversation_id: row.get(21)?,
-                sequence_index: row.get(22)?,
-                is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
-                last_accessed_at: row.get(24)?,
-                latest_child_date: row.get(25)?,
-            })
-        })?.collect::<Result<Vec<_>>>()?;
-
+        let nodes = stmt.query_map([], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
         Ok(nodes)
     }
 
@@ -937,42 +906,12 @@ impl Database {
     /// Get items that need clustering (needs_clustering = 1 AND is_item = 1)
     pub fn get_items_needing_clustering(&self) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, type, title, url, content, position_x, position_y, created_at, updated_at,
-                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date
-             FROM nodes WHERE is_item = 1 AND needs_clustering = 1 ORDER BY created_at DESC"
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE is_item = 1 AND needs_clustering = 1 ORDER BY created_at DESC",
+            Self::NODE_COLUMNS
+        ))?;
 
-        let nodes = stmt.query_map([], |row| {
-            Ok(Node {
-                id: row.get(0)?,
-                node_type: NodeType::from_str(&row.get::<_, String>(1)?).unwrap_or(NodeType::Thought),
-                title: row.get(2)?,
-                url: row.get(3)?,
-                content: row.get(4)?,
-                position: Position { x: row.get(5)?, y: row.get(6)? },
-                created_at: row.get(7)?,
-                updated_at: row.get(8)?,
-                cluster_id: row.get(9)?,
-                cluster_label: row.get(10)?,
-                ai_title: row.get(11)?,
-                summary: row.get(12)?,
-                tags: row.get(13)?,
-                emoji: row.get(14)?,
-                is_processed: row.get::<_, i32>(15).unwrap_or(0) != 0,
-                depth: row.get::<_, i32>(16).unwrap_or(0),
-                is_item: row.get::<_, i32>(17).unwrap_or(0) != 0,
-                is_universe: row.get::<_, i32>(18).unwrap_or(0) != 0,
-                parent_id: row.get(19)?,
-                child_count: row.get::<_, i32>(20).unwrap_or(0),
-                conversation_id: row.get(21)?,
-                sequence_index: row.get(22)?,
-                is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
-                last_accessed_at: row.get(24)?,
-                latest_child_date: row.get(25)?,
-            })
-        })?.collect::<Result<Vec<_>>>()?;
-
+        let nodes = stmt.query_map([], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
         Ok(nodes)
     }
 
@@ -1154,7 +1093,7 @@ impl Database {
 
         let mut stmt = conn.prepare(
             "SELECT n.id, n.type, n.title, n.url, n.content, n.position_x, n.position_y, n.created_at, n.updated_at,
-                    n.cluster_id, n.cluster_label, n.ai_title, n.summary, n.tags, n.emoji, n.is_processed, n.depth, n.is_item, n.is_universe, n.parent_id, n.child_count, n.conversation_id, n.sequence_index, n.is_pinned, n.last_accessed_at
+                    n.cluster_id, n.cluster_label, n.ai_title, n.summary, n.tags, n.emoji, n.is_processed, n.depth, n.is_item, n.is_universe, n.parent_id, n.child_count, n.conversation_id, n.sequence_index, n.is_pinned, n.last_accessed_at, n.latest_child_date, n.is_private, n.privacy_reason
              FROM nodes n
              JOIN edges e ON n.id = e.source_id
              WHERE (e.target_id = ?1 OR e.target_id = ?2)
@@ -1163,36 +1102,7 @@ impl Database {
              ORDER BY e.weight DESC"
         )?;
 
-        let nodes = stmt.query_map(params![topic_id, placeholder_id, min_w], |row| {
-            Ok(Node {
-                id: row.get(0)?,
-                node_type: NodeType::from_str(&row.get::<_, String>(1)?).unwrap_or(NodeType::Thought),
-                title: row.get(2)?,
-                url: row.get(3)?,
-                content: row.get(4)?,
-                position: Position { x: row.get(5)?, y: row.get(6)? },
-                created_at: row.get(7)?,
-                updated_at: row.get(8)?,
-                cluster_id: row.get(9)?,
-                cluster_label: row.get(10)?,
-                ai_title: row.get(11)?,
-                summary: row.get(12)?,
-                tags: row.get(13)?,
-                emoji: row.get(14)?,
-                is_processed: row.get::<_, i32>(15).unwrap_or(0) != 0,
-                depth: row.get::<_, i32>(16).unwrap_or(0),
-                is_item: row.get::<_, i32>(17).unwrap_or(0) != 0,
-                is_universe: row.get::<_, i32>(18).unwrap_or(0) != 0,
-                parent_id: row.get(19)?,
-                child_count: row.get::<_, i32>(20).unwrap_or(0),
-                conversation_id: row.get(21)?,
-                sequence_index: row.get(22)?,
-                is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
-                last_accessed_at: row.get(24)?,
-                latest_child_date: row.get(25)?,
-            })
-        })?.collect::<Result<Vec<_>>>()?;
-
+        let nodes = stmt.query_map(params![topic_id, placeholder_id, min_w], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
         Ok(nodes)
     }
 
@@ -1319,6 +1229,8 @@ impl Database {
             is_pinned: false,
             last_accessed_at: None,
             latest_child_date: None,
+            is_private: None,
+            privacy_reason: None,
         };
 
         self.insert_node(&node)
@@ -1339,42 +1251,12 @@ impl Database {
     /// Get all messages belonging to a conversation, ordered by sequence_index
     pub fn get_conversation_messages(&self, conversation_id: &str) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, type, title, url, content, position_x, position_y, created_at, updated_at,
-                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date
-             FROM nodes WHERE conversation_id = ?1 ORDER BY sequence_index ASC"
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE conversation_id = ?1 ORDER BY sequence_index ASC",
+            Self::NODE_COLUMNS
+        ))?;
 
-        let nodes = stmt.query_map(params![conversation_id], |row| {
-            Ok(Node {
-                id: row.get(0)?,
-                node_type: NodeType::from_str(&row.get::<_, String>(1)?).unwrap_or(NodeType::Thought),
-                title: row.get(2)?,
-                url: row.get(3)?,
-                content: row.get(4)?,
-                position: Position { x: row.get(5)?, y: row.get(6)? },
-                created_at: row.get(7)?,
-                updated_at: row.get(8)?,
-                cluster_id: row.get(9)?,
-                cluster_label: row.get(10)?,
-                ai_title: row.get(11)?,
-                summary: row.get(12)?,
-                tags: row.get(13)?,
-                emoji: row.get(14)?,
-                is_processed: row.get::<_, i32>(15).unwrap_or(0) != 0,
-                depth: row.get::<_, i32>(16).unwrap_or(0),
-                is_item: row.get::<_, i32>(17).unwrap_or(0) != 0,
-                is_universe: row.get::<_, i32>(18).unwrap_or(0) != 0,
-                parent_id: row.get(19)?,
-                child_count: row.get::<_, i32>(20).unwrap_or(0),
-                conversation_id: row.get(21)?,
-                sequence_index: row.get(22)?,
-                is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
-                last_accessed_at: row.get(24)?,
-                latest_child_date: row.get(25)?,
-            })
-        })?.collect::<Result<Vec<_>>>()?;
-
+        let nodes = stmt.query_map(params![conversation_id], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
         Ok(nodes)
     }
 
@@ -1497,84 +1379,24 @@ impl Database {
     /// Get pinned nodes (for Sidebar Pinned tab)
     pub fn get_pinned_nodes(&self) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, type, title, url, content, position_x, position_y, created_at, updated_at,
-                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date
-             FROM nodes WHERE is_pinned = 1 ORDER BY last_accessed_at DESC"
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE is_pinned = 1 ORDER BY last_accessed_at DESC",
+            Self::NODE_COLUMNS
+        ))?;
 
-        let nodes = stmt.query_map([], |row| {
-            Ok(Node {
-                id: row.get(0)?,
-                node_type: NodeType::from_str(&row.get::<_, String>(1)?).unwrap_or(NodeType::Thought),
-                title: row.get(2)?,
-                url: row.get(3)?,
-                content: row.get(4)?,
-                position: Position { x: row.get(5)?, y: row.get(6)? },
-                created_at: row.get(7)?,
-                updated_at: row.get(8)?,
-                cluster_id: row.get(9)?,
-                cluster_label: row.get(10)?,
-                ai_title: row.get(11)?,
-                summary: row.get(12)?,
-                tags: row.get(13)?,
-                emoji: row.get(14)?,
-                is_processed: row.get::<_, i32>(15).unwrap_or(0) != 0,
-                depth: row.get::<_, i32>(16).unwrap_or(0),
-                is_item: row.get::<_, i32>(17).unwrap_or(0) != 0,
-                is_universe: row.get::<_, i32>(18).unwrap_or(0) != 0,
-                parent_id: row.get(19)?,
-                child_count: row.get::<_, i32>(20).unwrap_or(0),
-                conversation_id: row.get(21)?,
-                sequence_index: row.get(22)?,
-                is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
-                last_accessed_at: row.get(24)?,
-                latest_child_date: row.get(25)?,
-            })
-        })?.collect::<Result<Vec<_>>>()?;
-
+        let nodes = stmt.query_map([], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
         Ok(nodes)
     }
 
     /// Get recently accessed nodes (for Sidebar Recent tab)
     pub fn get_recent_nodes(&self, limit: i32) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, type, title, url, content, position_x, position_y, created_at, updated_at,
-                    cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date
-             FROM nodes WHERE last_accessed_at IS NOT NULL ORDER BY last_accessed_at DESC LIMIT ?1"
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE last_accessed_at IS NOT NULL ORDER BY last_accessed_at DESC LIMIT ?1",
+            Self::NODE_COLUMNS
+        ))?;
 
-        let nodes = stmt.query_map(params![limit], |row| {
-            Ok(Node {
-                id: row.get(0)?,
-                node_type: NodeType::from_str(&row.get::<_, String>(1)?).unwrap_or(NodeType::Thought),
-                title: row.get(2)?,
-                url: row.get(3)?,
-                content: row.get(4)?,
-                position: Position { x: row.get(5)?, y: row.get(6)? },
-                created_at: row.get(7)?,
-                updated_at: row.get(8)?,
-                cluster_id: row.get(9)?,
-                cluster_label: row.get(10)?,
-                ai_title: row.get(11)?,
-                summary: row.get(12)?,
-                tags: row.get(13)?,
-                emoji: row.get(14)?,
-                is_processed: row.get::<_, i32>(15).unwrap_or(0) != 0,
-                depth: row.get::<_, i32>(16).unwrap_or(0),
-                is_item: row.get::<_, i32>(17).unwrap_or(0) != 0,
-                is_universe: row.get::<_, i32>(18).unwrap_or(0) != 0,
-                parent_id: row.get(19)?,
-                child_count: row.get::<_, i32>(20).unwrap_or(0),
-                conversation_id: row.get(21)?,
-                sequence_index: row.get(22)?,
-                is_pinned: row.get::<_, i32>(23).unwrap_or(0) != 0,
-                last_accessed_at: row.get(24)?,
-                latest_child_date: row.get(25)?,
-            })
-        })?.collect::<Result<Vec<_>>>()?;
-
+        let nodes = stmt.query_map(params![limit], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
         Ok(nodes)
     }
 

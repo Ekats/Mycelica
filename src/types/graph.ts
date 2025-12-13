@@ -80,6 +80,10 @@ export interface Node {
   // --- Conversation context (for message Leafs) ---
   conversationId?: string;  // ID of parent conversation this message belongs to
   sequenceIndex?: number;   // Position in original conversation (0, 1, 2...)
+
+  // --- Privacy filtering ---
+  isPrivate?: boolean;      // undefined = not scanned, true = private, false = safe
+  privacyReason?: string;   // Why it was marked private (for review)
 }
 
 export interface Edge {

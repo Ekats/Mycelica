@@ -131,6 +131,8 @@ pub fn import_claude_conversations(db: &Database, json_content: &str) -> Result<
             is_pinned: false,
             last_accessed_at: None,
             latest_child_date: None,
+            is_private: None,
+            privacy_reason: None,
         };
 
         if let Err(e) = db.insert_node(&container) {
@@ -179,6 +181,8 @@ pub fn import_claude_conversations(db: &Database, json_content: &str) -> Result<
                 is_pinned: false,
                 last_accessed_at: None,
                 latest_child_date: None,
+                is_private: None,
+                privacy_reason: None,
             };
 
             if let Err(e) = db.insert_node(&exchange_node) {

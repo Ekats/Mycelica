@@ -886,6 +886,8 @@ pub async fn consolidate_root(state: State<'_, AppState>) -> Result<ConsolidateR
             is_pinned: false,
             last_accessed_at: None,
             latest_child_date: None,
+            is_private: None,
+            privacy_reason: None,
         };
 
         state.db.insert_node(&uber_node).map_err(|e| e.to_string())?;

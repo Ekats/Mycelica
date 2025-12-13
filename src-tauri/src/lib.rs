@@ -41,6 +41,8 @@ use commands::{
     get_db_path, switch_database, tidy_database,
     // Processing stats commands
     get_processing_stats, add_ai_processing_time, add_rebuild_time,
+    // Privacy filtering commands
+    analyze_node_privacy, analyze_all_privacy, analyze_categories_privacy, cancel_privacy_scan, get_privacy_stats, export_shareable_db,
 };
 use db::Database;
 use std::sync::Arc;
@@ -161,6 +163,13 @@ pub fn run() {
             get_processing_stats,
             add_ai_processing_time,
             add_rebuild_time,
+            // Privacy filtering
+            analyze_node_privacy,
+            analyze_all_privacy,
+            analyze_categories_privacy,
+            cancel_privacy_scan,
+            get_privacy_stats,
+            export_shareable_db,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -16,6 +16,8 @@ import {
   HardDrive,
   Clock,
   Zap,
+  Shield,
+  Download,
 } from 'lucide-react';
 import { ConfirmDialog } from './ConfirmDialog';
 
@@ -64,6 +66,16 @@ interface TidyReport {
   durationMs: number;
 }
 
+interface PrivacyStats {
+  total: number;
+  scanned: number;
+  unscanned: number;
+  private: number;
+  safe: number;
+  totalCategories: number;
+  scannedCategories: number;
+}
+
 export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelProps) {
   // API Keys
   const [apiKeyStatus, setApiKeyStatus] = useState<ApiKeyStatus | null>(null);
@@ -100,6 +112,12 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const [isTidying, setIsTidying] = useState(false);
   const [operationResult, setOperationResult] = useState<string | null>(null);
 
+  // Privacy scanning
+  const [privacyStats, setPrivacyStats] = useState<PrivacyStats | null>(null);
+  const [isScanning, setIsScanning] = useState(false);
+  const [scanProgress, setScanProgress] = useState<{ current: number; total: number; status: string } | null>(null);
+  const [privacyResult, setPrivacyResult] = useState<string | null>(null);
+
   // Load data on mount
   useEffect(() => {
     if (open) {
@@ -108,8 +126,10 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
       loadDbStats();
       loadDbPath();
       loadProcessingStats();
+      loadPrivacyStats();
       setImportResult(null);
       setActionResult(null);
+      setPrivacyResult(null);
     }
   }, [open]);
 
@@ -158,6 +178,15 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     }
   };
 
+  const loadPrivacyStats = async () => {
+    try {
+      const stats = await invoke<PrivacyStats>('get_privacy_stats');
+      setPrivacyStats(stats);
+    } catch (err) {
+      console.error('Failed to load privacy stats:', err);
+    }
+  };
+
   // Format seconds to human readable
   const formatTime = (secs: number): string => {
     if (secs < 60) return `${Math.round(secs)}s`;
@@ -178,17 +207,16 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
         filters: [{ name: 'SQLite Database', extensions: ['db'] }],
       });
       if (file && typeof file === 'string') {
-        const stats = await invoke<DbStats>('switch_database', { dbPath: file });
-        setDbPath(file);
-        setDbStats(stats);
-        setActionResult(`Switched to database: ${file.split('/').pop()} - Restart app to apply changes`);
-        onDataChanged?.();
+        await invoke<DbStats>('switch_database', { dbPath: file });
+        // Force full page reload to load new database
+        // (Arc-wrapped Database cannot be hot-swapped)
+        window.location.reload();
       }
     } catch (err) {
       setActionResult(`Error: ${err}`);
-    } finally {
       setSwitchingDb(false);
     }
+    // Note: no finally block - page will reload on success
   };
 
   // API Key handlers
@@ -263,6 +291,75 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
       setImportResult(`Error: ${err}`);
     } finally {
       setImporting(false);
+    }
+  };
+
+  // Privacy scan handlers
+  const handlePrivacyScan = async () => {
+    setIsScanning(true);
+    setScanProgress({ current: 0, total: 0, status: 'starting' });
+    setPrivacyResult(null);
+
+    // Listen for progress events
+    const { listen } = await import('@tauri-apps/api/event');
+    const unlisten = await listen<{
+      current: number;
+      total: number;
+      nodeTitle: string;
+      isPrivate: boolean;
+      reason: string | null;
+      status: string;
+      errorMessage: string | null;
+    }>('privacy-progress', (event) => {
+      const { current, total, status } = event.payload;
+      setScanProgress({ current, total, status });
+
+      if (status === 'complete' || status === 'cancelled') {
+        unlisten();
+        setIsScanning(false);
+        loadPrivacyStats();
+      }
+    });
+
+    try {
+      const result = await invoke<{
+        total: number;
+        privateCount: number;
+        safeCount: number;
+        errorCount: number;
+        cancelled: boolean;
+      }>('analyze_all_privacy');
+
+      if (result.cancelled) {
+        setPrivacyResult('Scan cancelled');
+      } else {
+        setPrivacyResult(`Scanned ${result.total} items: ${result.privateCount} private, ${result.safeCount} safe${result.errorCount > 0 ? `, ${result.errorCount} errors` : ''}`);
+      }
+    } catch (err) {
+      setPrivacyResult(`Error: ${err}`);
+      unlisten();
+    } finally {
+      setIsScanning(false);
+      setScanProgress(null);
+      await loadPrivacyStats();
+    }
+  };
+
+  const handleCancelPrivacyScan = async () => {
+    try {
+      await invoke('cancel_privacy_scan');
+    } catch (err) {
+      console.error('Failed to cancel privacy scan:', err);
+    }
+  };
+
+  const handleExportShareable = async () => {
+    setPrivacyResult(null);
+    try {
+      const path = await invoke<string>('export_shareable_db');
+      setPrivacyResult(`Exported: ${path}`);
+    } catch (err) {
+      setPrivacyResult(`Error: ${err}`);
     }
   };
 
@@ -770,6 +867,116 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
 
                 {operationResult && (
                   <p className="text-xs text-green-400">{operationResult}</p>
+                )}
+              </div>
+            </section>
+
+            {/* Privacy Section */}
+            <section>
+              <div className="flex items-center gap-2 mb-4">
+                <Shield className="w-5 h-5 text-rose-400" />
+                <h3 className="text-lg font-medium text-white">Privacy Filter</h3>
+              </div>
+
+              <div className="space-y-3">
+                {/* Privacy Stats */}
+                {privacyStats && (
+                  <div className="bg-gray-900/50 rounded-lg p-4 text-sm">
+                    {/* Item stats */}
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <span className="text-gray-400">Total Items:</span>
+                        <span className="ml-2 text-white font-medium">{privacyStats.total}</span>
+                      </div>
+                      <div>
+                        <span className="text-gray-400">Scanned:</span>
+                        <span className="ml-2 text-white font-medium">{privacyStats.scanned}</span>
+                      </div>
+                      <div>
+                        <span className="text-gray-400">🔒 Private:</span>
+                        <span className="ml-2 text-rose-400 font-medium">{privacyStats.private}</span>
+                      </div>
+                      <div>
+                        <span className="text-gray-400">✓ Safe:</span>
+                        <span className="ml-2 text-green-400 font-medium">{privacyStats.safe}</span>
+                      </div>
+                    </div>
+                    {privacyStats.unscanned > 0 && (
+                      <div className="mt-2 text-xs text-amber-400">
+                        {privacyStats.unscanned} items not yet scanned
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Scan Progress */}
+                {scanProgress && (
+                  <div className="bg-gray-900/50 rounded-lg p-4">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-sm text-gray-300">
+                        Scanning... {scanProgress.current}/{scanProgress.total}
+                      </span>
+                      <span className="text-xs text-amber-400">
+                        {scanProgress.total > 0 ? ((scanProgress.current / scanProgress.total) * 100).toFixed(0) : 0}%
+                      </span>
+                    </div>
+                    <div className="h-2 bg-gray-700 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-rose-500 transition-all duration-300"
+                        style={{ width: scanProgress.total > 0 ? `${(scanProgress.current / scanProgress.total) * 100}%` : '0%' }}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {/* Scan Items */}
+                <div className="bg-gray-900/50 rounded-lg p-4">
+                  <div className="flex gap-2">
+                    <button
+                      onClick={handlePrivacyScan}
+                      disabled={isScanning || !apiKeyStatus?.hasKey || privacyStats?.unscanned === 0}
+                      className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-rose-600 hover:bg-rose-700 text-white rounded-lg font-medium transition-colors disabled:opacity-50"
+                    >
+                      {isScanning ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Shield className="w-4 h-4" />
+                      )}
+                      {isScanning ? 'Scanning...' : 'Scan Items'}
+                    </button>
+                    {isScanning && (
+                      <button
+                        onClick={handleCancelPrivacyScan}
+                        className="px-4 py-2.5 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition-colors"
+                      >
+                        Cancel
+                      </button>
+                    )}
+                  </div>
+                  <p className="mt-2 text-xs text-gray-500">
+                    Scans {privacyStats?.unscanned || 0} items. Categories inherit privacy from children (hidden when ALL children are private).
+                  </p>
+                </div>
+
+                {/* Export Button */}
+                <div className="bg-gray-900/50 rounded-lg p-4">
+                  <button
+                    onClick={handleExportShareable}
+                    disabled={isScanning || privacyStats?.scanned === 0}
+                    className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-medium transition-colors disabled:opacity-50"
+                  >
+                    <Download className="w-4 h-4" />
+                    Export Shareable DB
+                  </button>
+                  <p className="mt-2 text-xs text-gray-500">
+                    Creates a copy with private nodes removed
+                  </p>
+                </div>
+
+                {privacyResult && (
+                  <p className={`text-xs ${privacyResult.startsWith('Error') ? 'text-red-400' : 'text-green-400'}`}>
+                    {privacyResult}
+                  </p>
                 )}
               </div>
             </section>

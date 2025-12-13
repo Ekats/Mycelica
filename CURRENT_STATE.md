@@ -31,34 +31,55 @@ For each item node, generates:
 | tags     | 3-5 specific tags (technologies, concepts, task types) |
 | emoji    | Single representative emoji                            |
 
-### 3. Clustering (Claude Haiku)
+### 3. Full Rebuild Pipeline (6 Steps)
+
+The "Full Rebuild" command runs these steps in sequence:
+
+| Step | Name                | Description                                              |
+|------|---------------------|----------------------------------------------------------|
+| 1    | Clustering          | AI groups items into fine-grained topics (Claude Haiku)  |
+| 2    | Initial Hierarchy   | Creates Universe → Topics → Items structure              |
+| 3    | Recursive Grouping  | AI groups topics into 5-12 parent categories (Sonnet)    |
+| 4    | Child Counts        | Updates child_count for all nodes                        |
+| 5    | Embeddings          | Generates OpenAI vectors for similarity search           |
+| 6    | Date Propagation    | Bubbles latestChildDate from leaves to Universe          |
+
+### 4. Clustering (Claude Haiku)
 
 - Groups items into fine-grained topics
 - Assigns cluster_id and cluster_label
 - Uses AI-processed summaries + tags for context
 - Creates multi-path associations with strength weights
 
-### 4. Hierarchy Grouping (Claude Sonnet)
+### 5. Hierarchy Grouping (Claude Sonnet)
 
 - Recursively groups topics into 5-12 parent categories
 - Detects project names (e.g., "Mycelica") as umbrella categories
 - Creates navigable tree: Universe → Galaxies → Domains → Topics → Items
 - Target: 8-15 children per level for usability
 
-### 5. Embeddings (OpenAI text-embedding-3-small)
+### 6. Embeddings (OpenAI text-embedding-3-small)
 
 - 1536-dimensional vectors from ai_title + summary
 - Stored as BLOB in SQLite
 - Generated for both items AND category nodes
 
-### 6. Semantic Similarity
+### 7. Semantic Similarity
 
 - Cosine similarity between embeddings
 - Creates "Related" edges (min 50% similarity)
 - Sibling bonus (+20%) for nodes with same parent
 - Lower threshold for category-to-category edges
 
-### 7. Full-Text Search
+### 8. Date Propagation
+
+- `latestChildDate` field on every node
+- Leaves: set to their own `createdAt`
+- Groups: set to MAX of children's `latestChildDate`
+- Processed bottom-up from deepest level to Universe
+- Enables date-based coloring of group nodes
+
+### 9. Full-Text Search
 
 - FTS5 index on title + content
 - Keyword search across all nodes
@@ -115,12 +136,46 @@ For each item node, generates:
 
 ---
 
+## Visualization Features
+
+### Date-Based Coloring
+
+- Colorblind-friendly gradient: red (oldest) → yellow → blue → cyan (newest)
+- Skips green to accommodate red-green colorblindness
+- Applied to: item dates, group latest dates, edge similarity weights
+- Color legend in bottom-right corner
+
+### Node Cards
+
+| Element         | Items                    | Groups                           |
+|-----------------|--------------------------|----------------------------------|
+| Footer left     | Creation date (colored)  | "X items" (white)                |
+| Footer right    | —                        | "Latest: date" (colored)         |
+| Footer bg       | Semi-transparent black   | Semi-transparent black           |
+
+### Edge Visualization
+
+- Thickness: 6-24px based on similarity weight
+- Color: same gradient as dates (weak=red, strong=cyan)
+- Curved paths with arrow markers
+- Opacity dims for unconnected edges during selection
+
+### Selection Feedback
+
+- Yellow outline (#fbbf24) on selected node
+- Connection highlighting via opacity
+- Direct connections: full opacity
+- Chain connections (2+ hops): slightly faded
+- Unconnected: 30% opacity
+
+---
+
 ## Architecture Insight
 
 The current pipeline:
 
 ```
-Import → AI Process → Cluster → Hierarchy → Embeddings → Edges
+Import → AI Process → Cluster → Hierarchy → Recursive Grouping → Embeddings → Dates → Edges
 ```
 
 Is designed for extensibility:
@@ -129,6 +184,17 @@ Is designed for extensibility:
 - `EdgeType` enum can add: References, Contradicts, Precedes, etc.
 - Embedding dimension is configurable (currently 1536)
 - Hierarchy depth is fully dynamic
+
+### Node Fields
+
+| Field            | Type          | Purpose                                    |
+|------------------|---------------|--------------------------------------------|
+| is_item          | bool          | Can open in Leaf reader                    |
+| is_universe      | bool          | Root node (exactly one)                    |
+| is_processed     | bool          | AI has processed this node                 |
+| is_pinned        | bool          | User-pinned to sidebar                     |
+| latestChildDate  | Option<i64>   | MAX of children's dates (for groups)       |
+| last_accessed_at | Option<i64>   | Recency tracking for sidebar               |
 
 ### Future: Browser Integration
 

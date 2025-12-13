@@ -311,6 +311,8 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
             is_pinned: false,
             last_accessed_at: None,
             latest_child_date: None,
+            is_private: None,
+            privacy_reason: None,
         };
 
         db.insert_node(&topic_node).map_err(|e| e.to_string())?;
@@ -486,6 +488,8 @@ fn create_parent_level(
             is_pinned: false,
             last_accessed_at: None,
             latest_child_date: None,
+            is_private: None,
+            privacy_reason: None,
         };
 
         db.insert_node(&parent_node).map_err(|e| e.to_string())?;
@@ -542,6 +546,8 @@ fn create_universe(db: &Database, child_ids: &[String]) -> Result<String, String
         is_pinned: false,
         last_accessed_at: None,
         latest_child_date: None,
+        is_private: None,
+        privacy_reason: None,
     };
 
     db.insert_node(&universe_node).map_err(|e| e.to_string())?;
@@ -884,6 +890,8 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
             is_pinned: false,
             last_accessed_at: None,
             latest_child_date: None,
+            is_private: None,
+            privacy_reason: None,
         };
 
         db.insert_node(&category_node).map_err(|e| e.to_string())?;
@@ -1082,6 +1090,8 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
                 is_pinned: false,
                 last_accessed_at: None,
                 latest_child_date: None,
+                is_private: None,
+                privacy_reason: None,
             };
 
             // Insert umbrella node
