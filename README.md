@@ -11,6 +11,8 @@ But thinking is associative, not hierarchical. You don't file a thought — you 
 
 Mycelica makes connections explicit and discoverable.
 
+https://github.com/user-attachments/assets/149d3241-1b93-4269-94c2-10edb9153db3
+
 ## Current State
 
 - **Graph Navigation**: Zoomable node graph with tiered layout
