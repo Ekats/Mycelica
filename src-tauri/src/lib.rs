@@ -27,7 +27,7 @@ use commands::{
     // Conversation context commands
     get_conversation_context,
     // Import commands
-    import_claude_conversations,
+    import_claude_conversations, import_markdown_files,
     // Quick access commands (Sidebar)
     set_node_pinned, touch_node, get_pinned_nodes, get_recent_nodes, clear_recent,
     // Semantic similarity commands
@@ -42,7 +42,7 @@ use commands::{
     // Processing stats commands
     get_processing_stats, add_ai_processing_time, add_rebuild_time,
     // Privacy filtering commands
-    analyze_node_privacy, analyze_all_privacy, analyze_categories_privacy, cancel_privacy_scan, get_privacy_stats, export_shareable_db, set_node_privacy,
+    analyze_node_privacy, analyze_all_privacy, analyze_categories_privacy, cancel_privacy_scan, reset_privacy_flags, get_privacy_stats, export_shareable_db, set_node_privacy,
     // Recent Notes protection commands
     get_protect_recent_notes, set_protect_recent_notes,
 };
@@ -150,6 +150,7 @@ pub fn run() {
             get_conversation_context,
             // Import
             import_claude_conversations,
+            import_markdown_files,
             // Quick access (Sidebar)
             set_node_pinned,
             touch_node,
@@ -186,6 +187,7 @@ pub fn run() {
             analyze_all_privacy,
             analyze_categories_privacy,
             cancel_privacy_scan,
+            reset_privacy_flags,
             get_privacy_stats,
             export_shareable_db,
             set_node_privacy,

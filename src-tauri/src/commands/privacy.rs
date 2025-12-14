@@ -12,6 +12,42 @@ use tauri::{AppHandle, Emitter, State};
 
 pub static CANCEL_PRIVACY_SCAN: AtomicBool = AtomicBool::new(false);
 
+/// Showcase mode - much stricter, for demo databases
+const PRIVACY_PROMPT_SHOWCASE: &str = r#"Analyze this content for a PUBLIC SHOWCASE database. Be VERY strict. Return JSON only.
+
+Content:
+- Title: {title}
+- Summary: {summary}
+- Tags: {tags}
+- Content snippet: {content}
+
+Mark as PRIVATE (is_private: true) - filter OUT - if it contains ANY of:
+- ANY personal information, names, locations, employers, schools
+- Health, medical, relationships, family, dating
+- Financial details of any kind
+- Opinions about specific people or companies
+- Personal projects (unless it's Mycelica itself)
+- Career discussions, job searching, interviews
+- Personal struggles, emotions, venting
+- Specific usernames, accounts, file paths with names
+- "I want", "I need", "I feel" personal statements
+- Daily life, routines, personal preferences
+- Anything that reveals identity or personal context
+
+Mark as SAFE (is_private: false) - KEEP for showcase - ONLY if it's:
+- Mycelica development (this project itself - always keep!)
+- Pure philosophy, epistemology, consciousness discussions
+- Abstract technical architecture discussions
+- Interesting AI/ML concepts and discussions
+- Pure code examples with no personal context
+- Educational explanations of universal concepts
+- Meta discussions about knowledge organization
+
+The goal is a CLEAN demo database with only universally interesting content.
+When in doubt, mark PRIVATE. Be aggressive about filtering.
+
+Respond with ONLY: {"is_private": true, "reason": "brief explanation"} or {"is_private": false, "reason": null}"#;
+
 const PRIVACY_PROMPT: &str = r#"Analyze this content for privacy sensitivity. Return JSON only.
 
 Content:
@@ -143,6 +179,13 @@ fn emit_progress(app: &AppHandle, event: PrivacyProgressEvent) {
 pub fn cancel_privacy_scan() -> Result<(), String> {
     CANCEL_PRIVACY_SCAN.store(true, Ordering::SeqCst);
     Ok(())
+}
+
+/// Reset all privacy flags (to re-scan with different settings)
+#[tauri::command]
+pub fn reset_privacy_flags(state: State<AppState>) -> Result<usize, String> {
+    state.db.reset_all_privacy_flags()
+        .map_err(|e| e.to_string())
 }
 
 /// Get privacy statistics
@@ -308,10 +351,16 @@ fn parse_privacy_response(text: &str) -> Result<(bool, Option<String>), String> 
 pub async fn analyze_all_privacy(
     state: State<'_, AppState>,
     app: AppHandle,
+    showcase_mode: Option<bool>,
 ) -> Result<PrivacyReport, String> {
     CANCEL_PRIVACY_SCAN.store(false, Ordering::SeqCst);
 
     let api_key = settings::get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
+    let prompt_template = if showcase_mode.unwrap_or(false) {
+        PRIVACY_PROMPT_SHOWCASE
+    } else {
+        PRIVACY_PROMPT
+    };
 
     // Get all items that haven't been scanned
     let nodes = state.db.get_items_needing_privacy_scan()
@@ -394,7 +443,7 @@ pub async fn analyze_all_privacy(
             content.to_string()
         };
 
-        let prompt = PRIVACY_PROMPT
+        let prompt = prompt_template
             .replace("{title}", title)
             .replace("{summary}", summary)
             .replace("{tags}", tags)
@@ -533,10 +582,16 @@ pub async fn analyze_all_privacy(
 pub async fn analyze_categories_privacy(
     state: State<'_, AppState>,
     app: AppHandle,
+    showcase_mode: Option<bool>,
 ) -> Result<CategoryPrivacyReport, String> {
     CANCEL_PRIVACY_SCAN.store(false, Ordering::SeqCst);
 
     let api_key = settings::get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
+    let prompt_template = if showcase_mode.unwrap_or(false) {
+        PRIVACY_PROMPT_SHOWCASE
+    } else {
+        PRIVACY_PROMPT
+    };
 
     // Get all category nodes (non-items with children) that haven't been scanned
     let categories = state.db.get_category_nodes_needing_privacy_scan()
@@ -625,7 +680,7 @@ pub async fn analyze_categories_privacy(
             content.to_string()
         };
 
-        let prompt = PRIVACY_PROMPT
+        let prompt = prompt_template
             .replace("{title}", title)
             .replace("{summary}", summary)
             .replace("{tags}", tags)

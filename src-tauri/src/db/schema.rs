@@ -595,6 +595,16 @@ impl Database {
         Ok(())
     }
 
+    /// Reset all privacy flags to unscanned state (is_private = NULL)
+    pub fn reset_all_privacy_flags(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.execute(
+            "UPDATE nodes SET is_private = NULL, privacy_reason = NULL WHERE is_private IS NOT NULL",
+            [],
+        )?;
+        Ok(count)
+    }
+
     pub fn get_items_needing_privacy_scan(&self) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(

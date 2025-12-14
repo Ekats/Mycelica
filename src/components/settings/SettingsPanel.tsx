@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { readTextFile } from '@tauri-apps/plugin-fs';
@@ -7,7 +7,6 @@ import {
   Key,
   RefreshCw,
   Trash2,
-  Upload,
   Check,
   AlertCircle,
   Loader2,
@@ -56,7 +55,7 @@ interface SettingsPanelProps {
   onDataChanged?: () => void;
 }
 
-type ConfirmAction = 'deleteAll' | 'resetAi' | 'resetClustering' | 'clearEmbeddings' | 'clearHierarchy' | 'fullRebuild' | 'flattenHierarchy' | 'consolidateRoot' | 'tidyDatabase' | null;
+type ConfirmAction = 'deleteAll' | 'resetAi' | 'resetClustering' | 'clearEmbeddings' | 'clearHierarchy' | 'resetPrivacy' | 'fullRebuild' | 'flattenHierarchy' | 'consolidateRoot' | 'tidyDatabase' | null;
 
 interface TidyReport {
   sameNameMerged: number;
@@ -108,6 +107,21 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   // Import
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState<string | null>(null);
+  const [showImportSources, setShowImportSources] = useState(false);
+  const importDropdownRef = useRef<HTMLDivElement>(null);
+
+  // Click outside to close import sources dropdown
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (importDropdownRef.current && !importDropdownRef.current.contains(event.target as Node)) {
+        setShowImportSources(false);
+      }
+    };
+    if (showImportSources) {
+      document.addEventListener('mousedown', handleClickOutside);
+    }
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [showImportSources]);
 
   // Confirmation dialog
   const [confirmAction, setConfirmAction] = useState<ConfirmAction>(null);
@@ -141,6 +155,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const [isScanning, setIsScanning] = useState(false);
   const [scanProgress, setScanProgress] = useState<{ current: number; total: number; status: string } | null>(null);
   const [privacyResult, setPrivacyResult] = useState<string | null>(null);
+  const [showcaseMode, setShowcaseMode] = useState(false);
 
   // Protection settings
   const [protectRecentNotes, setProtectRecentNotes] = useState(true);
@@ -367,6 +382,36 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     }
   };
 
+  // Markdown import handler
+  const handleImportMarkdown = async () => {
+    setImporting(true);
+    setImportResult(null);
+    try {
+      const files = await openDialog({
+        title: 'Select Markdown files',
+        filters: [{ name: 'Markdown', extensions: ['md', 'markdown', 'txt'] }],
+        multiple: true,
+      });
+      if (files) {
+        const filePaths = Array.isArray(files) ? files : [files];
+        if (filePaths.length > 0) {
+          const result = await invoke<{ exchangesImported: number; skipped: number; errors: string[] }>(
+            'import_markdown_files',
+            { filePaths }
+          );
+          await loadDbStats();
+          onDataChanged?.();
+          const errorMsg = result.errors.length > 0 ? ` (${result.errors.length} errors)` : '';
+          setImportResult(`Imported ${result.exchangesImported} markdown file${result.exchangesImported !== 1 ? 's' : ''}${errorMsg}`);
+        }
+      }
+    } catch (err) {
+      setImportResult(`Error: ${err}`);
+    } finally {
+      setImporting(false);
+    }
+  };
+
   const handleQuickProcess = async () => {
     setIsQuickProcessing(true);
     setQuickProcessStep('');
@@ -436,12 +481,13 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
         safeCount: number;
         errorCount: number;
         cancelled: boolean;
-      }>('analyze_all_privacy');
+      }>('analyze_all_privacy', { showcaseMode });
 
       if (result.cancelled) {
         setPrivacyResult('Scan cancelled');
       } else {
-        setPrivacyResult(`Scanned ${result.total} items: ${result.privateCount} private, ${result.safeCount} safe${result.errorCount > 0 ? `, ${result.errorCount} errors` : ''}`);
+        const modeLabel = showcaseMode ? ' (showcase mode)' : '';
+        setPrivacyResult(`Scanned ${result.total} items: ${result.privateCount} private, ${result.safeCount} safe${result.errorCount > 0 ? `, ${result.errorCount} errors` : ''}${modeLabel}`);
       }
     } catch (err) {
       setPrivacyResult(`Error: ${err}`);
@@ -458,6 +504,57 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
       await invoke('cancel_privacy_scan');
     } catch (err) {
       console.error('Failed to cancel privacy scan:', err);
+    }
+  };
+
+  const handleCategoryScan = async () => {
+    setIsScanning(true);
+    setScanProgress({ current: 0, total: 0, status: 'starting' });
+    setPrivacyResult(null);
+
+    const { listen } = await import('@tauri-apps/api/event');
+    const unlisten = await listen<{
+      current: number;
+      total: number;
+      nodeTitle: string;
+      isPrivate: boolean;
+      reason: string | null;
+      status: string;
+      errorMessage: string | null;
+    }>('privacy-progress', (event) => {
+      const { current, total, status } = event.payload;
+      setScanProgress({ current, total, status });
+
+      if (status === 'complete' || status === 'cancelled') {
+        unlisten();
+        setIsScanning(false);
+        loadPrivacyStats();
+      }
+    });
+
+    try {
+      const result = await invoke<{
+        categoriesScanned: number;
+        categoriesPrivate: number;
+        categoriesSafe: number;
+        itemsPropagated: number;
+        errorCount: number;
+        cancelled: boolean;
+      }>('analyze_categories_privacy', { showcaseMode });
+
+      if (result.cancelled) {
+        setPrivacyResult('Scan cancelled');
+      } else {
+        const modeLabel = showcaseMode ? ' (showcase)' : '';
+        setPrivacyResult(`Scanned ${result.categoriesScanned} categories: ${result.categoriesPrivate} private, ${result.categoriesSafe} safe → ${result.itemsPropagated} items filtered${modeLabel}`);
+      }
+    } catch (err) {
+      setPrivacyResult(`Error: ${err}`);
+      unlisten();
+    } finally {
+      setIsScanning(false);
+      setScanProgress(null);
+      await loadPrivacyStats();
     }
   };
 
@@ -603,6 +700,15 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
       handler: async () => {
         const count = await invoke<number>('clear_hierarchy');
         return `Deleted ${count} hierarchy nodes`;
+      },
+    },
+    resetPrivacy: {
+      title: 'Reset Privacy Flags',
+      message: 'This will clear all privacy scan results, marking all items as unscanned. Use this before re-scanning with different settings (e.g., showcase mode).',
+      handler: async () => {
+        const count = await invoke<number>('reset_privacy_flags');
+        await loadPrivacyStats();
+        return `Reset privacy flags for ${count} nodes`;
       },
     },
     fullRebuild: {
@@ -930,20 +1036,54 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
 
               <div className="space-y-2">
                 {/* Step 1: Import */}
-                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
-                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-blue-600 flex items-center justify-center text-white text-sm font-bold">1</span>
-                  <div className="flex-1 min-w-0">
+                <div className="bg-gray-900/50 rounded-lg p-4">
+                  <div className="flex items-center gap-2 mb-3">
+                    <span className="flex-shrink-0 w-7 h-7 rounded-full bg-blue-600 flex items-center justify-center text-white text-sm font-bold">1</span>
                     <div className="text-sm font-medium text-gray-200">Import Data</div>
-                    <div className="text-xs text-gray-500">Load conversations.json from Claude</div>
-                    <div className="text-xs text-gray-600 mt-0.5">No API calls</div>
+                    <span className="text-xs text-gray-600">No API calls</span>
                   </div>
-                  <button
-                    onClick={handleImport}
-                    disabled={importing}
-                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-blue-600 hover:bg-blue-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
-                  >
-                    {importing ? <Loader2 className="w-5 h-5 animate-spin" /> : <Upload className="w-5 h-5" />}
-                  </button>
+                  <div className="flex gap-3">
+                    <div className="flex-1 relative" ref={importDropdownRef}>
+                      <button
+                        onClick={() => setShowImportSources(!showImportSources)}
+                        disabled={importing}
+                        className="w-full flex flex-col items-center gap-2 p-3 bg-gray-800/50 hover:bg-gray-800 rounded-lg transition-colors disabled:opacity-50"
+                      >
+                        <span className="text-2xl">{importing ? <Loader2 className="w-6 h-6 animate-spin" /> : '💬'}</span>
+                        <span className="text-xs text-gray-300">Conversations</span>
+                        <span className="text-xs text-gray-500">select source ▾</span>
+                      </button>
+                      {showImportSources && (
+                        <div className="absolute top-full left-0 right-0 mt-1 bg-gray-800 border border-gray-700 rounded-lg shadow-xl z-10 overflow-hidden">
+                          <button
+                            onClick={() => {
+                              setShowImportSources(false);
+                              handleImport();
+                            }}
+                            className="w-full flex items-center gap-3 px-4 py-3 hover:bg-gray-700 transition-colors text-left"
+                          >
+                            <span className="text-xl">🟠</span>
+                            <div>
+                              <div className="text-sm text-gray-200">Claude</div>
+                              <div className="text-xs text-gray-500">conversations.json</div>
+                            </div>
+                          </button>
+                          <div className="px-4 py-2 text-xs text-gray-600 border-t border-gray-700">
+                            More sources coming soon...
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                    <button
+                      onClick={handleImportMarkdown}
+                      disabled={importing}
+                      className="flex-1 flex flex-col items-center gap-2 p-3 bg-gray-800/50 hover:bg-gray-800 rounded-lg transition-colors disabled:opacity-50"
+                    >
+                      <span className="text-2xl">{importing ? <Loader2 className="w-6 h-6 animate-spin" /> : '📄'}</span>
+                      <span className="text-xs text-gray-300">Markdown</span>
+                      <span className="text-xs text-gray-500">.md</span>
+                    </button>
+                  </div>
                 </div>
 
                 {/* Quick Process prompt (after import) */}
@@ -1393,6 +1533,14 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   <span className="text-sm font-medium text-gray-200">Clear Hierarchy</span>
                   <span className="text-xs text-gray-500">Delete category nodes</span>
                 </button>
+
+                <button
+                  onClick={() => setConfirmAction('resetPrivacy')}
+                  className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
+                >
+                  <span className="text-sm font-medium text-gray-200">Reset Privacy Flags</span>
+                  <span className="text-xs text-gray-500">Re-scan with new settings</span>
+                </button>
               </div>
 
               {actionResult && (
@@ -1489,9 +1637,45 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   </div>
                 )}
 
-                {/* Scan Items */}
+                {/* Showcase Mode Toggle */}
                 <div className="bg-gray-900/50 rounded-lg p-4">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <div className="text-sm font-medium text-gray-200">Showcase Mode</div>
+                      <div className="text-xs text-gray-500 mt-1">
+                        Stricter filtering for demo databases — keeps only Mycelica, philosophy, and pure tech content
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => setShowcaseMode(!showcaseMode)}
+                      className={`relative w-12 h-6 rounded-full transition-colors ${
+                        showcaseMode ? 'bg-amber-500' : 'bg-gray-600'
+                      }`}
+                    >
+                      <div
+                        className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-all ${
+                          showcaseMode ? 'left-7' : 'left-1'
+                        }`}
+                      />
+                    </button>
+                  </div>
+                </div>
+
+                {/* Scan Buttons */}
+                <div className="bg-gray-900/50 rounded-lg p-4 space-y-3">
                   <div className="flex gap-2">
+                    <button
+                      onClick={handleCategoryScan}
+                      disabled={isScanning || !apiKeyStatus?.hasKey}
+                      className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-medium transition-colors disabled:opacity-50"
+                    >
+                      {isScanning ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Zap className="w-4 h-4" />
+                      )}
+                      Scan Categories
+                    </button>
                     <button
                       onClick={handlePrivacyScan}
                       disabled={isScanning || !apiKeyStatus?.hasKey || privacyStats?.unscanned === 0}
@@ -1502,7 +1686,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                       ) : (
                         <Shield className="w-4 h-4" />
                       )}
-                      {isScanning ? 'Scanning...' : 'Scan Items'}
+                      Scan Items
                     </button>
                     {isScanning && (
                       <button
@@ -1513,8 +1697,9 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                       </button>
                     )}
                   </div>
-                  <p className="mt-2 text-xs text-gray-500">
-                    Scans {privacyStats?.unscanned || 0} items. Categories inherit privacy from children (hidden when ALL children are private).
+                  <p className="text-xs text-gray-500">
+                    <strong className="text-amber-400">Categories</strong> = fast, filters by topic name (~{privacyStats?.totalCategories || 0} calls).
+                    <strong className="text-rose-400 ml-2">Items</strong> = thorough, scans content ({privacyStats?.unscanned || 0} remaining).
                   </p>
                 </div>
 

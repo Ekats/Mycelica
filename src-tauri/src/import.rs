@@ -197,6 +197,154 @@ pub fn import_claude_conversations(db: &Database, json_content: &str) -> Result<
     Ok(result)
 }
 
+/// Import markdown files as notes.
+///
+/// Each .md file becomes a note under "Recent Notes" container.
+/// Title is extracted from first # heading or filename.
+pub fn import_markdown_files(db: &Database, file_paths: &[String]) -> Result<ImportResult, String> {
+    use std::fs;
+    use std::path::Path;
+    use uuid::Uuid;
+
+    let mut result = ImportResult {
+        conversations_imported: 0,
+        exchanges_imported: 0,
+        skipped: 0,
+        errors: Vec::new(),
+    };
+
+    if file_paths.is_empty() {
+        return Ok(result);
+    }
+
+    let now = chrono::Utc::now().timestamp_millis();
+
+    // Ensure "Recent Notes" container exists
+    let container_id = crate::settings::RECENT_NOTES_CONTAINER_ID;
+    if db.get_node(container_id).ok().flatten().is_none() {
+        let container = Node {
+            id: container_id.to_string(),
+            node_type: NodeType::Cluster,
+            title: "Recent Notes".to_string(),
+            url: None,
+            content: None,
+            position: Position { x: 0.0, y: 0.0 },
+            created_at: now,
+            updated_at: now,
+            cluster_id: None,
+            cluster_label: Some("Recent Notes".to_string()),
+            depth: 1,
+            is_item: false,
+            is_universe: false,
+            parent_id: Some("universe".to_string()),
+            child_count: 0,
+            ai_title: None,
+            summary: None,
+            tags: None,
+            emoji: Some("📝".to_string()),
+            is_processed: true,
+            conversation_id: None,
+            sequence_index: None,
+            is_pinned: false,
+            last_accessed_at: None,
+            latest_child_date: None,
+            is_private: None,
+            privacy_reason: None,
+        };
+        if let Err(e) = db.insert_node(&container) {
+            result.errors.push(format!("Failed to create Recent Notes container: {}", e));
+        }
+    }
+
+    for file_path in file_paths {
+        let path = Path::new(file_path);
+
+        // Read file content
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                result.errors.push(format!("Failed to read {}: {}", file_path, e));
+                result.skipped += 1;
+                continue;
+            }
+        };
+
+        if content.trim().is_empty() {
+            result.skipped += 1;
+            continue;
+        }
+
+        // Extract title: first # heading or filename
+        let title = extract_markdown_title(&content)
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Untitled")
+                    .to_string()
+            });
+
+        let note_id = format!("note-{}", Uuid::new_v4());
+
+        let note = Node {
+            id: note_id.clone(),
+            node_type: NodeType::Thought,
+            title: title.clone(),
+            url: None,
+            content: Some(content),
+            position: Position { x: 0.0, y: 0.0 },
+            created_at: now,
+            updated_at: now,
+            cluster_id: None,
+            cluster_label: None,
+            depth: 2,
+            is_item: true,
+            is_universe: false,
+            parent_id: Some(container_id.to_string()),
+            child_count: 0,
+            ai_title: None,
+            summary: None,
+            tags: None,
+            emoji: Some("📄".to_string()),
+            is_processed: false,
+            conversation_id: None,
+            sequence_index: None,
+            is_pinned: false,
+            last_accessed_at: None,
+            latest_child_date: Some(now),
+            is_private: None,
+            privacy_reason: None,
+        };
+
+        if let Err(e) = db.insert_node(&note) {
+            result.errors.push(format!("Failed to import {}: {}", title, e));
+            result.skipped += 1;
+            continue;
+        }
+
+        result.exchanges_imported += 1; // Reusing this field for notes count
+    }
+
+    // Update container child count
+    if let Ok(Some(mut container)) = db.get_node(container_id) {
+        let children = db.get_children(container_id).unwrap_or_default();
+        container.child_count = children.len() as i32;
+        let _ = db.update_node(&container);
+    }
+
+    Ok(result)
+}
+
+/// Extract title from markdown: first # heading
+fn extract_markdown_title(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("# ") {
+            return Some(trimmed[2..].trim().to_string());
+        }
+    }
+    None
+}
+
 /// Paired exchange: human question + assistant response
 struct Exchange {
     title: String,

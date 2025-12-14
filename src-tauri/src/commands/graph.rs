@@ -684,6 +684,15 @@ pub fn import_claude_conversations(state: State<AppState>, json_content: String)
     import::import_claude_conversations(&state.db, &json_content)
 }
 
+/// Import markdown files as notes
+///
+/// Each .md file becomes a note under "Recent Notes" container.
+/// Title is extracted from first # heading or filename.
+#[tauri::command]
+pub fn import_markdown_files(state: State<AppState>, file_paths: Vec<String>) -> Result<import::ImportResult, String> {
+    import::import_markdown_files(&state.db, &file_paths)
+}
+
 // ==================== Quick Access Commands (Sidebar) ====================
 
 /// Pin or unpin a node for quick access
