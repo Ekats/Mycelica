@@ -2,6 +2,53 @@
 
 All notable changes to Mycelica will be documented in this file.
 
+## [0.5.0] - 2025-12-14
+
+### Settings Panel Redesign
+- Reorganized into 5 tabs: Setup, API Keys, Maintenance, Privacy, Info
+- Panel width increased for better readability
+- Tab navigation with icons and active indicator
+- All action buttons now use consistent compact row format with:
+  - Colored icon circle on left
+  - Description + API cost estimates in middle
+  - Large square emoji button on right (48×48px)
+
+### Maintenance Tab
+- Operations section: Full Rebuild, Flatten, Consolidate Root, Tidy Database
+- Each operation shows API call estimates and item counts
+- Combined "Danger Zone" section with Reset Flags
+- Reset buttons in 2×2 grid: Reset AI, Reset Clustering, Clear Embeddings, Clear Hierarchy
+- "Delete All Data" moved to bottom with subtle danger styling
+
+### Privacy Tab Improvements
+- Added description explaining privacy scanning functionality
+- Documents category inheritance behavior (hidden when ALL children private)
+- Instructions for adjusting sensitivity: edit `PRIVACY_PROMPT` in `src-tauri/src/commands/privacy.rs` (lines 15-45)
+- References lock button location for toggling private content visibility
+
+### Recent Notes Protection
+- New protection system for "Recent Notes" container and all descendants
+- Protected from: AI processing, clustering, hierarchy building, consolidate root, tidy operations
+- Toggle in Settings → Info tab: "Protect Recent Notes"
+- Defaults to enabled
+
+### Node Details Panel
+- Added privacy toggle button (Lock/LockOpen icons) next to pin button
+- Rose color when node is marked private
+- New `set_node_privacy` Tauri command for manual privacy control
+- Pin button now syncs with sidebar via Tauri events
+
+### Quick Notes
+- 📝 button in hamburger menu to add quick notes
+- Notes saved under "Recent Notes" container (auto-created if missing)
+- Modal with title and content fields
+- Notes automatically added to current view after creation
+
+### UI Polish
+- X button in sidebar Recent section always visible (was hover-only)
+- Pin and privacy buttons use consistent Lucide icons
+- Larger, square action buttons throughout Settings panel
+
 ## [0.4.0] - 2025-12-13
 
 ### Date-Based Coloring

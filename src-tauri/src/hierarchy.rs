@@ -203,8 +203,18 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
     // Step 1: Clean up old hierarchy completely
     cleanup_hierarchy(db)?;
 
-    // Step 2: Get all items
-    let items = db.get_items().map_err(|e| e.to_string())?;
+    // Step 2: Get all items (excluding protected)
+    let all_items = db.get_items().map_err(|e| e.to_string())?;
+    let protected_ids = db.get_protected_node_ids();
+    let items: Vec<Node> = all_items
+        .into_iter()
+        .filter(|item| !protected_ids.contains(&item.id))
+        .collect();
+
+    if !protected_ids.is_empty() {
+        println!("[Hierarchy] Excluding {} protected items (Recent Notes)", protected_ids.len());
+    }
+
     let item_count = items.len();
 
     println!("Building hierarchy for {} items", item_count);
@@ -708,8 +718,19 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 /// For large datasets (>200 children), splits into batches of 150, calls AI for each,
 /// then merges similar categories across batches to prevent fragmentation.
 pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option<&AppHandle>) -> Result<bool, String> {
-    // Get children of this parent
-    let children = db.get_children(parent_id).map_err(|e| e.to_string())?;
+    // Get children of this parent (excluding protected)
+    let all_children = db.get_children(parent_id).map_err(|e| e.to_string())?;
+    let all_children_count = all_children.len();
+    let protected_ids = db.get_protected_node_ids();
+    let children: Vec<Node> = all_children
+        .into_iter()
+        .filter(|child| !protected_ids.contains(&child.id))
+        .collect();
+
+    let excluded_count = all_children_count - children.len();
+    if excluded_count > 0 {
+        emit_log(app, "info", &format!("Excluding {} protected nodes (Recent Notes) from grouping", excluded_count));
+    }
 
     if children.len() <= MAX_CHILDREN_PER_LEVEL {
         emit_log(app, "info", &format!("Parent {} has {} children (≤{}), no grouping needed",

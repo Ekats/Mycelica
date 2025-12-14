@@ -167,6 +167,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       currentParentId: node.id,
       breadcrumbs: [...state.breadcrumbs, newBreadcrumb],
       visibleNodes: [],  // Will be loaded by the component
+      activeNodeId: null,  // Deselect when switching view
     };
   }),
 
@@ -190,6 +191,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       currentParentId: newParentId,
       breadcrumbs: newBreadcrumbs,
       visibleNodes: [],
+      activeNodeId: null,  // Deselect when switching view
     });
 
     return popped;
@@ -200,6 +202,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     currentParentId: null,
     breadcrumbs: [],
     visibleNodes: [],
+    activeNodeId: null,  // Deselect when switching view
   }),
 
   jumpToNode: (node, fromNode) => set((state) => {

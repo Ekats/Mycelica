@@ -5,7 +5,6 @@ import { readTextFile } from '@tauri-apps/plugin-fs';
 import {
   X,
   Key,
-  Database,
   RefreshCw,
   Trash2,
   Upload,
@@ -32,6 +31,11 @@ interface DbStats {
   totalItems: number;
   processedItems: number;
   itemsWithEmbeddings: number;
+  // For API cost estimation
+  unprocessedItems: number;
+  unclusteredItems: number;
+  orphanItems: number;
+  topicsCount: number;
 }
 
 interface ProcessingStats {
@@ -76,7 +80,12 @@ interface PrivacyStats {
   scannedCategories: number;
 }
 
+type SettingsTab = 'setup' | 'keys' | 'maintenance' | 'privacy' | 'info';
+
 export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelProps) {
+  // Active tab
+  const [activeTab, setActiveTab] = useState<SettingsTab>('setup');
+
   // API Keys
   const [apiKeyStatus, setApiKeyStatus] = useState<ApiKeyStatus | null>(null);
   const [apiKeyInput, setApiKeyInput] = useState('');
@@ -112,11 +121,29 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const [isTidying, setIsTidying] = useState(false);
   const [operationResult, setOperationResult] = useState<string | null>(null);
 
+  // Setup flow operations
+  const [isProcessingAi, setIsProcessingAi] = useState(false);
+  const [isClustering, setIsClustering] = useState(false);
+  const [isBuildingHierarchy, setIsBuildingHierarchy] = useState(false);
+  const [isUpdatingDates, setIsUpdatingDates] = useState(false);
+  const [isQuickAdding, setIsQuickAdding] = useState(false);
+  const [inboxCount, setInboxCount] = useState(0);
+  const [setupResult, setSetupResult] = useState<string | null>(null);
+
+  // Quick Process (post-import)
+  const [showQuickProcessPrompt, setShowQuickProcessPrompt] = useState(false);
+  const [newItemCount, setNewItemCount] = useState(0);
+  const [isQuickProcessing, setIsQuickProcessing] = useState(false);
+  const [quickProcessStep, setQuickProcessStep] = useState('');
+
   // Privacy scanning
   const [privacyStats, setPrivacyStats] = useState<PrivacyStats | null>(null);
   const [isScanning, setIsScanning] = useState(false);
   const [scanProgress, setScanProgress] = useState<{ current: number; total: number; status: string } | null>(null);
   const [privacyResult, setPrivacyResult] = useState<string | null>(null);
+
+  // Protection settings
+  const [protectRecentNotes, setProtectRecentNotes] = useState(true);
 
   // Load data on mount
   useEffect(() => {
@@ -127,6 +154,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
       loadDbPath();
       loadProcessingStats();
       loadPrivacyStats();
+      loadProtectionSettings();
       setImportResult(null);
       setActionResult(null);
       setPrivacyResult(null);
@@ -187,6 +215,24 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     }
   };
 
+  const loadProtectionSettings = async () => {
+    try {
+      const protected_ = await invoke<boolean>('get_protect_recent_notes');
+      setProtectRecentNotes(protected_);
+    } catch (err) {
+      console.error('Failed to load protection settings:', err);
+    }
+  };
+
+  const handleToggleProtectRecentNotes = async (enabled: boolean) => {
+    try {
+      await invoke('set_protect_recent_notes', { protected: enabled });
+      setProtectRecentNotes(enabled);
+    } catch (err) {
+      console.error('Failed to toggle protection:', err);
+    }
+  };
+
   // Format seconds to human readable
   const formatTime = (secs: number): string => {
     if (secs < 60) return `${Math.round(secs)}s`;
@@ -196,6 +242,24 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     const hours = Math.floor(mins / 60);
     const remainMins = mins % 60;
     return `${hours}h ${remainMins}m`;
+  };
+
+  // Estimate API cost (returns formatted string)
+  // Pricing: Haiku $1/$5 MTok, Sonnet $3/$15 MTok, OpenAI embed $0.02/MTok
+  const estimateCost = (calls: number, model: 'haiku' | 'sonnet' | 'openai', avgTokensPerCall: number = 2000): string => {
+    if (calls === 0) return '$0.00';
+    const totalTokens = calls * avgTokensPerCall;
+    let cost = 0;
+    if (model === 'haiku') {
+      // ~50% input, ~50% output tokens assumed
+      cost = (totalTokens * 0.5 / 1_000_000) * 1 + (totalTokens * 0.5 / 1_000_000) * 5;
+    } else if (model === 'sonnet') {
+      cost = (totalTokens * 0.5 / 1_000_000) * 3 + (totalTokens * 0.5 / 1_000_000) * 15;
+    } else {
+      cost = (totalTokens / 1_000_000) * 0.02;
+    }
+    if (cost < 0.01) return '<$0.01';
+    return `~$${cost.toFixed(2)}`;
   };
 
   // Database selector
@@ -272,6 +336,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const handleImport = async () => {
     setImporting(true);
     setImportResult(null);
+    setShowQuickProcessPrompt(false);
     try {
       const file = await openDialog({
         title: 'Select Claude conversations JSON',
@@ -283,14 +348,57 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
           'import_claude_conversations',
           { jsonContent: content }
         );
-        setImportResult(`Imported ${result.conversationsImported} conversations, ${result.exchangesImported} exchanges`);
         await loadDbStats();
         onDataChanged?.();
+
+        // Show Quick Process prompt if items were imported
+        if (result.conversationsImported > 0) {
+          setNewItemCount(result.conversationsImported);
+          setShowQuickProcessPrompt(true);
+          setImportResult(null); // Clear result, prompt will show instead
+        } else {
+          setImportResult(`No new conversations found`);
+        }
       }
     } catch (err) {
       setImportResult(`Error: ${err}`);
     } finally {
       setImporting(false);
+    }
+  };
+
+  const handleQuickProcess = async () => {
+    setIsQuickProcessing(true);
+    setQuickProcessStep('');
+    try {
+      // Step 1: Process AI (only unprocessed items)
+      setQuickProcessStep('Processing AI titles & summaries...');
+      await invoke('process_nodes');
+
+      // Step 2: Cluster (only unclustered items)
+      setQuickProcessStep('Clustering into topics...');
+      await invoke('run_clustering');
+
+      // Step 3: Quick Add to hierarchy
+      setQuickProcessStep('Adding to hierarchy...');
+      const result = await invoke<{
+        items_added: number;
+        topics_created: number;
+        inbox_count: number;
+      }>('quick_add_to_hierarchy');
+
+      setShowQuickProcessPrompt(false);
+      setInboxCount(result.inbox_count);
+      setImportResult(`Processed ${newItemCount} items → ${result.items_added} added, ${result.topics_created} new topics`);
+      await loadDbStats();
+      onDataChanged?.();
+      window.location.reload();
+    } catch (err) {
+      setImportResult(`Error: ${err}`);
+      setShowQuickProcessPrompt(false);
+    } finally {
+      setIsQuickProcessing(false);
+      setQuickProcessStep('');
     }
   };
 
@@ -360,6 +468,98 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
       setPrivacyResult(`Exported: ${path}`);
     } catch (err) {
       setPrivacyResult(`Error: ${err}`);
+    }
+  };
+
+  // Setup flow handlers
+  const handleProcessAi = async () => {
+    setIsProcessingAi(true);
+    setSetupResult(null);
+    try {
+      await invoke('run_ai_processing');
+      setSetupResult('AI processing complete');
+      await loadDbStats();
+      onDataChanged?.();
+      // Reload to show updated data
+      window.location.reload();
+    } catch (err) {
+      setSetupResult(`Error: ${err}`);
+      setIsProcessingAi(false);
+    }
+  };
+
+  const handleClustering = async () => {
+    setIsClustering(true);
+    setSetupResult(null);
+    try {
+      const result = await invoke<{ clusters_created: number; nodes_clustered: number }>('run_clustering');
+      setSetupResult(`Clustering complete: ${result.clusters_created} clusters, ${result.nodes_clustered} nodes`);
+      await loadDbStats();
+      onDataChanged?.();
+      window.location.reload();
+    } catch (err) {
+      setSetupResult(`Error: ${err}`);
+      setIsClustering(false);
+    }
+  };
+
+  const handleBuildHierarchy = async () => {
+    setIsBuildingHierarchy(true);
+    setSetupResult(null);
+    try {
+      const result = await invoke<{
+        clusteringResult: { itemsProcessed: number; clustersCreated: number; itemsAssigned: number } | null;
+        hierarchyResult: { levelsCreated: number; intermediateNodesCreated: number; itemsOrganized: number; maxDepth: number };
+        levelsCreated: number;
+        groupingIterations: number;
+      }>('build_full_hierarchy', { runClustering: false });
+      setSetupResult(`Hierarchy built: ${result.levelsCreated} levels, ${result.groupingIterations} AI grouping iterations`);
+      await loadDbStats();
+      onDataChanged?.();
+      window.location.reload();
+    } catch (err) {
+      setSetupResult(`Error: ${err}`);
+      setIsBuildingHierarchy(false);
+    }
+  };
+
+  const handleUpdateDates = async () => {
+    setIsUpdatingDates(true);
+    setSetupResult(null);
+    try {
+      await invoke('propagate_latest_dates');
+      setSetupResult('Dates updated');
+      await loadDbStats();
+      onDataChanged?.();
+      window.location.reload();
+    } catch (err) {
+      setSetupResult(`Error: ${err}`);
+      setIsUpdatingDates(false);
+    }
+  };
+
+  const handleQuickAdd = async () => {
+    setIsQuickAdding(true);
+    setSetupResult(null);
+    try {
+      const result = await invoke<{
+        items_added: number;
+        topics_created: number;
+        items_skipped: number;
+        inbox_count: number;
+      }>('quick_add_to_hierarchy');
+      setInboxCount(result.inbox_count);
+      if (result.items_added === 0 && result.topics_created === 0) {
+        setSetupResult('No orphan items to add');
+      } else {
+        setSetupResult(`Added ${result.items_added} items, created ${result.topics_created} topics`);
+      }
+      await loadDbStats();
+      onDataChanged?.();
+      window.location.reload();
+    } catch (err) {
+      setSetupResult(`Error: ${err}`);
+      setIsQuickAdding(false);
     }
   };
 
@@ -531,7 +731,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
         />
 
         {/* Panel */}
-        <div className="relative bg-gray-800 rounded-xl border border-gray-700 shadow-2xl max-w-xl w-full mx-4 max-h-[85vh] overflow-hidden flex flex-col">
+        <div className="relative bg-gray-800 rounded-xl border border-gray-700 shadow-2xl max-w-2xl w-full mx-4 max-h-[85vh] overflow-hidden flex flex-col">
           {/* Header */}
           <div className="flex items-center justify-between px-6 py-4 border-b border-gray-700">
             <h2 className="text-xl font-semibold text-white">Settings</h2>
@@ -543,9 +743,37 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
             </button>
           </div>
 
+          {/* Tab Navigation */}
+          <div className="flex border-b border-gray-700 px-4">
+            {[
+              { id: 'setup' as const, label: 'Setup', icon: '🚀' },
+              { id: 'keys' as const, label: 'API Keys', icon: '🔑' },
+              { id: 'maintenance' as const, label: 'Maintenance', icon: '🔧' },
+              { id: 'privacy' as const, label: 'Privacy', icon: '🔒' },
+              { id: 'info' as const, label: 'Info', icon: 'ℹ️' },
+            ].map((tab) => (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className={`px-4 py-2.5 text-sm font-medium transition-colors relative ${
+                  activeTab === tab.id
+                    ? 'text-amber-400'
+                    : 'text-gray-400 hover:text-gray-200'
+                }`}
+              >
+                <span className="mr-1.5">{tab.icon}</span>
+                {tab.label}
+                {activeTab === tab.id && (
+                  <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-amber-400" />
+                )}
+              </button>
+            ))}
+          </div>
+
           {/* Content */}
           <div className="flex-1 overflow-y-auto p-6 space-y-6">
-            {/* Database Section */}
+            {/* INFO TAB - Database Section */}
+            {activeTab === 'info' && (
             <section>
               <div className="flex items-center gap-2 mb-4">
                 <HardDrive className="w-5 h-5 text-green-400" />
@@ -562,7 +790,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                     className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {switchingDb ? (
-                      <Loader2 className="w-3 h-3 animate-spin" />
+                      <Loader2 className="w-5 h-5 animate-spin" />
                     ) : (
                       <FolderOpen className="w-3 h-3" />
                     )}
@@ -666,9 +894,245 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   </div>
                 </div>
               )}
-            </section>
 
-            {/* API Keys Section */}
+              {/* Protection Settings */}
+              <div className="bg-gray-900/50 rounded-lg p-4 mt-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-sm font-medium text-gray-200">Protect Recent Notes</div>
+                    <div className="text-xs text-gray-500 mt-0.5">Exclude from AI, clustering, hierarchy, and tidy operations</div>
+                  </div>
+                  <button
+                    onClick={() => handleToggleProtectRecentNotes(!protectRecentNotes)}
+                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                      protectRecentNotes ? 'bg-amber-500' : 'bg-gray-600'
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                        protectRecentNotes ? 'translate-x-6' : 'translate-x-1'
+                      }`}
+                    />
+                  </button>
+                </div>
+              </div>
+            </section>
+            )}
+
+            {/* SETUP TAB - Setup Flow Section */}
+            {activeTab === 'setup' && (
+            <section>
+              <div className="flex items-center gap-2 mb-4">
+                <Zap className="w-5 h-5 text-amber-400" />
+                <h3 className="text-lg font-medium text-white">Setup Flow</h3>
+                <span className="text-xs text-gray-500">(follow in order)</span>
+              </div>
+
+              <div className="space-y-2">
+                {/* Step 1: Import */}
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-blue-600 flex items-center justify-center text-white text-sm font-bold">1</span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Import Data</div>
+                    <div className="text-xs text-gray-500">Load conversations.json from Claude</div>
+                    <div className="text-xs text-gray-600 mt-0.5">No API calls</div>
+                  </div>
+                  <button
+                    onClick={handleImport}
+                    disabled={importing}
+                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-blue-600 hover:bg-blue-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                  >
+                    {importing ? <Loader2 className="w-5 h-5 animate-spin" /> : <Upload className="w-5 h-5" />}
+                  </button>
+                </div>
+
+                {/* Quick Process prompt (after import) */}
+                {showQuickProcessPrompt && (
+                  <div className="bg-blue-900/30 border border-blue-500/50 rounded-lg p-4">
+                    <div className="flex items-start gap-3">
+                      <span className="text-2xl">📥</span>
+                      <div className="flex-1">
+                        <div className="text-sm font-medium text-blue-200">
+                          Imported {newItemCount} new conversation{newItemCount !== 1 ? 's' : ''}
+                        </div>
+                        <div className="text-xs text-gray-400 mt-1">
+                          Process them now? (AI titles → Cluster → Add to hierarchy)
+                        </div>
+                        {isQuickProcessing && (
+                          <div className="text-xs text-amber-400 mt-2 flex items-center gap-2">
+                            <Loader2 className="w-5 h-5 animate-spin" />
+                            {quickProcessStep}
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => setShowQuickProcessPrompt(false)}
+                          disabled={isQuickProcessing}
+                          className="px-3 py-1.5 text-gray-400 hover:text-white text-xs disabled:opacity-50"
+                        >
+                          Later
+                        </button>
+                        <button
+                          onClick={handleQuickProcess}
+                          disabled={isQuickProcessing || !apiKeyStatus?.hasKey}
+                          className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-xs font-medium disabled:opacity-50"
+                        >
+                          {isQuickProcessing ? 'Processing...' : 'Quick Process'}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Step 2: Process AI */}
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-purple-600 flex items-center justify-center text-white text-sm font-bold">2</span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Process AI</div>
+                    <div className="text-xs text-gray-500">Generate titles, summaries & embeddings</div>
+                    {dbStats && dbStats.unprocessedItems > 0 && (
+                      <div className="text-xs text-amber-400/80 mt-0.5">
+                        {dbStats.unprocessedItems} calls · Haiku {estimateCost(dbStats.unprocessedItems, 'haiku', 3500)}
+                        {openaiKeyStatus && ` + OpenAI ${estimateCost(dbStats.unprocessedItems, 'openai', 1500)}`}
+                      </div>
+                    )}
+                    {dbStats && dbStats.unprocessedItems === 0 && (
+                      <div className="text-xs text-green-500/70 mt-0.5">All items processed</div>
+                    )}
+                  </div>
+                  <button
+                    onClick={handleProcessAi}
+                    disabled={isProcessingAi || !apiKeyStatus?.hasKey}
+                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-purple-600 hover:bg-purple-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                  >
+                    {isProcessingAi ? <Loader2 className="w-5 h-5 animate-spin" /> : '🤖'}
+                  </button>
+                </div>
+
+                {/* Step 3: Cluster */}
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-amber-600 flex items-center justify-center text-white text-sm font-bold">3</span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Cluster</div>
+                    <div className="text-xs text-gray-500">Assign items to topic clusters</div>
+                    {dbStats && dbStats.unclusteredItems > 0 && (
+                      <div className="text-xs text-amber-400/80 mt-0.5">
+                        {Math.ceil(dbStats.unclusteredItems / 20)} calls · Haiku {estimateCost(Math.ceil(dbStats.unclusteredItems / 20), 'haiku', 4000)}
+                        <span className="text-gray-500 ml-1">({dbStats.unclusteredItems} items)</span>
+                      </div>
+                    )}
+                    {dbStats && dbStats.unclusteredItems === 0 && (
+                      <div className="text-xs text-green-500/70 mt-0.5">All items clustered</div>
+                    )}
+                  </div>
+                  <button
+                    onClick={handleClustering}
+                    disabled={isClustering || !apiKeyStatus?.hasKey}
+                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-amber-600 hover:bg-amber-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                  >
+                    {isClustering ? <Loader2 className="w-5 h-5 animate-spin" /> : '🎯'}
+                  </button>
+                </div>
+
+                {/* Step 4: Build Hierarchy */}
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-green-600 flex items-center justify-center text-white text-sm font-bold">4</span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Build Hierarchy</div>
+                    <div className="text-xs text-gray-500">Create navigation structure + group embeddings</div>
+                    {dbStats && dbStats.topicsCount > 15 && (
+                      <div className="text-xs text-amber-400/80 mt-0.5">
+                        ~{Math.ceil(Math.log(dbStats.topicsCount / 10) / Math.log(10) * 3)} calls · Sonnet {estimateCost(Math.ceil(Math.log(dbStats.topicsCount / 10) / Math.log(10) * 3), 'sonnet', 5000)}
+                        {openaiKeyStatus && ` + OpenAI ${estimateCost(Math.ceil(dbStats.topicsCount / 8), 'openai', 500)}`}
+                        <span className="text-gray-500 ml-1">({dbStats.topicsCount} topics)</span>
+                      </div>
+                    )}
+                    {dbStats && dbStats.topicsCount <= 15 && dbStats.topicsCount > 0 && (
+                      <div className="text-xs text-green-500/70 mt-0.5">
+                        1 call · Sonnet {estimateCost(1, 'sonnet', 5000)}
+                        {openaiKeyStatus && ` + OpenAI ${estimateCost(dbStats.topicsCount, 'openai', 500)}`}
+                      </div>
+                    )}
+                    {dbStats && dbStats.topicsCount === 0 && (
+                      <div className="text-xs text-gray-500 mt-0.5">Run Cluster first</div>
+                    )}
+                  </div>
+                  <button
+                    onClick={handleBuildHierarchy}
+                    disabled={isBuildingHierarchy || !apiKeyStatus?.hasKey}
+                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-green-600 hover:bg-green-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                  >
+                    {isBuildingHierarchy ? <Loader2 className="w-5 h-5 animate-spin" /> : '🏗️'}
+                  </button>
+                </div>
+
+                {/* Step 5: Update Dates (optional) */}
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-cyan-600 flex items-center justify-center text-white text-sm font-bold">5</span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Update Dates <span className="text-gray-500">(optional)</span></div>
+                    <div className="text-xs text-gray-500">Propagate dates to groups (fast)</div>
+                    <div className="text-xs text-gray-600 mt-0.5">No API calls</div>
+                  </div>
+                  <button
+                    onClick={handleUpdateDates}
+                    disabled={isUpdatingDates}
+                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-cyan-600 hover:bg-cyan-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                  >
+                    {isUpdatingDates ? <Loader2 className="w-5 h-5 animate-spin" /> : '📅'}
+                  </button>
+                </div>
+
+                {/* Step 6: Quick Add (for incremental imports) */}
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-indigo-600 flex items-center justify-center text-white text-sm font-bold">6</span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Quick Add <span className="text-gray-500">(incremental)</span></div>
+                    <div className="text-xs text-gray-500">Fast add new items to hierarchy (~2s)</div>
+                    <div className="text-xs text-gray-600 mt-0.5">
+                      No API calls
+                      {dbStats && dbStats.orphanItems > 0 && (
+                        <span className="text-amber-400/80 ml-1">· {dbStats.orphanItems} items to add</span>
+                      )}
+                    </div>
+                  </div>
+                  <button
+                    onClick={handleQuickAdd}
+                    disabled={isQuickAdding}
+                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-indigo-600 hover:bg-indigo-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                  >
+                    {isQuickAdding ? <Loader2 className="w-5 h-5 animate-spin" /> : '⚡'}
+                  </button>
+                </div>
+
+                {/* Inbox warning */}
+                {inboxCount > 20 && (
+                  <div className="bg-amber-900/30 border border-amber-600/50 rounded-lg p-3 flex items-start gap-2">
+                    <AlertCircle className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
+                    <div className="text-xs text-amber-200">
+                      <strong>📥 Inbox has {inboxCount} items.</strong> Consider running "Build Hierarchy" (Step 4) to properly organize new topics.
+                    </div>
+                  </div>
+                )}
+
+                {setupResult && (
+                  <p className={`text-xs mt-2 ${setupResult.startsWith('Error') ? 'text-red-400' : 'text-green-400'}`}>
+                    {setupResult}
+                  </p>
+                )}
+
+                {importResult && (
+                  <p className={`text-xs ${importResult.startsWith('Error') ? 'text-red-400' : 'text-green-400'}`}>
+                    {importResult}
+                  </p>
+                )}
+              </div>
+            </section>
+            )}
+
+            {/* KEYS TAB - API Keys Section */}
+            {activeTab === 'keys' && (
             <section>
               <div className="flex items-center gap-2 mb-4">
                 <Key className="w-5 h-5 text-amber-400" />
@@ -780,89 +1244,108 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                 </p>
               </div>
             </section>
+            )}
 
-            {/* Operations Section */}
+            {/* MAINTENANCE TAB - Operations, Reset Flags, Danger Zone */}
+            {activeTab === 'maintenance' && (
+            <>
             <section>
               <div className="flex items-center gap-2 mb-4">
                 <RefreshCw className="w-5 h-5 text-green-400" />
                 <h3 className="text-lg font-medium text-white">Operations</h3>
               </div>
 
-              <div className="space-y-3">
+              <div className="space-y-2">
                 {/* Full Rebuild */}
-                <div className="bg-gray-900/50 rounded-lg p-4">
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-green-600 flex items-center justify-center text-white text-sm">
+                    <RefreshCw className="w-3.5 h-3.5" />
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Full Rebuild</div>
+                    <div className="text-xs text-gray-500">Clustering + hierarchy. Replaces all organization.</div>
+                    {dbStats && (dbStats.unclusteredItems > 0 || dbStats.topicsCount > 0) && (
+                      <div className="text-xs text-amber-400/80 mt-0.5">
+                        {dbStats.unclusteredItems > 0 && (
+                          <>{Math.ceil(dbStats.unclusteredItems / 20)} cluster calls · Haiku {estimateCost(Math.ceil(dbStats.unclusteredItems / 20), 'haiku', 4000)}</>
+                        )}
+                        {dbStats.unclusteredItems > 0 && dbStats.topicsCount > 15 && ' + '}
+                        {dbStats.topicsCount > 15 && (
+                          <>~{Math.ceil(Math.log(dbStats.topicsCount / 10) / Math.log(10) * 3)} hierarchy calls · Sonnet {estimateCost(Math.ceil(Math.log(dbStats.topicsCount / 10) / Math.log(10) * 3), 'sonnet', 5000)}</>
+                        )}
+                        <span className="text-gray-500 ml-1">({dbStats.totalItems} items, {dbStats.topicsCount} topics)</span>
+                      </div>
+                    )}
+                    {dbStats && dbStats.unclusteredItems === 0 && dbStats.topicsCount <= 15 && (
+                      <div className="text-xs text-green-500/70 mt-0.5">All items organized</div>
+                    )}
+                  </div>
                   <button
                     onClick={() => setConfirmAction('fullRebuild')}
                     disabled={isFullRebuilding || isFlattening || isConsolidating || isTidying}
-                    className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium transition-colors disabled:opacity-50"
+                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-green-600 hover:bg-green-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
-                    {isFullRebuilding ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <RefreshCw className="w-4 h-4" />
-                    )}
-                    {isFullRebuilding ? 'Rebuilding...' : 'Full Rebuild'}
+                    {isFullRebuilding ? <Loader2 className="w-5 h-5 animate-spin" /> : '🔄'}
                   </button>
-                  <p className="mt-2 text-xs text-gray-500">
-                    Runs clustering + hierarchy building. Replaces all organization.
-                  </p>
                 </div>
 
                 {/* Flatten Hierarchy */}
-                <div className="bg-gray-900/50 rounded-lg p-4">
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-amber-600 flex items-center justify-center text-white text-sm">
+                    <Zap className="w-3.5 h-3.5" />
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Flatten Empty Levels</div>
+                    <div className="text-xs text-gray-500">Remove passthrough "Uncategorized" nodes</div>
+                    <div className="text-xs text-gray-600 mt-0.5">No API calls · Fast local operation</div>
+                  </div>
                   <button
                     onClick={() => setConfirmAction('flattenHierarchy')}
                     disabled={isFlattening || isFullRebuilding || isConsolidating || isTidying}
-                    className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-medium transition-colors disabled:opacity-50"
+                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-amber-600 hover:bg-amber-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
-                    {isFlattening ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <Zap className="w-4 h-4" />
-                    )}
-                    {isFlattening ? 'Flattening...' : 'Flatten Empty Levels'}
+                    {isFlattening ? <Loader2 className="w-5 h-5 animate-spin" /> : '⚡'}
                   </button>
-                  <p className="mt-2 text-xs text-gray-500">
-                    Removes passthrough "Uncategorized" nodes and cleans up hierarchy.
-                  </p>
                 </div>
 
                 {/* Consolidate Root */}
-                <div className="bg-gray-900/50 rounded-lg p-4">
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-purple-600 flex items-center justify-center text-white text-sm">
+                    <Zap className="w-3.5 h-3.5" />
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Consolidate Root</div>
+                    <div className="text-xs text-gray-500">Group into 4-8 uber-categories (TECH, LIFE, etc.)</div>
+                    <div className="text-xs text-amber-400/80 mt-0.5">
+                      1 call · Sonnet {estimateCost(1, 'sonnet', 5000)}
+                    </div>
+                  </div>
                   <button
                     onClick={() => setConfirmAction('consolidateRoot')}
                     disabled={isConsolidating || isFullRebuilding || isFlattening || isTidying}
-                    className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium transition-colors disabled:opacity-50"
+                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-purple-600 hover:bg-purple-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
-                    {isConsolidating ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <Zap className="w-4 h-4" />
-                    )}
-                    {isConsolidating ? 'Consolidating...' : 'Consolidate Root'}
+                    {isConsolidating ? <Loader2 className="w-5 h-5 animate-spin" /> : '🏛️'}
                   </button>
-                  <p className="mt-2 text-xs text-gray-500">
-                    Groups Universe's children into 4-8 uber-categories (TECH, LIFE, MIND, etc.)
-                  </p>
                 </div>
 
                 {/* Tidy Database */}
-                <div className="bg-gray-900/50 rounded-lg p-4">
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-cyan-600 flex items-center justify-center text-white text-sm">
+                    <Zap className="w-3.5 h-3.5" />
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Tidy Database</div>
+                    <div className="text-xs text-gray-500">Fix counts/depths, remove empties, flatten chains, prune edges</div>
+                    <div className="text-xs text-gray-600 mt-0.5">No API calls · Fast local operation</div>
+                  </div>
                   <button
                     onClick={() => setConfirmAction('tidyDatabase')}
                     disabled={isTidying || isFullRebuilding || isFlattening || isConsolidating}
-                    className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-cyan-600 hover:bg-cyan-700 text-white rounded-lg font-medium transition-colors disabled:opacity-50"
+                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-cyan-600 hover:bg-cyan-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
-                    {isTidying ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <Zap className="w-4 h-4" />
-                    )}
-                    {isTidying ? 'Tidying...' : 'Tidy Database'}
+                    {isTidying ? <Loader2 className="w-5 h-5 animate-spin" /> : '🧹'}
                   </button>
-                  <p className="mt-2 text-xs text-gray-500">
-                    Fast cleanup: fix counts/depths, remove empties, flatten chains, prune edges.
-                  </p>
                 </div>
 
                 {operationResult && (
@@ -871,18 +1354,95 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
               </div>
             </section>
 
-            {/* Privacy Section */}
+            {/* Danger Zone Section */}
+            <section>
+              <div className="flex items-center gap-2 mb-4">
+                <Trash2 className="w-5 h-5 text-red-400" />
+                <h3 className="text-lg font-medium text-white">Danger Zone</h3>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <button
+                  onClick={() => setConfirmAction('resetAi')}
+                  className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
+                >
+                  <span className="text-sm font-medium text-gray-200">Reset AI Processing</span>
+                  <span className="text-xs text-gray-500">Re-run title/summary generation</span>
+                </button>
+
+                <button
+                  onClick={() => setConfirmAction('resetClustering')}
+                  className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
+                >
+                  <span className="text-sm font-medium text-gray-200">Reset Clustering</span>
+                  <span className="text-xs text-gray-500">Re-assign topics</span>
+                </button>
+
+                <button
+                  onClick={() => setConfirmAction('clearEmbeddings')}
+                  className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
+                >
+                  <span className="text-sm font-medium text-gray-200">Clear Embeddings</span>
+                  <span className="text-xs text-gray-500">Re-generate semantic vectors</span>
+                </button>
+
+                <button
+                  onClick={() => setConfirmAction('clearHierarchy')}
+                  className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
+                >
+                  <span className="text-sm font-medium text-gray-200">Clear Hierarchy</span>
+                  <span className="text-xs text-gray-500">Delete category nodes</span>
+                </button>
+              </div>
+
+              {actionResult && (
+                <p className={`mt-3 text-sm text-center ${actionResult.startsWith('Error') ? 'text-red-400' : 'text-green-400'}`}>
+                  {actionResult}
+                </p>
+              )}
+
+              {/* Delete All Data - at the very bottom */}
+              <div className="mt-6 pt-4 border-t border-gray-700/50">
+                <button
+                  onClick={() => setConfirmAction('deleteAll')}
+                  className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-red-600/20 hover:bg-red-600 text-red-400 hover:text-white rounded-lg font-medium transition-colors border border-red-600/30 hover:border-red-600"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  Delete All Data
+                </button>
+                <p className="mt-2 text-xs text-gray-500 text-center">
+                  Permanently delete all nodes and edges. Cannot be undone.
+                </p>
+              </div>
+            </section>
+            </>
+            )}
+
+            {/* PRIVACY TAB */}
+            {activeTab === 'privacy' && (
             <section>
               <div className="flex items-center gap-2 mb-4">
                 <Shield className="w-5 h-5 text-rose-400" />
                 <h3 className="text-lg font-medium text-white">Privacy Filter</h3>
               </div>
 
+              {/* Description */}
+              <div className="bg-gray-900/50 rounded-lg p-4 mb-4 text-sm text-gray-400 space-y-2">
+                <p>
+                  Uses AI to scan your items for sensitive content (personal info, credentials, private conversations, etc.) and marks them as <span className="text-rose-400">private</span> or <span className="text-green-400">safe</span>.
+                </p>
+                <p className="text-xs text-gray-500">
+                  <strong className="text-gray-400">How it works:</strong> Categories automatically inherit privacy status — a category is hidden only when <em>all</em> its children are private. Use the 🔒 lock button in the top-right menu to toggle private content visibility. Export creates a shareable database with private items removed.
+                </p>
+                <p className="text-xs text-gray-500">
+                  <strong className="text-gray-400">Adjusting sensitivity:</strong> Edit the <code className="text-gray-400 bg-gray-800 px-1 rounded">PRIVACY_PROMPT</code> in <code className="text-gray-400 bg-gray-800 px-1 rounded">src-tauri/src/commands/privacy.rs</code> (lines 15-45) to customize what's considered private. Add/remove categories, change "when uncertain" behavior, or adjust examples.
+                </p>
+              </div>
+
               <div className="space-y-3">
                 {/* Privacy Stats */}
                 {privacyStats && (
                   <div className="bg-gray-900/50 rounded-lg p-4 text-sm">
-                    {/* Item stats */}
                     <div className="grid grid-cols-2 gap-4">
                       <div>
                         <span className="text-gray-400">Total Items:</span>
@@ -980,103 +1540,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                 )}
               </div>
             </section>
-
-            {/* Data Section */}
-            <section>
-              <div className="flex items-center gap-2 mb-4">
-                <Database className="w-5 h-5 text-blue-400" />
-                <h3 className="text-lg font-medium text-white">Data</h3>
-              </div>
-
-              <div className="space-y-3">
-                {/* Import */}
-                <div className="bg-gray-900/50 rounded-lg p-4">
-                  <button
-                    onClick={handleImport}
-                    disabled={importing}
-                    className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors disabled:opacity-50"
-                  >
-                    {importing ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <Upload className="w-4 h-4" />
-                    )}
-                    Import Claude Conversations
-                  </button>
-                  <p className="mt-2 text-xs text-gray-500">
-                    Select a <code className="bg-gray-800 px-1 rounded">conversations.json</code> file exported from Claude.
-                    Duplicates will be skipped automatically.
-                  </p>
-                  {importResult && (
-                    <p className={`mt-2 text-xs ${importResult.startsWith('Error') ? 'text-red-400' : 'text-green-400'}`}>
-                      {importResult}
-                    </p>
-                  )}
-                </div>
-
-                {/* Delete All */}
-                <div className="bg-gray-900/50 rounded-lg p-4">
-                  <button
-                    onClick={() => setConfirmAction('deleteAll')}
-                    className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition-colors"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                    Delete All Data
-                  </button>
-                  <p className="mt-2 text-xs text-gray-500">
-                    Permanently delete all nodes and edges. Cannot be undone.
-                  </p>
-                </div>
-              </div>
-            </section>
-
-            {/* Reset Flags Section */}
-            <section>
-              <div className="flex items-center gap-2 mb-4">
-                <RefreshCw className="w-5 h-5 text-purple-400" />
-                <h3 className="text-lg font-medium text-white">Reset Flags</h3>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <button
-                  onClick={() => setConfirmAction('resetAi')}
-                  className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
-                >
-                  <span className="text-sm font-medium text-gray-200">Reset AI Processing</span>
-                  <span className="text-xs text-gray-500">Re-run title/summary generation</span>
-                </button>
-
-                <button
-                  onClick={() => setConfirmAction('resetClustering')}
-                  className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
-                >
-                  <span className="text-sm font-medium text-gray-200">Reset Clustering</span>
-                  <span className="text-xs text-gray-500">Re-assign topics</span>
-                </button>
-
-                <button
-                  onClick={() => setConfirmAction('clearEmbeddings')}
-                  className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
-                >
-                  <span className="text-sm font-medium text-gray-200">Clear Embeddings</span>
-                  <span className="text-xs text-gray-500">Re-generate semantic vectors</span>
-                </button>
-
-                <button
-                  onClick={() => setConfirmAction('clearHierarchy')}
-                  className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
-                >
-                  <span className="text-sm font-medium text-gray-200">Clear Hierarchy</span>
-                  <span className="text-xs text-gray-500">Delete category nodes</span>
-                </button>
-              </div>
-
-              {actionResult && (
-                <p className={`mt-3 text-sm text-center ${actionResult.startsWith('Error') ? 'text-red-400' : 'text-green-400'}`}>
-                  {actionResult}
-                </p>
-              )}
-            </section>
+            )}
           </div>
         </div>
       </div>

@@ -1,7 +1,7 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
 import * as d3 from 'd3';
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { listen, emit } from '@tauri-apps/api/event';
 import { useGraphStore } from '../../stores/graphStore';
 import type { Node } from '../../types/graph';
 import { getEmojiForNode, initLearnedMappings } from '../../utils/emojiMatcher';
@@ -9,7 +9,7 @@ import { ChevronRight, AlertTriangle, X } from 'lucide-react';
 import { SimilarNodesPanel, SimilarNodesLoading } from './SimilarNodesPanel';
 
 // Confirmation dialog types
-type ConfirmAction = 'processAi' | 'cluster' | 'buildHierarchy' | null;
+type ConfirmAction = 'deleteNode' | null;
 
 interface ConfirmConfig {
   title: string;
@@ -154,6 +154,8 @@ export function Graph({ width, height }: GraphProps) {
   const clickHandledRef = useRef(false);
   // Ref to track last click time (to avoid deselecting during double-click)
   const lastClickTimeRef = useRef(0);
+  // Ref to track pending fetch timeout (to cancel on double-click navigation)
+  const pendingFetchRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const {
     nodes,
     edges,
@@ -170,22 +172,33 @@ export function Graph({ width, height }: GraphProps) {
     setCurrentDepth,
     setMaxDepth,
     openLeaf,
+    addNode,
+    updateNode,
+    removeNode,
   } = useGraphStore();
   const [hoveredNode, setHoveredNode] = useState<GraphNode | null>(null);
   const [zoomLevel, setZoomLevel] = useState(1);
   const [devLogs, setDevLogs] = useState<DevConsoleLog[]>([]);
-  const [showDevConsole, setShowDevConsole] = useState(true);
+  const [showDevConsole, setShowDevConsole] = useState(false);
   const [showPanels, setShowPanels] = useState(true); // Hamburger menu toggle for all panels
   const [showDetails, setShowDetails] = useState(true); // Toggle for details panel
   const [hidePrivate, setHidePrivate] = useState(false); // Privacy filter toggle
-  const [isClustering, setIsClustering] = useState(false);
+  const [showNoteModal, setShowNoteModal] = useState(false);
+  const [noteTitle, setNoteTitle] = useState('');
+  const [noteContent, setNoteContent] = useState('');
+  const [nodeMenuId, setNodeMenuId] = useState<string | null>(null); // Which node's menu is open
+  const [nodeMenuPos, setNodeMenuPos] = useState<{ x: number; y: number } | null>(null);
+  const [nodeToDelete, setNodeToDelete] = useState<string | null>(null); // Node pending deletion
+  // Workflow states (used for auto-build and internal functions)
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isClustering, setIsClustering] = useState(false);
   const [isBuildingHierarchy, setIsBuildingHierarchy] = useState(false);
   const [isUpdatingDates, setIsUpdatingDates] = useState(false);
+  const [isFullRebuilding, setIsFullRebuilding] = useState(false);
   const [rebuildQueued, setRebuildQueued] = useState(false);
-  const rebuildQueuedRef = useRef(false);
   const [cancelRequested, setCancelRequested] = useState<'ai' | 'rebuild' | null>(null);
-  const fullRebuildRef = useRef<() => Promise<void>>();
+  const rebuildQueuedRef = useRef(false);
+  const fullRebuildRef = useRef<(() => Promise<void>) | undefined>(undefined);
   const processingStartTimeRef = useRef<number>(0);
   const rebuildStartTimeRef = useRef<number>(0);
   const [autoScroll, setAutoScroll] = useState(true);
@@ -202,8 +215,9 @@ export function Graph({ width, height }: GraphProps) {
     stackNodesRef.current = value;
     setStackNodesState(value);
   };
-  const [detailsPanelSize, setDetailsPanelSize] = useState({ width: 400, height: 400 });
+  const [detailsPanelSize, setDetailsPanelSize] = useState({ width: 400, height: 800 });
   const [isResizingDetails, setIsResizingDetails] = useState(false);
+  const [pinnedIds, setPinnedIds] = useState<Set<string>>(new Set());
   // Zen mode removed - hover/selection now handles connection highlighting
   // const [zenModeNodeId, setZenModeNodeId] = useState<string | null>(null);
   // const zenModeNodeIdRef = useRef<string | null>(null);
@@ -222,23 +236,11 @@ export function Graph({ width, height }: GraphProps) {
 
   // Confirmation dialog configs
   const confirmConfigs: Record<NonNullable<ConfirmAction>, ConfirmConfig> = {
-    processAi: {
-      title: 'Process AI',
-      message: 'This will use AI to generate titles, summaries, and embeddings for all unprocessed items. This can take a long time for large databases and uses API credits.',
-      confirmText: 'Start Processing',
-      variant: 'warning',
-    },
-    cluster: {
-      title: 'Cluster Items',
-      message: 'This will assign all items to topic clusters using AI. Existing cluster assignments will be replaced. This uses API credits.',
-      confirmText: 'Run Clustering',
-      variant: 'warning',
-    },
-    buildHierarchy: {
-      title: 'Build Hierarchy',
-      message: 'This will rebuild the navigation structure (Universe → Topics → Items). All intermediate levels will be recreated. This uses API credits for grouping.',
-      confirmText: 'Build Hierarchy',
-      variant: 'warning',
+    deleteNode: {
+      title: 'Delete Item',
+      message: 'Are you sure you want to delete this item? This cannot be undone.',
+      confirmText: 'Delete',
+      variant: 'danger',
     },
   };
 
@@ -246,14 +248,42 @@ export function Graph({ width, height }: GraphProps) {
     const action = confirmAction;
     setConfirmAction(null);
 
-    if (action === 'processAi') {
-      runProcessing();
-    } else if (action === 'cluster') {
-      runClustering();
-    } else if (action === 'buildHierarchy') {
-      buildHierarchy();
+    if (action === 'deleteNode' && nodeToDelete) {
+      // Get the node to find its parent BEFORE removing
+      const nodeData = nodes.get(nodeToDelete);
+      const parentId = nodeData?.parentId;
+
+      try {
+        // Delete from database FIRST
+        await invoke('delete_node', { id: nodeToDelete });
+
+        // Then update local state
+        removeNode(nodeToDelete);
+
+        // Update parent's childCount and latestChildDate
+        if (parentId) {
+          const parent = nodes.get(parentId);
+          if (parent) {
+            // Find remaining children to recalculate latest date
+            const remainingChildren = Array.from(nodes.values())
+              .filter(n => n.parentId === parentId && n.id !== nodeToDelete);
+            const latestChildDate = remainingChildren.length > 0
+              ? Math.max(...remainingChildren.map(n => n.createdAt))
+              : undefined;
+
+            updateNode(parentId, {
+              childCount: Math.max(0, parent.childCount - 1),
+              latestChildDate,
+            });
+          }
+        }
+      } catch (err) {
+        console.error('Failed to delete node:', err);
+      }
+
+      setNodeToDelete(null);
     }
-  }, [confirmAction]);
+  }, [confirmAction, nodeToDelete, nodes, removeNode, updateNode]);
 
   // Load learned emoji mappings on mount
   useEffect(() => {
@@ -281,6 +311,50 @@ export function Graph({ width, height }: GraphProps) {
     };
     loadMaxDepth();
   }, [setMaxDepth]);
+
+  // Load pinned node IDs on mount
+  useEffect(() => {
+    const loadPinnedIds = async () => {
+      try {
+        const pinned = await invoke<{ id: string }[]>('get_pinned_nodes');
+        setPinnedIds(new Set(pinned.map(n => n.id)));
+      } catch (err) {
+        console.error('Failed to load pinned nodes:', err);
+      }
+    };
+    loadPinnedIds();
+  }, []);
+
+  // Handle toggling pin status
+  const handleTogglePin = useCallback(async (nodeId: string, currentlyPinned: boolean) => {
+    try {
+      await invoke('set_node_pinned', { nodeId, pinned: !currentlyPinned });
+      setPinnedIds(prev => {
+        const next = new Set(prev);
+        if (currentlyPinned) {
+          next.delete(nodeId);
+        } else {
+          next.add(nodeId);
+        }
+        return next;
+      });
+      // Notify sidebar to refresh pinned list
+      emit('pins-changed');
+    } catch (err) {
+      console.error('Failed to toggle pin:', err);
+    }
+  }, []);
+
+  // Handle toggling privacy status
+  const handleTogglePrivacy = useCallback(async (nodeId: string, currentlyPrivate: boolean) => {
+    try {
+      await invoke('set_node_privacy', { nodeId, isPrivate: !currentlyPrivate });
+      // Update the node in local state
+      updateNode(nodeId, { isPrivate: !currentlyPrivate });
+    } catch (err) {
+      console.error('Failed to toggle privacy:', err);
+    }
+  }, [updateNode]);
 
   // Listen for hierarchy log events from Rust backend
   useEffect(() => {
@@ -344,8 +418,8 @@ export function Graph({ width, height }: GraphProps) {
 
     setLoadingSimilar(prev => new Set(prev).add(nodeId));
     try {
-      // Fetch top 100 similar nodes (enough for practical use)
-      const similar = await invoke<SimilarNode[]>('get_similar_nodes', { nodeId, topN: 100, minSimilarity: 0.25 });
+      // Fetch top 200 similar nodes (enough for practical use)
+      const similar = await invoke<SimilarNode[]>('get_similar_nodes', { nodeId, topN: 200, minSimilarity: 0.25 });
 
       // Prioritize nodes in current view (ones you can see and click)
       const currentViewNodeIds = new Set(nodes.keys());
@@ -659,7 +733,6 @@ export function Graph({ width, height }: GraphProps) {
   }, [devLog, nodes, setMaxDepth]);
 
   // Full rebuild: cluster + hierarchy in one shot
-  const [isFullRebuilding, setIsFullRebuilding] = useState(false);
   const fullRebuild = useCallback(async () => {
     // If AI processing is running, queue the rebuild instead
     if (isProcessing) {
@@ -827,6 +900,9 @@ export function Graph({ width, height }: GraphProps) {
     devLog('info', 'Main render useEffect running');
     if (!svgRef.current || nodes.size === 0) return;
 
+    // Reset click handled flag so activeNodeId useEffect runs after rebuild
+    clickHandledRef.current = false;
+
     const svg = d3.select(svgRef.current);
     svg.selectAll('*').remove();
     svg.attr('width', width).attr('height', height);
@@ -925,19 +1001,18 @@ export function Graph({ width, height }: GraphProps) {
     // IMPORTANCE-BASED TIERED LAYOUT (per pyspiral.md spec)
     // ==========================================================================
 
-    // Ring capacity: Ring 0 = 0 (skip center), Ring 1 = 4, Ring N = 6 * N
+    // Ring capacity: Ring 0 = 1 (center), all others = 4 max
     const getNodesPerRing = (ring: number): number => {
-      // if (ring === 0) return 1; // Commented out - nothing in exact center
-      if (ring === 0) return 0;
-      if (ring === 1) return 4;
-      return 6 * ring;
+      if (ring === 0) return 1; // Center node (Recent Notes or most important)
+      return 4; // Max 4 nodes per ring
     };
 
     // Ring radius: based on noteHeight + spacing
     const getRingRadius = (ring: number): number => {
-      if (ring === 1) return (noteHeight + nodeSpacing * 1.5) * 0.7; // First ring closer together
-      // Outer rings: slightly reduced growth rate
-      return (noteHeight + nodeSpacing * 1.5) * (0.7 + (ring - 1) * 0.85);
+      if (ring === 0) return 0; // Center node at exact center
+      if (ring === 1) return (noteHeight + nodeSpacing * 1.5) * 1.1; // First ring - bigger
+      // Outer rings: consistent spacing
+      return (noteHeight + nodeSpacing * 1.5) * (1.1 + (ring - 1) * 0.9);
     };
 
     // Golden angle for ring offset (prevents spoke alignment)
@@ -962,10 +1037,16 @@ export function Graph({ width, height }: GraphProps) {
       ...unclustered,
     ];
 
-    // Sort by childCount descending (importance)
-    const sortedByImportance = [...allLayoutNodes].sort((a, b) => (b.childCount || 0) - (a.childCount || 0));
+    // Sort: Recent Notes first (center), then by childCount descending (importance)
+    const sortedByImportance = [...allLayoutNodes].sort((a, b) => {
+      // Recent Notes always goes to center
+      if (a.id === 'container-recent-notes') return -1;
+      if (b.id === 'container-recent-notes') return 1;
+      // Then sort by childCount descending
+      return (b.childCount || 0) - (a.childCount || 0);
+    });
 
-    devLog('info', `Sorted ${sortedByImportance.length} nodes by importance (childCount)`);
+    devLog('info', `Sorted ${sortedByImportance.length} nodes by importance (Recent Notes first, then childCount)`);
 
     // Helper to count total nodes that fit in N rings
     const totalNodesInRings = (numRings: number): number => {
@@ -1183,7 +1264,7 @@ export function Graph({ width, height }: GraphProps) {
         // Chain: slight fade based on distance (0.85 at 2 hops, 0.70 at 3, etc.)
         return Math.max(0.5, 1 - conn.distance * 0.15);
       }
-      return 0.3; // Unconnected = significant fade
+      return 0.7; // Unconnected = subtle fade
     };
 
     // Define arrow markers for edge endpoints
@@ -1286,27 +1367,26 @@ export function Graph({ width, height }: GraphProps) {
     // ==================== UNIFIED NODE RENDERING ====================
     // All nodes use the same card style - clean "cute api"
 
-    // Calculate date range for items (for gradient coloring)
-    const itemNodes = graphNodes.filter(d => d.childCount === 0);
-    const itemDates = itemNodes.map(d => new Date(d.createdAt).getTime());
-    const minDate = itemDates.length > 0 ? Math.min(...itemDates) : 0;
-    const maxDate = itemDates.length > 0 ? Math.max(...itemDates) : 0;
-    const dateRange = maxDate - minDate || 1; // Avoid division by zero
+    // Date range from VISIBLE nodes in current view
+    const viewDates = graphNodes.map(n => {
+      const ts = n.childCount > 0 && n.latestChildDate ? n.latestChildDate : n.createdAt;
+      return typeof ts === 'number' ? ts : new Date(ts).getTime();
+    });
+    const viewMinDate = viewDates.length > 0 ? Math.min(...viewDates) : Date.now();
+    const viewMaxDate = viewDates.length > 0 ? Math.max(...viewDates) : Date.now();
+    const viewDateRange = viewMaxDate - viewMinDate || 1;
 
-    // Date to color: red (oldest) → orange → yellow → blue → cyan (newest)
+    // Date to color: red (oldest in view) → yellow → blue → cyan (newest in view)
     // Skips green for colorblind accessibility
-    const getDateColor = (dateStr: string): string => {
-      const timestamp = new Date(dateStr).getTime();
-      const t = (timestamp - minDate) / dateRange; // 0 = oldest, 1 = newest
+    const getDateColor = (dateValue: string | number): string => {
+      const timestamp = typeof dateValue === 'number' ? dateValue : new Date(dateValue).getTime();
+      const t = Math.max(0, Math.min(1, (timestamp - viewMinDate) / viewDateRange));
 
-      // Piecewise hue: 0→60° (red→yellow) then jump to 200→180° (blue→cyan)
       let hue: number;
       if (t < 0.5) {
-        // First half: red (0°) → yellow (60°)
-        hue = t * 2 * 60;
+        hue = t * 2 * 60; // red → yellow
       } else {
-        // Second half: blue (210°) → cyan (180°)
-        hue = 210 - (t - 0.5) * 2 * 30;
+        hue = 210 - (t - 0.5) * 2 * 30; // blue → cyan
       }
       return `hsl(${hue}, 75%, 65%)`;
     };
@@ -1562,6 +1642,46 @@ export function Graph({ width, height }: GraphProps) {
         return '';
       });
 
+    // 3-dots menu button for end nodes (items) - inside footer area
+    const menuBtnGroups = cardGroups.filter(d => d.childCount === 0)
+      .append('g')
+      .attr('class', 'node-menu-btn')
+      .attr('cursor', 'pointer')
+      .attr('transform', `translate(${noteWidth - 36}, ${noteHeight - 32})`);
+
+    // Button background
+    menuBtnGroups.append('rect')
+      .attr('width', 28)
+      .attr('height', 22)
+      .attr('rx', 4)
+      .attr('fill', 'rgba(255,255,255,0.1)');
+
+    // Three dots
+    menuBtnGroups.append('text')
+      .attr('x', 14)
+      .attr('y', 16)
+      .attr('text-anchor', 'middle')
+      .attr('font-size', '16px')
+      .attr('font-weight', 'bold')
+      .attr('fill', 'rgba(255,255,255,0.6)')
+      .text('•••');
+
+    menuBtnGroups
+      .on('click', function(event, d) {
+        event.stopPropagation();
+        const rect = (event.target as SVGElement).getBoundingClientRect();
+        setNodeMenuId(prev => prev === d.id ? null : d.id);
+        setNodeMenuPos({ x: rect.right + 10, y: rect.top });
+      })
+      .on('mouseenter', function() {
+        d3.select(this).select('rect').attr('fill', 'rgba(255,255,255,0.25)');
+        d3.select(this).select('text').attr('fill', 'rgba(255,255,255,0.9)');
+      })
+      .on('mouseleave', function() {
+        d3.select(this).select('rect').attr('fill', 'rgba(255,255,255,0.1)');
+        d3.select(this).select('text').attr('fill', 'rgba(255,255,255,0.6)');
+      });
+
     // Zen mode removed - hover/selection now handles connection highlighting
 
     // Unified bubble rendering for ALL nodes (low zoom)
@@ -1693,7 +1813,7 @@ export function Graph({ width, height }: GraphProps) {
             el.attr('stroke-width', originalWidth);
           });
 
-          setSimilarNodesMap(new Map());
+          // Keep details panel open on deselect (user can close manually)
           return;
         }
 
@@ -1749,7 +1869,7 @@ export function Graph({ width, height }: GraphProps) {
             if (conn.distance === 1) return 1;
             return Math.max(0.5, 1 - conn.distance * 0.15);
           }
-          return 0.3;
+          return 0.7; // Unconnected = subtle fade
         };
 
         // D3 updates directly in click handler (instant, no transitions)
@@ -1840,10 +1960,16 @@ export function Graph({ width, height }: GraphProps) {
         // THEN update React state for sidebar/other consumers
         // setActiveNode(d.id); // TEMP: testing if React re-render is bottleneck
         // Defer similar nodes fetch - don't block visual feedback
-        setTimeout(() => fetchSimilarNodes(d.id), 50);
+        // Store timeout ID so we can cancel on double-click
+        pendingFetchRef.current = setTimeout(() => fetchSimilarNodes(d.id), 50);
       })
       .on('dblclick', function(event, d) {
         event.stopPropagation();
+        // Cancel pending fetch to preserve existing details pane
+        if (pendingFetchRef.current) {
+          clearTimeout(pendingFetchRef.current);
+          pendingFetchRef.current = null;
+        }
         if (d.isItem) {
           devLog('info', `Opening item "${d.displayTitle}" in Leaf mode`);
           openLeaf(d.id);
@@ -1886,7 +2012,7 @@ export function Graph({ width, height }: GraphProps) {
         // Opacity: direct=bright, chain=visible, unconnected=dim
         const getHoverOpacity = (n: GraphNode): number => {
           const conn = hoverConnectionMap.get(n.id);
-          if (!conn) return 0.2; // Unconnected = most dim
+          if (!conn) return 0.7; // Unconnected = subtle fade
           if (conn.distance === 0) return 1; // Hovered node
           if (conn.distance === 1) return 0.6 + conn.weight * 0.4; // Direct: 0.6-1.0
           return 0.8; // Chain: consistently visible
@@ -2031,7 +2157,7 @@ export function Graph({ width, height }: GraphProps) {
             if (conn.distance === 1) return 1;
             return Math.max(0.5, 1 - conn.distance * 0.15);
           }
-          return 0.3;
+          return 0.7; // Unconnected = subtle fade
         };
 
         // D3 updates directly (instant, no transitions)
@@ -2062,10 +2188,16 @@ export function Graph({ width, height }: GraphProps) {
         // THEN update React state
         // setActiveNode(d.id); // TEMP: testing if React re-render is bottleneck
         // Defer similar nodes fetch - don't block visual feedback
-        setTimeout(() => fetchSimilarNodes(d.id), 50);
+        // Store timeout ID so we can cancel on double-click
+        pendingFetchRef.current = setTimeout(() => fetchSimilarNodes(d.id), 50);
       })
       .on('dblclick', function(event, d) {
         event.stopPropagation();
+        // Cancel pending fetch to preserve existing details pane
+        if (pendingFetchRef.current) {
+          clearTimeout(pendingFetchRef.current);
+          pendingFetchRef.current = null;
+        }
         if (d.isItem) {
           devLog('info', `Opening item "${d.displayTitle}" in Leaf mode`);
           openLeaf(d.id);
@@ -2110,7 +2242,7 @@ export function Graph({ width, height }: GraphProps) {
         // Opacity: direct=bright, chain=visible, unconnected=dim
         const getHoverOpacity = (n: GraphNode): number => {
           const conn = hoverConnectionMap.get(n.id);
-          if (!conn) return 0.2; // Unconnected = most dim
+          if (!conn) return 0.7; // Unconnected = subtle fade
           if (conn.distance === 0) return 1; // Hovered node
           if (conn.distance === 1) return 0.6 + conn.weight * 0.4; // Direct: 0.6-1.0
           return 0.8; // Chain: consistently visible
@@ -2384,9 +2516,8 @@ export function Graph({ width, height }: GraphProps) {
         el.attr('stroke-width', originalWidth);
       });
 
-      // Clear React state
+      // Clear selection but keep details panel open (user can close manually)
       setActiveNode(null);
-      setSimilarNodesMap(new Map());
     });
 
     // Fit to view
@@ -2513,7 +2644,7 @@ export function Graph({ width, height }: GraphProps) {
         // Chain: slight fade based on distance
         return Math.max(0.5, 1 - conn.distance * 0.15);
       }
-      return 0.3; // Unconnected = significant fade
+      return 0.7; // Unconnected = subtle fade
     };
 
     // Update card background colors and selection stroke (with transition for smooth feel)
@@ -2648,20 +2779,51 @@ export function Graph({ width, height }: GraphProps) {
             const lastNode = isLast ? crumbNode : null;
             const isJump = crumb.isJump;
             const crumbEmoji = crumbNode ? getNodeEmoji(crumbNode) : crumb.emoji;
-            const jumpFromNode = crumb.jumpFromId ? nodes.get(crumb.jumpFromId) : null;
-            const jumpFromEmoji = jumpFromNode ? getNodeEmoji(jumpFromNode) : crumb.jumpFromEmoji;
+            // Check if jumpFrom is same as previous breadcrumb (avoid duplicate)
+            const prevCrumb = index > 0 ? breadcrumbs[index - 1] : null;
+            const jumpFromIsDuplicate = isJump && prevCrumb && crumb.jumpFromId === prevCrumb.id;
+            // Build full hierarchy path for tooltip
+            const getHierarchyPath = (nodeId: string): string => {
+              const path: string[] = [];
+              let current = nodes.get(nodeId);
+              while (current) {
+                path.unshift(`${current.emoji || getNodeEmoji(current)} ${current.aiTitle || current.title}`);
+                current = current.parentId ? nodes.get(current.parentId) : undefined;
+              }
+              return path.join(' → ');
+            };
+            const hierarchyTooltip = crumbNode ? getHierarchyPath(crumb.id) : crumb.title;
 
             return (
               <div key={`${crumb.id}-${index}`} className="flex items-center">
                 {isJump ? (
-                  // Show source node + dashed arrow for jump navigation
+                  // Show jump arrow (skip duplicate "from" if same as previous breadcrumb)
                   <>
-                    <ChevronRight size={16} className="text-gray-600 mx-0.5" />
-                    <span className="text-gray-400 text-sm px-1" title={`Jumped from: ${crumb.jumpFromTitle}`}>
-                      {jumpFromEmoji && <span className="mr-1">{jumpFromEmoji}</span>}
-                      {crumb.jumpFromTitle}
-                    </span>
-                    <span className="text-blue-400 mx-1 text-sm" title="Jumped via Similar Nodes">⤳</span>
+                    {!jumpFromIsDuplicate && (
+                      <>
+                        <ChevronRight size={16} className="text-gray-600 mx-0.5" />
+                        <button
+                          onClick={() => {
+                            // Navigate to the jumpFrom node
+                            const jumpFromNode = crumb.jumpFromId ? nodes.get(crumb.jumpFromId) : null;
+                            if (jumpFromNode) {
+                              setActiveNode(null);
+                              jumpToNode(jumpFromNode, undefined);
+                            }
+                          }}
+                          className="text-gray-400 hover:text-gray-200 text-sm px-1 rounded hover:bg-gray-700 transition-colors"
+                          title={`Jumped from: ${crumb.jumpFromTitle}`}
+                        >
+                          {(() => {
+                            const jumpFromNode = crumb.jumpFromId ? nodes.get(crumb.jumpFromId) : null;
+                            const jumpFromEmoji = jumpFromNode ? getNodeEmoji(jumpFromNode) : crumb.jumpFromEmoji;
+                            return jumpFromEmoji && <span className="mr-1">{jumpFromEmoji}</span>;
+                          })()}
+                          {crumb.jumpFromTitle}
+                        </button>
+                      </>
+                    )}
+                    <span className="text-blue-400 mx-1 text-sm" title={`Jumped to: ${hierarchyTooltip}`}>⤳</span>
                   </>
                 ) : (
                   <ChevronRight size={16} className="text-gray-600 mx-0.5" />
@@ -2670,7 +2832,7 @@ export function Graph({ width, height }: GraphProps) {
                   // Current location: highlighted, not clickable
                   <span
                     className={`flex items-center gap-1 px-2 py-1 text-sm font-medium ${isJump ? 'text-blue-300' : 'text-amber-300'}`}
-                    title={lastNode?.summary || lastNode?.content || crumb.title}
+                    title={hierarchyTooltip}
                   >
                     {crumbEmoji && <span>{crumbEmoji}</span>}
                     {crumb.title}{toSuperscript(crumb.depth)}
@@ -2748,13 +2910,17 @@ export function Graph({ width, height }: GraphProps) {
           stackNodes={stackNodes}
           detailsPanelSize={detailsPanelSize}
           isResizingDetails={isResizingDetails}
+          pinnedIds={pinnedIds}
           getNodeEmoji={getNodeEmoji}
           onJumpToNode={jumpToNode}
+          onFetchDetails={fetchSimilarNodes}
           onRemoveNode={(nodeId) => setSimilarNodesMap(prev => {
             const next = new Map(prev);
             next.delete(nodeId);
             return next;
           })}
+          onTogglePin={handleTogglePin}
+          onTogglePrivacy={handleTogglePrivacy}
           onClearAll={() => setSimilarNodesMap(new Map())}
           onToggleStack={() => setStackNodes(!stackNodes)}
           onStartResize={() => setIsResizingDetails(true)}
@@ -2772,78 +2938,6 @@ export function Graph({ width, height }: GraphProps) {
         <span>{edges.size} edges</span>
         <span className="text-gray-500">|</span>
         <span className="text-amber-400">Zoom: {(zoomLevel * 100).toFixed(0)}%</span>
-        <span className="text-gray-500">|</span>
-        {/* Workflow buttons: Process AI | Cluster | Build Hierarchy */}
-        <div className="flex items-center gap-1">
-          <button
-            onClick={() => setConfirmAction('processAi')}
-            disabled={isProcessing}
-            className="bg-purple-600 hover:bg-purple-500 disabled:bg-purple-800 disabled:cursor-wait px-3 py-1 rounded-l text-white text-xs font-medium transition-colors"
-            title="AI generates titles, summaries & embeddings for items"
-          >
-            {isProcessing ? 'Processing...' : 'Process AI'}
-          </button>
-          {isProcessing && (
-            <button
-              onClick={async () => {
-                // Clear queue first so the callback doesn't trigger rebuild
-                setRebuildQueued(false);
-                rebuildQueuedRef.current = false;
-                await invoke('cancel_processing');
-                setIsProcessing(false);
-                setAiProgress({ current: 0, total: 0, status: 'idle' });
-                console.log('[Cancel] AI processing cancelled (queue cleared)');
-                devLog('info', 'AI processing cancelled');
-              }}
-              className="bg-red-600 hover:bg-red-500 px-2 py-1 rounded-r text-white text-xs font-medium transition-colors"
-              title="Cancel AI processing"
-            >
-              ✕
-            </button>
-          )}
-        </div>
-        <div className="flex items-center gap-1">
-          <button
-            onClick={() => setConfirmAction('cluster')}
-            disabled={isClustering || isFullRebuilding}
-            className="bg-blue-600 hover:bg-blue-500 disabled:bg-blue-800 disabled:cursor-wait px-3 py-1 rounded text-white text-xs font-medium transition-colors"
-            title="Assign items to topic clusters using AI"
-          >
-            {isClustering ? 'Clustering...' : 'Cluster'}
-          </button>
-        </div>
-        <div className="flex items-center gap-1">
-          <button
-            onClick={() => setConfirmAction('buildHierarchy')}
-            disabled={isBuildingHierarchy || isFullRebuilding}
-            className="bg-green-600 hover:bg-green-500 disabled:bg-green-800 disabled:cursor-wait px-3 py-1 rounded-l text-white text-xs font-medium transition-colors"
-            title="Build navigation hierarchy from clusters"
-          >
-            {isBuildingHierarchy ? 'Building...' : 'Hierarchy'}
-          </button>
-          {isBuildingHierarchy && (
-            <button
-              onClick={async () => {
-                await invoke('cancel_rebuild');
-                setIsBuildingHierarchy(false);
-                console.log('[Cancel] Hierarchy build cancelled');
-                devLog('info', 'Hierarchy build cancelled');
-              }}
-              className="bg-red-600 hover:bg-red-500 px-2 py-1 rounded-r text-white text-xs font-medium transition-colors"
-              title="Cancel hierarchy build"
-            >
-              ✕
-            </button>
-          )}
-        </div>
-        <button
-          onClick={handleUpdateDates}
-          disabled={isUpdatingDates}
-          className="bg-cyan-600 hover:bg-cyan-500 disabled:bg-cyan-800 disabled:cursor-wait px-3 py-1 rounded text-white text-xs font-medium transition-colors"
-          title="Update latest dates for all groups (fast, no AI)"
-        >
-          {isUpdatingDates ? 'Updating...' : '📅 Dates'}
-        </button>
       </div>
 
       {/* Color legend */}
@@ -2998,6 +3092,41 @@ export function Graph({ width, height }: GraphProps) {
         </button>
       </div>
 
+      {/* Node context menu */}
+      {nodeMenuId && nodeMenuPos && (
+        <>
+          <div
+            className="fixed inset-0 z-[55]"
+            onClick={() => setNodeMenuId(null)}
+          />
+          <div
+            className="fixed z-[56] bg-gray-800 border border-gray-700 rounded-lg shadow-xl py-1 min-w-[120px]"
+            style={{ left: nodeMenuPos.x, top: nodeMenuPos.y }}
+          >
+            <button
+              onClick={() => {
+                setNodeToDelete(nodeMenuId);
+                setNodeMenuId(null);
+                setConfirmAction('deleteNode');
+              }}
+              className="w-full px-4 py-2 text-left text-sm text-red-400 hover:bg-gray-700 flex items-center gap-2"
+            >
+              <span>🗑️</span>
+              <span>Delete</span>
+            </button>
+          </div>
+        </>
+      )}
+
+      {/* Add Note Button - Bottom Center */}
+      <button
+        onClick={() => setShowNoteModal(true)}
+        className="absolute bottom-6 left-1/2 -translate-x-1/2 bg-gray-800/90 hover:bg-gray-700/90 backdrop-blur-sm rounded-full p-3 text-gray-400 hover:text-white transition-all hover:scale-110 shadow-lg"
+        title="Add a note"
+      >
+        <span className="text-xl">📝</span>
+      </button>
+
       {/* Dev Console */}
       {showPanels && showDevConsole && (
         <div
@@ -3091,11 +3220,11 @@ export function Graph({ width, height }: GraphProps) {
         <div className="fixed inset-0 z-[60] flex items-center justify-center">
           <div
             className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-            onClick={() => setConfirmAction(null)}
+            onClick={() => { setConfirmAction(null); setNodeToDelete(null); }}
           />
           <div className="relative bg-gray-800 rounded-lg border border-gray-700 shadow-xl max-w-md w-full mx-4 p-6">
             <button
-              onClick={() => setConfirmAction(null)}
+              onClick={() => { setConfirmAction(null); setNodeToDelete(null); }}
               className="absolute top-4 right-4 p-1 text-gray-400 hover:text-white rounded transition-colors"
             >
               <X className="w-5 h-5" />
@@ -3114,7 +3243,7 @@ export function Graph({ width, height }: GraphProps) {
             </div>
             <div className="flex justify-end gap-3 mt-6">
               <button
-                onClick={() => setConfirmAction(null)}
+                onClick={() => { setConfirmAction(null); setNodeToDelete(null); }}
                 className="px-4 py-2 text-sm font-medium text-gray-300 bg-gray-700 hover:bg-gray-600 rounded-lg transition-colors"
               >
                 Cancel
@@ -3127,6 +3256,94 @@ export function Graph({ width, height }: GraphProps) {
                 } text-white`}
               >
                 {confirmConfigs[confirmAction].confirmText}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Note Modal */}
+      {showNoteModal && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center">
+          <div
+            className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+            onClick={() => setShowNoteModal(false)}
+          />
+          <div className="relative bg-gray-800 rounded-lg border border-gray-700 shadow-xl max-w-lg w-full mx-4 p-6">
+            <h2 className="text-lg font-medium text-white mb-4">Add Note</h2>
+            <input
+              type="text"
+              placeholder="Title (optional)"
+              value={noteTitle}
+              onChange={(e) => setNoteTitle(e.target.value)}
+              className="w-full bg-gray-700 text-white rounded px-3 py-2 mb-3 border border-gray-600 focus:border-amber-500 focus:outline-none"
+            />
+            <textarea
+              placeholder="What's on your mind?"
+              value={noteContent}
+              onChange={(e) => setNoteContent(e.target.value)}
+              rows={6}
+              className="w-full bg-gray-700 text-white rounded px-3 py-2 mb-4 resize-none border border-gray-600 focus:border-amber-500 focus:outline-none"
+              autoFocus
+            />
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => {
+                  setShowNoteModal(false);
+                  setNoteTitle('');
+                  setNoteContent('');
+                }}
+                className="px-4 py-2 text-gray-400 hover:text-white"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  if (noteContent.trim()) {
+                    const title = noteTitle.trim() || 'Untitled Note';
+                    const content = noteContent.trim();
+                    const containerId = 'container-recent-notes';
+
+                    // Save to database and get the ID
+                    const noteId = await invoke<string>('add_note', { title, content });
+
+                    // Add to local state immediately (no reload needed)
+                    const now = Date.now();
+                    addNode({
+                      id: noteId,
+                      type: 'thought',
+                      title,
+                      content,
+                      depth: 2,
+                      isItem: true,
+                      isUniverse: false,
+                      parentId: containerId,
+                      childCount: 0,
+                      position: { x: 0, y: 0 },
+                      createdAt: now,
+                      updatedAt: now,
+                      isProcessed: false,
+                      isPinned: false,
+                    });
+
+                    // Update parent container's childCount and latestChildDate
+                    const container = nodes.get(containerId);
+                    if (container) {
+                      updateNode(containerId, {
+                        childCount: container.childCount + 1,
+                        latestChildDate: now,
+                      });
+                    }
+
+                    setShowNoteModal(false);
+                    setNoteTitle('');
+                    setNoteContent('');
+                  }
+                }}
+                disabled={!noteContent.trim()}
+                className="px-4 py-2 bg-amber-600 hover:bg-amber-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded"
+              >
+                Save
               </button>
             </div>
           </div>

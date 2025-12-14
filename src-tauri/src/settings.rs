@@ -35,7 +35,7 @@ pub struct ProcessingStats {
     pub total_openai_tokens: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub anthropic_api_key: Option<String>,
@@ -43,6 +43,26 @@ pub struct Settings {
     pub openai_api_key: Option<String>,
     #[serde(default)]
     pub processing_stats: ProcessingStats,
+    #[serde(default)]
+    pub custom_db_path: Option<String>,
+    #[serde(default = "default_true")]
+    pub protect_recent_notes: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            anthropic_api_key: None,
+            openai_api_key: None,
+            processing_stats: ProcessingStats::default(),
+            custom_db_path: None,
+            protect_recent_notes: true,
+        }
+    }
 }
 
 impl Settings {
@@ -292,3 +312,67 @@ pub fn add_openai_tokens(tokens: u64) -> Result<(), String> {
     settings.save(&config_path)?;
     Ok(())
 }
+
+// ==================== Custom Database Path ====================
+
+/// Get custom database path (if set)
+pub fn get_custom_db_path() -> Option<String> {
+    let guard = SETTINGS.read().ok()?;
+    let settings = guard.as_ref()?;
+    settings.custom_db_path.clone()
+}
+
+/// Set custom database path
+pub fn set_custom_db_path(path: Option<String>) -> Result<(), String> {
+    let mut settings_guard = SETTINGS.write()
+        .map_err(|_| "Failed to acquire settings lock")?;
+
+    let settings = settings_guard.get_or_insert_with(Settings::default);
+    settings.custom_db_path = path.clone();
+
+    // Save to disk
+    let config_path = CONFIG_PATH.read()
+        .map_err(|_| "Failed to acquire config path lock")?
+        .clone()
+        .ok_or("Settings not initialized")?;
+
+    settings.save(&config_path)?;
+
+    println!("Custom DB path saved: {:?}", path);
+    Ok(())
+}
+
+// ==================== Recent Notes Protection ====================
+
+/// Check if Recent Notes protection is enabled (default: true)
+pub fn is_recent_notes_protected() -> bool {
+    let guard = SETTINGS.read().ok();
+    guard
+        .as_ref()
+        .and_then(|g| g.as_ref())
+        .map(|s| s.protect_recent_notes)
+        .unwrap_or(true) // Default to protected
+}
+
+/// Set Recent Notes protection
+pub fn set_protect_recent_notes(protected: bool) -> Result<(), String> {
+    let mut settings_guard = SETTINGS.write()
+        .map_err(|_| "Failed to acquire settings lock")?;
+
+    let settings = settings_guard.get_or_insert_with(Settings::default);
+    settings.protect_recent_notes = protected;
+
+    // Save to disk
+    let config_path = CONFIG_PATH.read()
+        .map_err(|_| "Failed to acquire config path lock")?
+        .clone()
+        .ok_or("Settings not initialized")?;
+
+    settings.save(&config_path)?;
+
+    println!("Recent Notes protection set to: {}", protected);
+    Ok(())
+}
+
+/// The fixed ID for the Recent Notes container
+pub const RECENT_NOTES_CONTAINER_ID: &str = "container-recent-notes";

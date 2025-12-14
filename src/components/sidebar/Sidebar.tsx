@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Search, X, ChevronRight, ChevronDown, Settings, Pin, Clock, PinOff } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { useGraphStore } from '../../stores/graphStore';
 import { getEmojiForNode, initLearnedMappings } from '../../utils/emojiMatcher';
 import type { Node } from '../../types/graph';
@@ -12,7 +13,7 @@ interface SidebarProps {
 }
 
 export function Sidebar({ onOpenSettings }: SidebarProps) {
-  const { nodes, activeNodeId, setActiveNode, navigateToRoot, navigateToNode } = useGraphStore();
+  const { nodes, activeNodeId, setActiveNode, navigateToRoot, jumpToNode } = useGraphStore();
   const [activeTab, setActiveTab] = useState<SidebarTab>('pinned');
   const [searchQuery, setSearchQuery] = useState('');
 
@@ -31,6 +32,14 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
   useEffect(() => {
     loadRecentNodes();
     loadPinnedNodes();
+  }, []);
+
+  // Listen for pins-changed event (from Graph details pane)
+  useEffect(() => {
+    const unlisten = listen('pins-changed', () => {
+      loadPinnedNodes();
+    });
+    return () => { unlisten.then(f => f()); };
   }, []);
 
   // Touch node whenever activeNodeId changes (from graph or sidebar clicks)
@@ -87,11 +96,11 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
   const handleNodeClick = useCallback((nodeId: string) => {
     const node = nodes.get(nodeId);
     if (node) {
-      navigateToNode(node);
-      setActiveNode(nodeId);
+      // Jump to node (navigate to its parent so the node is visible)
+      jumpToNode(node, undefined);
     }
     // touch_node is handled by the useEffect on activeNodeId
-  }, [nodes, navigateToNode, setActiveNode]);
+  }, [nodes, jumpToNode]);
 
   const handleTogglePin = useCallback(async (nodeId: string, currentlyPinned: boolean) => {
     try {
@@ -123,12 +132,14 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
     return (
       <div
         key={node.id}
-        className={`group flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-all duration-150 ${
+        className={`group flex items-center gap-2 px-2 py-2 rounded-lg text-sm transition-all duration-150 ${
           node.id === activeNodeId
             ? 'bg-amber-500/20 ring-1 ring-amber-500/50'
             : 'hover:bg-gray-700/50'
         }`}
       >
+        <span className="text-base shrink-0">{getNodeEmoji(node)}</span>
+
         <button
           onClick={() => handleNodeClick(node.id)}
           className="flex-1 min-w-0 text-left"
@@ -136,7 +147,6 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
           <div className={`font-medium truncate ${
             node.id === activeNodeId ? 'text-amber-200' : 'text-gray-200'
           }`}>
-            <span className="mr-1.5">{getNodeEmoji(node)}</span>
             {node.aiTitle || node.title}
           </div>
           {node.summary && (
@@ -152,7 +162,7 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
               e.stopPropagation();
               handleTogglePin(node.id, isPinned);
             }}
-            className={`p-1 rounded transition-colors opacity-0 group-hover:opacity-100 ${
+            className={`p-1 rounded transition-colors shrink-0 ${
               isPinned
                 ? 'text-amber-400 hover:text-amber-300'
                 : 'text-gray-500 hover:text-gray-300'
@@ -344,53 +354,52 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
               <div className="space-y-0.5">
                 {recentNodes.slice(0, 10).map(node => {
                   const isActive = node.id === activeNodeId;
+                  const isPinned = pinnedIds.has(node.id);
                   return (
                   <div
                     key={node.id}
-                    className={`group flex items-center gap-1 px-2 py-1.5 rounded text-xs transition-colors ${
+                    className={`group flex items-center gap-1.5 px-1.5 py-1 rounded text-xs transition-colors ${
                       isActive
                         ? 'bg-amber-500/20 text-amber-300'
                         : 'text-gray-400 hover:text-gray-200 hover:bg-gray-700/30'
                     }`}
                   >
+                    <span className="shrink-0">{getNodeEmoji(node)}</span>
                     <button
                       onClick={() => handleNodeClick(node.id)}
-                      className="flex-1 flex items-center gap-2 text-left truncate"
+                      className="flex-1 text-left truncate"
                     >
-                      <span>{getNodeEmoji(node)}</span>
                       <span className="truncate">{node.aiTitle || node.title}</span>
                     </button>
-                    <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleTogglePin(node.id, node.isPinned);
-                        }}
-                        className={`p-1 rounded transition-colors ${
-                          pinnedIds.has(node.id)
-                            ? 'text-amber-400 hover:text-amber-300'
-                            : 'text-gray-500 hover:text-gray-300'
-                        }`}
-                        title={pinnedIds.has(node.id) ? 'Unpin' : 'Pin'}
-                      >
-                        {pinnedIds.has(node.id) ? <PinOff className="w-3 h-3" /> : <Pin className="w-3 h-3" />}
-                      </button>
-                      <button
-                        onClick={async (e) => {
-                          e.stopPropagation();
-                          try {
-                            await invoke('clear_recent', { nodeId: node.id });
-                            setRecentNodes(prev => prev.filter(n => n.id !== node.id));
-                          } catch (err) {
-                            console.error('Failed to remove from recents:', err);
-                          }
-                        }}
-                        className="p-1 text-gray-500 hover:text-red-400 rounded transition-colors"
-                        title="Remove from recents"
-                      >
-                        <X className="w-3 h-3" />
-                      </button>
-                    </div>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleTogglePin(node.id, isPinned);
+                      }}
+                      className={`p-1 rounded transition-colors shrink-0 ${
+                        isPinned
+                          ? 'text-amber-400 hover:text-amber-300'
+                          : 'text-gray-500 hover:text-gray-300'
+                      }`}
+                      title={isPinned ? 'Unpin' : 'Pin'}
+                    >
+                      {isPinned ? <PinOff className="w-3 h-3" /> : <Pin className="w-3 h-3" />}
+                    </button>
+                    <button
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        try {
+                          await invoke('clear_recent', { nodeId: node.id });
+                          setRecentNodes(prev => prev.filter(n => n.id !== node.id));
+                        } catch (err) {
+                          console.error('Failed to remove from recents:', err);
+                        }
+                      }}
+                      className="p-1 text-gray-500 hover:text-red-400 rounded transition-colors shrink-0"
+                      title="Remove from recents"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
                   </div>
                   );
                 })}

@@ -403,6 +403,97 @@ impl Database {
         }
     }
 
+    /// Check if a node is protected (Recent Notes container or its descendants)
+    /// Returns true only if protection is enabled AND node is in the protected subtree
+    pub fn is_node_protected(&self, node_id: &str) -> bool {
+        use crate::settings;
+
+        // Check if protection is enabled
+        if !settings::is_recent_notes_protected() {
+            return false;
+        }
+
+        // Check if this IS the Recent Notes container
+        if node_id == settings::RECENT_NOTES_CONTAINER_ID {
+            return true;
+        }
+
+        // Check if this node is a descendant of Recent Notes
+        self.is_descendant_of(node_id, settings::RECENT_NOTES_CONTAINER_ID)
+    }
+
+    /// Check if a node is a descendant of another node (by traversing parent_id chain)
+    pub fn is_descendant_of(&self, node_id: &str, ancestor_id: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        let mut current_id = node_id.to_string();
+        let mut depth = 0;
+        const MAX_DEPTH: i32 = 50; // Safety limit
+
+        while depth < MAX_DEPTH {
+            let parent_id: Option<String> = conn
+                .query_row(
+                    "SELECT parent_id FROM nodes WHERE id = ?1",
+                    params![&current_id],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
+
+            match parent_id {
+                Some(pid) if pid == ancestor_id => return true,
+                Some(pid) => {
+                    current_id = pid;
+                    depth += 1;
+                }
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// Get all protected node IDs (Recent Notes and descendants)
+    /// Returns empty set if protection is disabled
+    pub fn get_protected_node_ids(&self) -> std::collections::HashSet<String> {
+        use crate::settings;
+
+        let mut protected = std::collections::HashSet::new();
+
+        if !settings::is_recent_notes_protected() {
+            return protected;
+        }
+
+        // Add the container itself
+        protected.insert(settings::RECENT_NOTES_CONTAINER_ID.to_string());
+
+        // Recursively get all descendants
+        self.collect_descendants(settings::RECENT_NOTES_CONTAINER_ID, &mut protected);
+
+        protected
+    }
+
+    /// Recursively collect all descendant IDs of a node
+    fn collect_descendants(&self, parent_id: &str, ids: &mut std::collections::HashSet<String>) {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT id FROM nodes WHERE parent_id = ?1") {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        let children: Vec<String> = stmt
+            .query_map(params![parent_id], |row| row.get(0))
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+
+        drop(stmt);
+        drop(conn);
+
+        for child_id in children {
+            ids.insert(child_id.clone());
+            self.collect_descendants(&child_id, ids);
+        }
+    }
+
     /// Helper to convert a row to Node (reduces duplication)
     fn row_to_node(row: &rusqlite::Row) -> Result<Node> {
         Ok(Node {
@@ -864,22 +955,67 @@ impl Database {
     }
 
     /// Delete all non-item nodes (intermediate hierarchy scaffolding)
+    /// Skips protected nodes (Recent Notes container and descendants)
     pub fn delete_hierarchy_nodes(&self) -> Result<usize> {
+        use crate::settings;
+
+        let protected_ids = self.get_protected_node_ids();
         let conn = self.conn.lock().unwrap();
-        let deleted = conn.execute(
-            "DELETE FROM nodes WHERE is_item = 0 AND is_universe = 0",
-            [],
-        )?;
-        Ok(deleted)
+
+        if protected_ids.is_empty() {
+            // No protection - delete all
+            let deleted = conn.execute(
+                "DELETE FROM nodes WHERE is_item = 0 AND is_universe = 0",
+                [],
+            )?;
+            Ok(deleted)
+        } else {
+            // Build exclusion list
+            let placeholders: Vec<String> = protected_ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let sql = format!(
+                "DELETE FROM nodes WHERE is_item = 0 AND is_universe = 0 AND id NOT IN ({})",
+                placeholders.join(", ")
+            );
+
+            let params: Vec<&str> = protected_ids.iter().map(|s| s.as_str()).collect();
+            let deleted = conn.execute(&sql, rusqlite::params_from_iter(params))?;
+
+            if settings::is_recent_notes_protected() {
+                println!("[Hierarchy] Preserved {} protected nodes (Recent Notes)", protected_ids.len());
+            }
+            Ok(deleted)
+        }
     }
 
     /// Clear parent_id on all items (for rebuild)
+    /// Skips protected items (descendants of Recent Notes)
     pub fn clear_item_parents(&self) -> Result<()> {
+        use crate::settings;
+
+        let protected_ids = self.get_protected_node_ids();
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE nodes SET parent_id = NULL WHERE is_item = 1",
-            [],
-        )?;
+
+        if protected_ids.is_empty() {
+            // No protection - clear all
+            conn.execute(
+                "UPDATE nodes SET parent_id = NULL WHERE is_item = 1",
+                [],
+            )?;
+        } else {
+            // Build exclusion list
+            let placeholders: Vec<String> = protected_ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let sql = format!(
+                "UPDATE nodes SET parent_id = NULL WHERE is_item = 1 AND id NOT IN ({})",
+                placeholders.join(", ")
+            );
+
+            let params: Vec<&str> = protected_ids.iter().map(|s| s.as_str()).collect();
+            conn.execute(&sql, rusqlite::params_from_iter(params))?;
+
+            if settings::is_recent_notes_protected() {
+                println!("[Hierarchy] Preserved parent_id on {} protected items", protected_ids.len());
+            }
+        }
         Ok(())
     }
 
@@ -942,6 +1078,54 @@ impl Database {
         })?.collect::<Result<Vec<_>>>()?;
 
         Ok(clusters)
+    }
+
+    /// Find a topic node by cluster_label (for quick hierarchy add)
+    pub fn find_topic_by_cluster_label(&self, cluster_label: &str) -> Result<Option<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE cluster_label = ? AND is_item = 0 AND depth > 0 LIMIT 1",
+            Self::NODE_COLUMNS
+        ))?;
+
+        let mut rows = stmt.query([cluster_label])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(Self::row_to_node(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get orphaned items (items with no parent_id) that have been clustered
+    pub fn get_orphaned_clustered_items(&self) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE is_item = 1 AND parent_id IS NULL AND cluster_id IS NOT NULL ORDER BY created_at DESC",
+            Self::NODE_COLUMNS
+        ))?;
+
+        let nodes = stmt.query_map([], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
+        Ok(nodes)
+    }
+
+    /// Update a node's parent and depth
+    pub fn set_node_parent(&self, node_id: &str, parent_id: &str, depth: i32) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE nodes SET parent_id = ?, depth = ? WHERE id = ?",
+            rusqlite::params![parent_id, depth, node_id],
+        )?;
+        Ok(())
+    }
+
+    /// Increment a node's child_count
+    pub fn increment_child_count(&self, node_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE nodes SET child_count = child_count + 1 WHERE id = ?",
+            [node_id],
+        )?;
+        Ok(())
     }
 
     /// Get next available cluster_id
@@ -1630,13 +1814,22 @@ impl Database {
     }
 
     /// Get database stats for settings panel
-    pub fn get_stats(&self) -> Result<(usize, usize, usize, usize)> {
+    pub fn get_stats(&self) -> Result<(usize, usize, usize, usize, usize, usize, usize, usize)> {
         let conn = self.conn.lock().unwrap();
         let total_nodes: usize = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
         let total_items: usize = conn.query_row("SELECT COUNT(*) FROM nodes WHERE is_item = 1", [], |r| r.get(0))?;
         let processed: usize = conn.query_row("SELECT COUNT(*) FROM nodes WHERE is_processed = 1", [], |r| r.get(0))?;
         let with_embeddings: usize = conn.query_row("SELECT COUNT(*) FROM nodes WHERE embedding IS NOT NULL", [], |r| r.get(0))?;
-        Ok((total_nodes, total_items, processed, with_embeddings))
+        // Additional stats for API cost estimation
+        let unprocessed: usize = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND is_processed = 0", [], |r| r.get(0))?;
+        let unclustered: usize = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND cluster_id IS NULL", [], |r| r.get(0))?;
+        let orphan_items: usize = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND parent_id IS NULL AND cluster_id IS NOT NULL", [], |r| r.get(0))?;
+        let topics: usize = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 0 AND is_universe = 0 AND depth > 0", [], |r| r.get(0))?;
+        Ok((total_nodes, total_items, processed, with_embeddings, unprocessed, unclustered, orphan_items, topics))
     }
 
     // ==================== Hierarchy Flattening Operations ====================
@@ -1778,7 +1971,9 @@ impl Database {
 
     /// Merge children that have the same name as their parent
     /// Example: "Consciousness" → "Consciousness" (7 children) becomes "Consciousness" (7 children)
+    /// Skips protected nodes (Recent Notes)
     pub fn merge_same_name_children(&self) -> Result<usize> {
+        let protected_ids = self.get_protected_node_ids();
         let conn = self.conn.lock().unwrap();
 
         // Find parent-child pairs where labels match (case-insensitive)
@@ -1798,6 +1993,12 @@ impl Database {
             })?.filter_map(|r| r.ok()).collect();
             results
         };
+
+        // Filter out protected nodes
+        let duplicates: Vec<(String, String)> = duplicates
+            .into_iter()
+            .filter(|(parent_id, child_id)| !protected_ids.contains(parent_id) && !protected_ids.contains(child_id))
+            .collect();
 
         let count = duplicates.len();
 
@@ -1834,7 +2035,9 @@ impl Database {
     /// Flatten single-child chains: reparent child to grandparent, delete middle node
     /// Loops until no single-child chains remain. Returns total nodes removed.
     /// Optimized with batching and transactions for performance.
+    /// Skips protected nodes (Recent Notes)
     pub fn flatten_single_child_chains(&self) -> Result<usize> {
+        let protected_ids = self.get_protected_node_ids();
         let mut total_flattened = 0;
 
         loop {
@@ -1856,6 +2059,12 @@ impl Database {
                 })?.filter_map(|r| r.ok()).collect();
                 results
             };
+
+            // Filter out protected nodes
+            let chains: Vec<(String, Option<String>, String)> = chains
+                .into_iter()
+                .filter(|(middle_id, _, child_id)| !protected_ids.contains(middle_id) && !protected_ids.contains(child_id))
+                .collect();
 
             if chains.is_empty() {
                 break;
@@ -1889,14 +2098,30 @@ impl Database {
     }
 
     /// Remove empty category nodes (non-item, non-universe with 0 children)
+    /// Skips protected nodes (Recent Notes)
     pub fn remove_empty_categories(&self) -> Result<usize> {
+        let protected_ids = self.get_protected_node_ids();
         let conn = self.conn.lock().unwrap();
-        let count = conn.execute(
-            "DELETE FROM nodes WHERE is_item = 0 AND is_universe = 0 AND child_count = 0",
-            [],
-        )?;
-        println!("[Tidy] Removed {} empty categories", count);
-        Ok(count)
+
+        if protected_ids.is_empty() {
+            let count = conn.execute(
+                "DELETE FROM nodes WHERE is_item = 0 AND is_universe = 0 AND child_count = 0",
+                [],
+            )?;
+            println!("[Tidy] Removed {} empty categories", count);
+            Ok(count)
+        } else {
+            // Build exclusion list
+            let placeholders: Vec<String> = protected_ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let sql = format!(
+                "DELETE FROM nodes WHERE is_item = 0 AND is_universe = 0 AND child_count = 0 AND id NOT IN ({})",
+                placeholders.join(", ")
+            );
+            let params: Vec<&str> = protected_ids.iter().map(|s| s.as_str()).collect();
+            let count = conn.execute(&sql, rusqlite::params_from_iter(params))?;
+            println!("[Tidy] Removed {} empty categories (protected {} nodes)", count, protected_ids.len());
+            Ok(count)
+        }
     }
 
     /// Fix all child_count fields by actually counting children
@@ -1963,7 +2188,9 @@ impl Database {
     }
 
     /// Reparent orphan nodes (parent_id points to non-existent node) to Universe
+    /// Skips protected nodes (Recent Notes descendants)
     pub fn reparent_orphans(&self) -> Result<usize> {
+        let protected_ids = self.get_protected_node_ids();
         let conn = self.conn.lock().unwrap();
 
         // Find universe id
@@ -1981,18 +2208,35 @@ impl Database {
             }
         };
 
-        // Find and reparent orphans
-        let count = conn.execute(
-            "UPDATE nodes
-             SET parent_id = ?1
-             WHERE parent_id IS NOT NULL
-               AND parent_id NOT IN (SELECT id FROM nodes)
-               AND is_universe = 0",
-            params![&universe_id],
-        )?;
-
-        println!("[Tidy] Reparented {} orphan nodes to Universe", count);
-        Ok(count)
+        // Find and reparent orphans (excluding protected)
+        if protected_ids.is_empty() {
+            let count = conn.execute(
+                "UPDATE nodes
+                 SET parent_id = ?1
+                 WHERE parent_id IS NOT NULL
+                   AND parent_id NOT IN (SELECT id FROM nodes)
+                   AND is_universe = 0",
+                params![&universe_id],
+            )?;
+            println!("[Tidy] Reparented {} orphan nodes to Universe", count);
+            Ok(count)
+        } else {
+            let placeholders: Vec<String> = protected_ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 2)).collect();
+            let sql = format!(
+                "UPDATE nodes
+                 SET parent_id = ?1
+                 WHERE parent_id IS NOT NULL
+                   AND parent_id NOT IN (SELECT id FROM nodes)
+                   AND is_universe = 0
+                   AND id NOT IN ({})",
+                placeholders.join(", ")
+            );
+            let mut params: Vec<&str> = vec![&universe_id];
+            params.extend(protected_ids.iter().map(|s| s.as_str()));
+            let count = conn.execute(&sql, rusqlite::params_from_iter(params))?;
+            println!("[Tidy] Reparented {} orphan nodes to Universe (protected {} nodes)", count, protected_ids.len());
+            Ok(count)
+        }
     }
 
     /// Delete edges where source or target node doesn't exist

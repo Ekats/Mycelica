@@ -163,6 +163,22 @@ pub fn get_privacy_stats(state: State<AppState>) -> Result<PrivacyStats, String>
     })
 }
 
+/// Manually set a node's privacy status
+#[tauri::command]
+pub fn set_node_privacy(
+    state: State<'_, AppState>,
+    node_id: String,
+    is_private: bool,
+) -> Result<(), String> {
+    let reason = if is_private {
+        Some("Manually marked as private")
+    } else {
+        None
+    };
+    state.db.update_node_privacy(&node_id, is_private, reason)
+        .map_err(|e| e.to_string())
+}
+
 /// Analyze a single node for privacy
 #[tauri::command]
 pub async fn analyze_node_privacy(

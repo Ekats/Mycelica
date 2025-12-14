@@ -9,7 +9,7 @@ mod similarity;
 
 use commands::{
     AppState,
-    get_nodes, get_node, create_node, update_node, delete_node,
+    get_nodes, get_node, create_node, add_note, update_node, delete_node,
     get_edges, get_edges_for_node, create_edge, delete_edge,
     search_nodes,
     // Clustering commands
@@ -21,7 +21,7 @@ use commands::{
     // Hierarchy commands
     get_nodes_at_depth, get_children, get_universe, get_items, get_max_depth,
     build_hierarchy, build_full_hierarchy, cluster_hierarchy_level, get_children_flat,
-    propagate_latest_dates,
+    propagate_latest_dates, quick_add_to_hierarchy,
     // Multi-path association commands
     get_item_associations, get_related_items, get_category_items,
     // Conversation context commands
@@ -42,7 +42,9 @@ use commands::{
     // Processing stats commands
     get_processing_stats, add_ai_processing_time, add_rebuild_time,
     // Privacy filtering commands
-    analyze_node_privacy, analyze_all_privacy, analyze_categories_privacy, cancel_privacy_scan, get_privacy_stats, export_shareable_db,
+    analyze_node_privacy, analyze_all_privacy, analyze_categories_privacy, cancel_privacy_scan, get_privacy_stats, export_shareable_db, set_node_privacy,
+    // Recent Notes protection commands
+    get_protect_recent_notes, set_protect_recent_notes,
 };
 use db::Database;
 use std::sync::Arc;
@@ -63,15 +65,29 @@ pub fn run() {
             // Initialize settings
             settings::init(app_data_dir.clone());
 
-            // In development, use local data/mycelica.db if it exists
-            let local_db = std::path::PathBuf::from("data/mycelica.db");
-            let db_path = if local_db.exists() {
-                println!("Using local database: {:?}", local_db);
-                local_db
+            // Check for custom database path in settings first
+            let db_path = if let Some(custom_path) = settings::get_custom_db_path() {
+                let path = std::path::PathBuf::from(&custom_path);
+                if path.exists() {
+                    println!("Using custom database from settings: {:?}", path);
+                    path
+                } else {
+                    // Custom path no longer exists, clear it and fall back to default
+                    eprintln!("Custom database not found: {:?}, reverting to default", path);
+                    let _ = settings::set_custom_db_path(None);
+                    app_data_dir.join("mycelica.db")
+                }
             } else {
-                let path = app_data_dir.join("mycelica.db");
-                println!("Using app data database: {:?}", path);
-                path
+                // In development, use local data/mycelica.db if it exists
+                let local_db = std::path::PathBuf::from("data/mycelica.db");
+                if local_db.exists() {
+                    println!("Using local database: {:?}", local_db);
+                    local_db
+                } else {
+                    let path = app_data_dir.join("mycelica.db");
+                    println!("Using app data database: {:?}", path);
+                    path
+                }
             };
 
             let db = Database::new(&db_path).expect("Failed to initialize database");
@@ -92,6 +108,7 @@ pub fn run() {
             get_nodes,
             get_node,
             create_node,
+            add_note,
             update_node,
             delete_node,
             get_edges,
@@ -124,6 +141,7 @@ pub fn run() {
             build_full_hierarchy,
             cluster_hierarchy_level,
             propagate_latest_dates,
+            quick_add_to_hierarchy,
             // Multi-path associations
             get_item_associations,
             get_related_items,
@@ -170,6 +188,10 @@ pub fn run() {
             cancel_privacy_scan,
             get_privacy_stats,
             export_shareable_db,
+            set_node_privacy,
+            // Recent Notes protection
+            get_protect_recent_notes,
+            set_protect_recent_notes,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

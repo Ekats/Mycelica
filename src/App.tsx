@@ -107,6 +107,13 @@ function App() {
     }
   }, [nodes]);
 
+  // Auto-open Settings if database is empty (no nodes after loading)
+  useEffect(() => {
+    if (!loading && nodes.size === 0) {
+      setShowSettings(true);
+    }
+  }, [loading, nodes.size]);
+
   if (loading) {
     return (
       <div className="h-screen w-screen flex items-center justify-center bg-gray-900">

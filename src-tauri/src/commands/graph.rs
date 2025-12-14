@@ -1,4 +1,4 @@
-use crate::db::{Database, Node, Edge};
+use crate::db::{Database, Node, Edge, Position, NodeType};
 use crate::clustering::{self, ClusteringResult as ClusterResult};
 use crate::ai_client;
 use crate::hierarchy;
@@ -55,6 +55,112 @@ pub fn reset_rebuild_cancel() {
 #[tauri::command]
 pub fn create_node(state: State<AppState>, node: Node) -> Result<(), String> {
     state.db.insert_node(&node).map_err(|e| e.to_string())
+}
+
+/// Add a quick note - creates note under "Recent Notes" container
+#[tauri::command]
+pub fn add_note(state: State<AppState>, title: String, content: String) -> Result<String, String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use uuid::Uuid;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    // 1. Find or create "Recent Notes" container
+    let container_id = "container-recent-notes";
+    let container_exists = state.db.get_node(container_id).ok().flatten().is_some();
+
+    if !container_exists {
+        // Get Universe to set as parent
+        let universe = state.db.get_universe()
+            .map_err(|e| e.to_string())?
+            .ok_or("No Universe found")?;
+
+        // Create container at depth 1
+        let container_node = Node {
+            id: container_id.to_string(),
+            node_type: NodeType::Cluster,
+            title: "Recent Notes".to_string(),
+            emoji: Some("📝".to_string()),
+            depth: 1,
+            is_item: false,
+            is_universe: false,
+            parent_id: Some(universe.id.clone()),
+            child_count: 0,
+            created_at: now,
+            updated_at: now,
+            position: Position { x: 0.0, y: 0.0 },
+            url: None,
+            content: None,
+            cluster_id: None,
+            cluster_label: Some("Recent Notes".to_string()),
+            ai_title: None,
+            summary: Some("User-created notes".to_string()),
+            tags: None,
+            is_processed: true,
+            conversation_id: None,
+            sequence_index: None,
+            is_pinned: false,
+            last_accessed_at: None,
+            latest_child_date: None,
+            is_private: None,
+            privacy_reason: None,
+        };
+        state.db.insert_node(&container_node).map_err(|e| e.to_string())?;
+
+        // Update Universe child_count
+        state.db.update_child_count(&universe.id, universe.child_count + 1)
+            .map_err(|e| e.to_string())?;
+    }
+
+    // 2. Create the note
+    let note_id = format!("note-{}", Uuid::new_v4());
+    let note_title = if title.trim().is_empty() {
+        "Untitled Note".to_string()
+    } else {
+        title
+    };
+
+    let note = Node {
+        id: note_id.clone(),
+        node_type: NodeType::Thought,
+        title: note_title,
+        content: Some(content),
+        depth: 2,
+        is_item: true,
+        is_universe: false,
+        parent_id: Some(container_id.to_string()),
+        child_count: 0,
+        is_processed: false,
+        created_at: now,
+        updated_at: now,
+        position: Position { x: 0.0, y: 0.0 },
+        url: None,
+        cluster_id: None,
+        cluster_label: None,
+        ai_title: None,
+        summary: None,
+        tags: None,
+        emoji: None,
+        conversation_id: None,
+        sequence_index: None,
+        is_pinned: false,
+        last_accessed_at: None,
+        latest_child_date: None,
+        is_private: None,
+        privacy_reason: None,
+    };
+
+    state.db.insert_node(&note).map_err(|e| e.to_string())?;
+
+    // 3. Update container child_count
+    let children = state.db.get_children(container_id).map_err(|e| e.to_string())?;
+    state.db.update_child_count(container_id, children.len() as i32)
+        .map_err(|e| e.to_string())?;
+
+    Ok(note_id)
 }
 
 #[tauri::command]
@@ -195,7 +301,18 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
         return Err("ANTHROPIC_API_KEY not set".to_string());
     }
 
-    let unprocessed = state.db.get_unprocessed_nodes().map_err(|e| e.to_string())?;
+    // Get unprocessed nodes, excluding protected (Recent Notes)
+    let all_unprocessed = state.db.get_unprocessed_nodes().map_err(|e| e.to_string())?;
+    let protected_ids = state.db.get_protected_node_ids();
+    let unprocessed: Vec<_> = all_unprocessed
+        .into_iter()
+        .filter(|node| !protected_ids.contains(&node.id))
+        .collect();
+
+    if !protected_ids.is_empty() {
+        println!("[AI Processing] Excluding {} protected items (Recent Notes)", protected_ids.len());
+    }
+
     let total = unprocessed.len();
     println!("[AI Processing] Found {} unprocessed nodes", total);
 
@@ -726,6 +843,11 @@ pub struct DbStats {
     pub total_items: usize,
     pub processed_items: usize,
     pub items_with_embeddings: usize,
+    // For API cost estimation
+    pub unprocessed_items: usize,      // Items needing AI processing
+    pub unclustered_items: usize,      // Items without cluster_id
+    pub orphan_items: usize,           // Items with cluster_id but no parent_id
+    pub topics_count: usize,           // Number of topic nodes (for hierarchy grouping)
 }
 
 /// Delete all data (nodes + edges)
@@ -764,6 +886,215 @@ pub fn clear_hierarchy(state: State<AppState>) -> Result<usize, String> {
     state.db.delete_hierarchy_nodes().map_err(|e| e.to_string())
 }
 
+/// Result of quick_add_to_hierarchy
+#[derive(Debug, serde::Serialize)]
+pub struct QuickAddResult {
+    pub items_added: usize,
+    pub topics_created: usize,
+    pub items_skipped: usize,
+    pub inbox_count: usize,  // Items in Inbox - prompt rebuild when > 20
+}
+
+/// Quickly add orphaned items to existing hierarchy without full rebuild
+/// For small additions (1-10 items) - takes ~2 seconds instead of 30 minutes
+/// New clusters go into "📥 Inbox" category to avoid cluttering top-level
+#[tauri::command]
+pub async fn quick_add_to_hierarchy(
+    state: State<'_, AppState>,
+) -> Result<QuickAddResult, String> {
+    use crate::db::{Node, NodeType, Position};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const INBOX_ID: &str = "inbox-category";
+    const INBOX_TITLE: &str = "📥 Inbox";
+
+    // Get orphaned items that have been clustered but not added to hierarchy
+    let orphans = state.db.get_orphaned_clustered_items().map_err(|e| e.to_string())?;
+
+    if orphans.is_empty() {
+        // Still return inbox count for UI
+        let inbox_count = match state.db.get_node(INBOX_ID) {
+            Ok(Some(inbox)) => inbox.child_count as usize,
+            _ => 0,
+        };
+        return Ok(QuickAddResult {
+            items_added: 0,
+            topics_created: 0,
+            items_skipped: 0,
+            inbox_count,
+        });
+    }
+
+    println!("[QuickAdd] Found {} orphaned items to add", orphans.len());
+
+    let mut items_added = 0;
+    let mut topics_created = 0;
+    let mut items_skipped = 0;
+
+    // Get Universe for fallback parent
+    let universe = state.db.get_universe()
+        .map_err(|e| e.to_string())?
+        .ok_or("No Universe node found - run full hierarchy build first")?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    // Get or create Inbox category for new topics
+    let inbox_depth = universe.depth + 1;
+    let inbox = match state.db.get_node(INBOX_ID).map_err(|e| e.to_string())? {
+        Some(existing) => existing,
+        None => {
+            // Create Inbox category
+            let inbox_node = Node {
+                id: INBOX_ID.to_string(),
+                title: INBOX_TITLE.to_string(),
+                node_type: NodeType::Cluster,
+                url: None,
+                content: None,
+                position: Position { x: 0.0, y: 0.0 },
+                created_at: now,
+                updated_at: now,
+                cluster_id: None,
+                cluster_label: Some("Inbox".to_string()),
+                depth: inbox_depth,
+                is_item: false,
+                is_universe: false,
+                parent_id: Some(universe.id.clone()),
+                child_count: 0,
+                ai_title: None,
+                summary: Some("New items awaiting organization".to_string()),
+                tags: None,
+                emoji: Some("📥".to_string()),
+                is_processed: true,
+                conversation_id: None,
+                sequence_index: None,
+                is_pinned: false,
+                last_accessed_at: None,
+                latest_child_date: None,
+                is_private: None,
+                privacy_reason: None,
+            };
+            state.db.insert_node(&inbox_node).map_err(|e| e.to_string())?;
+            state.db.increment_child_count(&universe.id).map_err(|e| e.to_string())?;
+            println!("[QuickAdd] Created 📥 Inbox category");
+            inbox_node
+        }
+    };
+
+    for item in orphans {
+        // Skip items without cluster_label
+        let cluster_label = match &item.cluster_label {
+            Some(label) => label.clone(),
+            None => {
+                println!("[QuickAdd] Skipping {} - no cluster_label", item.id);
+                items_skipped += 1;
+                continue;
+            }
+        };
+
+        // Try to find existing topic with matching cluster_label
+        let topic = state.db.find_topic_by_cluster_label(&cluster_label)
+            .map_err(|e| e.to_string())?;
+
+        match topic {
+            Some(existing_topic) => {
+                // Add item to existing topic
+                let item_depth = existing_topic.depth + 1;
+                state.db.set_node_parent(&item.id, &existing_topic.id, item_depth)
+                    .map_err(|e| e.to_string())?;
+                state.db.increment_child_count(&existing_topic.id)
+                    .map_err(|e| e.to_string())?;
+
+                println!("[QuickAdd] Added '{}' to existing topic '{}'",
+                    item.ai_title.as_ref().unwrap_or(&item.title),
+                    existing_topic.title);
+                items_added += 1;
+            }
+            None => {
+                // Create new topic under Inbox (not Universe)
+                let topic_id = format!("topic-quick-{}", item.cluster_id.unwrap_or(0));
+
+                // Check if this topic already exists (might have been created in this batch)
+                if let Ok(Some(_)) = state.db.get_node(&topic_id) {
+                    // Topic was just created, add item to it
+                    let topic_depth = inbox_depth + 1;
+                    let item_depth = topic_depth + 1;
+                    state.db.set_node_parent(&item.id, &topic_id, item_depth)
+                        .map_err(|e| e.to_string())?;
+                    state.db.increment_child_count(&topic_id)
+                        .map_err(|e| e.to_string())?;
+                    items_added += 1;
+                    continue;
+                }
+
+                // Create new topic node under Inbox
+                let topic_depth = inbox_depth + 1;
+                let topic_node = Node {
+                    id: topic_id.clone(),
+                    title: cluster_label.clone(),
+                    node_type: NodeType::Cluster,
+                    url: None,
+                    content: None,
+                    position: Position { x: 0.0, y: 0.0 },
+                    created_at: now,
+                    updated_at: now,
+                    cluster_id: item.cluster_id,
+                    cluster_label: Some(cluster_label.clone()),
+                    depth: topic_depth,
+                    is_item: false,
+                    is_universe: false,
+                    parent_id: Some(inbox.id.clone()),  // Under Inbox, not Universe
+                    child_count: 1, // The item we're adding
+                    ai_title: None,
+                    summary: Some(format!("New topic: {}", cluster_label)),
+                    tags: None,
+                    emoji: None,
+                    is_processed: false,
+                    conversation_id: None,
+                    sequence_index: None,
+                    is_pinned: false,
+                    last_accessed_at: None,
+                    latest_child_date: Some(item.created_at),
+                    is_private: None,
+                    privacy_reason: None,
+                };
+
+                state.db.insert_node(&topic_node).map_err(|e| e.to_string())?;
+                state.db.increment_child_count(&inbox.id).map_err(|e| e.to_string())?;
+                topics_created += 1;
+
+                // Add item to new topic
+                let item_depth = topic_depth + 1;
+                state.db.set_node_parent(&item.id, &topic_id, item_depth)
+                    .map_err(|e| e.to_string())?;
+
+                println!("[QuickAdd] Created new topic '{}' under Inbox for '{}'",
+                    cluster_label,
+                    item.ai_title.as_ref().unwrap_or(&item.title));
+                items_added += 1;
+            }
+        }
+    }
+
+    // Get final inbox count
+    let inbox_count = match state.db.get_node(INBOX_ID) {
+        Ok(Some(inbox)) => inbox.child_count as usize,
+        _ => 0,
+    };
+
+    println!("[QuickAdd] Done: {} items added, {} topics created, {} skipped, {} in Inbox",
+        items_added, topics_created, items_skipped, inbox_count);
+
+    Ok(QuickAddResult {
+        items_added,
+        topics_created,
+        items_skipped,
+        inbox_count,
+    })
+}
+
 /// Flatten empty passthrough levels in hierarchy
 /// Removes single-child chains and "Uncategorized" passthrough nodes
 #[tauri::command]
@@ -783,8 +1114,17 @@ pub async fn consolidate_root(state: State<'_, AppState>) -> Result<ConsolidateR
         .map_err(|e| e.to_string())?
         .ok_or("No Universe node found")?;
 
-    // Get Universe's direct children
-    let children = state.db.get_children(&universe.id).map_err(|e| e.to_string())?;
+    // Get Universe's direct children (excluding protected)
+    let all_children = state.db.get_children(&universe.id).map_err(|e| e.to_string())?;
+    let protected_ids = state.db.get_protected_node_ids();
+    let children: Vec<Node> = all_children
+        .into_iter()
+        .filter(|child| !protected_ids.contains(&child.id))
+        .collect();
+
+    if !protected_ids.is_empty() {
+        println!("[Consolidate] Excluding {} protected nodes (Recent Notes)", protected_ids.len());
+    }
 
     if children.is_empty() {
         return Err("Universe has no children to consolidate".to_string());
@@ -978,13 +1318,18 @@ pub fn tidy_database(state: State<AppState>) -> Result<TidyReport, String> {
 /// Get database stats for settings panel
 #[tauri::command]
 pub fn get_db_stats(state: State<AppState>) -> Result<DbStats, String> {
-    let (total_nodes, total_items, processed_items, items_with_embeddings) =
+    let (total_nodes, total_items, processed_items, items_with_embeddings,
+         unprocessed_items, unclustered_items, orphan_items, topics_count) =
         state.db.get_stats().map_err(|e| e.to_string())?;
     Ok(DbStats {
         total_nodes,
         total_items,
         processed_items,
         items_with_embeddings,
+        unprocessed_items,
+        unclustered_items,
+        orphan_items,
+        topics_count,
     })
 }
 
@@ -996,17 +1341,21 @@ pub fn get_db_path(state: State<AppState>) -> Result<String, String> {
 
 /// Switch to a different database file
 #[tauri::command]
-pub fn switch_database(app: AppHandle, state: State<AppState>, db_path: String) -> Result<DbStats, String> {
+pub fn switch_database(_app: AppHandle, _state: State<AppState>, db_path: String) -> Result<DbStats, String> {
     use std::path::PathBuf;
     use crate::db::Database;
     use crate::hierarchy;
+    use crate::settings;
 
     let path = PathBuf::from(&db_path);
     if !path.exists() {
         return Err(format!("Database file not found: {}", db_path));
     }
 
-    // Create new database connection
+    // Save the custom db path to settings (will be loaded on next startup)
+    settings::set_custom_db_path(Some(db_path.clone()))?;
+
+    // Create new database connection to get stats
     let new_db = Database::new(&path).map_err(|e| e.to_string())?;
 
     // Auto-build hierarchy if no Universe exists
@@ -1016,23 +1365,36 @@ pub fn switch_database(app: AppHandle, state: State<AppState>, db_path: String) 
         }
     }
 
-    // Replace the database in the app state
-    // Note: This is a bit hacky - we're replacing the Arc's inner value
-    // In a real app, you'd want proper state management
-    let arc_db = std::sync::Arc::new(new_db);
-
     // Get stats before returning
-    let (total_nodes, total_items, processed_items, items_with_embeddings) =
-        arc_db.get_stats().map_err(|e| e.to_string())?;
+    let (total_nodes, total_items, processed_items, items_with_embeddings,
+         unprocessed_items, unclustered_items, orphan_items, topics_count) =
+        new_db.get_stats().map_err(|e| e.to_string())?;
 
-    // Update the managed state - we need to use interior mutability
-    // For now, we'll just return success and require app restart
-    // TODO: Proper hot-swap would require RwLock around the Database
+    // Note: The actual switch happens on page reload (frontend calls window.location.reload())
+    // which restarts the app and loads the saved custom_db_path from settings
 
     Ok(DbStats {
         total_nodes,
         total_items,
         processed_items,
         items_with_embeddings,
+        unprocessed_items,
+        unclustered_items,
+        orphan_items,
+        topics_count,
     })
+}
+
+// ==================== Recent Notes Protection ====================
+
+/// Get Recent Notes protection status
+#[tauri::command]
+pub fn get_protect_recent_notes() -> bool {
+    crate::settings::is_recent_notes_protected()
+}
+
+/// Set Recent Notes protection status
+#[tauri::command]
+pub fn set_protect_recent_notes(protected: bool) -> Result<(), String> {
+    crate::settings::set_protect_recent_notes(protected)
 }

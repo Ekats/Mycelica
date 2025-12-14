@@ -342,7 +342,19 @@ pub async fn run_clustering(db: &Database, use_ai: bool) -> Result<ClusteringRes
     reset_rebuild_cancel();
 
     // Get items needing clustering
-    let items = db.get_items_needing_clustering().map_err(|e| e.to_string())?;
+    let all_items = db.get_items_needing_clustering().map_err(|e| e.to_string())?;
+
+    // Filter out protected items (Recent Notes and descendants)
+    let protected_ids = db.get_protected_node_ids();
+    let items: Vec<Node> = all_items
+        .into_iter()
+        .filter(|item| !protected_ids.contains(&item.id))
+        .collect();
+
+    let skipped = protected_ids.len();
+    if skipped > 0 {
+        println!("[Clustering] Skipping {} protected items (Recent Notes)", skipped);
+    }
 
     if items.is_empty() {
         return Ok(ClusteringResult {
