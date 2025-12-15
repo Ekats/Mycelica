@@ -1222,13 +1222,96 @@ pub struct CategoryGrouping {
     pub children: Vec<String>,  // Topic labels that belong to this category
 }
 
-/// Group topics into 5-12 parent categories using AI
+/// OpenAI fallback for grouping when Claude is overloaded
+async fn call_openai_grouping(client: &reqwest::Client, prompt: &str) -> Result<String, String> {
+    let openai_key = settings::get_openai_api_key()
+        .ok_or("OpenAI API key not set - cannot fallback")?;
+
+    #[derive(Serialize)]
+    struct OpenAIRequest {
+        model: String,
+        messages: Vec<OpenAIMessage>,
+        max_tokens: u32,
+    }
+
+    #[derive(Serialize)]
+    struct OpenAIMessage {
+        role: String,
+        content: String,
+    }
+
+    #[derive(Deserialize)]
+    struct OpenAIResponse {
+        choices: Vec<OpenAIChoice>,
+        usage: Option<OpenAIUsage>,
+    }
+
+    #[derive(Deserialize)]
+    struct OpenAIChoice {
+        message: OpenAIMessageContent,
+    }
+
+    #[derive(Deserialize)]
+    struct OpenAIMessageContent {
+        content: String,
+    }
+
+    #[derive(Deserialize)]
+    struct OpenAIUsage {
+        total_tokens: u64,
+    }
+
+    let request = OpenAIRequest {
+        model: "gpt-4o".to_string(),
+        messages: vec![OpenAIMessage {
+            role: "user".to_string(),
+            content: prompt.to_string(),
+        }],
+        max_tokens: 4000,
+    };
+
+    let response = client
+        .post("https://api.openai.com/v1/chat/completions")
+        .header("Authorization", format!("Bearer {}", openai_key))
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| format!("OpenAI request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("OpenAI API error {}: {}", status, body));
+    }
+
+    let api_response: OpenAIResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse OpenAI response: {}", e))?;
+
+    // Track token usage
+    if let Some(usage) = &api_response.usage {
+        let _ = settings::add_openai_tokens(usage.total_tokens);
+    }
+
+    api_response
+        .choices
+        .first()
+        .map(|c| c.message.content.clone())
+        .ok_or_else(|| "No response from OpenAI".to_string())
+}
+
+/// Group topics into parent categories using AI
 /// Used for recursive hierarchy building when a level has too many children
 /// Preserves project/product names as umbrella categories
+/// max_groups: maximum number of categories to create (default 8 if None)
 pub async fn group_topics_into_categories(
     topics: &[TopicInfo],
     context: &GroupingContext,
+    max_groups: Option<usize>,
 ) -> Result<Vec<CategoryGrouping>, String> {
+    let max_groups = max_groups.unwrap_or(8);
     let api_key = get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
 
     if topics.is_empty() {
@@ -1333,7 +1416,7 @@ EXISTING SIBLINGS (do not duplicate these names): {siblings}
 {projects_hint}{mandatory_section}
 
 YOUR TASK:
-Create 5-12 SUB-CATEGORIES for the {count} topics listed below.
+Create {max_groups} or fewer SUB-CATEGORIES for the {count} topics listed below.
 
 CRITICAL RULES:
 
@@ -1351,7 +1434,7 @@ CRITICAL RULES:
 3. PREFER BROADER CATEGORIES AT TOP LEVELS
    - Level 1 (under Universe): Projects, Domains, Life Areas
    - Level 2+: Get more specific WITHIN those umbrellas
-   - Target 5-8 categories, not 15
+   - Target 3-{max_groups} categories maximum
 
 4. NO GENERIC CATCH-ALL NAMES:
    - FORBIDDEN: "Other", "Miscellaneous", "General", "Various", "Mixed", "Uncategorized"
@@ -1382,21 +1465,23 @@ Return ONLY valid JSON, no markdown:
         projects_hint = projects_hint,
         mandatory_section = mandatory_section,
         count = topics.len(),
-        topics_section = topics_section
+        topics_section = topics_section,
+        max_groups = max_groups
     );
 
-    // Use Sonnet for hierarchy grouping - this is a one-time operation that
-    // defines the entire UX structure and requires nuanced semantic understanding
+    // Try Claude first, fall back to OpenAI if overloaded (529)
+    let client = reqwest::Client::new();
+
+    // Try Anthropic first
     let request = AnthropicRequest {
         model: "claude-sonnet-4-20250514".to_string(),
-        max_tokens: 4000,  // More tokens for potentially large topic lists
+        max_tokens: 4000,
         messages: vec![Message {
             role: "user".to_string(),
-            content: prompt,
+            content: prompt.clone(),
         }],
     };
 
-    let client = reqwest::Client::new();
     let response = client
         .post("https://api.anthropic.com/v1/messages")
         .header("x-api-key", &api_key)
@@ -1404,36 +1489,47 @@ Return ONLY valid JSON, no markdown:
         .header("content-type", "application/json")
         .json(&request)
         .send()
-        .await
-        .map_err(|e| format!("HTTP request failed: {}", e))?;
+        .await;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("API error {}: {}", status, body));
-    }
-
-    let api_response: AnthropicResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-    // Track token usage
-    if let Some(usage) = &api_response.usage {
-        let _ = settings::add_anthropic_tokens(usage.input_tokens, usage.output_tokens);
-    }
-
-    let text = api_response
-        .content
-        .first()
-        .map(|c| c.text.clone())
-        .unwrap_or_default();
+    let text = match response {
+        Ok(resp) if resp.status().is_success() => {
+            let api_response: AnthropicResponse = resp
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse response: {}", e))?;
+            if let Some(usage) = &api_response.usage {
+                let _ = settings::add_anthropic_tokens(usage.input_tokens, usage.output_tokens);
+            }
+            api_response.content.first().map(|c| c.text.clone()).unwrap_or_default()
+        }
+        Ok(resp) if resp.status().as_u16() == 529 => {
+            // Claude overloaded - try OpenAI fallback
+            println!("[AI] Claude overloaded (529), trying OpenAI fallback...");
+            call_openai_grouping(&client, &prompt).await?
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            // Try OpenAI fallback for other errors too
+            println!("[AI] Claude error {}, trying OpenAI fallback...", status);
+            match call_openai_grouping(&client, &prompt).await {
+                Ok(text) => text,
+                Err(_) => return Err(format!("API error {}: {}", status, body)),
+            }
+        }
+        Err(e) => {
+            // Network error - try OpenAI
+            println!("[AI] Claude request failed: {}, trying OpenAI fallback...", e);
+            call_openai_grouping(&client, &prompt).await?
+        }
+    };
 
     parse_category_groupings(&text, topics)
 }
 
-/// Group categories into 4-8 uber-categories with SINGLE WORD ALL-CAPS names
-/// Used for consolidating Universe's direct children into high-level domains
+/// Group categories into 4-8 uber-categories, preserving project names
+/// Used for consolidating Universe's direct children into navigable top-level domains
+/// Projects (Mycelica, etc.) stay as their own categories; generic topics get grouped by theme
 pub async fn group_into_uber_categories(
     categories: &[TopicInfo],
 ) -> Result<Vec<CategoryGrouping>, String> {
@@ -1451,48 +1547,56 @@ pub async fn group_into_uber_categories(
         .join("\n");
 
     let prompt = format!(
-        r#"You are consolidating a knowledge graph's top-level categories into uber-categories.
+        r#"You are consolidating a knowledge graph's top-level categories into 4-8 uber-categories.
 
 CURRENT CATEGORIES ({count} total):
 {categories_section}
 
 YOUR TASK:
-Group these into 4-8 UBER-CATEGORIES with SINGLE WORD, ALL-CAPS names.
+Group these into 4-8 top-level categories that make the graph navigable.
 
-STRICT RULES:
+CRITICAL RULES:
 
-1. NAMES MUST BE:
-   - Single word ONLY (no spaces, no hyphens)
-   - ALL CAPS
-   - Abstract/conceptual domains
-   - Examples: TECH, LIFE, MIND, WORK, CREATE, SCIENCE, SYSTEM, BUILD, LEARN, META
+1. PRESERVE PROJECT/PRODUCT NAMES AS THEIR OWN CATEGORIES
+   - If you see "Mycelica", "Ascension", or ANY named project/product/app,
+     that name MUST become its own top-level category
+   - Project names are NAMESPACES - never dissolve them into generic buckets
+   - "Mycelica UI", "Mycelica Backend", "Mycelica Architecture" → ALL go under "Mycelica"
+   - Even single-topic projects stay as their own category
 
-2. TARGET 4-8 CATEGORIES:
-   - Minimum 4 uber-categories
-   - Maximum 8 uber-categories
-   - Each should contain 1-4 of the input categories
+2. GROUP NON-PROJECT CATEGORIES BY THEME
+   - Categories that aren't project-specific CAN be grouped into broader themes
+   - Use meaningful 1-3 word names (not forced single-word ALL-CAPS)
+   - Examples: "Philosophy & Mind", "Technical Learning", "Personal Growth"
 
-3. SEMANTIC GROUPING:
-   - TECH: Programming, Software, AI, Systems, Architecture
-   - LIFE: Personal, Health, Relationships, Daily life
-   - MIND: Psychology, Philosophy, Consciousness, Learning
-   - WORK: Career, Business, Productivity, Projects
-   - CREATE: Art, Writing, Music, Design, Creative projects
-   - SCIENCE: Research, Biology, Physics, Data
-   - BUILD: Engineering, Construction, Making things
-   - META: Self-reference, Organization, Tools
+3. NAMING RULES:
+   - Project names: Keep exact name (e.g., "Mycelica", "Ascension")
+   - Theme groups: 1-3 descriptive words (e.g., "AI & Machine Learning", "Life & Health")
+   - FORBIDDEN: "Other", "Miscellaneous", "General", "Various", "Mixed"
 
-4. NO GENERIC CATCH-ALLS:
-   - FORBIDDEN: OTHER, MISC, GENERAL, VARIOUS
-   - Every category MUST fit somewhere meaningful
+4. TARGET 4-8 CATEGORIES:
+   - Each project gets its own category (even if small)
+   - Non-project categories can be merged into themes
+   - Result should have 4-8 total uber-categories
+
+5. WHAT COUNTS AS A PROJECT:
+   - Named software/apps (Mycelica, VSCode extensions, specific tools)
+   - Named creative works (book titles, game names)
+   - Named initiatives or ventures
+   - NOT generic topics like "Programming" or "AI Research"
 
 Return ONLY valid JSON, no markdown:
 {{
   "categories": [
     {{
-      "name": "TECH",
-      "description": "Technology and software",
-      "children": ["Software Engineering", "AI Research", "System Design"]
+      "name": "Mycelica",
+      "description": "Knowledge graph application development",
+      "children": ["Mycelica UI", "Mycelica Backend", "Mycelica Architecture"]
+    }},
+    {{
+      "name": "AI & Machine Learning",
+      "description": "Artificial intelligence concepts and research",
+      "children": ["Neural Networks", "LLM Research", "ML Infrastructure"]
     }}
   ]
 }}
@@ -1501,16 +1605,18 @@ Return ONLY valid JSON, no markdown:
         categories_section = categories_section
     );
 
+    // Try Claude first, fall back to OpenAI if overloaded
+    let client = reqwest::Client::new();
+
     let request = AnthropicRequest {
         model: "claude-sonnet-4-20250514".to_string(),
         max_tokens: 2000,
         messages: vec![Message {
             role: "user".to_string(),
-            content: prompt,
+            content: prompt.clone(),
         }],
     };
 
-    let client = reqwest::Client::new();
     let response = client
         .post("https://api.anthropic.com/v1/messages")
         .header("x-api-key", &api_key)
@@ -1518,30 +1624,37 @@ Return ONLY valid JSON, no markdown:
         .header("content-type", "application/json")
         .json(&request)
         .send()
-        .await
-        .map_err(|e| format!("HTTP request failed: {}", e))?;
+        .await;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("API error {}: {}", status, body));
-    }
-
-    let api_response: AnthropicResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-    // Track token usage
-    if let Some(usage) = &api_response.usage {
-        let _ = settings::add_anthropic_tokens(usage.input_tokens, usage.output_tokens);
-    }
-
-    let text = api_response
-        .content
-        .first()
-        .map(|c| c.text.clone())
-        .unwrap_or_default();
+    let text = match response {
+        Ok(resp) if resp.status().is_success() => {
+            let api_response: AnthropicResponse = resp
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse response: {}", e))?;
+            if let Some(usage) = &api_response.usage {
+                let _ = settings::add_anthropic_tokens(usage.input_tokens, usage.output_tokens);
+            }
+            api_response.content.first().map(|c| c.text.clone()).unwrap_or_default()
+        }
+        Ok(resp) if resp.status().as_u16() == 529 => {
+            println!("[AI] Claude overloaded (529), trying OpenAI fallback...");
+            call_openai_grouping(&client, &prompt).await?
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            println!("[AI] Claude error {}, trying OpenAI fallback...", status);
+            match call_openai_grouping(&client, &prompt).await {
+                Ok(text) => text,
+                Err(_) => return Err(format!("API error {}: {}", status, body)),
+            }
+        }
+        Err(e) => {
+            println!("[AI] Claude request failed: {}, trying OpenAI fallback...", e);
+            call_openai_grouping(&client, &prompt).await?
+        }
+    };
 
     parse_category_groupings(&text, categories)
 }

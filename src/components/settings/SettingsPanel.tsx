@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { readTextFile } from '@tauri-apps/plugin-fs';
+import { useGraphStore } from '../../stores/graphStore';
 import {
   X,
   Key,
@@ -61,6 +62,7 @@ interface TidyReport {
   sameNameMerged: number;
   chainsFlattened: number;
   emptiesRemoved: number;
+  emptyItemsRemoved: number;
   childCountsFixed: number;
   depthsFixed: number;
   orphansReparented: number;
@@ -82,6 +84,9 @@ interface PrivacyStats {
 type SettingsTab = 'setup' | 'keys' | 'maintenance' | 'privacy' | 'info';
 
 export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelProps) {
+  // Navigation reset for database switches
+  const { navigateToRoot } = useGraphStore();
+
   // Active tab
   const [activeTab, setActiveTab] = useState<SettingsTab>('setup');
 
@@ -286,16 +291,21 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
         filters: [{ name: 'SQLite Database', extensions: ['db'] }],
       });
       if (file && typeof file === 'string') {
-        await invoke<DbStats>('switch_database', { dbPath: file });
-        // Force full page reload to load new database
-        // (Arc-wrapped Database cannot be hot-swapped)
-        window.location.reload();
+        const stats = await invoke<DbStats>('switch_database', { dbPath: file });
+        // Update local state with new db stats
+        setDbStats(stats);
+        setDbPath(file);
+        // Reset navigation to universe root
+        navigateToRoot();
+        // Trigger graph data refresh
+        onDataChanged?.();
+        setActionResult('Database switched successfully');
       }
     } catch (err) {
       setActionResult(`Error: ${err}`);
+    } finally {
       setSwitchingDb(false);
     }
-    // Note: no finally block - page will reload on success
   };
 
   // API Key handlers
@@ -573,12 +583,11 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     setIsProcessingAi(true);
     setSetupResult(null);
     try {
-      await invoke('run_ai_processing');
-      setSetupResult('AI processing complete');
+      const result = await invoke<{ processed: number; skipped: number }>('process_nodes');
+      setSetupResult(`AI processing complete: ${result.processed} processed, ${result.skipped} skipped`);
       await loadDbStats();
       onDataChanged?.();
-      // Reload to show updated data
-      window.location.reload();
+      setIsProcessingAi(false);
     } catch (err) {
       setSetupResult(`Error: ${err}`);
       setIsProcessingAi(false);
@@ -777,7 +786,8 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
           const parts: string[] = [];
           if (report.sameNameMerged > 0) parts.push(`merged ${report.sameNameMerged} same-name`);
           if (report.chainsFlattened > 0) parts.push(`flattened ${report.chainsFlattened} chains`);
-          if (report.emptiesRemoved > 0) parts.push(`removed ${report.emptiesRemoved} empties`);
+          if (report.emptiesRemoved > 0) parts.push(`removed ${report.emptiesRemoved} empty categories`);
+          if (report.emptyItemsRemoved > 0) parts.push(`removed ${report.emptyItemsRemoved} empty items`);
           if (report.childCountsFixed > 0) parts.push(`fixed ${report.childCountsFixed} counts`);
           if (report.depthsFixed > 0) parts.push(`fixed ${report.depthsFixed} depths`);
           if (report.orphansReparented > 0) parts.push(`reparented ${report.orphansReparented} orphans`);

@@ -1,5 +1,5 @@
 import { memo, useState, useCallback, useMemo } from 'react';
-import { Pin, PinOff, Lock, LockOpen } from 'lucide-react';
+import { Pin, PinOff, Lock, LockOpen, GitBranch, GitMerge } from 'lucide-react';
 import type { Node } from '../../types/graph';
 
 interface SimilarNode {
@@ -35,6 +35,8 @@ interface SimilarNodesPanelProps {
   onRemoveNode: (nodeId: string) => void;
   onTogglePin: (nodeId: string, currentlyPinned: boolean) => void;
   onTogglePrivacy: (nodeId: string, currentlyPrivate: boolean) => void;
+  onSplitNode?: (nodeId: string) => void;  // Split node's children into sub-categories
+  onUnsplitNode?: (nodeId: string) => void;  // Flatten intermediate categories back into parent
   onClearAll: () => void;
   onToggleStack: () => void;
   onStartResize: () => void;
@@ -72,6 +74,8 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
   onRemoveNode,
   onTogglePin,
   onTogglePrivacy,
+  onSplitNode,
+  onUnsplitNode,
   onClearAll,
   onToggleStack,
   onStartResize,
@@ -431,7 +435,7 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
     );
   }, [expandedGroups, toggleGroup, nodes, onJumpToNode, devLog, countAllDescendants, similarNodesMap, isDescendant]);
 
-  // Recursive render for hierarchy inside node
+  // Recursive render for hierarchy inside node - shows clear groupings
   const renderHierarchyNode = useCallback((node: Node, sourceId: string, depth: number) => {
     const children = getDirectChildren(node.id);
     const hasChildren = children.length > 0;
@@ -439,8 +443,12 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
     const isExpanded = expandedHierarchyNodes.has(path);
     const displayDate = node.childCount > 0 && node.latestChildDate ? node.latestChildDate : node.createdAt;
 
+    // Count total items in this subtree
+    const totalItems = countNodeDescendants(node.id);
+    const isGroup = hasChildren && !node.isItem;
+
     return (
-      <div key={node.id} style={{ marginLeft: depth * 12 }}>
+      <div key={node.id} className={depth === 0 && isGroup ? 'mb-1' : ''}>
         <button
           onClick={() => {
             if (hasChildren) {
@@ -458,7 +466,10 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
               onJumpToNode(node, nodes.get(sourceId));
             }
           }}
-          className="w-full px-2 py-1 text-left hover:bg-gray-700/50 transition-colors flex items-center justify-between gap-2"
+          className={`w-full px-2 py-1 text-left hover:bg-gray-700/50 transition-colors flex items-center justify-between gap-2 ${
+            depth === 0 && isGroup ? 'bg-gray-700/30 rounded' : ''
+          }`}
+          style={{ marginLeft: depth * 12 }}
           title={node.aiTitle || node.title}
         >
           <span className="flex items-center gap-1.5 text-sm min-w-0">
@@ -466,9 +477,13 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
               {hasChildren ? (isExpanded ? '▼' : '▶') : '•'}
             </span>
             <span className="shrink-0">{node.emoji || getNodeEmoji(node)}</span>
-            <span className="truncate max-w-[180px]">{node.aiTitle || node.title}</span>
-            {hasChildren && (
-              <span className="text-xs text-gray-500 shrink-0">({node.childCount})</span>
+            <span className={`truncate max-w-[180px] ${depth === 0 && isGroup ? 'font-medium' : ''}`}>
+              {node.aiTitle || node.title}
+            </span>
+            {isGroup && (
+              <span className="text-xs text-gray-500 shrink-0">
+                ({totalItems > 0 ? `${totalItems} items` : node.childCount})
+              </span>
             )}
           </span>
           <span className="text-xs shrink-0" style={{ color: getDateColor(displayDate) }}>
@@ -476,13 +491,13 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
           </span>
         </button>
         {isExpanded && hasChildren && (
-          <div className="border-l border-gray-700/50 ml-4">
+          <div className="border-l-2 border-gray-600/50 ml-4 pl-1">
             {children.map(child => renderHierarchyNode(child, sourceId, depth + 1))}
           </div>
         )}
       </div>
     );
-  }, [getDirectChildren, expandedHierarchyNodes, getNodeEmoji, onJumpToNode, nodes, getDateColor]);
+  }, [getDirectChildren, expandedHierarchyNodes, getNodeEmoji, onJumpToNode, nodes, getDateColor, countNodeDescendants]);
 
   if (similarNodesMap.size === 0) return null;
 
@@ -558,6 +573,35 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
                     >
                       {sourceNode?.isPrivate === true ? <Lock className="w-4 h-4" /> : <LockOpen className="w-4 h-4" />}
                     </button>
+                    {sourceNode && sourceNode.childCount > 0 && (
+                      <>
+                        {onSplitNode && (
+                          <button
+                            onClick={() => onSplitNode(sourceId)}
+                            className={`p-1.5 rounded-md transition-colors ${
+                              sourceNode.childCount > 5
+                                ? 'bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 hover:text-blue-300'
+                                : 'bg-gray-600/50 text-gray-400 hover:bg-gray-600 hover:text-gray-300'
+                            }`}
+                            title={sourceNode.childCount > 5
+                              ? `Split ${sourceNode.childCount} children into sub-categories`
+                              : `${sourceNode.childCount} children (split works best with >5)`
+                            }
+                          >
+                            <GitBranch className="w-4 h-4" />
+                          </button>
+                        )}
+                        {onUnsplitNode && (
+                          <button
+                            onClick={() => onUnsplitNode(sourceId)}
+                            className="p-1.5 rounded-md bg-gray-600/50 text-gray-400 hover:bg-orange-500/30 hover:text-orange-400 transition-colors"
+                            title="Unsplit - flatten intermediate categories back into this node"
+                          >
+                            <GitMerge className="w-4 h-4" />
+                          </button>
+                        )}
+                      </>
+                    )}
                     {stackNodes && (
                       <button
                         onClick={() => onRemoveNode(sourceId)}

@@ -184,14 +184,14 @@ pub fn cancel_privacy_scan() -> Result<(), String> {
 /// Reset all privacy flags (to re-scan with different settings)
 #[tauri::command]
 pub fn reset_privacy_flags(state: State<AppState>) -> Result<usize, String> {
-    state.db.reset_all_privacy_flags()
+    state.db.read().unwrap().reset_all_privacy_flags()
         .map_err(|e| e.to_string())
 }
 
 /// Get privacy statistics
 #[tauri::command]
 pub fn get_privacy_stats(state: State<AppState>) -> Result<PrivacyStats, String> {
-    let (total, scanned, unscanned, private, safe, total_categories, scanned_categories) = state.db
+    let (total, scanned, unscanned, private, safe, total_categories, scanned_categories) = state.db.read().unwrap()
         .get_privacy_stats_extended()
         .map_err(|e| e.to_string())?;
 
@@ -206,20 +206,48 @@ pub fn get_privacy_stats(state: State<AppState>) -> Result<PrivacyStats, String>
     })
 }
 
+/// Result of setting node privacy - includes affected node IDs for frontend update
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetPrivacyResult {
+    pub affected_ids: Vec<String>,
+}
+
 /// Manually set a node's privacy status
 #[tauri::command]
 pub fn set_node_privacy(
     state: State<'_, AppState>,
     node_id: String,
     is_private: bool,
-) -> Result<(), String> {
+) -> Result<SetPrivacyResult, String> {
     let reason = if is_private {
         Some("Manually marked as private")
     } else {
         None
     };
-    state.db.update_node_privacy(&node_id, is_private, reason)
-        .map_err(|e| e.to_string())
+
+    // Update the node itself
+    state.db.read().unwrap().update_node_privacy(&node_id, is_private, reason)
+        .map_err(|e| e.to_string())?;
+
+    // Propagate to all descendants
+    let descendant_ids = if is_private {
+        let propagation_reason = "Inherited from manually marked private parent";
+        state.db.read().unwrap().force_propagate_privacy_to_descendants(&node_id, propagation_reason)
+            .map_err(|e| e.to_string())?
+    } else {
+        state.db.read().unwrap().clear_privacy_from_descendants(&node_id)
+            .map_err(|e| e.to_string())?
+    };
+
+    println!("[Privacy] Marked '{}' {}, propagated to {} descendants",
+             node_id,
+             if is_private { "private" } else { "public" },
+             descendant_ids.len());
+
+    let mut all_ids = vec![node_id];
+    all_ids.extend(descendant_ids);
+    Ok(SetPrivacyResult { affected_ids: all_ids })
 }
 
 /// Analyze a single node for privacy
@@ -231,7 +259,7 @@ pub async fn analyze_node_privacy(
     let api_key = settings::get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
 
     // Get node from db
-    let node = state.db.get_node(&node_id)
+    let node = state.db.read().unwrap().get_node(&node_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Node {} not found", node_id))?;
 
@@ -306,7 +334,7 @@ pub async fn analyze_node_privacy(
     let (is_private, reason) = parse_privacy_response(&text)?;
 
     // Update node in database
-    state.db.update_node_privacy(&node_id, is_private, reason.as_deref())
+    state.db.read().unwrap().update_node_privacy(&node_id, is_private, reason.as_deref())
         .map_err(|e| e.to_string())?;
 
     Ok(PrivacyResult { is_private, reason })
@@ -363,7 +391,7 @@ pub async fn analyze_all_privacy(
     };
 
     // Get all items that haven't been scanned
-    let nodes = state.db.get_items_needing_privacy_scan()
+    let nodes = state.db.read().unwrap().get_items_needing_privacy_scan()
         .map_err(|e| e.to_string())?;
 
     let total = nodes.len();
@@ -486,7 +514,7 @@ pub async fn analyze_all_privacy(
                             .unwrap_or((true, Some("Parse error".to_string())));
 
                         // Update database
-                        if let Err(e) = state.db.update_node_privacy(&node.id, is_private, reason.as_deref()) {
+                        if let Err(e) = state.db.read().unwrap().update_node_privacy(&node.id, is_private, reason.as_deref()) {
                             eprintln!("Failed to update node {}: {}", node.id, e);
                             error_count += 1;
                         } else {
@@ -594,7 +622,7 @@ pub async fn analyze_categories_privacy(
     };
 
     // Get all category nodes (non-items with children) that haven't been scanned
-    let categories = state.db.get_category_nodes_needing_privacy_scan()
+    let categories = state.db.read().unwrap().get_category_nodes_needing_privacy_scan()
         .map_err(|e| e.to_string())?;
 
     let total = categories.len();
@@ -723,7 +751,7 @@ pub async fn analyze_categories_privacy(
                             .unwrap_or((true, Some("Parse error".to_string())));
 
                         // Update the category node itself
-                        if let Err(e) = state.db.update_node_privacy(&category.id, is_private, reason.as_deref()) {
+                        if let Err(e) = state.db.read().unwrap().update_node_privacy(&category.id, is_private, reason.as_deref()) {
                             eprintln!("Failed to update category {}: {}", category.id, e);
                             error_count += 1;
                             continue;
@@ -734,7 +762,7 @@ pub async fn analyze_categories_privacy(
 
                             // PROPAGATE to all descendants!
                             let propagation_reason = format!("Inherited from private category: {}", title);
-                            match state.db.propagate_privacy_to_descendants(&category.id, &propagation_reason) {
+                            match state.db.read().unwrap().propagate_privacy_to_descendants(&category.id, &propagation_reason) {
                                 Ok(count) => {
                                     items_propagated += count;
                                     println!("Category '{}' marked private, propagated to {} descendants", title, count);
@@ -839,7 +867,7 @@ pub fn export_shareable_db(state: State<AppState>) -> Result<String, String> {
     use rusqlite::Connection;
 
     // Get current db path
-    let db_path = state.db.get_path();
+    let db_path = state.db.read().unwrap().get_path();
 
     // Generate shareable path
     let shareable_path = if db_path.ends_with(".db") {

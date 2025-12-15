@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import ReactMarkdown from 'react-markdown';
-import { ChevronLeft, ChevronRight } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Pencil, Save, X } from 'lucide-react';
 import { useGraphStore } from '../../stores/graphStore';
 import { getEmojiForNode } from '../../utils/emojiMatcher';
 import { ConversationRenderer, isConversationContent } from './ConversationRenderer';
@@ -13,10 +13,13 @@ interface LeafViewProps {
 }
 
 export function LeafView({ nodeId, onBack }: LeafViewProps) {
-  const { nodes, navigateToNode, closeLeaf } = useGraphStore();
+  const { nodes, navigateToBreadcrumb, closeLeaf, updateNode } = useGraphStore();
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [isEditing, setIsEditing] = useState(false);
+  const [editContent, setEditContent] = useState<string>('');
+  const [saving, setSaving] = useState(false);
 
   const node = nodes.get(nodeId);
 
@@ -59,6 +62,40 @@ export function LeafView({ nodeId, onBack }: LeafViewProps) {
 
   const hierarchyPath = getHierarchyPath();
 
+  // Start editing
+  const handleEdit = () => {
+    setEditContent(content || '');
+    setIsEditing(true);
+  };
+
+  // Cancel editing
+  const handleCancel = () => {
+    setIsEditing(false);
+    setEditContent('');
+  };
+
+  // Save changes to database
+  const handleSave = async () => {
+    if (!node) return;
+    setSaving(true);
+    try {
+      // Update content in database using simpler API
+      await invoke('update_node_content', {
+        nodeId,
+        content: editContent,
+      });
+      // Update local state
+      setContent(editContent);
+      updateNode(nodeId, { content: editContent });
+      setIsEditing(false);
+    } catch (err) {
+      console.error('Failed to save:', err);
+      alert('Failed to save: ' + (err instanceof Error ? err.message : String(err)));
+    } finally {
+      setSaving(false);
+    }
+  };
+
   if (!node) {
     return (
       <div className="h-full flex items-center justify-center bg-gray-900 text-gray-400">
@@ -96,7 +133,7 @@ export function LeafView({ nodeId, onBack }: LeafViewProps) {
               <ChevronRight className="w-4 h-4 text-gray-600" />
               <button
                 onClick={() => {
-                  navigateToNode(pathNode);
+                  navigateToBreadcrumb(pathNode.id);
                   closeLeaf();
                 }}
                 className="px-2 py-1 text-gray-400 hover:text-white hover:bg-gray-700 rounded transition-colors"
@@ -118,10 +155,43 @@ export function LeafView({ nodeId, onBack }: LeafViewProps) {
 
         {/* Title bar */}
         <div className="px-6 py-4">
-          <h1 className="text-2xl font-bold text-white flex items-center gap-3">
-            <span className="text-3xl">{node.emoji || getEmojiForNode(node)}</span>
-            {node.aiTitle || node.title}
-          </h1>
+          <div className="flex items-start justify-between gap-4">
+            <h1 className="text-2xl font-bold text-white flex items-center gap-3">
+              <span className="text-3xl">{node.emoji || getEmojiForNode(node)}</span>
+              {node.aiTitle || node.title}
+            </h1>
+            {/* Edit/Save/Cancel buttons */}
+            <div className="flex items-center gap-2 shrink-0">
+              {isEditing ? (
+                <>
+                  <button
+                    onClick={handleCancel}
+                    disabled={saving}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-gray-300 hover:text-white transition-colors disabled:opacity-50"
+                  >
+                    <X className="w-4 h-4" />
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleSave}
+                    disabled={saving}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-amber-600 hover:bg-amber-500 text-white transition-colors disabled:opacity-50"
+                  >
+                    <Save className="w-4 h-4" />
+                    {saving ? 'Saving...' : 'Save'}
+                  </button>
+                </>
+              ) : (
+                <button
+                  onClick={handleEdit}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-gray-300 hover:text-white transition-colors"
+                >
+                  <Pencil className="w-4 h-4" />
+                  Edit
+                </button>
+              )}
+            </div>
+          </div>
           {node.summary && (
             <p className="mt-2 text-gray-400 text-sm">{node.summary}</p>
           )}
@@ -156,6 +226,17 @@ export function LeafView({ nodeId, onBack }: LeafViewProps) {
               <div className="text-3xl mb-2">⚠️</div>
               <p>{error}</p>
             </div>
+          </div>
+        ) : isEditing ? (
+          // Edit mode - full-height textarea
+          <div className="h-full p-4">
+            <textarea
+              value={editContent}
+              onChange={(e) => setEditContent(e.target.value)}
+              className="w-full h-full bg-gray-800 text-gray-200 border border-gray-600 rounded-lg p-4 font-mono text-sm resize-none focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500"
+              placeholder="Enter content..."
+              autoFocus
+            />
           </div>
         ) : content && isConversationContent(content) ? (
           // Conversation format - document style

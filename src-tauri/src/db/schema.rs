@@ -579,6 +579,16 @@ impl Database {
         Ok(())
     }
 
+    /// Update just the content of a node (simpler API for editing)
+    pub fn update_node_content(&self, node_id: &str, content: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE nodes SET content = ?2, updated_at = ?3 WHERE id = ?1",
+            params![node_id, content, chrono::Utc::now().timestamp_millis()],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_node(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM nodes WHERE id = ?1", params![id])?;
@@ -651,10 +661,11 @@ impl Database {
 
     /// Propagate privacy status to all descendants of a node
     /// Uses iterative approach to mark all children, grandchildren, etc. as private
+    /// Propagate privacy to descendants (only unscanned nodes - for AI scan)
     pub fn propagate_privacy_to_descendants(&self, node_id: &str, reason: &str) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
 
-        // Use recursive CTE to find all descendants
+        // Use recursive CTE to find all descendants - only update unscanned
         let count = conn.execute(
             "UPDATE nodes SET is_private = 1, privacy_reason = ?2
              WHERE id IN (
@@ -670,6 +681,74 @@ impl Database {
         )?;
 
         Ok(count)
+    }
+
+    /// Force propagate privacy to ALL descendants (for manual marking)
+    pub fn force_propagate_privacy_to_descendants(&self, node_id: &str, reason: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+
+        // First get all descendant IDs
+        let mut stmt = conn.prepare(
+            "WITH RECURSIVE descendants AS (
+                 SELECT id FROM nodes WHERE parent_id = ?1
+                 UNION ALL
+                 SELECT n.id FROM nodes n
+                 INNER JOIN descendants d ON n.parent_id = d.id
+             )
+             SELECT id FROM descendants"
+        )?;
+
+        let ids: Vec<String> = stmt.query_map(params![node_id], |row| row.get(0))?
+            .collect::<Result<Vec<_>>>()?;
+
+        // Update all descendants
+        if !ids.is_empty() {
+            conn.execute(
+                &format!(
+                    "UPDATE nodes SET is_private = 1, privacy_reason = ?1
+                     WHERE id IN ({})",
+                    ids.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+                ),
+                rusqlite::params_from_iter(
+                    std::iter::once(reason.to_string()).chain(ids.iter().cloned())
+                ),
+            )?;
+        }
+
+        Ok(ids)
+    }
+
+    /// Clear privacy from ALL descendants (for manual un-marking)
+    pub fn clear_privacy_from_descendants(&self, node_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+
+        // First get all descendant IDs
+        let mut stmt = conn.prepare(
+            "WITH RECURSIVE descendants AS (
+                 SELECT id FROM nodes WHERE parent_id = ?1
+                 UNION ALL
+                 SELECT n.id FROM nodes n
+                 INNER JOIN descendants d ON n.parent_id = d.id
+             )
+             SELECT id FROM descendants"
+        )?;
+
+        let ids: Vec<String> = stmt.query_map(params![node_id], |row| row.get(0))?
+            .collect::<Result<Vec<_>>>()?;
+
+        // Clear privacy from all descendants
+        if !ids.is_empty() {
+            conn.execute(
+                &format!(
+                    "UPDATE nodes SET is_private = 0, privacy_reason = NULL
+                     WHERE id IN ({})",
+                    ids.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+                ),
+                rusqlite::params_from_iter(ids.iter().cloned()),
+            )?;
+        }
+
+        Ok(ids)
     }
 
     /// Get privacy stats including category counts
@@ -1800,6 +1879,21 @@ impl Database {
     pub fn delete_all_edges(&self) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         let deleted = conn.execute("DELETE FROM edges", [])?;
+        Ok(deleted)
+    }
+
+    /// Delete empty items (items with no meaningful content/raw data)
+    pub fn delete_empty_items(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM nodes WHERE is_item = 1 AND (
+                content IS NULL
+                OR TRIM(content) = ''
+                OR LENGTH(TRIM(content)) < 10
+                OR TRIM(REPLACE(REPLACE(REPLACE(REPLACE(content, 'Human:', ''), 'Assistant:', ''), 'A:', ''), char(10), '')) = ''
+            )",
+            [],
+        )?;
         Ok(deleted)
     }
 

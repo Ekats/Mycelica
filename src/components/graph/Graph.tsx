@@ -64,6 +64,7 @@ const formatTime = (secs: number): string => {
 interface GraphProps {
   width: number;
   height: number;
+  onDataChanged?: () => void;
 }
 
 interface GraphNode extends Node {
@@ -140,7 +141,7 @@ const hashString = (str: string): number => {
   return Math.abs(hash);
 };
 
-export function Graph({ width, height }: GraphProps) {
+export function Graph({ width, height, onDataChanged }: GraphProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const consoleRef = useRef<HTMLDivElement>(null);
   const stackNodesRef = useRef(false);
@@ -348,9 +349,13 @@ export function Graph({ width, height }: GraphProps) {
   // Handle toggling privacy status
   const handleTogglePrivacy = useCallback(async (nodeId: string, currentlyPrivate: boolean) => {
     try {
-      await invoke('set_node_privacy', { nodeId, isPrivate: !currentlyPrivate });
-      // Update the node in local state
-      updateNode(nodeId, { isPrivate: !currentlyPrivate });
+      const result = await invoke<{ affectedIds: string[] }>('set_node_privacy', { nodeId, isPrivate: !currentlyPrivate });
+      // Update all affected nodes in-place (no reload to preserve viewport)
+      const newPrivacy = !currentlyPrivate;
+      for (const id of result.affectedIds) {
+        updateNode(id, { isPrivate: newPrivacy });
+      }
+      console.log(`Privacy updated for ${result.affectedIds.length} nodes`);
     } catch (err) {
       console.error('Failed to toggle privacy:', err);
     }
@@ -393,33 +398,82 @@ export function Graph({ width, height }: GraphProps) {
     else console.log(`[Graph] ${message}`);
   }, []);
 
+  // Handle splitting a node's children into sub-categories (max 5 groups)
+  const handleSplitNode = useCallback(async (nodeId: string) => {
+    const node = nodes.get(nodeId);
+    const nodeName = node?.aiTitle || node?.title || nodeId.slice(0, 8);
+    try {
+      devLog('info', `Splitting children of "${nodeName}" into max 5 sub-categories...`);
+      await invoke('cluster_hierarchy_level', { parentId: nodeId, maxGroups: 5 });
+      devLog('info', `Split complete! Refreshing graph...`);
+      // Clear the panel and refresh the graph data
+      setSimilarNodesMap(new Map());
+      if (onDataChanged) {
+        await onDataChanged();
+        devLog('info', `Graph refreshed. Navigate into "${nodeName}" to see new structure.`);
+      }
+    } catch (err) {
+      console.error('Failed to split node:', err);
+      devLog('error', `Failed to split: ${err}`);
+    }
+  }, [nodes, devLog, onDataChanged]);
+
+  // Handle unsplitting a node - flatten intermediate categories back into parent
+  const handleUnsplitNode = useCallback(async (nodeId: string) => {
+    const node = nodes.get(nodeId);
+    const nodeName = node?.aiTitle || node?.title || nodeId.slice(0, 8);
+    try {
+      devLog('info', `Unsplitting "${nodeName}" - flattening intermediate categories...`);
+      const flattened = await invoke<number>('unsplit_node', { parentId: nodeId });
+      devLog('info', `Unsplit complete! Moved ${flattened} nodes up. Refreshing...`);
+      // Clear the panel and refresh the graph data
+      setSimilarNodesMap(new Map());
+      if (onDataChanged) {
+        await onDataChanged();
+        devLog('info', `Graph refreshed.`);
+      }
+    } catch (err) {
+      console.error('Failed to unsplit node:', err);
+      devLog('error', `Failed to unsplit: ${err}`);
+    }
+  }, [nodes, devLog, onDataChanged]);
+
+  // Track the latest requested node to prevent race conditions
+  const latestFetchRef = useRef<string | null>(null);
+
   // Fetch similar nodes for a node - prioritize nodes in current view
   const fetchSimilarNodes = useCallback(async (nodeId: string) => {
     const isStacking = stackNodesRef.current;
 
-    // Toggle off if already showing
-    if (similarNodesMap.has(nodeId)) {
-      if (isStacking) {
-        setSimilarNodesMap(prev => {
+    // In stacking mode, toggle off if already showing
+    if (isStacking) {
+      // Use functional update to avoid stale closure
+      let alreadyShowing = false;
+      setSimilarNodesMap(prev => {
+        if (prev.has(nodeId)) {
+          alreadyShowing = true;
           const next = new Map(prev);
           next.delete(nodeId);
           return next;
-        });
-      } else {
-        setSimilarNodesMap(new Map());
-      }
-      return;
-    }
-
-    // If stacking enabled, add to existing; otherwise clear and show only this one
-    if (!isStacking) {
-      setSimilarNodesMap(new Map());
+        }
+        return prev;
+      });
+      if (alreadyShowing) return;
+    } else {
+      // In single mode, always show the clicked node (no toggle)
+      latestFetchRef.current = nodeId;
     }
 
     setLoadingSimilar(prev => new Set(prev).add(nodeId));
     try {
       // Fetch top 200 similar nodes (enough for practical use)
       const similar = await invoke<SimilarNode[]>('get_similar_nodes', { nodeId, topN: 200, minSimilarity: 0.25 });
+
+      // Race condition guard: only update if this is still the latest request (when not stacking)
+      if (!isStacking && latestFetchRef.current !== nodeId) {
+        devLog('info', `Ignoring stale fetch for ${nodeId}, latest is ${latestFetchRef.current}`);
+        return;
+      }
 
       // Prioritize nodes in current view (ones you can see and click)
       const currentViewNodeIds = new Set(nodes.keys());
@@ -435,6 +489,12 @@ export function Graph({ width, height }: GraphProps) {
       devLog('info', `Found ${similar.length} similar nodes (${inView.length} in view)`);
     } catch (err) {
       devLog('warn', `No similar nodes: ${err}`);
+      // Still show source node details even if no similar nodes found
+      if (isStacking) {
+        setSimilarNodesMap(prev => new Map(prev).set(nodeId, []));
+      } else {
+        setSimilarNodesMap(new Map([[nodeId, []]]));
+      }
     } finally {
       setLoadingSimilar(prev => {
         const next = new Set(prev);
@@ -442,7 +502,7 @@ export function Graph({ width, height }: GraphProps) {
         return next;
       });
     }
-  }, [similarNodesMap, devLog, nodes]);
+  }, [devLog, nodes]); // Removed similarNodesMap - using functional updates to avoid stale closure
 
   // Auto-build hierarchy if we have items but no Universe
   useEffect(() => {
@@ -2921,6 +2981,8 @@ export function Graph({ width, height }: GraphProps) {
           })}
           onTogglePin={handleTogglePin}
           onTogglePrivacy={handleTogglePrivacy}
+          onSplitNode={handleSplitNode}
+          onUnsplitNode={handleUnsplitNode}
           onClearAll={() => setSimilarNodesMap(new Map())}
           onToggleStack={() => setStackNodes(!stackNodes)}
           onStartResize={() => setIsResizingDetails(true)}

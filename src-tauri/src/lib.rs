@@ -9,7 +9,7 @@ mod similarity;
 
 use commands::{
     AppState,
-    get_nodes, get_node, create_node, add_note, update_node, delete_node,
+    get_nodes, get_node, create_node, add_note, update_node, update_node_content, delete_node,
     get_edges, get_edges_for_node, create_edge, delete_edge,
     search_nodes,
     // Clustering commands
@@ -20,7 +20,7 @@ use commands::{
     get_learned_emojis, save_learned_emoji,
     // Hierarchy commands
     get_nodes_at_depth, get_children, get_universe, get_items, get_max_depth,
-    build_hierarchy, build_full_hierarchy, cluster_hierarchy_level, get_children_flat,
+    build_hierarchy, build_full_hierarchy, cluster_hierarchy_level, unsplit_node, get_children_flat,
     propagate_latest_dates, quick_add_to_hierarchy,
     // Multi-path association commands
     get_item_associations, get_related_items, get_category_items,
@@ -37,7 +37,7 @@ use commands::{
     // Leaf view commands
     get_leaf_content,
     // Settings panel commands
-    delete_all_data, reset_ai_processing, reset_clustering, clear_embeddings, clear_hierarchy, flatten_hierarchy, consolidate_root, get_db_stats,
+    delete_all_data, reset_ai_processing, reset_clustering, clear_embeddings, clear_hierarchy, delete_empty_nodes, flatten_hierarchy, consolidate_root, get_db_stats,
     get_db_path, switch_database, tidy_database,
     // Processing stats commands
     get_processing_stats, add_ai_processing_time, add_rebuild_time,
@@ -100,7 +100,7 @@ pub fn run() {
                 }
             }
 
-            app.manage(AppState { db: Arc::new(db) });
+            app.manage(AppState { db: std::sync::RwLock::new(Arc::new(db)) });
 
             Ok(())
         })
@@ -110,6 +110,7 @@ pub fn run() {
             create_node,
             add_note,
             update_node,
+            update_node_content,
             delete_node,
             get_edges,
             get_edges_for_node,
@@ -140,6 +141,7 @@ pub fn run() {
             build_hierarchy,
             build_full_hierarchy,
             cluster_hierarchy_level,
+            unsplit_node,
             propagate_latest_dates,
             quick_add_to_hierarchy,
             // Multi-path associations
@@ -172,6 +174,7 @@ pub fn run() {
             reset_clustering,
             clear_embeddings,
             clear_hierarchy,
+            delete_empty_nodes,
             flatten_hierarchy,
             consolidate_root,
             tidy_database,

@@ -57,6 +57,7 @@ interface GraphState {
   navigateToNode: (node: Node) => void;  // Drill down into a node
   navigateBack: () => BreadcrumbEntry | null;  // Go back one level
   navigateToRoot: () => void;  // Go back to Universe (depth 0)
+  navigateToBreadcrumb: (nodeId: string) => void;  // Navigate to existing breadcrumb
   jumpToNode: (node: Node, fromNode?: Node) => void;  // Jump to any node (from similar nodes)
 }
 
@@ -203,6 +204,24 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     breadcrumbs: [],
     visibleNodes: [],
     activeNodeId: null,  // Deselect when switching view
+  }),
+
+  // Navigate to a specific breadcrumb (truncates breadcrumbs to that point)
+  navigateToBreadcrumb: (nodeId: string) => set((state) => {
+    const index = state.breadcrumbs.findIndex(b => b.id === nodeId);
+    if (index === -1) return state;
+
+    // Truncate breadcrumbs to include this one
+    const newBreadcrumbs = state.breadcrumbs.slice(0, index + 1);
+    const targetBreadcrumb = newBreadcrumbs[index];
+
+    return {
+      currentDepth: targetBreadcrumb.depth + 1,
+      currentParentId: targetBreadcrumb.id,
+      breadcrumbs: newBreadcrumbs,
+      visibleNodes: [],
+      activeNodeId: null,
+    };
   }),
 
   jumpToNode: (node, fromNode) => set((state) => {

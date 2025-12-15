@@ -136,7 +136,7 @@ function App() {
         {viewMode === 'leaf' && leafNodeId ? (
           <LeafView nodeId={leafNodeId} onBack={closeLeaf} />
         ) : (
-          <Graph width={dimensions.width} height={dimensions.height} />
+          <Graph width={dimensions.width} height={dimensions.height} onDataChanged={reload} />
         )}
       </main>
       <SettingsPanel

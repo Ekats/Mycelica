@@ -599,6 +599,7 @@ async fn group_topics_in_batches(
     topics: &[TopicInfo],
     context: &ai_client::GroupingContext,
     app: Option<&AppHandle>,
+    max_groups: usize,
 ) -> Result<Vec<ai_client::CategoryGrouping>, String> {
     let batch_count = (topics.len() + BATCH_SIZE_FOR_GROUPING - 1) / BATCH_SIZE_FOR_GROUPING;
     emit_log(app, "info", &format!("Splitting {} topics into {} batches of ~{}",
@@ -621,7 +622,7 @@ async fn group_topics_in_batches(
 
         match timeout(
             Duration::from_secs(120),
-            ai_client::group_topics_into_categories(batch, &batch_context)
+            ai_client::group_topics_into_categories(batch, &batch_context, Some(max_groups))
         ).await {
             Ok(Ok(batch_groupings)) => {
                 emit_log(app, "info", &format!("    Batch {} returned {} categories",
@@ -717,7 +718,9 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 ///
 /// For large datasets (>200 children), splits into batches of 150, calls AI for each,
 /// then merges similar categories across batches to prevent fragmentation.
-pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option<&AppHandle>) -> Result<bool, String> {
+/// max_groups: maximum number of categories to create (default 5 if None for manual splits)
+pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option<&AppHandle>, max_groups: Option<usize>) -> Result<bool, String> {
+    let max_groups = max_groups.unwrap_or(5); // Default to 5 for manual splits
     // Get children of this parent (excluding protected)
     let all_children = db.get_children(parent_id).map_err(|e| e.to_string())?;
     let all_children_count = all_children.len();
@@ -738,7 +741,7 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
         return Ok(false);
     }
 
-    emit_log(app, "info", &format!("Grouping {} children of {} into 8-15 categories", children.len(), parent_id));
+    emit_log(app, "info", &format!("Grouping {} children of {} into max {} categories", children.len(), parent_id, max_groups));
 
     // === Gather hierarchy context for AI ===
 
@@ -817,11 +820,11 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
     // Both paths have 120s timeout to prevent hanging
     let groupings = if topics.len() > BATCH_THRESHOLD {
         emit_log(app, "info", &format!("Large dataset ({} topics) - using batch processing", topics.len()));
-        group_topics_in_batches(&topics, &context, app).await?
+        group_topics_in_batches(&topics, &context, app, max_groups).await?
     } else {
         match timeout(
             Duration::from_secs(120),
-            ai_client::group_topics_into_categories(&topics, &context)
+            ai_client::group_topics_into_categories(&topics, &context, Some(max_groups))
         ).await {
             Ok(Ok(g)) => g,
             Ok(Err(e)) => return Err(e),
@@ -1208,7 +1211,7 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
                 });
 
                 emit_log(app, "info", &format!("  Iteration {}: Grouping children of {}", grouping_iterations + 1, node_id));
-                let grouped = cluster_hierarchy_level(db, &node_id, app).await?;
+                let grouped = cluster_hierarchy_level(db, &node_id, app, None).await?;
                 if grouped {
                     grouping_iterations += 1;
                 } else {
