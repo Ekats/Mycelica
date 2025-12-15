@@ -1,5 +1,5 @@
-import { memo, useState, useCallback, useMemo } from 'react';
-import { Pin, PinOff, Lock, LockOpen, GitBranch, GitMerge } from 'lucide-react';
+import { memo, useState, useCallback, useMemo, useEffect, useRef } from 'react';
+import { Pin, PinOff, Lock, LockOpen, GitBranch, GitMerge, MoreHorizontal } from 'lucide-react';
 import type { Node } from '../../types/graph';
 
 interface SimilarNode {
@@ -88,6 +88,20 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
   );
   const [collapsedHierarchy, setCollapsedHierarchy] = useState<Set<string>>(new Set());
   const [expandedHierarchyNodes, setExpandedHierarchyNodes] = useState<Set<string>>(new Set());
+  const [moreMenuOpen, setMoreMenuOpen] = useState<string | null>(null);
+  const moreMenuRef = useRef<HTMLDivElement>(null);
+
+  // Close more menu when clicking outside
+  useEffect(() => {
+    if (!moreMenuOpen) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (moreMenuRef.current && !moreMenuRef.current.contains(e.target as HTMLElement)) {
+        setMoreMenuOpen(null);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [moreMenuOpen]);
 
   // Toggle a group's expanded state
   const toggleGroup = useCallback((groupPath: string) => {
@@ -545,15 +559,15 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
                     {sourceNode && (
                       <button
                         onClick={() => onJumpToNode(sourceNode, undefined)}
-                        className="p-1.5 rounded-md bg-gray-600/50 hover:bg-gray-600 text-gray-300 hover:text-amber-400 transition-colors"
+                        className="w-7 h-7 flex items-center justify-center rounded-md bg-gray-600/50 hover:bg-gray-600 text-gray-300 hover:text-amber-400 transition-colors"
                         title="Go to this node"
                       >
-                        <span className="text-sm font-medium">↩</span>
+                        <span className="text-base leading-none">↩</span>
                       </button>
                     )}
                     <button
                       onClick={() => onTogglePin(sourceId, pinnedIds.has(sourceId))}
-                      className={`p-1.5 rounded-md transition-colors ${
+                      className={`w-7 h-7 flex items-center justify-center rounded-md transition-colors ${
                         pinnedIds.has(sourceId)
                           ? 'bg-amber-500/30 text-amber-400 hover:bg-amber-500/40 hover:text-amber-300'
                           : 'bg-gray-600/50 hover:bg-gray-600 text-gray-300 hover:text-gray-100'
@@ -562,53 +576,69 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
                     >
                       {pinnedIds.has(sourceId) ? <PinOff className="w-4 h-4" /> : <Pin className="w-4 h-4" />}
                     </button>
-                    <button
-                      onClick={() => onTogglePrivacy(sourceId, sourceNode?.isPrivate === true)}
-                      className={`p-1.5 rounded-md transition-colors ${
-                        sourceNode?.isPrivate === true
-                          ? 'bg-rose-500/30 text-rose-400 hover:bg-rose-500/40 hover:text-rose-300'
-                          : 'bg-gray-600/50 hover:bg-gray-600 text-gray-300 hover:text-gray-100'
-                      }`}
-                      title={sourceNode?.isPrivate === true ? 'Mark as safe' : 'Mark as private'}
-                    >
-                      {sourceNode?.isPrivate === true ? <Lock className="w-4 h-4" /> : <LockOpen className="w-4 h-4" />}
-                    </button>
-                    {sourceNode && sourceNode.childCount > 0 && (
-                      <>
-                        {onSplitNode && (
+                    {/* More options menu */}
+                    <div className="relative" ref={moreMenuOpen === sourceId ? moreMenuRef : undefined}>
+                      <button
+                        onClick={() => setMoreMenuOpen(moreMenuOpen === sourceId ? null : sourceId)}
+                        className={`w-7 h-7 flex items-center justify-center rounded-md transition-colors ${
+                          moreMenuOpen === sourceId
+                            ? 'bg-gray-600 text-white'
+                            : 'bg-gray-600/50 hover:bg-gray-600 text-gray-300 hover:text-gray-100'
+                        }`}
+                        title="More options"
+                      >
+                        <MoreHorizontal className="w-4 h-4" />
+                      </button>
+                      {moreMenuOpen === sourceId && (
+                        <div className="absolute right-0 top-full mt-1 bg-gray-700 rounded-lg shadow-xl border border-gray-600 py-1 z-50 min-w-[120px]">
                           <button
-                            onClick={() => onSplitNode(sourceId)}
-                            className={`p-1.5 rounded-md transition-colors ${
-                              sourceNode.childCount > 5
-                                ? 'bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 hover:text-blue-300'
-                                : 'bg-gray-600/50 text-gray-400 hover:bg-gray-600 hover:text-gray-300'
+                            onClick={() => {
+                              onTogglePrivacy(sourceId, sourceNode?.isPrivate === true);
+                              setMoreMenuOpen(null);
+                            }}
+                            className={`w-full px-3 py-1.5 text-left text-sm flex items-center gap-2 hover:bg-gray-600 transition-colors ${
+                              sourceNode?.isPrivate === true ? 'text-rose-400' : 'text-gray-300'
                             }`}
-                            title={sourceNode.childCount > 5
-                              ? `Split ${sourceNode.childCount} children into sub-categories`
-                              : `${sourceNode.childCount} children (split works best with >5)`
-                            }
                           >
-                            <GitBranch className="w-4 h-4" />
+                            {sourceNode?.isPrivate === true ? <Lock className="w-4 h-4" /> : <LockOpen className="w-4 h-4" />}
+                            {sourceNode?.isPrivate === true ? 'Safe' : 'Private'}
                           </button>
-                        )}
-                        {onUnsplitNode && (
-                          <button
-                            onClick={() => onUnsplitNode(sourceId)}
-                            className="p-1.5 rounded-md bg-gray-600/50 text-gray-400 hover:bg-orange-500/30 hover:text-orange-400 transition-colors"
-                            title="Unsplit - flatten intermediate categories back into this node"
-                          >
-                            <GitMerge className="w-4 h-4" />
-                          </button>
-                        )}
-                      </>
-                    )}
+                          {sourceNode && sourceNode.childCount > 0 && onSplitNode && (
+                            <button
+                              onClick={() => {
+                                onSplitNode(sourceId);
+                                setMoreMenuOpen(null);
+                              }}
+                              className={`w-full px-3 py-1.5 text-left text-sm flex items-center gap-2 hover:bg-gray-600 transition-colors ${
+                                sourceNode.childCount > 5 ? 'text-blue-400' : 'text-gray-400'
+                              }`}
+                            >
+                              <GitBranch className="w-4 h-4" />
+                              Split
+                            </button>
+                          )}
+                          {sourceNode && sourceNode.childCount > 0 && onUnsplitNode && (
+                            <button
+                              onClick={() => {
+                                onUnsplitNode(sourceId);
+                                setMoreMenuOpen(null);
+                              }}
+                              className="w-full px-3 py-1.5 text-left text-sm flex items-center gap-2 text-gray-400 hover:bg-gray-600 hover:text-orange-400 transition-colors"
+                            >
+                              <GitMerge className="w-4 h-4" />
+                              Unsplit
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
                     {stackNodes && (
                       <button
                         onClick={() => onRemoveNode(sourceId)}
-                        className="p-1.5 rounded-md bg-gray-600/50 hover:bg-red-500/30 text-gray-300 hover:text-red-400 transition-colors"
+                        className="w-7 h-7 flex items-center justify-center rounded-md bg-gray-600/50 hover:bg-red-500/30 text-gray-300 hover:text-red-400 transition-colors"
                         title="Remove from stack"
                       >
-                        <span className="text-sm">✕</span>
+                        <span className="text-base leading-none">✕</span>
                       </button>
                     )}
                   </div>

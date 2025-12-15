@@ -5,7 +5,7 @@ import { listen, emit } from '@tauri-apps/api/event';
 import { useGraphStore } from '../../stores/graphStore';
 import type { Node } from '../../types/graph';
 import { getEmojiForNode, initLearnedMappings } from '../../utils/emojiMatcher';
-import { ChevronRight, AlertTriangle, X } from 'lucide-react';
+import { ChevronRight, AlertTriangle, X, Lock, LockOpen } from 'lucide-react';
 import { SimilarNodesPanel, SimilarNodesLoading } from './SimilarNodesPanel';
 
 // Confirmation dialog types
@@ -3128,14 +3128,14 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
             </button>
             <button
               onClick={() => setHidePrivate(!hidePrivate)}
-              className={`px-3 py-1.5 text-xs rounded transition-colors ${
+              className={`w-7 h-7 flex items-center justify-center rounded transition-colors ${
                 hidePrivate
-                  ? 'bg-rose-500/30 text-rose-300'
+                  ? 'bg-rose-500/30 text-rose-400'
                   : 'text-gray-400 hover:text-white hover:bg-gray-700'
               }`}
               title={hidePrivate ? 'Show private nodes' : 'Hide private nodes'}
             >
-              🔒
+              {hidePrivate ? <Lock className="w-4 h-4" /> : <LockOpen className="w-4 h-4" />}
             </button>
           </div>
         )}
