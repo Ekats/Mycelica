@@ -299,7 +299,8 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
         navigateToRoot();
         // Trigger graph data refresh
         onDataChanged?.();
-        setActionResult('Database switched successfully');
+        // Close settings panel to show the new data
+        onClose();
       }
     } catch (err) {
       setActionResult(`Error: ${err}`);

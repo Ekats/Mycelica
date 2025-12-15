@@ -59,7 +59,8 @@ function App() {
   const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
   const [loading, setLoading] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
-  const { nodes, edges, reload } = useGraph();
+  const [settingsChecked, setSettingsChecked] = useState(false);
+  const { nodes, edges, reload, loaded } = useGraph();
   const { viewMode, leafNodeId, closeLeaf } = useGraphStore();
 
   useEffect(() => {
@@ -107,12 +108,15 @@ function App() {
     }
   }, [nodes]);
 
-  // Auto-open Settings if database is empty (no nodes after loading)
+  // Auto-open Settings if database is empty (only check once after data loaded)
   useEffect(() => {
-    if (!loading && nodes.size === 0) {
-      setShowSettings(true);
+    if (loaded && !settingsChecked) {
+      setSettingsChecked(true);
+      if (nodes.size === 0) {
+        setShowSettings(true);
+      }
     }
-  }, [loading, nodes.size]);
+  }, [loaded, settingsChecked, nodes.size]);
 
   if (loading) {
     return (

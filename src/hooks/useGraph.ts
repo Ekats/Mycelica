@@ -1,4 +1,4 @@
-import { useEffect, useCallback } from 'react';
+import { useEffect, useCallback, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useGraphStore } from '../stores/graphStore';
 import type { Node, Edge } from '../types/graph';
@@ -120,6 +120,7 @@ function mapBackendEdge(e: BackendEdge): Edge {
 
 export function useGraph() {
   const { setNodes, setEdges, nodes, edges } = useGraphStore();
+  const [loaded, setLoaded] = useState(false);
 
   const loadGraph = useCallback(async () => {
     try {
@@ -147,8 +148,10 @@ export function useGraph() {
 
       setNodes(nodeMap);
       setEdges(edgeMap);
+      setLoaded(true);
     } catch (error) {
       console.error('Failed to load graph:', error);
+      setLoaded(true); // Mark as loaded even on error so UI doesn't hang
     }
   }, [setNodes, setEdges]);
 
@@ -156,5 +159,5 @@ export function useGraph() {
     loadGraph();
   }, [loadGraph]);
 
-  return { nodes, edges, reload: loadGraph };
+  return { nodes, edges, reload: loadGraph, loaded };
 }
