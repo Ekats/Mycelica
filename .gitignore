@@ -5,6 +5,7 @@ dist/
 dist-ssr/
 node_modules/
 target/
+releases/
 
 # ===================
 # Private data - NEVER COMMIT

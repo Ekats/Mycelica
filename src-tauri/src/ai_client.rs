@@ -199,19 +199,7 @@ fn parse_ai_response(text: &str, fallback_title: &str) -> Result<AiAnalysisResul
     }
 }
 
-// ==================== AI Clustering ====================
-
-/// Result of AI clustering for a single item (single-cluster assignment)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClusterAssignment {
-    pub item_id: String,
-    pub cluster_id: i32,
-    pub cluster_label: String,
-    #[serde(default)]
-    pub is_new_cluster: bool,
-}
-
-// ==================== Multi-Path Clustering ====================
+// ==================== Multi-Path Clustering Data Structures ====================
 
 /// Single cluster assignment with strength (for multi-path associations)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,107 +218,58 @@ pub struct MultiClusterAssignment {
     pub clusters: Vec<ClusterWithStrength>,
 }
 
-/// Existing cluster info for AI context
-#[derive(Debug, Clone)]
-pub struct ExistingCluster {
-    pub id: i32,
-    pub label: String,
-    pub count: i32,
-}
+// NOTE: Old AI clustering code has been removed.
+// Clustering now uses embedding similarity (see clustering.rs::cluster_with_embeddings).
+// AI is only used for naming clusters after they form (see name_clusters below).
 
-/// Item to be clustered
-#[derive(Debug, Clone)]
-pub struct ClusterItem {
-    pub id: String,
-    pub title: String,
-    pub content: String,
-    pub ai_title: Option<String>,
-    pub summary: Option<String>,
-    pub tags: Option<String>,
-}
+// ==================== Cluster Naming ====================
 
-/// Cluster items using Claude AI
-/// Returns cluster assignments for each item
-#[allow(dead_code)]
-pub async fn cluster_items_with_ai(
-    items: &[ClusterItem],
-    existing_clusters: &[ExistingCluster],
-    next_cluster_id: i32,
-) -> Result<Vec<ClusterAssignment>, String> {
+/// Name clusters using AI (single call for all clusters)
+/// Takes cluster IDs with sample member titles, returns cluster ID -> name mappings
+pub async fn name_clusters(
+    clusters: &[(i32, Vec<String>)],  // (cluster_id, member_titles)
+) -> Result<Vec<(i32, String)>, String> {
     let api_key = get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
 
-    if items.is_empty() {
+    if clusters.is_empty() {
         return Ok(vec![]);
     }
 
-    // Build existing clusters section
-    let clusters_section = if existing_clusters.is_empty() {
-        "None yet - create new categories as needed.".to_string()
-    } else {
-        existing_clusters
-            .iter()
-            .map(|c| format!("- [id: {}] \"{}\" ({} items)", c.id, c.label, c.count))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    // Build items section - prefer AI-processed summary when available
-    let items_section = items
+    // Build prompt with cluster samples
+    let clusters_section: String = clusters
         .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let display_text = if let Some(summary) = &item.summary {
-                format!("{} | {} | Tags: {}",
-                    item.ai_title.as_deref().unwrap_or(&item.title),
-                    summary,
-                    item.tags.as_deref().unwrap_or("none"))
-            } else {
-                let content_preview = if item.content.len() > 800 {
-                    let mut end = 800;
-                    while end > 0 && !item.content.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    format!("{}...", &item.content[..end])
-                } else {
-                    item.content.clone()
-                };
-                format!("{} | {}", item.title, content_preview.replace('\n', " ").trim())
-            };
-            format!("{}. [{}] {}", i + 1, item.id, display_text)
+        .map(|(id, titles)| {
+            let titles_preview = titles
+                .iter()
+                .take(10)
+                .map(|t| format!("\"{}\"", t.chars().take(60).collect::<String>()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Cluster {}: [{}]", id, titles_preview)
         })
         .collect::<Vec<_>>()
-        .join("\n\n");
+        .join("\n");
 
     let prompt = format!(
-        r#"You are organizing a knowledge base. Given these items and existing categories, assign each item to the best category or suggest a new one.
+        r#"Name these topic clusters based on their member items. For each cluster, provide a specific, descriptive name (2-4 words).
 
-EXISTING CATEGORIES:
+CLUSTERS TO NAME:
 {clusters_section}
 
-ITEMS TO CATEGORIZE:
-{items_section}
-
 RULES:
-1. Prefer assigning to existing categories when they fit well
-2. Create new categories only when items don't fit existing ones
-3. New cluster IDs should start from {next_cluster_id}
-4. Category names should be 2-4 words, specific and descriptive (e.g., "Rust Development", "AI Integration", "Browser Extensions")
-5. Avoid generic names like "General" or "Other" - find a meaningful grouping
-6. If an item truly doesn't fit anywhere, use cluster_id: -1 with label: "Miscellaneous"
+1. Names should be specific and descriptive (e.g., "Rust Development", "AI Integration", "Browser Extensions")
+2. Avoid generic names like "General", "Other", "Miscellaneous", "Various"
+3. Focus on the common theme across the items
+4. Use proper nouns when items share a project/product name (e.g., "Mycelica Development")
 
-Return ONLY valid JSON array, no markdown:
-[
-  {{"item_id": "uuid-1", "cluster_id": 0, "cluster_label": "Existing Category"}},
-  {{"item_id": "uuid-2", "cluster_id": {next_cluster_id}, "cluster_label": "New Category Name", "is_new_cluster": true}}
-]"#,
-        clusters_section = clusters_section,
-        items_section = items_section,
-        next_cluster_id = next_cluster_id
+Return ONLY valid JSON, no markdown:
+{{"clusters": [{{"id": 1, "name": "Specific Name"}}, {{"id": 2, "name": "Another Name"}}]}}"#,
+        clusters_section = clusters_section
     );
 
     let request = AnthropicRequest {
         model: "claude-3-5-haiku-20241022".to_string(),
-        max_tokens: 2000,
+        max_tokens: 1000,
         messages: vec![Message {
             role: "user".to_string(),
             content: prompt,
@@ -370,13 +309,15 @@ Return ONLY valid JSON array, no markdown:
         .map(|c| c.text.clone())
         .unwrap_or_default();
 
-    // Parse the clustering response
-    parse_clustering_response(&text, items)
+    // Parse response
+    parse_cluster_names_response(&text, clusters)
 }
 
-/// Parse the AI clustering response
-#[allow(dead_code)]
-fn parse_clustering_response(text: &str, items: &[ClusterItem]) -> Result<Vec<ClusterAssignment>, String> {
+/// Parse the cluster naming response
+fn parse_cluster_names_response(
+    text: &str,
+    clusters: &[(i32, Vec<String>)],
+) -> Result<Vec<(i32, String)>, String> {
     // Remove markdown wrapping if present
     let json_text = if text.starts_with("```") {
         text.lines()
@@ -388,222 +329,28 @@ fn parse_clustering_response(text: &str, items: &[ClusterItem]) -> Result<Vec<Cl
         text.to_string()
     };
 
-    // Parse JSON array
-    match serde_json::from_str::<Vec<ClusterAssignment>>(&json_text) {
-        Ok(assignments) => Ok(assignments),
-        Err(e) => {
-            eprintln!("Failed to parse clustering response: {}\nResponse: {}", e, text);
-            // Fallback: assign all items to Miscellaneous
-            Ok(items
-                .iter()
-                .map(|item| ClusterAssignment {
-                    item_id: item.id.clone(),
-                    cluster_id: -1,
-                    cluster_label: "Miscellaneous".to_string(),
-                    is_new_cluster: false,
-                })
-                .collect())
-        }
-    }
-}
-
-// ==================== Multi-Path AI Clustering ====================
-
-/// Cluster items with AI using multi-path associations
-/// Returns 1-4 category assignments per item with confidence scores
-pub async fn cluster_items_with_ai_multipath(
-    items: &[ClusterItem],
-    existing_clusters: &[ExistingCluster],
-    next_cluster_id: i32,
-) -> Result<Vec<MultiClusterAssignment>, String> {
-    let api_key = get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
-
-    if items.is_empty() {
-        return Ok(vec![]);
-    }
-
-    // Build existing clusters section
-    let clusters_section = if existing_clusters.is_empty() {
-        "None yet - create new categories as needed.".to_string()
-    } else {
-        existing_clusters
-            .iter()
-            .map(|c| format!("- [id: {}] \"{}\" ({} items)", c.id, c.label, c.count))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    // Build items section - prefer AI-processed summary when available
-    let items_section = items
-        .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            // Use AI-processed content if available, otherwise fall back to raw content
-            let display_text = if let Some(summary) = &item.summary {
-                // AI has processed this item - use clean summary
-                format!("{} | {} | Tags: {}",
-                    item.ai_title.as_deref().unwrap_or(&item.title),
-                    summary,
-                    item.tags.as_deref().unwrap_or("none"))
-            } else {
-                // Not processed - use truncated raw content
-                let content_preview = if item.content.len() > 800 {
-                    let mut end = 800;
-                    while end > 0 && !item.content.is_char_boundary(end) {
-                        end -= 1;
+    // Try to parse JSON
+    match serde_json::from_str::<serde_json::Value>(&json_text) {
+        Ok(json) => {
+            let mut results = Vec::new();
+            if let Some(clusters_arr) = json.get("clusters").and_then(|v| v.as_array()) {
+                for item in clusters_arr {
+                    if let (Some(id), Some(name)) = (
+                        item.get("id").and_then(|v| v.as_i64()),
+                        item.get("name").and_then(|v| v.as_str()),
+                    ) {
+                        results.push((id as i32, name.to_string()));
                     }
-                    format!("{}...", &item.content[..end])
-                } else {
-                    item.content.clone()
-                };
-                format!("{} | {}", item.title, content_preview.replace('\n', " ").trim())
-            };
-            format!("{}. [{}] {}", i + 1, item.id, display_text)
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-
-    let prompt = format!(
-        r#"You are organizing a knowledge base with brain-like multi-category associations.
-Each item can belong to MULTIPLE categories with varying strengths.
-
-EXISTING CATEGORIES:
-{clusters_section}
-
-ITEMS TO CATEGORIZE:
-{items_section}
-
-RULES:
-1. Assign 1-4 relevant categories per item with confidence scores (0.0 to 1.0)
-2. Primary category should have highest strength (0.7-1.0)
-3. Secondary categories can have lower strengths (0.3-0.7)
-4. Only include weak associations (0.1-0.3) if genuinely relevant
-5. Prefer existing categories when they fit; create new ones when needed
-6. New cluster IDs should start from {next_cluster_id}
-7. Category names: 2-4 words, specific (e.g., "Rust Development", "AI Integration")
-8. If an item truly doesn't fit anywhere, use id: -1 with label: "Miscellaneous" and strength: 1.0
-
-Return ONLY valid JSON array, no markdown:
-[
-  {{
-    "item_id": "uuid-1",
-    "clusters": [
-      {{"id": 0, "label": "Rust Development", "strength": 0.9}},
-      {{"id": 2, "label": "AI Integration", "strength": 0.6, "is_new": true}}
-    ]
-  }},
-  {{
-    "item_id": "uuid-2",
-    "clusters": [
-      {{"id": {next_cluster_id}, "label": "New Category", "strength": 0.85, "is_new": true}}
-    ]
-  }}
-]"#,
-        clusters_section = clusters_section,
-        items_section = items_section,
-        next_cluster_id = next_cluster_id
-    );
-
-    let request = AnthropicRequest {
-        model: "claude-3-5-haiku-20241022".to_string(),
-        max_tokens: 3000,  // More tokens for multi-cluster output
-        messages: vec![Message {
-            role: "user".to_string(),
-            content: prompt,
-        }],
-    };
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| format!("HTTP request failed: {}", e))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("API error {}: {}", status, body));
-    }
-
-    let api_response: AnthropicResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-    // Track token usage
-    if let Some(usage) = &api_response.usage {
-        let _ = settings::add_anthropic_tokens(usage.input_tokens, usage.output_tokens);
-    }
-
-    let text = api_response
-        .content
-        .first()
-        .map(|c| c.text.clone())
-        .unwrap_or_default();
-
-    // Parse the multi-path clustering response
-    parse_multipath_response(&text, items)
-}
-
-/// Parse the multi-path AI clustering response
-fn parse_multipath_response(text: &str, items: &[ClusterItem]) -> Result<Vec<MultiClusterAssignment>, String> {
-    // Remove markdown wrapping if present
-    let json_text = if text.starts_with("```") {
-        text.lines()
-            .skip(1)
-            .take_while(|l| !l.starts_with("```"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        text.to_string()
-    };
-
-    // Parse JSON array
-    match serde_json::from_str::<Vec<MultiClusterAssignment>>(&json_text) {
-        Ok(assignments) => {
-            // Validate and normalize strengths
-            let normalized: Vec<MultiClusterAssignment> = assignments
-                .into_iter()
-                .map(|mut a| {
-                    // Ensure at least one cluster per item
-                    if a.clusters.is_empty() {
-                        a.clusters.push(ClusterWithStrength {
-                            id: -1,
-                            label: "Miscellaneous".to_string(),
-                            strength: 1.0,
-                            is_new: false,
-                        });
-                    }
-                    // Sort by strength (highest first)
-                    a.clusters.sort_by(|x, y| y.strength.partial_cmp(&x.strength).unwrap_or(std::cmp::Ordering::Equal));
-                    // Clamp strengths to 0.0-1.0
-                    for c in &mut a.clusters {
-                        c.strength = c.strength.clamp(0.0, 1.0);
-                    }
-                    a
-                })
-                .collect();
-            Ok(normalized)
+                }
+            }
+            Ok(results)
         }
         Err(e) => {
-            eprintln!("Failed to parse multi-path clustering response: {}\nResponse: {}", e, text);
-            // Fallback: assign all items to Miscellaneous with single association
-            Ok(items
+            eprintln!("Failed to parse cluster names response: {}\nResponse: {}", e, text);
+            // Fallback: return generic names
+            Ok(clusters
                 .iter()
-                .map(|item| MultiClusterAssignment {
-                    item_id: item.id.clone(),
-                    clusters: vec![ClusterWithStrength {
-                        id: -1,
-                        label: "Miscellaneous".to_string(),
-                        strength: 1.0,
-                        is_new: false,
-                    }],
-                })
+                .map(|(id, _)| (*id, format!("Cluster {}", id)))
                 .collect())
         }
     }
@@ -1972,22 +1719,7 @@ mod tests {
         assert_eq!(result.title, "Test");
     }
 
-    #[test]
-    fn test_parse_clustering_response() {
-        let json = r#"[{"item_id": "abc", "cluster_id": 0, "cluster_label": "Test"}]"#;
-        let items = vec![ClusterItem {
-            id: "abc".to_string(),
-            title: "Test".to_string(),
-            content: "Content".to_string(),
-            ai_title: None,
-            summary: None,
-            tags: None,
-        }];
-        let result = parse_clustering_response(json, &items).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].cluster_id, 0);
-        assert_eq!(result[0].cluster_label, "Test");
-    }
+    // NOTE: test_parse_clustering_response removed - old AI clustering code deleted
 
     #[test]
     fn test_parse_category_groupings() {

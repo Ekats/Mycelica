@@ -20,6 +20,46 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / (norm_a * norm_b)
 }
 
+/// Compute the centroid (average) of multiple embeddings
+/// Returns a normalized centroid vector
+pub fn compute_centroid(embeddings: &[&[f32]]) -> Option<Vec<f32>> {
+    if embeddings.is_empty() {
+        return None;
+    }
+
+    let dim = embeddings[0].len();
+    if dim == 0 {
+        return None;
+    }
+
+    // Sum all embeddings
+    let mut centroid = vec![0.0f32; dim];
+    for emb in embeddings {
+        if emb.len() != dim {
+            continue; // Skip mismatched dimensions
+        }
+        for (i, &val) in emb.iter().enumerate() {
+            centroid[i] += val;
+        }
+    }
+
+    // Average
+    let n = embeddings.len() as f32;
+    for val in &mut centroid {
+        *val /= n;
+    }
+
+    // Normalize (L2 norm)
+    let norm: f32 = centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 1e-10 {
+        for val in &mut centroid {
+            *val /= norm;
+        }
+    }
+
+    Some(centroid)
+}
+
 /// Find the top N most similar nodes to a target embedding
 /// Returns (node_id, similarity_score) pairs, sorted by similarity descending
 pub fn find_similar(

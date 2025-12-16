@@ -84,9 +84,44 @@ pub fn run() {
                     println!("Using local database: {:?}", local_db);
                     local_db
                 } else {
-                    let path = app_data_dir.join("mycelica.db");
-                    println!("Using app data database: {:?}", path);
-                    path
+                    let default_path = app_data_dir.join("mycelica.db");
+
+                    // First run: copy bundled sample database if no database exists
+                    if !default_path.exists() {
+                        println!("First run detected: no database at {:?}", default_path);
+                        match app.path().resource_dir() {
+                            Ok(resource_dir) => {
+                                println!("Resource dir: {:?}", resource_dir);
+                                // Try both possible paths (with and without resources/ prefix)
+                                let bundled_db = resource_dir.join("resources/mycelica-testing-preview.db");
+                                let bundled_db_alt = resource_dir.join("mycelica-testing-preview.db");
+
+                                let source = if bundled_db.exists() {
+                                    Some(bundled_db)
+                                } else if bundled_db_alt.exists() {
+                                    Some(bundled_db_alt)
+                                } else {
+                                    println!("Bundled database not found at {:?} or {:?}", bundled_db, bundled_db_alt);
+                                    None
+                                };
+
+                                if let Some(src) = source {
+                                    println!("First run: copying bundled sample database from {:?}", src);
+                                    if let Err(e) = std::fs::copy(&src, &default_path) {
+                                        eprintln!("Failed to copy bundled database: {}", e);
+                                    } else {
+                                        println!("Sample database copied to {:?}", default_path);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to get resource dir: {}", e);
+                            }
+                        }
+                    }
+
+                    println!("Using app data database: {:?}", default_path);
+                    default_path
                 }
             };
 
