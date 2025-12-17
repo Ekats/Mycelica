@@ -66,7 +66,9 @@ impl Database {
                 is_pinned INTEGER NOT NULL DEFAULT 0,
                 last_accessed_at INTEGER,
                 -- Hierarchy date propagation
-                latest_child_date INTEGER  -- MAX(children's created_at), bubbled up
+                latest_child_date INTEGER,  -- MAX(children's created_at), bubbled up
+                -- Import source tracking
+                source TEXT  -- e.g. claude, googlekeep, markdown
             );
 
             -- Learned emoji mappings from AI
@@ -333,6 +335,18 @@ impl Database {
             eprintln!("Migration: Added is_private and privacy_reason columns for privacy filtering");
         }
 
+        // Migration: Add source column for import tracking if it doesn't exist
+        let has_source: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('nodes') WHERE name = 'source'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !has_source {
+            conn.execute("ALTER TABLE nodes ADD COLUMN source TEXT", [])?;
+            eprintln!("Migration: Added source column for import tracking");
+        }
+
         // Create indexes for dynamic hierarchy columns (after migrations ensure columns exist)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_depth ON nodes(depth)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_is_item ON nodes(is_item)", [])?;
@@ -355,8 +369,8 @@ impl Database {
     pub fn insert_node(&self, node: &Node) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO nodes (id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+            "INSERT INTO nodes (id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
             params![
                 node.id,
                 node.node_type.as_str(),
@@ -383,6 +397,7 @@ impl Database {
                 node.sequence_index,
                 node.is_pinned,
                 node.last_accessed_at,
+                node.source,
             ],
         )?;
         Ok(())
@@ -524,11 +539,12 @@ impl Database {
             latest_child_date: row.get(25)?,
             is_private: row.get::<_, Option<i32>>(26)?.map(|v| v != 0),
             privacy_reason: row.get(27)?,
+            source: row.get(28)?,
         })
     }
 
     /// Standard SELECT columns for nodes (excludes embedding - use dedicated functions)
-    const NODE_COLUMNS: &'static str = "id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date, is_private, privacy_reason";
+    const NODE_COLUMNS: &'static str = "id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date, is_private, privacy_reason, source";
 
     pub fn get_all_nodes(&self) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
@@ -1504,6 +1520,7 @@ impl Database {
             latest_child_date: None,
             is_private: None,
             privacy_reason: None,
+            source: None,
         };
 
         self.insert_node(&node)

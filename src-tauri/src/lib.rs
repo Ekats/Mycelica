@@ -27,7 +27,7 @@ use commands::{
     // Conversation context commands
     get_conversation_context,
     // Import commands
-    import_claude_conversations, import_markdown_files,
+    import_claude_conversations, import_markdown_files, import_google_keep,
     // Quick access commands (Sidebar)
     set_node_pinned, touch_node, get_pinned_nodes, get_recent_nodes, clear_recent,
     // Semantic similarity commands
@@ -188,6 +188,7 @@ pub fn run() {
             // Import
             import_claude_conversations,
             import_markdown_files,
+            import_google_keep,
             // Quick access (Sidebar)
             set_node_pinned,
             touch_node,

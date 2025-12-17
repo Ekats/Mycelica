@@ -13,6 +13,7 @@ use crate::db::{Database, Node, Edge, EdgeType};
 use crate::ai_client::{self, MultiClusterAssignment};
 use crate::commands::{is_rebuild_cancelled, reset_rebuild_cancel};
 use serde::Serialize;
+use rand::seq::SliceRandom;
 
 /// Result of clustering operation
 #[derive(Debug, Clone, Serialize)]
@@ -283,9 +284,7 @@ async fn ensure_embeddings(
 }
 
 /// Agglomerative clustering using cosine similarity on embeddings
-/// Uses average linkage (UPGMA) for cluster merging
-// TODO: Future optimization - use priority queue for merge candidates
-// instead of scanning all pairs each iteration (would improve from O(n³) to O(n² log n))
+/// Uses Union-Find for O(n²) complexity instead of O(n³)
 fn agglomerative_cluster_embeddings(
     embeddings: &[(String, Vec<f32>)],
     threshold: f32,
@@ -295,88 +294,160 @@ fn agglomerative_cluster_embeddings(
         return vec![];
     }
 
-    // Start with each item in its own cluster
-    let mut labels: Vec<i32> = (0..n as i32).collect();
+    // Use Union-Find for efficient clustering
+    let mut uf = UnionFind::new(n);
 
-    // Precompute similarity matrix
-    let mut similarities: Vec<Vec<f32>> = vec![vec![0.0; n]; n];
+    // Single pass: union all pairs above threshold - O(n²)
     for i in 0..n {
-        similarities[i][i] = 1.0;
         for j in (i + 1)..n {
             let sim = cosine_similarity(&embeddings[i].1, &embeddings[j].1);
-            similarities[i][j] = sim;
-            similarities[j][i] = sim;
+            if sim >= threshold {
+                uf.union(i, j);
+            }
         }
     }
 
-    // Merge clusters iteratively
-    loop {
-        let mut best_merge: Option<(i32, i32, f32)> = None;
+    // Group indices by their root - O(n)
+    let mut groups: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for i in 0..n {
+        let root = uf.find(i);
+        groups.entry(root).or_default().push(i);
+    }
 
-        // Find best merge (highest average linkage above threshold)
-        for i in 0..n {
-            for j in (i + 1)..n {
-                if labels[i] != labels[j] {
-                    // Calculate average linkage between clusters
-                    let cluster_i: Vec<usize> = labels.iter()
-                        .enumerate()
-                        .filter(|(_, &l)| l == labels[i])
-                        .map(|(idx, _)| idx)
-                        .collect();
-                    let cluster_j: Vec<usize> = labels.iter()
-                        .enumerate()
-                        .filter(|(_, &l)| l == labels[j])
-                        .map(|(idx, _)| idx)
-                        .collect();
+    groups.into_values().collect()
+}
 
-                    let mut total_sim = 0.0;
-                    let mut count = 0;
-                    for &ci in &cluster_i {
-                        for &cj in &cluster_j {
-                            total_sim += similarities[ci][cj];
-                            count += 1;
-                        }
-                    }
-                    let avg_sim = if count > 0 { total_sim / count as f32 } else { 0.0 };
+/// Cluster a single batch of items using agglomerative clustering
+/// Returns: Vec<(centroid, Vec<item_indices>)>
+fn cluster_batch(
+    embeddings: &[(String, Vec<f32>)],
+    threshold: f32,
+) -> Vec<(Vec<f32>, Vec<usize>)> {
+    if embeddings.is_empty() {
+        return vec![];
+    }
 
-                    if avg_sim > threshold {
-                        match &best_merge {
-                            None => best_merge = Some((labels[i], labels[j], avg_sim)),
-                            Some((_, _, best_sim)) if avg_sim > *best_sim => {
-                                best_merge = Some((labels[i], labels[j], avg_sim));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
+    // Use existing agglomerative clustering for small batch
+    let cluster_groups = agglomerative_cluster_embeddings(embeddings, threshold);
 
-        match best_merge {
-            Some((cluster_a, cluster_b, _)) => {
-                // Merge cluster_b into cluster_a
-                for label in labels.iter_mut() {
-                    if *label == cluster_b {
-                        *label = cluster_a;
-                    }
-                }
-            }
-            None => break,
+    // Compute centroid for each cluster
+    cluster_groups.iter().map(|indices| {
+        let member_embeddings: Vec<&[f32]> = indices.iter()
+            .map(|&i| embeddings[i].1.as_slice())
+            .collect();
+        let centroid = compute_centroid(&member_embeddings)
+            .unwrap_or_else(|| vec![0.0; embeddings[0].1.len()]);
+        (centroid, indices.clone())
+    }).collect()
+}
+
+/// Union-Find data structure for efficient cluster merging
+struct UnionFind {
+    parent: Vec<usize>,
+    rank: Vec<usize>,
+}
+
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n).collect(),
+            rank: vec![0; n],
         }
     }
 
-    // Group indices by cluster label
-    let unique_labels: HashSet<i32> = labels.iter().copied().collect();
-    unique_labels
-        .into_iter()
-        .map(|cluster_label| {
-            labels.iter()
-                .enumerate()
-                .filter(|(_, &l)| l == cluster_label)
-                .map(|(idx, _)| idx)
-                .collect()
-        })
-        .collect()
+    fn find(&mut self, x: usize) -> usize {
+        if self.parent[x] != x {
+            self.parent[x] = self.find(self.parent[x]); // Path compression
+        }
+        self.parent[x]
+    }
+
+    fn union(&mut self, x: usize, y: usize) {
+        let px = self.find(x);
+        let py = self.find(y);
+        if px == py { return; }
+
+        // Union by rank
+        if self.rank[px] < self.rank[py] {
+            self.parent[px] = py;
+        } else if self.rank[px] > self.rank[py] {
+            self.parent[py] = px;
+        } else {
+            self.parent[py] = px;
+            self.rank[px] += 1;
+        }
+    }
+}
+
+/// Merge clusters with centroids above threshold similarity
+/// Uses Union-Find for O(c²) instead of O(c³) complexity
+fn merge_similar_clusters(
+    clusters: &mut Vec<(Vec<f32>, Vec<usize>)>,
+    threshold: f32,
+) {
+    let n = clusters.len();
+    if n <= 1 { return; }
+
+    // Step 1: Find ALL pairs above threshold (single O(c²) pass)
+    let mut uf = UnionFind::new(n);
+    let mut merge_count = 0;
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let sim = cosine_similarity(&clusters[i].0, &clusters[j].0);
+            if sim >= threshold {
+                uf.union(i, j);
+                merge_count += 1;
+            }
+        }
+    }
+
+    if merge_count == 0 { return; }
+
+    // Step 2: Group clusters by their root
+    let mut groups: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for i in 0..n {
+        let root = uf.find(i);
+        groups.entry(root).or_default().push(i);
+    }
+
+    // Step 3: Merge each group into single cluster
+    let mut new_clusters: Vec<(Vec<f32>, Vec<usize>)> = Vec::new();
+
+    for (_root, group) in groups {
+        if group.len() == 1 {
+            // Single cluster, keep as-is
+            new_clusters.push(clusters[group[0]].clone());
+        } else {
+            // Merge all clusters in group
+            let mut merged_indices: Vec<usize> = Vec::new();
+            let mut weighted_centroid: Vec<f32> = vec![0.0; clusters[group[0]].0.len()];
+            let mut total_size: f32 = 0.0;
+
+            for &idx in &group {
+                let (centroid, indices) = &clusters[idx];
+                let size = indices.len() as f32;
+
+                // Weighted centroid accumulation
+                for (i, &val) in centroid.iter().enumerate() {
+                    weighted_centroid[i] += val * size;
+                }
+                total_size += size;
+                merged_indices.extend(indices.iter().cloned());
+            }
+
+            // Normalize centroid
+            if total_size > 0.0 {
+                for val in &mut weighted_centroid {
+                    *val /= total_size;
+                }
+            }
+
+            new_clusters.push((weighted_centroid, merged_indices));
+        }
+    }
+
+    *clusters = new_clusters;
 }
 
 /// Cluster items using embedding similarity
@@ -404,30 +475,70 @@ pub async fn cluster_with_embeddings(
     let (primary_threshold, secondary_threshold) = get_adaptive_thresholds(items.len());
     println!("[Clustering] Using thresholds: primary={}, secondary={}", primary_threshold, secondary_threshold);
 
-    // Step 3: Run agglomerative clustering
-    let embeddings: Vec<(String, Vec<f32>)> = items_with_embeddings
+    // Step 3: Prepare embeddings for clustering
+    let mut embeddings: Vec<(String, Vec<f32>)> = items_with_embeddings
         .iter()
         .map(|(node, emb)| (node.id.clone(), emb.clone()))
         .collect();
 
-    let cluster_groups = agglomerative_cluster_embeddings(&embeddings, primary_threshold);
-    println!("[Clustering] Formed {} clusters", cluster_groups.len());
+    // Shuffle to spread similar items across batches
+    // (prevents systematic separation of related items that happen to be adjacent)
+    embeddings.shuffle(&mut rand::thread_rng());
 
-    // Step 4: Compute centroids for each cluster
-    let mut cluster_data: Vec<(i32, Vec<usize>, Vec<f32>)> = Vec::new(); // (cluster_id, member_indices, centroid)
-    let next_cluster_id = db.get_next_cluster_id().map_err(|e| e.to_string())?;
+    // Step 4: Mini-batch clustering for scalability
+    const BATCH_SIZE: usize = 300;
+    let mut all_clusters: Vec<(Vec<f32>, Vec<usize>)> = Vec::new();
+    let mut global_offset = 0;
+    let num_batches = (embeddings.len() + BATCH_SIZE - 1) / BATCH_SIZE;
 
-    for (idx, indices) in cluster_groups.iter().enumerate() {
-        let cluster_id = next_cluster_id + idx as i32;
-        let member_embeddings: Vec<&[f32]> = indices
+    // Cluster each batch independently
+    for batch_start in (0..embeddings.len()).step_by(BATCH_SIZE) {
+        let batch_end = (batch_start + BATCH_SIZE).min(embeddings.len());
+        let batch: Vec<(String, Vec<f32>)> = embeddings[batch_start..batch_end]
             .iter()
-            .map(|&i| embeddings[i].1.as_slice())
+            .cloned()
             .collect();
 
-        if let Some(centroid) = compute_centroid(&member_embeddings) {
-            cluster_data.push((cluster_id, indices.clone(), centroid));
+        println!("[Clustering] Processing batch {}-{} of {} ({}/{})",
+                 batch_start, batch_end, embeddings.len(),
+                 batch_start / BATCH_SIZE + 1, num_batches);
+
+        let batch_clusters = cluster_batch(&batch, primary_threshold);
+
+        // Adjust indices to global offset
+        for (centroid, local_indices) in batch_clusters {
+            let global_indices: Vec<usize> = local_indices.iter()
+                .map(|&i| i + global_offset)
+                .collect();
+            all_clusters.push((centroid, global_indices));
         }
+        global_offset = batch_end;
     }
+
+    println!("[Clustering] {} clusters from {} batches, merging similar...",
+             all_clusters.len(), num_batches);
+
+    // Merge similar clusters across batches
+    let merge_threshold = primary_threshold * 0.95;
+    merge_similar_clusters(&mut all_clusters, merge_threshold);
+
+    println!("[Clustering] After merge: {} clusters", all_clusters.len());
+
+    // Convert to cluster_groups format
+    let cluster_groups: Vec<Vec<usize>> = all_clusters.iter()
+        .map(|(_, indices)| indices.clone())
+        .collect();
+
+    // Step 5: Build cluster_data with IDs
+    let mut cluster_data: Vec<(i32, Vec<usize>, Vec<f32>)> = Vec::new();
+    let next_cluster_id = db.get_next_cluster_id().map_err(|e| e.to_string())?;
+
+    for (idx, (centroid, indices)) in all_clusters.iter().enumerate() {
+        let cluster_id = next_cluster_id + idx as i32;
+        cluster_data.push((cluster_id, indices.clone(), centroid.clone()));
+    }
+
+    println!("[Clustering] Formed {} clusters", cluster_groups.len());
 
     // Step 5: Name clusters with AI
     let cluster_names = name_clusters_with_ai(db, &cluster_data, &items_with_embeddings).await?;

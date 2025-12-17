@@ -108,6 +108,7 @@ pub fn add_note(state: State<AppState>, title: String, content: String) -> Resul
             latest_child_date: None,
             is_private: None,
             privacy_reason: None,
+            source: None,
         };
         state.db.read().unwrap().insert_node(&container_node).map_err(|e| e.to_string())?;
 
@@ -152,6 +153,7 @@ pub fn add_note(state: State<AppState>, title: String, content: String) -> Resul
         latest_child_date: None,
         is_private: None,
         privacy_reason: None,
+        source: None,
     };
 
     state.db.read().unwrap().insert_node(&note).map_err(|e| e.to_string())?;
@@ -768,6 +770,16 @@ pub fn import_markdown_files(state: State<AppState>, file_paths: Vec<String>) ->
     import::import_markdown_files(&db, &file_paths)
 }
 
+/// Import Google Keep notes from a Google Takeout zip file.
+///
+/// Extracts JSON files from Takeout/Keep/ in the zip, parses notes,
+/// and creates thought nodes with is_item=true and source="googlekeep".
+#[tauri::command]
+pub fn import_google_keep(state: State<AppState>, zip_path: String) -> Result<import::GoogleKeepImportResult, String> {
+    let db = state.db.read().unwrap();
+    import::import_google_keep(&db, &zip_path)
+}
+
 // ==================== Quick Access Commands (Sidebar) ====================
 
 /// Pin or unpin a node for quick access
@@ -1066,6 +1078,7 @@ pub async fn quick_add_to_hierarchy(
                 latest_child_date: None,
                 is_private: None,
                 privacy_reason: None,
+                source: None,
             };
             state.db.read().unwrap().insert_node(&inbox_node).map_err(|e| e.to_string())?;
             state.db.read().unwrap().increment_child_count(&universe.id).map_err(|e| e.to_string())?;
@@ -1150,6 +1163,7 @@ pub async fn quick_add_to_hierarchy(
                     latest_child_date: Some(item.created_at),
                     is_private: None,
                     privacy_reason: None,
+                    source: None,
                 };
 
                 state.db.read().unwrap().insert_node(&topic_node).map_err(|e| e.to_string())?;
@@ -1321,6 +1335,7 @@ pub async fn consolidate_root(state: State<'_, AppState>) -> Result<ConsolidateR
             latest_child_date: None,
             is_private: None,
             privacy_reason: None,
+            source: None,
         };
 
         state.db.read().unwrap().insert_node(&uber_node).map_err(|e| e.to_string())?;

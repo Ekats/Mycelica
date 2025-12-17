@@ -133,6 +133,7 @@ pub fn import_claude_conversations(db: &Database, json_content: &str) -> Result<
             latest_child_date: None,
             is_private: None,
             privacy_reason: None,
+            source: Some("claude".to_string()),
         };
 
         if let Err(e) = db.insert_node(&container) {
@@ -183,6 +184,7 @@ pub fn import_claude_conversations(db: &Database, json_content: &str) -> Result<
                 latest_child_date: None,
                 is_private: None,
                 privacy_reason: None,
+                source: Some("claude".to_string()),
             };
 
             if let Err(e) = db.insert_node(&exchange_node) {
@@ -250,6 +252,7 @@ pub fn import_markdown_files(db: &Database, file_paths: &[String]) -> Result<Imp
             latest_child_date: None,
             is_private: None,
             privacy_reason: None,
+            source: None,
         };
         if let Err(e) = db.insert_node(&container) {
             result.errors.push(format!("Failed to create Recent Notes container: {}", e));
@@ -313,6 +316,7 @@ pub fn import_markdown_files(db: &Database, file_paths: &[String]) -> Result<Imp
             latest_child_date: Some(now),
             is_private: None,
             privacy_reason: None,
+            source: Some("markdown".to_string()),
         };
 
         if let Err(e) = db.insert_node(&note) {
@@ -344,6 +348,248 @@ fn extract_markdown_title(content: &str) -> Option<String> {
     }
     None
 }
+
+// =============================================================================
+// Google Keep Import
+// =============================================================================
+
+/// Google Keep note format from Takeout export
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct GoogleKeepNote {
+    title: Option<String>,
+    text_content: Option<String>,
+    list_content: Option<Vec<GoogleKeepListItem>>,
+    labels: Option<Vec<GoogleKeepLabel>>,
+    is_pinned: Option<bool>,
+    is_trashed: Option<bool>,
+    is_archived: Option<bool>,
+    color: Option<String>,
+    created_timestamp_usec: Option<i64>,
+    user_edited_timestamp_usec: Option<i64>,
+    attachments: Option<Vec<GoogleKeepAttachment>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct GoogleKeepListItem {
+    text: String,
+    is_checked: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct GoogleKeepLabel {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct GoogleKeepAttachment {
+    file_path: String,
+}
+
+/// Import result for Google Keep
+#[derive(Debug, Serialize)]
+pub struct GoogleKeepImportResult {
+    pub notes_imported: i32,
+    pub skipped: i32,
+    pub warnings: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+/// Import Google Keep notes from a Google Takeout zip file.
+///
+/// Parses JSON files from Takeout/Keep/ directory in the zip.
+/// Creates thought nodes with is_item=true and source="googlekeep".
+pub fn import_google_keep(db: &Database, zip_path: &str) -> Result<GoogleKeepImportResult, String> {
+    use std::io::Read;
+    use uuid::Uuid;
+    use zip::ZipArchive;
+
+    let mut result = GoogleKeepImportResult {
+        notes_imported: 0,
+        skipped: 0,
+        warnings: Vec::new(),
+        errors: Vec::new(),
+    };
+
+    // Open the zip file
+    let file = std::fs::File::open(zip_path)
+        .map_err(|e| format!("Failed to open zip file: {}", e))?;
+
+    let mut archive = ZipArchive::new(file)
+        .map_err(|e| format!("Failed to read zip archive: {}", e))?;
+
+    // Collect existing notes for duplicate detection (title + created_at)
+    let existing_nodes = db.get_items().unwrap_or_default();
+    let existing_keys: std::collections::HashSet<(String, i64)> = existing_nodes
+        .iter()
+        .filter(|n| n.source.as_deref() == Some("googlekeep"))
+        .map(|n| (n.title.clone(), n.created_at))
+        .collect();
+
+    let now = chrono::Utc::now().timestamp_millis();
+
+    // Iterate through all files in the archive
+    for i in 0..archive.len() {
+        let mut file = match archive.by_index(i) {
+            Ok(f) => f,
+            Err(e) => {
+                result.errors.push(format!("Failed to read archive entry {}: {}", i, e));
+                continue;
+            }
+        };
+
+        let file_name = file.name().to_string();
+
+        // Only process JSON files in Takeout/Keep/
+        if !file_name.contains("Keep/") || !file_name.ends_with(".json") {
+            continue;
+        }
+
+        // Skip label definitions (Labels/*.json)
+        if file_name.contains("/Labels/") {
+            continue;
+        }
+
+        // Read the JSON content
+        let mut content = String::new();
+        if let Err(e) = file.read_to_string(&mut content) {
+            result.errors.push(format!("Failed to read {}: {}", file_name, e));
+            continue;
+        }
+
+        // Parse the note
+        let note: GoogleKeepNote = match serde_json::from_str(&content) {
+            Ok(n) => n,
+            Err(e) => {
+                result.errors.push(format!("Failed to parse {}: {}", file_name, e));
+                continue;
+            }
+        };
+
+        // Skip trashed notes
+        if note.is_trashed.unwrap_or(false) {
+            result.skipped += 1;
+            continue;
+        }
+
+        // Build content from textContent and/or listContent
+        let text_content = note.text_content.clone().unwrap_or_default();
+        let list_content = note.list_content.as_ref().map(|items| {
+            items.iter()
+                .map(|item| {
+                    let checkbox = if item.is_checked.unwrap_or(false) { "[x]" } else { "[ ]" };
+                    format!("- {} {}", checkbox, item.text)
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }).unwrap_or_default();
+
+        // Concatenate both if present
+        let full_content = match (text_content.is_empty(), list_content.is_empty()) {
+            (true, true) => {
+                result.skipped += 1;
+                result.warnings.push(format!("Skipped empty note: {}", file_name));
+                continue;
+            }
+            (false, true) => text_content,
+            (true, false) => list_content,
+            (false, false) => format!("{}\n\n{}", text_content, list_content),
+        };
+
+        // Extract title (use "Untitled Note" if empty)
+        let title = note.title.clone()
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| "Untitled Note".to_string());
+
+        // Convert timestamps (microseconds to milliseconds)
+        let created_at = note.created_timestamp_usec
+            .map(|usec| usec / 1000)
+            .unwrap_or(now);
+        let updated_at = note.user_edited_timestamp_usec
+            .map(|usec| usec / 1000)
+            .unwrap_or(created_at);
+
+        // Duplicate check
+        if existing_keys.contains(&(title.clone(), created_at)) {
+            result.skipped += 1;
+            continue;
+        }
+
+        // Warn about attachments
+        if let Some(attachments) = &note.attachments {
+            if !attachments.is_empty() {
+                result.warnings.push(format!(
+                    "Note '{}' has {} attachment(s) - text imported only",
+                    title, attachments.len()
+                ));
+            }
+        }
+
+        // Extract tags from labels
+        let tags = note.labels.as_ref().map(|labels| {
+            let tag_list: Vec<String> = labels.iter().map(|l| l.name.clone()).collect();
+            serde_json::to_string(&tag_list).unwrap_or_else(|_| "[]".to_string())
+        });
+
+        // Create the node
+        let note_id = format!("keep-{}", Uuid::new_v4());
+
+        let node = Node {
+            id: note_id.clone(),
+            node_type: NodeType::Thought,
+            title,
+            url: None,
+            content: Some(full_content),
+            position: Position { x: 0.0, y: 0.0 },
+            created_at,
+            updated_at,
+            cluster_id: None,
+            cluster_label: None,
+            depth: 0, // Will be set by hierarchy builder
+            is_item: true, // This is a leaf - will be clustered
+            is_universe: false,
+            parent_id: None, // Will be set by hierarchy builder
+            child_count: 0,
+            ai_title: None,
+            summary: None,
+            tags,
+            emoji: Some("📝".to_string()), // Note emoji for Keep notes
+            is_processed: false,
+            conversation_id: None,
+            sequence_index: None,
+            is_pinned: note.is_pinned.unwrap_or(false),
+            last_accessed_at: None,
+            latest_child_date: Some(created_at),
+            is_private: None,
+            privacy_reason: None,
+            source: Some("googlekeep".to_string()),
+        };
+
+        if let Err(e) = db.insert_node(&node) {
+            result.errors.push(format!("Failed to insert note: {}", e));
+            continue;
+        }
+
+        result.notes_imported += 1;
+    }
+
+    eprintln!(
+        "[Google Keep Import] Imported {} notes, skipped {}, {} warnings, {} errors",
+        result.notes_imported, result.skipped, result.warnings.len(), result.errors.len()
+    );
+
+    Ok(result)
+}
+
+// =============================================================================
+// Claude Import Helpers
+// =============================================================================
 
 /// Paired exchange: human question + assistant response
 struct Exchange {

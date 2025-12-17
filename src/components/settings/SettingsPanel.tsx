@@ -423,6 +423,41 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     }
   };
 
+  // Google Keep import handler
+  const handleImportGoogleKeep = async () => {
+    setImporting(true);
+    setImportResult(null);
+    try {
+      const file = await openDialog({
+        title: 'Select Google Takeout zip file',
+        filters: [{ name: 'Zip Archive', extensions: ['zip'] }],
+        multiple: false,
+      });
+      if (file && typeof file === 'string') {
+        const result = await invoke<{ notesImported: number; skipped: number; warnings: string[]; errors: string[] }>(
+          'import_google_keep',
+          { zipPath: file }
+        );
+        await loadDbStats();
+        onDataChanged?.();
+        const errorMsg = result.errors.length > 0 ? ` (${result.errors.length} errors)` : '';
+        const warnMsg = result.warnings.length > 0 ? ` (${result.warnings.length} warnings)` : '';
+        setImportResult(`Imported ${result.notesImported} Google Keep note${result.notesImported !== 1 ? 's' : ''}${warnMsg}${errorMsg}`);
+
+        // Show Quick Process prompt if notes were imported
+        if (result.notesImported > 0) {
+          setNewItemCount(result.notesImported);
+          setShowQuickProcessPrompt(true);
+          setImportResult(null);
+        }
+      }
+    } catch (err) {
+      setImportResult(`Error: ${err}`);
+    } finally {
+      setImporting(false);
+    }
+  };
+
   const handleQuickProcess = async () => {
     setIsQuickProcessing(true);
     setQuickProcessStep('');
@@ -1093,6 +1128,15 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                       <span className="text-2xl">{importing ? <Loader2 className="w-6 h-6 animate-spin" /> : '📄'}</span>
                       <span className="text-xs text-gray-300">Markdown</span>
                       <span className="text-xs text-gray-500">.md</span>
+                    </button>
+                    <button
+                      onClick={handleImportGoogleKeep}
+                      disabled={importing}
+                      className="flex-1 flex flex-col items-center gap-2 p-3 bg-gray-800/50 hover:bg-gray-800 rounded-lg transition-colors disabled:opacity-50"
+                    >
+                      <span className="text-2xl">{importing ? <Loader2 className="w-6 h-6 animate-spin" /> : '📝'}</span>
+                      <span className="text-xs text-gray-300">Google Keep</span>
+                      <span className="text-xs text-gray-500">.zip</span>
                     </button>
                   </div>
                 </div>

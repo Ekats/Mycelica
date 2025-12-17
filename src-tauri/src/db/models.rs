@@ -130,6 +130,9 @@ pub struct Node {
     pub is_private: Option<bool>,         // None = not scanned, Some(true) = private, Some(false) = safe
     #[serde(rename = "privacyReason")]
     pub privacy_reason: Option<String>,   // Why it was marked private (for review)
+
+    // Import source tracking
+    pub source: Option<String>,           // "claude", "googlekeep", "markdown", etc.
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
