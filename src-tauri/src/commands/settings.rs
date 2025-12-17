@@ -81,3 +81,15 @@ pub fn add_ai_processing_time(elapsed_secs: f64) -> Result<(), String> {
 pub fn add_rebuild_time(elapsed_secs: f64) -> Result<(), String> {
     settings::add_rebuild_time(elapsed_secs)
 }
+
+// ==================== Local Embeddings ====================
+
+#[tauri::command]
+pub fn get_use_local_embeddings() -> bool {
+    settings::use_local_embeddings()
+}
+
+#[tauri::command]
+pub fn set_use_local_embeddings(enabled: bool) -> Result<(), String> {
+    settings::set_use_local_embeddings(enabled)
+}

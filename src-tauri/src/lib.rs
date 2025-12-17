@@ -6,6 +6,7 @@ mod settings;
 mod hierarchy;
 mod import;
 mod similarity;
+mod local_embeddings;
 
 use commands::{
     AppState,
@@ -45,6 +46,8 @@ use commands::{
     analyze_node_privacy, analyze_all_privacy, analyze_categories_privacy, cancel_privacy_scan, reset_privacy_flags, get_privacy_stats, export_shareable_db, set_node_privacy,
     // Recent Notes protection commands
     get_protect_recent_notes, set_protect_recent_notes,
+    // Local embeddings commands
+    get_use_local_embeddings, set_use_local_embeddings, regenerate_all_embeddings,
 };
 use db::Database;
 use std::sync::Arc;
@@ -233,6 +236,10 @@ pub fn run() {
             // Recent Notes protection
             get_protect_recent_notes,
             set_protect_recent_notes,
+            // Local embeddings
+            get_use_local_embeddings,
+            set_use_local_embeddings,
+            regenerate_all_embeddings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

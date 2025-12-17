@@ -957,6 +957,80 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     }
   }, [devLog]);
 
+  // List current view's hierarchy path with children
+  const listCurrentPath = useCallback(async () => {
+    devLog('info', `=== CURRENT PATH ===`);
+
+    try {
+      // Always start with Universe
+      const universe = await invoke<Node | null>('get_universe');
+      if (!universe) {
+        devLog('warn', 'No universe node found');
+        return;
+      }
+
+      const universeTitle = universe.clusterLabel || universe.aiTitle || universe.title || 'Universe';
+      devLog('info', `🌌 ${universeTitle} (depth 0)`);
+
+      // Determine current parent to show children of
+      let currentViewParentId: string | null = null;
+      let baseIndent = 1;
+
+      // Show breadcrumb path
+      if (breadcrumbs.length === 0) {
+        currentViewParentId = universe.id;
+      } else {
+        for (let i = 0; i < breadcrumbs.length; i++) {
+          const crumb = breadcrumbs[i];
+          const isLast = i === breadcrumbs.length - 1;
+          const indent = '    '.repeat(i + 1);
+          const connector = '└── ';
+          const arrow = crumb.isJump ? ' ⟿ ' : '';
+          const emoji = crumb.emoji || '📁';
+          const title = crumb.title || 'Untitled';
+          const depthTag = ` (depth ${crumb.depth})`;
+
+          devLog('info', `${indent}${connector}${arrow}${emoji} ${title}${depthTag}`);
+
+          if (isLast) {
+            currentViewParentId = crumb.id;
+            baseIndent = i + 2;
+          }
+        }
+      }
+
+      // List children of current view
+      if (currentViewParentId) {
+        const children = await invoke<Node[]>('get_children', { parentId: currentViewParentId });
+        const sortedChildren = [...children].sort((a, b) => (b.childCount || 0) - (a.childCount || 0));
+
+        const childIndent = '    '.repeat(baseIndent);
+        devLog('info', `${childIndent}┌── Children (${sortedChildren.length}):`);
+
+        for (let i = 0; i < sortedChildren.length; i++) {
+          const child = sortedChildren[i];
+          const isLastChild = i === sortedChildren.length - 1;
+          const connector = isLastChild ? '└── ' : '├── ';
+          const emoji = child.emoji || (child.isItem ? '📄' : '📁');
+          const title = child.clusterLabel || child.aiTitle || child.title || 'Untitled';
+          const childCount = child.childCount || 0;
+          const itemTag = child.isItem ? ' [item]' : '';
+          const countTag = childCount > 0 ? ` (${childCount})` : '';
+
+          // Truncate title
+          const maxLen = 35;
+          const displayTitle = title.length > maxLen ? title.slice(0, maxLen - 3) + '...' : title;
+
+          devLog('info', `${childIndent}${connector}${emoji} ${displayTitle}${countTag}${itemTag}`);
+        }
+      }
+
+      devLog('info', `=== END PATH ===`);
+    } catch (error) {
+      devLog('error', `Failed to list path: ${error}`);
+    }
+  }, [devLog, breadcrumbs, nodes]);
+
   useEffect(() => {
     devLog('info', 'Main render useEffect running');
     if (!svgRef.current || nodes.size === 0) return;
@@ -3230,6 +3304,13 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
                 title="List all nodes in current view"
               >
                 Nodes
+              </button>
+              <button
+                onClick={listCurrentPath}
+                className="text-green-400 hover:text-green-300 transition-colors"
+                title="Show current view's hierarchy path"
+              >
+                Path
               </button>
               <button
                 onClick={listHierarchy}

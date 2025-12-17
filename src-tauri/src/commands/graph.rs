@@ -1514,3 +1514,187 @@ pub fn get_protect_recent_notes() -> bool {
 pub fn set_protect_recent_notes(protected: bool) -> Result<(), String> {
     crate::settings::set_protect_recent_notes(protected)
 }
+
+// ==================== Embedding Regeneration ====================
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegenerateProgress {
+    pub current: usize,
+    pub total: usize,
+    pub status: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegenerateResult {
+    pub count: usize,
+    pub embedding_source: String,
+    pub duration_secs: f64,
+}
+
+/// Regenerate all embeddings using current embedding source (local or OpenAI)
+/// Used when toggling between local and OpenAI embeddings to prevent dimension mismatch
+#[tauri::command]
+pub async fn regenerate_all_embeddings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<RegenerateResult, String> {
+    use crate::local_embeddings;
+
+    let start = std::time::Instant::now();
+    let db = state.db.read().unwrap().clone();
+
+    let use_local = settings::use_local_embeddings();
+    let embedding_source = if use_local {
+        "local (384-dim)"
+    } else {
+        "OpenAI (1536-dim)"
+    };
+
+    println!("[Regenerate] Starting embedding regeneration using {}", embedding_source);
+
+    // Get all items that need embeddings
+    let items = db.get_items().map_err(|e| e.to_string())?;
+    let total = items.len();
+
+    if total == 0 {
+        return Ok(RegenerateResult {
+            count: 0,
+            embedding_source: embedding_source.to_string(),
+            duration_secs: 0.0,
+        });
+    }
+
+    // Clear all existing embeddings first
+    db.clear_all_embeddings().map_err(|e| e.to_string())?;
+    // Also delete semantic edges since they depend on embeddings
+    let _ = db.delete_semantic_edges();
+
+    println!("[Regenerate] Cleared existing embeddings, processing {} items", total);
+
+    // Emit initial progress
+    let _ = app.emit("regenerate-progress", RegenerateProgress {
+        current: 0,
+        total,
+        status: format!("Starting regeneration using {}...", embedding_source),
+    });
+
+    // Build texts for all items
+    let mut item_texts: Vec<(String, String)> = Vec::with_capacity(total); // (id, text)
+    for item in &items {
+        let mut parts = Vec::new();
+        if let Some(title) = &item.ai_title {
+            parts.push(title.as_str());
+        } else {
+            parts.push(&item.title);
+        }
+        if let Some(summary) = &item.summary {
+            parts.push(summary.as_str());
+        }
+        if let Some(tags) = &item.tags {
+            parts.push(tags.as_str());
+        }
+        if let Some(content) = &item.content {
+            let preview: String = content.chars().take(500).collect();
+            parts.push(Box::leak(preview.into_boxed_str()));
+        }
+        item_texts.push((item.id.clone(), parts.join(" ")));
+    }
+
+    let mut success_count = 0;
+    let mut error_count = 0;
+    let batch_size = 32;
+
+    if use_local {
+        // Batch processing for local embeddings - much faster than one-by-one
+        let num_batches = (total + batch_size - 1) / batch_size;
+        println!("[Regenerate] Processing {} batches of {} items each", num_batches, batch_size);
+
+        for (batch_idx, chunk) in item_texts.chunks(batch_size).enumerate() {
+            let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
+
+            match local_embeddings::generate_batch(&texts) {
+                Ok(embeddings) => {
+                    for (i, embedding) in embeddings.into_iter().enumerate() {
+                        let item_id = &chunk[i].0;
+                        if let Err(e) = db.update_node_embedding(item_id, &embedding) {
+                            eprintln!("[Regenerate] Failed to save embedding for {}: {}", item_id, e);
+                            error_count += 1;
+                        } else {
+                            success_count += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[Regenerate] Batch {} failed: {}", batch_idx, e);
+                    error_count += chunk.len();
+                }
+            }
+
+            // Emit progress after each batch
+            let current = ((batch_idx + 1) * batch_size).min(total);
+            let _ = app.emit("regenerate-progress", RegenerateProgress {
+                current,
+                total,
+                status: format!("Batch {} of {}...", batch_idx + 1, num_batches),
+            });
+
+            // Yield to let the runtime flush events to the UI
+            tokio::task::yield_now().await;
+
+            // Log progress every 10 batches
+            if batch_idx % 10 == 0 {
+                let elapsed = start.elapsed().as_secs_f64();
+                let rate = current as f64 / elapsed;
+                println!("[Regenerate] Progress: {}/{} ({:.1}%, {:.0} items/sec)",
+                    current, total, (current as f64 / total as f64) * 100.0, rate);
+            }
+        }
+    } else {
+        // Sequential processing for OpenAI (API rate limits)
+        for (idx, (item_id, text)) in item_texts.iter().enumerate() {
+            match ai_client::generate_embedding(text).await {
+                Ok(embedding) => {
+                    if let Err(e) = db.update_node_embedding(item_id, &embedding) {
+                        eprintln!("[Regenerate] Failed to save embedding for {}: {}", item_id, e);
+                        error_count += 1;
+                    } else {
+                        success_count += 1;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[Regenerate] Failed to generate embedding for {}: {}", item_id, e);
+                    error_count += 1;
+                }
+            }
+
+            // Emit progress every 10 items
+            if idx % 10 == 0 || idx == total - 1 {
+                let _ = app.emit("regenerate-progress", RegenerateProgress {
+                    current: idx + 1,
+                    total,
+                    status: format!("Processing {} of {}...", idx + 1, total),
+                });
+            }
+        }
+    }
+
+    let duration_secs = start.elapsed().as_secs_f64();
+
+    println!("[Regenerate] Complete: {} succeeded, {} failed, {:.1}s",
+        success_count, error_count, duration_secs);
+
+    // Emit completion
+    let _ = app.emit("regenerate-progress", RegenerateProgress {
+        current: total,
+        total,
+        status: format!("Complete! {} embeddings regenerated", success_count),
+    });
+
+    Ok(RegenerateResult {
+        count: success_count,
+        embedding_source: embedding_source.to_string(),
+        duration_secs,
+    })
+}

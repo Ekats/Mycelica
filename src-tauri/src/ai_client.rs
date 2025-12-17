@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use crate::settings;
+use crate::local_embeddings;
 
 /// Result of AI analysis for a node
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1639,14 +1640,20 @@ struct EmbeddingData {
     embedding: Vec<f32>,
 }
 
-/// Check if embeddings are available (OpenAI API key is set)
+/// Check if embeddings are available (local embeddings enabled OR OpenAI API key is set)
 pub fn embeddings_available() -> bool {
-    settings::has_openai_api_key()
+    settings::use_local_embeddings() || settings::has_openai_api_key()
 }
 
-/// Generate an embedding for text using OpenAI's text-embedding-3-small model
-/// Returns a 1536-dimensional vector
+/// Generate an embedding for text.
+/// Uses local embeddings (384-dim) if enabled, otherwise OpenAI (1536-dim).
 pub async fn generate_embedding(text: &str) -> Result<Vec<f32>, String> {
+    // Route to local embeddings if enabled
+    if settings::use_local_embeddings() {
+        return local_embeddings::generate(text);
+    }
+
+    // Otherwise use OpenAI
     let api_key = settings::get_openai_api_key()
         .ok_or("OPENAI_API_KEY not set")?;
 

@@ -17,6 +17,7 @@ import {
   Zap,
   Shield,
   Download,
+  Cpu,
 } from 'lucide-react';
 import { ConfirmDialog } from './ConfirmDialog';
 
@@ -165,6 +166,11 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   // Protection settings
   const [protectRecentNotes, setProtectRecentNotes] = useState(true);
 
+  // Local embeddings
+  const [useLocalEmbeddings, setUseLocalEmbeddings] = useState(false);
+  const [isRegeneratingEmbeddings, setIsRegeneratingEmbeddings] = useState(false);
+  const [regenerateProgress, setRegenerateProgress] = useState<{ current: number; total: number; status: string } | null>(null);
+
   // Load data on mount
   useEffect(() => {
     if (open) {
@@ -175,6 +181,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
       loadProcessingStats();
       loadPrivacyStats();
       loadProtectionSettings();
+      loadLocalEmbeddingsStatus();
       setImportResult(null);
       setActionResult(null);
       setPrivacyResult(null);
@@ -250,6 +257,70 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
       setProtectRecentNotes(enabled);
     } catch (err) {
       console.error('Failed to toggle protection:', err);
+    }
+  };
+
+  const loadLocalEmbeddingsStatus = async () => {
+    try {
+      const enabled = await invoke<boolean>('get_use_local_embeddings');
+      setUseLocalEmbeddings(enabled);
+    } catch (err) {
+      console.error('Failed to load local embeddings status:', err);
+    }
+  };
+
+  const handleToggleLocalEmbeddings = async (enabled: boolean) => {
+    // Check if OpenAI key is available when switching away from local
+    if (!enabled && !openaiKeyStatus) {
+      setActionResult('Error: OpenAI API key required for cloud embeddings');
+      return;
+    }
+
+    try {
+      await invoke('set_use_local_embeddings', { enabled });
+      setUseLocalEmbeddings(enabled);
+      setActionResult(null);
+    } catch (err) {
+      setActionResult(`Error: ${err}`);
+    }
+  };
+
+  const handleRegenerateEmbeddings = async () => {
+    // Check requirements
+    if (!useLocalEmbeddings && !openaiKeyStatus) {
+      setActionResult('Error: OpenAI API key required for cloud embeddings');
+      return;
+    }
+
+    setIsRegeneratingEmbeddings(true);
+    setRegenerateProgress({ current: 0, total: 0, status: 'starting' });
+    setActionResult(null);
+
+    // Listen for progress events
+    const { listen } = await import('@tauri-apps/api/event');
+    const unlisten = await listen<{
+      current: number;
+      total: number;
+      status: string;
+    }>('regenerate-progress', (event) => {
+      setRegenerateProgress(event.payload);
+    });
+
+    try {
+      const result = await invoke<{
+        count: number;
+        embeddingSource: string;
+        durationSecs: number;
+      }>('regenerate_all_embeddings');
+
+      setActionResult(`Regenerated ${result.count} embeddings using ${result.embeddingSource} (${result.durationSecs.toFixed(1)}s)`);
+      await loadDbStats();
+    } catch (err) {
+      setActionResult(`Error: ${err}`);
+    } finally {
+      unlisten();
+      setIsRegeneratingEmbeddings(false);
+      setRegenerateProgress(null);
     }
   };
 
@@ -1207,14 +1278,13 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
 
                 {/* Step 3: Cluster */}
                 <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
-                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-amber-600 flex items-center justify-center text-white text-sm font-bold">3</span>
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-cyan-600 flex items-center justify-center text-white text-sm font-bold">3</span>
                   <div className="flex-1 min-w-0">
                     <div className="text-sm font-medium text-gray-200">Cluster</div>
-                    <div className="text-xs text-gray-500">Assign items to topic clusters</div>
+                    <div className="text-xs text-gray-500">Group items by embedding similarity (free)</div>
                     {dbStats && dbStats.unclusteredItems > 0 && (
-                      <div className="text-xs text-amber-400/80 mt-0.5">
-                        {Math.ceil(dbStats.unclusteredItems / 20)} calls · Haiku {estimateCost(Math.ceil(dbStats.unclusteredItems / 20), 'haiku', 4000)}
-                        <span className="text-gray-500 ml-1">({dbStats.unclusteredItems} items)</span>
+                      <div className="text-xs text-cyan-400 mt-0.5">
+                        {dbStats.unclusteredItems} items to cluster · Local embeddings
                       </div>
                     )}
                     {dbStats && dbStats.unclusteredItems === 0 && (
@@ -1223,8 +1293,8 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   </div>
                   <button
                     onClick={handleClustering}
-                    disabled={isClustering || !apiKeyStatus?.hasKey}
-                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-amber-600 hover:bg-amber-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                    disabled={isClustering}
+                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-cyan-600 hover:bg-cyan-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isClustering ? <Loader2 className="w-5 h-5 animate-spin" /> : '🎯'}
                   </button>
@@ -1438,6 +1508,109 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   </a>
                 </p>
               </div>
+
+              {/* Local Embeddings Toggle */}
+              <div className="bg-gray-900/50 rounded-lg p-4 mt-3">
+                <div className="flex items-center gap-2 mb-3">
+                  <Cpu className="w-5 h-5 text-cyan-400" />
+                  <span className="text-sm font-medium text-gray-200">Embedding Source</span>
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-sm text-gray-300">
+                      {useLocalEmbeddings ? (
+                        <span className="flex items-center gap-2">
+                          <span className="text-cyan-400">Local Model</span>
+                          <span className="text-xs text-gray-500">(all-MiniLM-L6-v2, 384-dim)</span>
+                        </span>
+                      ) : (
+                        <span className="flex items-center gap-2">
+                          <span className="text-amber-400">OpenAI API</span>
+                          <span className="text-xs text-gray-500">(text-embedding-3-small, 1536-dim)</span>
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-xs text-gray-500 mt-1">
+                      {useLocalEmbeddings
+                        ? 'Free, offline, optimized for clustering'
+                        : 'Requires API key, not optimized for clustering'}
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => handleToggleLocalEmbeddings(!useLocalEmbeddings)}
+                    disabled={isRegeneratingEmbeddings}
+                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                      useLocalEmbeddings ? 'bg-cyan-500' : 'bg-gray-600'
+                    } ${isRegeneratingEmbeddings ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  >
+                    <span
+                      className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                        useLocalEmbeddings ? 'translate-x-6' : 'translate-x-1'
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                {/* Regenerate Button */}
+                <div className="mt-3 flex items-center gap-2">
+                  <button
+                    onClick={handleRegenerateEmbeddings}
+                    disabled={isRegeneratingEmbeddings || (!useLocalEmbeddings && !openaiKeyStatus)}
+                    className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-cyan-600 hover:bg-cyan-700 text-white rounded text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {isRegeneratingEmbeddings ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Regenerating...
+                      </>
+                    ) : (
+                      <>
+                        <RefreshCw className="w-4 h-4" />
+                        Regenerate All Embeddings
+                      </>
+                    )}
+                  </button>
+                </div>
+
+                {/* Regeneration Progress */}
+                {regenerateProgress && (
+                  <div className="mt-3">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-xs text-gray-400">
+                        {regenerateProgress.status} {regenerateProgress.current}/{regenerateProgress.total}
+                      </span>
+                      <span className="text-xs text-cyan-400">
+                        {regenerateProgress.total > 0
+                          ? `${Math.round((regenerateProgress.current / regenerateProgress.total) * 100)}%`
+                          : '0%'}
+                      </span>
+                    </div>
+                    <div className="h-1.5 bg-gray-700 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-cyan-500 transition-all duration-300"
+                        style={{
+                          width: regenerateProgress.total > 0
+                            ? `${(regenerateProgress.current / regenerateProgress.total) * 100}%`
+                            : '0%',
+                        }}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                <p className="mt-3 text-xs text-gray-500">
+                  {!useLocalEmbeddings && (
+                    <span className="text-amber-400">OpenAI embeddings are higher-dimensional but not tuned for our clustering. </span>
+                  )}
+                  {!useLocalEmbeddings && !openaiKeyStatus && (
+                    <span className="text-red-400">OpenAI key required.</span>
+                  )}
+                  {useLocalEmbeddings && (
+                    <span>Local embeddings are optimized for semantic clustering and work offline.</span>
+                  )}
+                </p>
+              </div>
             </section>
             )}
 
@@ -1458,17 +1631,16 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   </span>
                   <div className="flex-1 min-w-0">
                     <div className="text-sm font-medium text-gray-200">Full Rebuild</div>
-                    <div className="text-xs text-gray-500">Clustering + hierarchy. Replaces all organization.</div>
+                    <div className="text-xs text-gray-500">Embedding clustering (free) + AI hierarchy. Replaces all organization.</div>
                     {dbStats && (dbStats.unclusteredItems > 0 || dbStats.topicsCount > 0) && (
                       <div className="text-xs text-amber-400/80 mt-0.5">
-                        {dbStats.unclusteredItems > 0 && (
-                          <>{Math.ceil(dbStats.unclusteredItems / 20)} cluster calls · Haiku {estimateCost(Math.ceil(dbStats.unclusteredItems / 20), 'haiku', 4000)}</>
-                        )}
-                        {dbStats.unclusteredItems > 0 && dbStats.topicsCount > 15 && ' + '}
                         {dbStats.topicsCount > 15 && (
                           <>~{Math.ceil(Math.log(dbStats.topicsCount / 10) / Math.log(10) * 3)} hierarchy calls · Sonnet {estimateCost(Math.ceil(Math.log(dbStats.topicsCount / 10) / Math.log(10) * 3), 'sonnet', 5000)}</>
                         )}
-                        <span className="text-gray-500 ml-1">({dbStats.totalItems} items, {dbStats.topicsCount} topics)</span>
+                        {dbStats.topicsCount <= 15 && (
+                          <span className="text-cyan-400">Clustering: free (local embeddings)</span>
+                        )}
+                        <span className="text-gray-500 ml-1">({dbStats.totalItems} items)</span>
                       </div>
                     )}
                     {dbStats && dbStats.unclusteredItems === 0 && dbStats.topicsCount <= 15 && (

@@ -47,6 +47,8 @@ pub struct Settings {
     pub custom_db_path: Option<String>,
     #[serde(default = "default_true")]
     pub protect_recent_notes: bool,
+    #[serde(default = "default_true")]
+    pub use_local_embeddings: bool,
 }
 
 fn default_true() -> bool {
@@ -61,6 +63,7 @@ impl Default for Settings {
             processing_stats: ProcessingStats::default(),
             custom_db_path: None,
             protect_recent_notes: true,
+            use_local_embeddings: true, // Local embeddings are optimized for clustering
         }
     }
 }
@@ -376,3 +379,35 @@ pub fn set_protect_recent_notes(protected: bool) -> Result<(), String> {
 
 /// The fixed ID for the Recent Notes container
 pub const RECENT_NOTES_CONTAINER_ID: &str = "container-recent-notes";
+
+// ==================== Local Embeddings ====================
+
+/// Check if local embeddings are enabled (default: false)
+pub fn use_local_embeddings() -> bool {
+    let guard = SETTINGS.read().ok();
+    guard
+        .as_ref()
+        .and_then(|g| g.as_ref())
+        .map(|s| s.use_local_embeddings)
+        .unwrap_or(false) // Default to OpenAI
+}
+
+/// Set local embeddings preference
+pub fn set_use_local_embeddings(enabled: bool) -> Result<(), String> {
+    let mut settings_guard = SETTINGS.write()
+        .map_err(|_| "Failed to acquire settings lock")?;
+
+    let settings = settings_guard.get_or_insert_with(Settings::default);
+    settings.use_local_embeddings = enabled;
+
+    // Save to disk
+    let config_path = CONFIG_PATH.read()
+        .map_err(|_| "Failed to acquire config path lock")?
+        .clone()
+        .ok_or("Settings not initialized")?;
+
+    settings.save(&config_path)?;
+
+    println!("Local embeddings set to: {}", enabled);
+    Ok(())
+}
