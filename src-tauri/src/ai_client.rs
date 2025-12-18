@@ -258,10 +258,12 @@ CLUSTERS TO NAME:
 {clusters_section}
 
 RULES:
-1. Names should be specific and descriptive (e.g., "Rust Development", "AI Integration", "Browser Extensions")
-2. Avoid generic names like "General", "Other", "Miscellaneous", "Various"
-3. Focus on the common theme across the items
-4. Use proper nouns when items share a project/product name (e.g., "Mycelica Development")
+1. Names should be SPECIFIC and DESCRIPTIVE based on content (e.g., "Rust Development", "AI Integration", "Browser Extensions")
+2. NEVER use "Cluster X" or "Group X" or the cluster ID as a name - always describe the actual content
+3. Avoid generic names like "General", "Other", "Miscellaneous", "Various", "Mixed Topics"
+4. Focus on the COMMON THEME across the items' titles
+5. Use proper nouns when items share a project/product name (e.g., "Mycelica Development")
+6. Each name should be unique and descriptive of that specific cluster's content
 
 Return ONLY valid JSON, no markdown:
 {{"clusters": [{{"id": 1, "name": "Specific Name"}}, {{"id": 2, "name": "Another Name"}}]}}"#,
@@ -270,7 +272,7 @@ Return ONLY valid JSON, no markdown:
 
     let request = AnthropicRequest {
         model: "claude-3-5-haiku-20241022".to_string(),
-        max_tokens: 1000,
+        max_tokens: 2000, // Increased for batch naming (50 clusters × ~30 chars each)
         messages: vec![Message {
             role: "user".to_string(),
             content: prompt,
@@ -317,7 +319,7 @@ Return ONLY valid JSON, no markdown:
 /// Parse the cluster naming response
 fn parse_cluster_names_response(
     text: &str,
-    clusters: &[(i32, Vec<String>)],
+    _clusters: &[(i32, Vec<String>)],
 ) -> Result<Vec<(i32, String)>, String> {
     // Remove markdown wrapping if present
     let json_text = if text.starts_with("```") {
@@ -348,11 +350,9 @@ fn parse_cluster_names_response(
         }
         Err(e) => {
             eprintln!("Failed to parse cluster names response: {}\nResponse: {}", e, text);
-            // Fallback: return generic names
-            Ok(clusters
-                .iter()
-                .map(|(id, _)| (*id, format!("Cluster {}", id)))
-                .collect())
+            // Fallback: return empty - clustering.rs will generate names from titles
+            // NEVER return "Cluster {id}" as that defeats the purpose
+            Ok(vec![])
         }
     }
 }

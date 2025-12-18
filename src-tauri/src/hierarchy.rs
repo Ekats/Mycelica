@@ -14,11 +14,80 @@ use crate::db::{Database, Node, NodeType, Position};
 use crate::ai_client::{self, TopicInfo};
 use crate::settings;
 use crate::commands::is_rebuild_cancelled;
+use crate::clustering::extract_keywords;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 use tokio::time::{timeout, Duration};
+
+/// Generate a meaningful topic name from item titles using TF-IDF keywords
+/// Never returns generic "Topic {id}" names
+/// Produces clean 1-2 word names, never comma-separated lists
+fn generate_topic_name_from_titles(titles: &[String], cluster_id: i32) -> String {
+    if titles.is_empty() {
+        return format!("Topic Group {}", cluster_id);
+    }
+
+    // Combine all titles and extract keywords
+    let combined = titles.join(" ");
+    let keywords = extract_keywords(&combined, 10);
+
+    // Filter out very generic/noisy keywords
+    let noise_words = ["code", "file", "data", "project", "system", "issue", "error",
+                       "work", "development", "implementation", "analysis", "based",
+                       "using", "creating", "building", "understanding", "exploring"];
+
+    let filtered_keywords: Vec<&(String, f64)> = keywords
+        .iter()
+        .filter(|(w, _)| !noise_words.contains(&w.to_lowercase().as_str()))
+        .collect();
+
+    // Use filtered keywords if we have any, otherwise fall back to original
+    let best_keywords = if filtered_keywords.len() >= 2 {
+        &filtered_keywords
+    } else {
+        &keywords.iter().collect::<Vec<_>>()
+    };
+
+    if best_keywords.is_empty() {
+        // Try using first significant words from first title
+        if let Some(first_title) = titles.first() {
+            let words: Vec<&str> = first_title.split_whitespace()
+                .filter(|w| w.len() >= 4 && !noise_words.contains(&w.to_lowercase().as_str()))
+                .take(2)
+                .collect();
+            if !words.is_empty() {
+                return words.iter()
+                    .map(|w| capitalize_word(w))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            }
+        }
+        return format!("Topic Group {}", cluster_id);
+    }
+
+    // Use only top 1-2 keywords for clean names
+    match best_keywords.len() {
+        0 => format!("Topic Group {}", cluster_id),
+        1 => capitalize_word(&best_keywords[0].0),
+        _ => {
+            // Two keywords joined with " & "
+            format!("{} & {}",
+                capitalize_word(&best_keywords[0].0),
+                capitalize_word(&best_keywords[1].0))
+        }
+    }
+}
+
+/// Capitalize first letter of a word
+fn capitalize_word(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+    }
+}
 
 /// Log event for frontend dev console
 #[derive(Clone, Serialize)]
@@ -271,14 +340,19 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
     let mut topics_created = 0;
 
     for (cluster_id, cluster_items) in &clusters {
-        // Get cluster label from first item with one
+        // Get cluster label from first item with one, or generate from titles
         let cluster_label = cluster_items.iter()
             .find_map(|item| item.cluster_label.clone())
             .unwrap_or_else(|| {
                 if *cluster_id == -1 {
                     "Uncategorized".to_string()
                 } else {
-                    format!("Topic {}", cluster_id)
+                    // Generate meaningful name from item titles using TF-IDF keywords
+                    let titles: Vec<String> = cluster_items.iter()
+                        .take(15)
+                        .map(|item| item.ai_title.clone().unwrap_or_else(|| item.title.clone()))
+                        .collect();
+                    generate_topic_name_from_titles(&titles, *cluster_id)
                 }
             });
 

@@ -829,7 +829,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     },
     fullRebuild: {
       title: 'Full Rebuild',
-      message: 'This will run AI clustering AND rebuild the entire hierarchy. This is a destructive operation that replaces all organization. This uses API credits and can take a long time for large databases.',
+      message: 'This will run embedding clustering (free), AI hierarchy grouping (Sonnet), and flatten empty levels. Replaces all organization.',
       handler: async () => {
         setIsFullRebuilding(true);
         setOperationResult(null);
@@ -840,9 +840,13 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
             levelsCreated: number;
             groupingIterations: number;
           }>('build_full_hierarchy', { runClustering: true });
+
+          // Flatten empty passthrough levels
+          const flattenCount = await invoke<number>('flatten_hierarchy');
+
           const msg = result.clusteringResult
-            ? `Clustered ${result.clusteringResult.itemsAssigned} items into ${result.clusteringResult.clustersCreated} clusters, created ${result.hierarchyResult.intermediateNodesCreated} hierarchy nodes`
-            : `Created ${result.hierarchyResult.intermediateNodesCreated} hierarchy nodes`;
+            ? `Clustered ${result.clusteringResult.itemsAssigned} items → ${result.clusteringResult.clustersCreated} clusters, ${result.hierarchyResult.intermediateNodesCreated} nodes, flattened ${flattenCount}`
+            : `Created ${result.hierarchyResult.intermediateNodesCreated} hierarchy nodes, flattened ${flattenCount}`;
           setOperationResult(msg);
           return msg;
         } finally {
