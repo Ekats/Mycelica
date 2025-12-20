@@ -9,14 +9,46 @@ use tauri::{State, AppHandle, Emitter};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use serde::Serialize;
 
 // Global cancellation flags
 static CANCEL_PROCESSING: AtomicBool = AtomicBool::new(false);
 pub static CANCEL_REBUILD: AtomicBool = AtomicBool::new(false);
 
+/// Cache for similarity search results with TTL
+pub struct SimilarityCache {
+    results: HashMap<String, (Vec<(String, f32)>, Instant)>,
+    ttl: Duration,
+}
+
+impl SimilarityCache {
+    pub fn new(ttl_secs: u64) -> Self {
+        Self {
+            results: HashMap::new(),
+            ttl: Duration::from_secs(ttl_secs),
+        }
+    }
+
+    pub fn get(&self, node_id: &str) -> Option<Vec<(String, f32)>> {
+        self.results.get(node_id)
+            .filter(|(_, time)| time.elapsed() < self.ttl)
+            .map(|(results, _)| results.clone())
+    }
+
+    pub fn insert(&mut self, node_id: String, results: Vec<(String, f32)>) {
+        self.results.insert(node_id, (results, Instant::now()));
+    }
+
+    pub fn invalidate(&mut self) {
+        self.results.clear();
+    }
+}
+
 pub struct AppState {
     pub db: RwLock<Arc<Database>>,
+    pub similarity_cache: RwLock<SimilarityCache>,
 }
 
 #[tauri::command]
@@ -826,7 +858,7 @@ pub struct SimilarNode {
 }
 
 /// Find nodes semantically similar to a given node
-/// Uses embedding cosine similarity
+/// Uses embedding cosine similarity with caching for performance
 #[tauri::command]
 pub fn get_similar_nodes(
     state: State<AppState>,
@@ -837,22 +869,43 @@ pub fn get_similar_nodes(
     let top_n = top_n.unwrap_or(10);
     let min_similarity = min_similarity.unwrap_or(0.0);
 
-    // Get the target node's embedding - return empty if none (e.g., category nodes)
-    let target_embedding = match state.db.read().unwrap().get_node_embedding(&node_id) {
-        Ok(Some(emb)) => emb,
-        _ => return Ok(vec![]), // No embedding = no similar nodes, but not an error
+    // Check cache first
+    let cached = state.similarity_cache.read().unwrap().get(&node_id);
+
+    let similar = if let Some(cached_results) = cached {
+        // Use cached results, but filter and limit
+        cached_results.into_iter()
+            .filter(|(_, score)| *score >= min_similarity)
+            .take(top_n)
+            .collect::<Vec<_>>()
+    } else {
+        // Get the target node's embedding - return empty if none (e.g., category nodes)
+        let target_embedding = match state.db.read().unwrap().get_node_embedding(&node_id) {
+            Ok(Some(emb)) => emb,
+            _ => return Ok(vec![]), // No embedding = no similar nodes, but not an error
+        };
+
+        // Get all embeddings
+        let all_embeddings = state.db.read().unwrap().get_nodes_with_embeddings()
+            .map_err(|e| e.to_string())?;
+
+        if all_embeddings.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Find similar nodes - get more than requested for caching
+        let max_cache_results = 50;
+        let similar = similarity::find_similar(&target_embedding, &all_embeddings, &node_id, max_cache_results, 0.0);
+
+        // Cache the full results
+        state.similarity_cache.write().unwrap().insert(node_id.clone(), similar.clone());
+
+        // Filter and limit for this request
+        similar.into_iter()
+            .filter(|(_, score)| *score >= min_similarity)
+            .take(top_n)
+            .collect::<Vec<_>>()
     };
-
-    // Get all embeddings
-    let all_embeddings = state.db.read().unwrap().get_nodes_with_embeddings()
-        .map_err(|e| e.to_string())?;
-
-    if all_embeddings.is_empty() {
-        return Ok(vec![]);
-    }
-
-    // Find similar nodes
-    let similar = similarity::find_similar(&target_embedding, &all_embeddings, &node_id, top_n, min_similarity);
 
     // Fetch full node data for results
     let mut results: Vec<SimilarNode> = Vec::new();

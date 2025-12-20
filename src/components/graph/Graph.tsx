@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { useRef, useEffect, useState, useCallback } from 'react';
+import { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import * as d3 from 'd3';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, emit } from '@tauri-apps/api/event';
@@ -158,6 +158,8 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
   const lastClickTimeRef = useRef(0);
   // Ref to track pending fetch timeout (to cancel on double-click navigation)
   const pendingFetchRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Ref to track current zoom transform for viewport culling
+  const zoomTransformRef = useRef<{ k: number; x: number; y: number }>({ k: 1, x: 0, y: 0 });
   const {
     nodes,
     edges,
@@ -286,6 +288,71 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
       setNodeToDelete(null);
     }
   }, [confirmAction, nodeToDelete, nodes, removeNode, updateNode]);
+
+  // ==========================================================================
+  // MEMOIZED CONNECTION MAP - Computed once per activeNodeId/edges change
+  // Replaces 4 redundant BFS computations throughout the component
+  // ==========================================================================
+  const memoizedConnectionMap = useMemo(() => {
+    const connectionMap = new Map<string, { weight: number; distance: number }>();
+
+    if (!activeNodeId || edges.size === 0) {
+      return connectionMap;
+    }
+
+    // BFS from activeNodeId to find all connected nodes with distances
+    connectionMap.set(activeNodeId, { weight: 1.0, distance: 0 });
+    const edgeArr = Array.from(edges.values());
+    const queue: { nodeId: string; dist: number }[] = [{ nodeId: activeNodeId, dist: 0 }];
+    const maxDist = 3;
+
+    while (queue.length > 0) {
+      const { nodeId, dist } = queue.shift()!;
+      if (dist >= maxDist) continue;
+
+      for (const edge of edgeArr) {
+        let neighborId: string | null = null;
+        let weight = edge.weight || 0.5;
+
+        if (edge.sourceId === nodeId && !connectionMap.has(edge.targetId)) {
+          neighborId = edge.targetId;
+        } else if (edge.targetId === nodeId && !connectionMap.has(edge.sourceId)) {
+          neighborId = edge.sourceId;
+        }
+
+        if (neighborId) {
+          connectionMap.set(neighborId, { weight, distance: dist + 1 });
+          queue.push({ nodeId: neighborId, dist: dist + 1 });
+        }
+      }
+    }
+
+    // Update the ref for event handlers that can't use the memoized value
+    connectionMapRef.current = connectionMap;
+
+    return connectionMap;
+  }, [activeNodeId, edges]);
+
+  // ==========================================================================
+  // VIEWPORT CULLING HELPER - Check if a node is visible in current viewport
+  // ==========================================================================
+  const isNodeVisible = useCallback((nodeX: number, nodeY: number, nodeSize: number = 320): boolean => {
+    const { k, x, y } = zoomTransformRef.current;
+    const buffer = nodeSize; // Buffer around viewport
+
+    // Transform node position to screen coordinates
+    const screenX = nodeX * k + x;
+    const screenY = nodeY * k + y;
+    const scaledSize = nodeSize * k;
+
+    // Check if node (with buffer) intersects viewport
+    return (
+      screenX + scaledSize + buffer > 0 &&
+      screenX - buffer < width &&
+      screenY + scaledSize + buffer > 0 &&
+      screenY - buffer < height
+    );
+  }, [width, height]);
 
   // Load learned emoji mappings on mount
   useEffect(() => {
@@ -1271,6 +1338,15 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
 
     devLog('info', `Layout complete: ${graphNodes.length} nodes in ${finalRing} rings`);
 
+    // Calculate graph bounds for pan limiting (with generous padding)
+    const boundsPadding = noteWidth * 40; // 40x node width padding
+    const graphBounds = {
+      minX: graphNodes.length > 0 ? Math.min(...graphNodes.map(n => n.x)) - boundsPadding : -1000,
+      maxX: graphNodes.length > 0 ? Math.max(...graphNodes.map(n => n.x)) + boundsPadding : 1000,
+      minY: graphNodes.length > 0 ? Math.min(...graphNodes.map(n => n.y)) - boundsPadding : -1000,
+      maxY: graphNodes.length > 0 ? Math.max(...graphNodes.map(n => n.y)) + boundsPadding : 1000,
+    };
+
     // Create node lookup
     const nodeMap = new Map(graphNodes.map(n => [n.id, n]));
 
@@ -1332,35 +1408,8 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     const weightRange = maxWeight - minWeight || 0.1; // Avoid division by zero
     devLog('info', `Edges in view: ${containsCount} contains, ${relatedCount} related (weights: ${(minWeight*100).toFixed(0)}%-${(maxWeight*100).toFixed(0)}%)`);
 
-    // Build connection map with BFS for multi-hop distances
-    const connectionMap = new Map<string, {weight: number, distance: number}>();
-    if (activeNodeId) {
-      // Build adjacency list from edges
-      const adjacency = new Map<string, Array<{nodeId: string, weight: number}>>();
-      edgeData.forEach(edge => {
-        const srcId = edge.source.id;
-        const tgtId = edge.target.id;
-        if (!adjacency.has(srcId)) adjacency.set(srcId, []);
-        if (!adjacency.has(tgtId)) adjacency.set(tgtId, []);
-        adjacency.get(srcId)!.push({nodeId: tgtId, weight: edge.weight});
-        adjacency.get(tgtId)!.push({nodeId: srcId, weight: edge.weight});
-      });
-
-      // BFS from activeNodeId
-      connectionMap.set(activeNodeId, {weight: 1.0, distance: 0});
-      const queue: Array<{id: string, dist: number}> = [{id: activeNodeId, dist: 0}];
-
-      while (queue.length > 0) {
-        const {id, dist} = queue.shift()!;
-        const neighbors = adjacency.get(id) || [];
-        for (const {nodeId, weight} of neighbors) {
-          if (!connectionMap.has(nodeId)) {
-            connectionMap.set(nodeId, {weight, distance: dist + 1});
-            queue.push({id: nodeId, dist: dist + 1});
-          }
-        }
-      }
-    }
+    // Use memoized connection map (computed once per activeNodeId/edges change)
+    const connectionMap = memoizedConnectionMap;
 
     // Helper to get muted cluster color (gray with hint of cluster hue)
     const getMutedClusterColor = (d: GraphNode): string => {
@@ -2483,6 +2532,7 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
 
     const zoom = d3.zoom<SVGSVGElement, unknown>()
       .scaleExtent([minZoom, maxZoom])
+      .translateExtent([[graphBounds.minX, graphBounds.minY], [graphBounds.maxX, graphBounds.maxY]])
       .filter((event) => {
         // Allow scroll wheel for zooming
         if (event.type === 'wheel') return true;
@@ -2494,10 +2544,32 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
         return true;
       })
       .on('zoom', (event) => {
-        const { k } = event.transform;
+        const { k, x, y } = event.transform;
         currentScale = k;
 
+        // Store transform for viewport culling
+        zoomTransformRef.current = { k, x, y };
+
         container.attr('transform', event.transform);
+
+        // Viewport culling: hide off-screen nodes for performance
+        const viewportBuffer = 400; // pixels
+        cardGroups.style('visibility', (d: GraphNode) => {
+          const screenX = d.x * k + x;
+          const screenY = d.y * k + y;
+          const isVisible =
+            screenX > -viewportBuffer && screenX < width + viewportBuffer &&
+            screenY > -viewportBuffer && screenY < height + viewportBuffer;
+          return isVisible ? 'visible' : 'hidden';
+        });
+        dotGroups.style('visibility', (d: GraphNode) => {
+          const screenX = d.x * k + x;
+          const screenY = d.y * k + y;
+          const isVisible =
+            screenX > -viewportBuffer && screenX < width + viewportBuffer &&
+            screenY > -viewportBuffer && screenY < height + viewportBuffer;
+          return isVisible ? 'visible' : 'hidden';
+        });
 
         if (k >= bubbleThreshold) {
           // Card mode - show cards, hide bubbles
@@ -2705,36 +2777,8 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
 
     const svg = d3.select(svgRef.current);
 
-    // Build connection map with BFS for multi-hop distances
-    const connectionMap = new Map<string, {weight: number, distance: number}>();
-    if (activeNodeId) {
-      // Build adjacency list from edges
-      const adjacency = new Map<string, Array<{nodeId: string, weight: number}>>();
-      edges.forEach(edge => {
-        const srcId = edge.source;
-        const tgtId = edge.target;
-        const w = edge.weight ?? 0.5;
-        if (!adjacency.has(srcId)) adjacency.set(srcId, []);
-        if (!adjacency.has(tgtId)) adjacency.set(tgtId, []);
-        adjacency.get(srcId)!.push({nodeId: tgtId, weight: w});
-        adjacency.get(tgtId)!.push({nodeId: srcId, weight: w});
-      });
-
-      // BFS from activeNodeId
-      connectionMap.set(activeNodeId, {weight: 1.0, distance: 0});
-      const queue: Array<{id: string, dist: number}> = [{id: activeNodeId, dist: 0}];
-
-      while (queue.length > 0) {
-        const {id, dist} = queue.shift()!;
-        const neighbors = adjacency.get(id) || [];
-        for (const {nodeId, weight} of neighbors) {
-          if (!connectionMap.has(nodeId)) {
-            connectionMap.set(nodeId, {weight, distance: dist + 1});
-            queue.push({id: nodeId, dist: dist + 1});
-          }
-        }
-      }
-    }
+    // Use memoized connection map (computed once per activeNodeId/edges change)
+    const connectionMap = memoizedConnectionMap;
 
     // Update refs for access by event handlers
     activeNodeIdRef.current = activeNodeId;

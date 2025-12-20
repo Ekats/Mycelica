@@ -566,68 +566,7 @@ pub async fn cluster_with_embeddings(
     })
 }
 
-/// Generate a meaningful name from titles using TF-IDF keywords
-/// Never returns generic "Cluster {id}" names
-/// Produces clean 1-2 word names, never comma-separated lists
-fn generate_name_from_titles(titles: &[String], cluster_id: i32) -> String {
-    if titles.is_empty() {
-        return format!("Topic Group {}", cluster_id);
-    }
-
-    // Combine all titles and extract keywords
-    let combined = titles.join(" ");
-    let keywords = extract_keywords(&combined, 10);
-
-    // Filter out very generic/noisy keywords
-    let noise_words = ["code", "file", "data", "project", "system", "issue", "error",
-                       "work", "development", "implementation", "analysis", "based",
-                       "using", "creating", "building", "understanding", "exploring"];
-
-    let filtered_keywords: Vec<&(String, f64)> = keywords
-        .iter()
-        .filter(|(w, _)| !noise_words.contains(&w.to_lowercase().as_str()))
-        .collect();
-
-    // Use filtered keywords if we have any, otherwise fall back to original
-    let best_keywords = if filtered_keywords.len() >= 2 {
-        &filtered_keywords
-    } else {
-        // Convert to same type for fallback
-        &keywords.iter().collect::<Vec<_>>()
-    };
-
-    if best_keywords.is_empty() {
-        // Try using first significant word from first title
-        if let Some(first_title) = titles.first() {
-            let words: Vec<&str> = first_title.split_whitespace()
-                .filter(|w| w.len() >= 4 && !noise_words.contains(&w.to_lowercase().as_str()))
-                .take(2)
-                .collect();
-            if !words.is_empty() {
-                return words.iter()
-                    .map(|w| capitalize(w))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-            }
-        }
-        return format!("Topic Group {}", cluster_id);
-    }
-
-    // Use only top 1-2 keywords for clean names
-    match best_keywords.len() {
-        0 => format!("Topic Group {}", cluster_id),
-        1 => capitalize(&best_keywords[0].0),
-        _ => {
-            // Two keywords joined with " & "
-            format!("{} & {}",
-                capitalize(&best_keywords[0].0),
-                capitalize(&best_keywords[1].0))
-        }
-    }
-}
-
-/// Name clusters using AI (batched to avoid token limits)
-/// Processes clusters in batches of 50 to ensure AI can return all names
+/// Name clusters using AI (single call for all clusters)
 async fn name_clusters_with_ai(
     _db: &Database,
     cluster_data: &[(i32, Vec<usize>, Vec<f32>)],
@@ -639,12 +578,12 @@ async fn name_clusters_with_ai(
         return Ok(names);
     }
 
-    // Build cluster info for AI - collect titles for each cluster
+    // Build cluster info for AI
     let mut clusters_info: Vec<(i32, Vec<String>)> = Vec::new();
     for (cluster_id, indices, _) in cluster_data {
         let titles: Vec<String> = indices
             .iter()
-            .take(10) // Sample up to 10 titles per cluster (reduced for batching)
+            .take(15) // Sample up to 15 titles per cluster
             .filter_map(|&i| {
                 items_with_embeddings.get(i).map(|(node, _)| {
                     node.ai_title.clone().unwrap_or_else(|| node.title.clone())
@@ -654,68 +593,37 @@ async fn name_clusters_with_ai(
         clusters_info.push((*cluster_id, titles));
     }
 
-    println!("[Clustering] Naming {} clusters with AI (batched)...", clusters_info.len());
-
-    // Process in batches of 50 clusters to avoid token limits
-    const BATCH_SIZE: usize = 50;
-    let total_batches = (clusters_info.len() + BATCH_SIZE - 1) / BATCH_SIZE;
-
-    for (batch_idx, batch) in clusters_info.chunks(BATCH_SIZE).enumerate() {
-        println!("[Clustering] Naming batch {}/{} ({} clusters)...",
-                 batch_idx + 1, total_batches, batch.len());
-
-        match ai_client::name_clusters(batch).await {
-            Ok(ai_names) => {
-                println!("[Clustering] Batch {} returned {} names", batch_idx + 1, ai_names.len());
-                for (cluster_id, name) in ai_names {
-                    // Validate AI didn't return a generic name
-                    let final_name = if name.to_lowercase().starts_with("cluster ")
-                        || name.to_lowercase().starts_with("group ")
-                        || name.to_lowercase() == "miscellaneous"
-                        || name.to_lowercase() == "other"
-                        || name.to_lowercase() == "general"
-                    {
-                        // AI returned generic name, use keyword fallback
-                        if let Some((_, titles)) = batch.iter().find(|(id, _)| *id == cluster_id) {
-                            generate_name_from_titles(titles, cluster_id)
-                        } else {
-                            name
-                        }
-                    } else {
-                        name
-                    };
-                    names.insert(cluster_id, final_name);
-                }
+    // Call AI to name clusters
+    match ai_client::name_clusters(&clusters_info).await {
+        Ok(ai_names) => {
+            for (cluster_id, name) in ai_names {
+                names.insert(cluster_id, name);
             }
-            Err(e) => {
-                eprintln!("[Clustering] Batch {} AI naming failed: {}", batch_idx + 1, e);
-                // Fallback for this batch: use TF-IDF keywords
-                for (cluster_id, titles) in batch {
-                    let name = generate_name_from_titles(titles, *cluster_id);
-                    names.insert(*cluster_id, name);
-                }
+        }
+        Err(e) => {
+            eprintln!("[Clustering] AI naming failed, using keyword fallback: {}", e);
+            // Fallback: use keywords from titles
+            for (cluster_id, titles) in &clusters_info {
+                let combined = titles.join(" ");
+                let keywords = extract_keywords(&combined, 3);
+                let name = if keywords.is_empty() {
+                    format!("Cluster {}", cluster_id)
+                } else {
+                    keywords.iter()
+                        .map(|(w, _)| capitalize(w))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                names.insert(*cluster_id, name);
             }
         }
     }
 
-    // Ensure all clusters have meaningful names
-    for (cluster_id, indices, _) in cluster_data {
-        if !names.contains_key(cluster_id) {
-            let titles: Vec<String> = indices
-                .iter()
-                .take(10)
-                .filter_map(|&i| {
-                    items_with_embeddings.get(i).map(|(node, _)| {
-                        node.ai_title.clone().unwrap_or_else(|| node.title.clone())
-                    })
-                })
-                .collect();
-            let name = generate_name_from_titles(&titles, *cluster_id);
-            names.insert(*cluster_id, name);
-        }
+    // Ensure all clusters have names
+    for (cluster_id, _, _) in cluster_data {
+        names.entry(*cluster_id).or_insert_with(|| format!("Cluster {}", cluster_id));
     }
 
-    println!("[Clustering] Named {} clusters total", names.len());
     Ok(names)
 }
 

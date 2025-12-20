@@ -121,6 +121,7 @@ function mapBackendEdge(e: BackendEdge): Edge {
 export function useGraph() {
   const { setNodes, setEdges, nodes, edges } = useGraphStore();
   const [loaded, setLoaded] = useState(false);
+  const [loadedParents, setLoadedParents] = useState<Set<string>>(new Set());
 
   const loadGraph = useCallback(async () => {
     try {
@@ -155,9 +156,40 @@ export function useGraph() {
     }
   }, [setNodes, setEdges]);
 
+  // Lazy load children of a parent node (for future incremental loading)
+  const loadChildren = useCallback(async (parentId: string, _limit: number = 100) => {
+    // Skip if already loaded
+    if (loadedParents.has(parentId)) {
+      return;
+    }
+
+    try {
+      console.log(`Lazy loading children of ${parentId}...`);
+      const backendNodes = await invoke<BackendNode[]>('get_children', { parentId });
+
+      // Merge new nodes into existing map
+      const newNodes = new Map(nodes);
+      for (const n of backendNodes) {
+        newNodes.set(n.id, mapBackendNode(n));
+      }
+      setNodes(newNodes);
+
+      // Mark parent as loaded
+      setLoadedParents(prev => new Set([...prev, parentId]));
+      console.log(`Loaded ${backendNodes.length} children of ${parentId}`);
+    } catch (error) {
+      console.error(`Failed to load children of ${parentId}:`, error);
+    }
+  }, [nodes, setNodes, loadedParents]);
+
+  // Check if a parent's children are loaded
+  const isParentLoaded = useCallback((parentId: string) => {
+    return loadedParents.has(parentId);
+  }, [loadedParents]);
+
   useEffect(() => {
     loadGraph();
   }, [loadGraph]);
 
-  return { nodes, edges, reload: loadGraph, loaded };
+  return { nodes, edges, reload: loadGraph, loaded, loadChildren, isParentLoaded };
 }

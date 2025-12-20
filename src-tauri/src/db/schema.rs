@@ -355,6 +355,7 @@ impl Database {
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_conversation ON nodes(conversation_id)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_pinned ON nodes(is_pinned)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_last_accessed ON nodes(last_accessed_at)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_is_processed ON nodes(is_processed)", [])?;
 
         // Rebuild FTS index to fix any corruption from interrupted writes (e.g., HMR during dev)
         // This is safe to run on every startup - it rebuilds from the content table
@@ -988,6 +989,18 @@ impl Database {
         Ok(nodes)
     }
 
+    /// Get children with pagination - for large node sets
+    pub fn get_children_paginated(&self, parent_id: &str, limit: usize, offset: usize) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE parent_id = ?1 ORDER BY child_count DESC, title LIMIT ?2 OFFSET ?3",
+            Self::NODE_COLUMNS
+        ))?;
+
+        let nodes = stmt.query_map(params![parent_id, limit as i64, offset as i64], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
+        Ok(nodes)
+    }
+
     /// Get the Universe node (single root, is_universe = true)
     pub fn get_universe(&self) -> Result<Option<Node>> {
         let conn = self.conn.lock().unwrap();
@@ -1013,6 +1026,18 @@ impl Database {
         ))?;
 
         let nodes = stmt.query_map([], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
+        Ok(nodes)
+    }
+
+    /// Get items with pagination - for large datasets
+    pub fn get_items_paginated(&self, limit: usize, offset: usize) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE is_item = 1 ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
+            Self::NODE_COLUMNS
+        ))?;
+
+        let nodes = stmt.query_map(params![limit as i64, offset as i64], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
         Ok(nodes)
     }
 

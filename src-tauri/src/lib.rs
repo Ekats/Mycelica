@@ -138,7 +138,10 @@ pub fn run() {
                 }
             }
 
-            app.manage(AppState { db: std::sync::RwLock::new(Arc::new(db)) });
+            app.manage(AppState {
+                db: std::sync::RwLock::new(Arc::new(db)),
+                similarity_cache: std::sync::RwLock::new(commands::SimilarityCache::new(300)), // 5 minute TTL
+            });
 
             Ok(())
         })
