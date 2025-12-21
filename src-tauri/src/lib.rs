@@ -7,6 +7,7 @@ mod hierarchy;
 mod import;
 mod similarity;
 mod local_embeddings;
+pub mod classification;
 
 use commands::{
     AppState,
@@ -25,6 +26,9 @@ use commands::{
     propagate_latest_dates, quick_add_to_hierarchy,
     // Multi-path association commands
     get_item_associations, get_related_items, get_category_items,
+    // Mini-clustering commands
+    get_graph_children, get_supporting_items, get_associated_items, get_supporting_counts,
+    classify_and_associate, classify_and_associate_children,
     // Conversation context commands
     get_conversation_context,
     // Import commands
@@ -189,6 +193,13 @@ pub fn run() {
             get_item_associations,
             get_related_items,
             get_category_items,
+            // Mini-clustering
+            get_graph_children,
+            get_supporting_items,
+            get_associated_items,
+            get_supporting_counts,
+            classify_and_associate,
+            classify_and_associate_children,
             // Conversation context
             get_conversation_context,
             // Import

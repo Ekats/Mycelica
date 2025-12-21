@@ -289,7 +289,7 @@ pub async fn analyze_node_privacy(
 
     // Call Claude Haiku API
     let request = AnthropicRequest {
-        model: "claude-3-5-haiku-20241022".to_string(),
+        model: "claude-haiku-4-5-20251001".to_string(),
         max_tokens: 200,
         messages: vec![AnthropicMessage {
             role: "user".to_string(),
@@ -478,7 +478,7 @@ pub async fn analyze_all_privacy(
             .replace("{content}", &content_snippet);
 
         let request = AnthropicRequest {
-            model: "claude-3-5-haiku-20241022".to_string(),
+            model: "claude-haiku-4-5-20251001".to_string(),
             max_tokens: 200,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -715,7 +715,7 @@ pub async fn analyze_categories_privacy(
             .replace("{content}", &content_snippet);
 
         let request = AnthropicRequest {
-            model: "claude-3-5-haiku-20241022".to_string(),
+            model: "claude-haiku-4-5-20251001".to_string(),
             max_tokens: 200,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),

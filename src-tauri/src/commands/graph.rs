@@ -17,6 +17,16 @@ use serde::Serialize;
 static CANCEL_PROCESSING: AtomicBool = AtomicBool::new(false);
 pub static CANCEL_REBUILD: AtomicBool = AtomicBool::new(false);
 
+/// Safely truncate a string at a UTF-8 boundary
+fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+    if max_bytes >= s.len() { return s; }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Cache for similarity search results with TTL
 pub struct SimilarityCache {
     results: HashMap<String, (Vec<(String, f32)>, Instant)>,
@@ -141,6 +151,8 @@ pub fn add_note(state: State<AppState>, title: String, content: String) -> Resul
             is_private: None,
             privacy_reason: None,
             source: None,
+            content_type: None,
+            associated_idea_id: None,
         };
         state.db.read().unwrap().insert_node(&container_node).map_err(|e| e.to_string())?;
 
@@ -186,6 +198,8 @@ pub fn add_note(state: State<AppState>, title: String, content: String) -> Resul
         is_private: None,
         privacy_reason: None,
         source: None,
+        content_type: None,
+        associated_idea_id: None,
     };
 
     state.db.read().unwrap().insert_node(&note).map_err(|e| e.to_string())?;
@@ -316,7 +330,7 @@ pub struct AiProgressEvent {
     pub total: usize,
     pub node_title: String,
     pub new_title: String,
-    pub emoji: Option<String>,
+    pub content_type: Option<String>,
     pub status: String, // "processing", "success", "error", "complete"
     pub error_message: Option<String>,
     pub elapsed_secs: Option<f64>,      // Time elapsed so far
@@ -382,7 +396,7 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
                 total,
                 node_title: "Cancelled".to_string(),
                 new_title: String::new(),
-                emoji: None,
+                content_type: None,
                 status: "cancelled".to_string(),
                 error_message: Some("Cancelled by user".to_string()),
                 elapsed_secs: Some(start_time.elapsed().as_secs_f64()),
@@ -418,7 +432,7 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
             total,
             node_title: node.title.clone(),
             new_title: String::new(),
-            emoji: None,
+            content_type: None,
             status: "processing".to_string(),
             error_message: None,
             elapsed_secs: Some(elapsed),
@@ -435,7 +449,7 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
                     &result.title,
                     &result.summary,
                     &tags_json,
-                    &result.emoji,
+                    &result.content_type,
                 ) {
                     let err_msg = format!("DB save failed: {}", e);
                     errors.push(format!("Failed to save node {}: {}", node.id, e));
@@ -446,7 +460,7 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
                         total,
                         node_title: node.title.clone(),
                         new_title: String::new(),
-                        emoji: None,
+                        content_type: None,
                         status: "error".to_string(),
                         error_message: Some(err_msg),
                         elapsed_secs: Some(elapsed_now),
@@ -455,11 +469,12 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
                     });
                 } else {
                     processed += 1;
-                    println!("Processed node: {} -> {} {}", node.title, result.emoji, result.title);
+                    println!("Processed node: {} -> [{}] {}", node.title, result.content_type, result.title);
 
-                    // Generate embedding if OpenAI API key is available
-                    let embed_text = format!("{} {}", result.title, result.summary);
-                    match ai_client::generate_embedding(&embed_text).await {
+                    // Generate embedding from content (truncated to ~1000 bytes)
+                    // Content is more semantically meaningful for clustering
+                    let embed_text = safe_truncate(content, 1000);
+                    match ai_client::generate_embedding(embed_text).await {
                         Ok(embedding) => {
                             if let Err(e) = db.update_node_embedding(&node.id, &embedding) {
                                 eprintln!("Failed to save embedding for {}: {}", node.id, e);
@@ -480,7 +495,7 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
                         total,
                         node_title: node.title.clone(),
                         new_title: result.title,
-                        emoji: Some(result.emoji),
+                        content_type: Some(result.content_type.clone()),
                         status: "success".to_string(),
                         error_message: None,
                         elapsed_secs: Some(elapsed_now),
@@ -499,7 +514,7 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
                     total,
                     node_title: node.title.clone(),
                     new_title: String::new(),
-                    emoji: None,
+                    content_type: None,
                     status: "error".to_string(),
                     error_message: Some(err_msg),
                     elapsed_secs: Some(elapsed_now),
@@ -518,7 +533,7 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
         total,
         node_title: String::new(),
         new_title: String::new(),
-        emoji: None,
+        content_type: None,
         status: "complete".to_string(),
         error_message: None,
         elapsed_secs: Some(final_elapsed),
@@ -681,6 +696,73 @@ pub fn unsplit_node(state: State<AppState>, parent_id: String) -> Result<usize, 
 pub fn get_children_flat(state: State<AppState>, parent_id: String) -> Result<Vec<Node>, String> {
     let db = state.db.read().unwrap();
     hierarchy::get_children_skip_single_chain(&db, &parent_id)
+}
+
+// ==================== Mini-Clustering Commands ====================
+
+/// Get only idea nodes for graph rendering (filters out code/debug/paste)
+#[tauri::command]
+pub fn get_graph_children(state: State<AppState>, parent_id: String) -> Result<Vec<Node>, String> {
+    state.db.read().unwrap().get_graph_children(&parent_id).map_err(|e| e.to_string())
+}
+
+/// Get supporting items (code/debug/paste) under a parent
+#[tauri::command]
+pub fn get_supporting_items(state: State<AppState>, parent_id: String) -> Result<Vec<Node>, String> {
+    state.db.read().unwrap().get_supporting_items(&parent_id).map_err(|e| e.to_string())
+}
+
+/// Get items associated with a specific idea
+#[tauri::command]
+pub fn get_associated_items(state: State<AppState>, idea_id: String) -> Result<Vec<Node>, String> {
+    state.db.read().unwrap().get_associated_items(&idea_id).map_err(|e| e.to_string())
+}
+
+/// Supporting item counts for badge display
+#[derive(serde::Serialize)]
+pub struct SupportingCounts {
+    pub code: i32,
+    pub debug: i32,
+    pub paste: i32,
+}
+
+/// Get counts of supporting items for badge display
+#[tauri::command]
+pub fn get_supporting_counts(state: State<AppState>, parent_id: String) -> Result<SupportingCounts, String> {
+    let (code, debug, paste) = state.db.read().unwrap().get_supporting_counts(&parent_id).map_err(|e| e.to_string())?;
+    Ok(SupportingCounts { code, debug, paste })
+}
+
+/// Run classification and association on all items
+#[tauri::command]
+pub fn classify_and_associate(state: State<AppState>) -> Result<(usize, usize), String> {
+    use crate::classification;
+
+    let db = state.db.read().unwrap();
+
+    // Step 1: Classify all unclassified items
+    let classified = classification::classify_all_items(&db)?;
+
+    // Step 2: Compute associations for all topics
+    let associated = classification::compute_all_associations(&db)?;
+
+    Ok((classified, associated))
+}
+
+/// Run classification and association on items under a specific parent
+#[tauri::command]
+pub fn classify_and_associate_children(state: State<AppState>, parent_id: String) -> Result<(usize, usize), String> {
+    use crate::classification;
+
+    let db = state.db.read().unwrap();
+
+    // Step 1: Classify children
+    let classified = classification::classify_children(&db, &parent_id)?;
+
+    // Step 2: Compute associations for this parent
+    let associated = classification::compute_associations(&db, &parent_id)?;
+
+    Ok((classified, associated))
 }
 
 /// Propagate latest_child_date from leaves up through the hierarchy
@@ -1132,6 +1214,8 @@ pub async fn quick_add_to_hierarchy(
                 is_private: None,
                 privacy_reason: None,
                 source: None,
+                content_type: None,
+                associated_idea_id: None,
             };
             state.db.read().unwrap().insert_node(&inbox_node).map_err(|e| e.to_string())?;
             state.db.read().unwrap().increment_child_count(&universe.id).map_err(|e| e.to_string())?;
@@ -1217,6 +1301,8 @@ pub async fn quick_add_to_hierarchy(
                     is_private: None,
                     privacy_reason: None,
                     source: None,
+                    content_type: None,
+                    associated_idea_id: None,
                 };
 
                 state.db.read().unwrap().insert_node(&topic_node).map_err(|e| e.to_string())?;
@@ -1389,6 +1475,8 @@ pub async fn consolidate_root(state: State<'_, AppState>) -> Result<ConsolidateR
             is_private: None,
             privacy_reason: None,
             source: None,
+            content_type: None,
+            associated_idea_id: None,
         };
 
         state.db.read().unwrap().insert_node(&uber_node).map_err(|e| e.to_string())?;
@@ -1411,7 +1499,7 @@ pub async fn consolidate_root(state: State<'_, AppState>) -> Result<ConsolidateR
     }
 
     // Update Universe's child count (new uber-categories + children that stayed at top level)
-    let children_stayed_at_top = children.len() - children_reparented;
+    let children_stayed_at_top = children.len().saturating_sub(children_reparented);
     let new_universe_child_count = uber_categories_created + children_stayed_at_top;
     state.db.read().unwrap().update_child_count(&universe.id, new_universe_child_count as i32)
         .map_err(|e| e.to_string())?;
@@ -1633,26 +1721,21 @@ pub async fn regenerate_all_embeddings(
         status: format!("Starting regeneration using {}...", embedding_source),
     });
 
-    // Build texts for all items
+    // Build texts for all items - prioritize content for semantic clustering
     let mut item_texts: Vec<(String, String)> = Vec::with_capacity(total); // (id, text)
     for item in &items {
-        let mut parts = Vec::new();
-        if let Some(title) = &item.ai_title {
-            parts.push(title.as_str());
+        let text = if let Some(content) = &item.content {
+            // Use content (truncated to ~1000 bytes) - most semantically meaningful
+            safe_truncate(content, 1000).to_string()
         } else {
-            parts.push(&item.title);
-        }
-        if let Some(summary) = &item.summary {
-            parts.push(summary.as_str());
-        }
-        if let Some(tags) = &item.tags {
-            parts.push(tags.as_str());
-        }
-        if let Some(content) = &item.content {
-            let preview: String = content.chars().take(500).collect();
-            parts.push(Box::leak(preview.into_boxed_str()));
-        }
-        item_texts.push((item.id.clone(), parts.join(" ")));
+            // Fallback for items without content
+            format!(
+                "{} {}",
+                item.ai_title.as_ref().unwrap_or(&item.title),
+                item.summary.as_deref().unwrap_or("")
+            )
+        };
+        item_texts.push((item.id.clone(), text));
     }
 
     let mut success_count = 0;

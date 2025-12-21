@@ -347,6 +347,19 @@ impl Database {
             eprintln!("Migration: Added source column for import tracking");
         }
 
+        // Migration: Add content classification columns if they don't exist
+        let has_content_type: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('nodes') WHERE name = 'content_type'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !has_content_type {
+            conn.execute("ALTER TABLE nodes ADD COLUMN content_type TEXT", [])?;
+            conn.execute("ALTER TABLE nodes ADD COLUMN associated_idea_id TEXT", [])?;
+            eprintln!("Migration: Added content_type and associated_idea_id columns for mini-clustering");
+        }
+
         // Create indexes for dynamic hierarchy columns (after migrations ensure columns exist)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_depth ON nodes(depth)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_is_item ON nodes(is_item)", [])?;
@@ -356,6 +369,8 @@ impl Database {
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_pinned ON nodes(is_pinned)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_last_accessed ON nodes(last_accessed_at)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_is_processed ON nodes(is_processed)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_content_type ON nodes(content_type)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_associated_idea ON nodes(associated_idea_id)", [])?;
 
         // Rebuild FTS index to fix any corruption from interrupted writes (e.g., HMR during dev)
         // This is safe to run on every startup - it rebuilds from the content table
@@ -370,8 +385,8 @@ impl Database {
     pub fn insert_node(&self, node: &Node) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO nodes (id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+            "INSERT INTO nodes (id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, source, content_type, associated_idea_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
             params![
                 node.id,
                 node.node_type.as_str(),
@@ -399,6 +414,8 @@ impl Database {
                 node.is_pinned,
                 node.last_accessed_at,
                 node.source,
+                node.content_type,
+                node.associated_idea_id,
             ],
         )?;
         Ok(())
@@ -541,11 +558,13 @@ impl Database {
             is_private: row.get::<_, Option<i32>>(26)?.map(|v| v != 0),
             privacy_reason: row.get(27)?,
             source: row.get(28)?,
+            content_type: row.get(29)?,
+            associated_idea_id: row.get(30)?,
         })
     }
 
     /// Standard SELECT columns for nodes (excludes embedding - use dedicated functions)
-    const NODE_COLUMNS: &'static str = "id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date, is_private, privacy_reason, source";
+    const NODE_COLUMNS: &'static str = "id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date, is_private, privacy_reason, source, content_type, associated_idea_id";
 
     pub fn get_all_nodes(&self) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
@@ -565,7 +584,8 @@ impl Database {
              position_x = ?6, position_y = ?7, updated_at = ?8, cluster_id = ?9, cluster_label = ?10,
              ai_title = ?11, summary = ?12, tags = ?13, emoji = ?14, is_processed = ?15,
              depth = ?16, is_item = ?17, is_universe = ?18, parent_id = ?19, child_count = ?20,
-             conversation_id = ?21, sequence_index = ?22, is_pinned = ?23, last_accessed_at = ?24 WHERE id = ?1",
+             conversation_id = ?21, sequence_index = ?22, is_pinned = ?23, last_accessed_at = ?24,
+             content_type = ?25, associated_idea_id = ?26 WHERE id = ?1",
             params![
                 node.id,
                 node.node_type.as_str(),
@@ -591,6 +611,8 @@ impl Database {
                 node.sequence_index,
                 node.is_pinned,
                 node.last_accessed_at,
+                node.content_type,
+                node.associated_idea_id,
             ],
         )?;
         Ok(())
@@ -919,11 +941,11 @@ impl Database {
     }
 
     // Update AI processing results for a node
-    pub fn update_node_ai(&self, node_id: &str, ai_title: &str, summary: &str, tags: &str, emoji: &str) -> Result<()> {
+    pub fn update_node_ai(&self, node_id: &str, ai_title: &str, summary: &str, tags: &str, content_type: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE nodes SET ai_title = ?2, summary = ?3, tags = ?4, emoji = ?5, is_processed = 1 WHERE id = ?1",
-            params![node_id, ai_title, summary, tags, emoji],
+            "UPDATE nodes SET ai_title = ?2, summary = ?3, tags = ?4, content_type = ?5, is_processed = 1 WHERE id = ?1",
+            params![node_id, ai_title, summary, tags, content_type],
         )?;
         Ok(())
     }
@@ -999,6 +1021,74 @@ impl Database {
 
         let nodes = stmt.query_map(params![parent_id, limit as i64, offset as i64], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
         Ok(nodes)
+    }
+
+    // ==================== Mini-Clustering Query Methods ====================
+
+    /// Get only idea nodes for graph rendering (filters out code/debug/paste)
+    /// Returns items with content_type = 'idea' OR content_type IS NULL (legacy/unclassified)
+    pub fn get_graph_children(&self, parent_id: &str) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE parent_id = ?1 AND (content_type = 'idea' OR content_type IS NULL OR is_item = 0) ORDER BY child_count DESC, title",
+            Self::NODE_COLUMNS
+        ))?;
+
+        let nodes = stmt.query_map(params![parent_id], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
+        Ok(nodes)
+    }
+
+    /// Get supporting items (code/debug/paste) under a parent
+    pub fn get_supporting_items(&self, parent_id: &str) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE parent_id = ?1 AND content_type IN ('code', 'debug', 'paste') ORDER BY content_type, created_at DESC",
+            Self::NODE_COLUMNS
+        ))?;
+
+        let nodes = stmt.query_map(params![parent_id], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
+        Ok(nodes)
+    }
+
+    /// Get items associated with a specific idea
+    pub fn get_associated_items(&self, idea_id: &str) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE associated_idea_id = ?1 ORDER BY content_type, created_at DESC",
+            Self::NODE_COLUMNS
+        ))?;
+
+        let nodes = stmt.query_map(params![idea_id], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
+        Ok(nodes)
+    }
+
+    /// Get counts of supporting items for badge display
+    pub fn get_supporting_counts(&self, parent_id: &str) -> Result<(i32, i32, i32)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT
+                COALESCE(SUM(CASE WHEN content_type = 'code' THEN 1 ELSE 0 END), 0) as code_count,
+                COALESCE(SUM(CASE WHEN content_type = 'debug' THEN 1 ELSE 0 END), 0) as debug_count,
+                COALESCE(SUM(CASE WHEN content_type = 'paste' THEN 1 ELSE 0 END), 0) as paste_count
+            FROM nodes WHERE parent_id = ?1"
+        )?;
+
+        let (code, debug, paste) = stmt.query_row(params![parent_id], |row| {
+            Ok((row.get::<_, i32>(0)?, row.get::<_, i32>(1)?, row.get::<_, i32>(2)?))
+        })?;
+
+        Ok((code, debug, paste))
+    }
+
+    /// Get count of items associated with a specific idea
+    pub fn get_associated_count(&self, idea_id: &str) -> Result<i32> {
+        let conn = self.conn.lock().unwrap();
+        let count: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE associated_idea_id = ?1",
+            params![idea_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
     }
 
     /// Get the Universe node (single root, is_universe = true)
@@ -1490,6 +1580,16 @@ impl Database {
         Ok(())
     }
 
+    /// Set depth for a single node (does NOT cascade to descendants)
+    pub fn set_node_depth(&self, node_id: &str, depth: i32) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE nodes SET depth = ?2 WHERE id = ?1",
+            params![node_id, depth],
+        )?;
+        Ok(())
+    }
+
     /// Get children by their labels (cluster_label or title)
     #[allow(dead_code)]
     pub fn get_children_by_labels(&self, parent_id: &str, labels: &[String]) -> Result<Vec<Node>> {
@@ -1546,6 +1646,8 @@ impl Database {
             is_private: None,
             privacy_reason: None,
             source: None,
+            content_type: None,
+            associated_idea_id: None,
         };
 
         self.insert_node(&node)
@@ -1630,6 +1732,36 @@ impl Database {
         conn.execute(
             "UPDATE nodes SET is_pinned = ?2 WHERE id = ?1",
             params![node_id, pinned as i32],
+        )?;
+        Ok(())
+    }
+
+    /// Set content type for classification (idea, code, debug, paste)
+    pub fn set_content_type(&self, node_id: &str, content_type: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE nodes SET content_type = ?2 WHERE id = ?1",
+            params![node_id, content_type],
+        )?;
+        Ok(())
+    }
+
+    /// Set the associated idea ID for a supporting item
+    pub fn set_associated_idea(&self, node_id: &str, idea_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE nodes SET associated_idea_id = ?2 WHERE id = ?1",
+            params![node_id, idea_id],
+        )?;
+        Ok(())
+    }
+
+    /// Clear the associated idea ID for a node
+    pub fn clear_associated_idea(&self, node_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE nodes SET associated_idea_id = NULL WHERE id = ?1",
+            params![node_id],
         )?;
         Ok(())
     }
@@ -1771,11 +1903,12 @@ impl Database {
     }
 
     /// Get all nodes that need embeddings
-    /// Includes both items (with ai_title) AND category nodes (with title)
+    /// Includes ALL items (for association matching) AND category nodes (with title)
     pub fn get_nodes_needing_embeddings(&self) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
+        // Include all items (needed for association matching) and non-items with titles
         let mut stmt = conn.prepare(&format!(
-            "SELECT {} FROM nodes WHERE (ai_title IS NOT NULL OR (is_item = 0 AND title IS NOT NULL)) AND embedding IS NULL",
+            "SELECT {} FROM nodes WHERE (is_item = 1 OR (is_item = 0 AND title IS NOT NULL)) AND embedding IS NULL",
             Self::NODE_COLUMNS
         ))?;
 
@@ -1933,6 +2066,27 @@ impl Database {
                 OR TRIM(content) = ''
                 OR LENGTH(TRIM(content)) < 10
                 OR TRIM(REPLACE(REPLACE(REPLACE(REPLACE(content, 'Human:', ''), 'Assistant:', ''), 'A:', ''), char(10), '')) = ''
+            )",
+            [],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Delete incomplete conversations (has human query but no real Claude response)
+    /// Detects:
+    /// - Conversations with [H] but no [A] (our format)
+    /// - Conversations with Human: but no Assistant: (legacy)
+    /// - Conversations with "*No response*" placeholder
+    pub fn delete_incomplete_conversations(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM nodes WHERE is_item = 1 AND content IS NOT NULL AND (
+                -- Our format: has [H] but no [A]
+                (content LIKE '%[H]%' AND content NOT LIKE '%[A]%')
+                -- Legacy format: has Human: but no Assistant:
+                OR (content LIKE '%Human:%' AND content NOT LIKE '%Assistant:%' AND content NOT LIKE '%[A]%')
+                -- Placeholder for missing response
+                OR content LIKE '%*No response*%'
             )",
             [],
         )?;

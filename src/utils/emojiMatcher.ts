@@ -869,22 +869,56 @@ export function matchEmoji(
   return { emoji: '💭', matched: false }
 }
 
+// Content type fallback emojis
+const contentTypeEmoji: Record<string, string> = {
+  idea: '💭',
+  investigation: '🔍',
+  code: '📝',
+  debug: '🐛',
+  paste: '📋',
+  trivial: '💨',
+}
+
 /**
  * Get emoji for a node, using stored emoji if available
  */
 export function getEmojiForNode(node: {
   title?: string
   aiTitle?: string
-  tags?: string[]
+  tags?: string[] | string
   content?: string
-  emoji?: string  // Pre-computed/AI-suggested emoji
+  emoji?: string
+  contentType?: string
 }): string {
   // If node has a stored emoji, use it
   if (node.emoji) {
     return node.emoji
   }
 
-  // Otherwise compute it
+  // Try to match from tags using the existing emojiIndex (thousands of mappings)
+  if (node.tags) {
+    const tagList = Array.isArray(node.tags)
+      ? node.tags
+      : node.tags.split(',').map(t => t.trim().toLowerCase())
+
+    for (const tag of tagList) {
+      const normalized = tag.toLowerCase().trim()
+      // Check customMappings first (tech-specific), then emojiIndex
+      if (customMappings[normalized]) {
+        return customMappings[normalized]
+      }
+      if (emojiIndex.has(normalized)) {
+        return emojiIndex.get(normalized)!
+      }
+    }
+  }
+
+  // Fall back to content_type emoji
+  if (node.contentType && contentTypeEmoji[node.contentType]) {
+    return contentTypeEmoji[node.contentType]
+  }
+
+  // Finally, compute from title
   const title = node.aiTitle || node.title || ''
   const result = matchEmoji(title, node.tags, node.content)
   return result.emoji

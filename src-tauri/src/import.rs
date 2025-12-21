@@ -134,6 +134,8 @@ pub fn import_claude_conversations(db: &Database, json_content: &str) -> Result<
             is_private: None,
             privacy_reason: None,
             source: Some("claude".to_string()),
+            content_type: None,
+            associated_idea_id: None,
         };
 
         if let Err(e) = db.insert_node(&container) {
@@ -185,6 +187,8 @@ pub fn import_claude_conversations(db: &Database, json_content: &str) -> Result<
                 is_private: None,
                 privacy_reason: None,
                 source: Some("claude".to_string()),
+                content_type: None,
+                associated_idea_id: None,
             };
 
             if let Err(e) = db.insert_node(&exchange_node) {
@@ -253,6 +257,8 @@ pub fn import_markdown_files(db: &Database, file_paths: &[String]) -> Result<Imp
             is_private: None,
             privacy_reason: None,
             source: None,
+            content_type: None,
+            associated_idea_id: None,
         };
         if let Err(e) = db.insert_node(&container) {
             result.errors.push(format!("Failed to create Recent Notes container: {}", e));
@@ -317,6 +323,8 @@ pub fn import_markdown_files(db: &Database, file_paths: &[String]) -> Result<Imp
             is_private: None,
             privacy_reason: None,
             source: Some("markdown".to_string()),
+            content_type: None,
+            associated_idea_id: None,
         };
 
         if let Err(e) = db.insert_node(&note) {
@@ -569,6 +577,8 @@ pub fn import_google_keep(db: &Database, zip_path: &str) -> Result<GoogleKeepImp
             is_private: None,
             privacy_reason: None,
             source: Some("googlekeep".to_string()),
+            content_type: None,
+            associated_idea_id: None,
         };
 
         if let Err(e) = db.insert_node(&node) {
@@ -611,19 +621,17 @@ fn pair_messages(messages: &[ClaudeMessage]) -> Vec<Exchange> {
             let human_time = parse_timestamp(&msg.created_at);
 
             // Look for following assistant response
-            let assistant_text = if i + 1 < messages.len() && messages[i + 1].sender == "assistant" {
+            if i + 1 < messages.len() && messages[i + 1].sender == "assistant" {
                 i += 1; // Consume the assistant message
-                messages[i].text.clone()
-            } else {
-                // Human message without response (rare)
-                String::from("*No response*")
-            };
+                let assistant_text = messages[i].text.clone();
 
-            exchanges.push(Exchange {
-                title: create_exchange_title(&human_text),
-                content: format!("Human: {}\n\nAssistant: {}", human_text, assistant_text),
-                created_at: human_time,
-            });
+                exchanges.push(Exchange {
+                    title: create_exchange_title(&human_text),
+                    content: format!("Human: {}\n\nAssistant: {}", human_text, assistant_text),
+                    created_at: human_time,
+                });
+            }
+            // Skip human messages without responses - they're incomplete
         } else {
             // Orphan assistant message (no preceding human) - include it solo
             exchanges.push(Exchange {

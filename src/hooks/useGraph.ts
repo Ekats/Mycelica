@@ -49,6 +49,9 @@ interface BackendNode {
   // Privacy filtering
   isPrivate: boolean | null;  // Rust uses #[serde(rename = "isPrivate")]
   privacyReason: string | null;  // Rust uses #[serde(rename = "privacyReason")]
+  // Content classification (mini-clustering)
+  contentType: string | null;  // Rust uses #[serde(rename = "contentType")]: "idea" | "code" | "debug" | "paste"
+  associatedIdeaId: string | null;  // Rust uses #[serde(rename = "associatedIdeaId")]
 }
 
 interface BackendEdge {
@@ -103,6 +106,9 @@ function mapBackendNode(n: BackendNode): Node {
     // Privacy filtering
     isPrivate: n.isPrivate ?? undefined,
     privacyReason: n.privacyReason ?? undefined,
+    // Content classification (mini-clustering)
+    contentType: n.contentType as Node['contentType'] ?? undefined,
+    associatedIdeaId: n.associatedIdeaId ?? undefined,
   };
 }
 

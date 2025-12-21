@@ -57,7 +57,7 @@ interface SettingsPanelProps {
   onDataChanged?: () => void;
 }
 
-type ConfirmAction = 'deleteAll' | 'resetAi' | 'resetClustering' | 'clearEmbeddings' | 'clearHierarchy' | 'resetPrivacy' | 'fullRebuild' | 'flattenHierarchy' | 'consolidateRoot' | 'tidyDatabase' | null;
+type ConfirmAction = 'deleteAll' | 'resetAi' | 'resetClustering' | 'clearEmbeddings' | 'clearHierarchy' | 'resetPrivacy' | 'fullRebuild' | 'flattenHierarchy' | 'consolidateRoot' | 'tidyDatabase' | 'classifyContent' | null;
 
 interface TidyReport {
   sameNameMerged: number;
@@ -139,6 +139,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const [isFlattening, setIsFlattening] = useState(false);
   const [isConsolidating, setIsConsolidating] = useState(false);
   const [isTidying, setIsTidying] = useState(false);
+  const [isClassifying, setIsClassifying] = useState(false);
   const [operationResult, setOperationResult] = useState<string | null>(null);
 
   // Setup flow operations
@@ -336,14 +337,14 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   };
 
   // Estimate API cost (returns formatted string)
-  // Pricing: Haiku $1/$5 MTok, Sonnet $3/$15 MTok, OpenAI embed $0.02/MTok
-  const estimateCost = (calls: number, model: 'haiku' | 'sonnet' | 'openai', avgTokensPerCall: number = 2000): string => {
+  // Pricing: Haiku 4.5 $0.80/$4.00 MTok, Sonnet 4 $3/$15 MTok, OpenAI embed $0.02/MTok
+  const estimateCost = (calls: number, model: 'haiku' | 'sonnet' | 'openai', avgTokensPerCall: number = 1200): string => {
     if (calls === 0) return '$0.00';
     const totalTokens = calls * avgTokensPerCall;
     let cost = 0;
     if (model === 'haiku') {
-      // ~50% input, ~50% output tokens assumed
-      cost = (totalTokens * 0.5 / 1_000_000) * 1 + (totalTokens * 0.5 / 1_000_000) * 5;
+      // ~83% input (~1000 tokens), ~17% output (~200 tokens) for title/summary generation
+      cost = (totalTokens * 0.83 / 1_000_000) * 0.80 + (totalTokens * 0.17 / 1_000_000) * 4.00;
     } else if (model === 'sonnet') {
       cost = (totalTokens * 0.5 / 1_000_000) * 3 + (totalTokens * 0.5 / 1_000_000) * 15;
     } else {
@@ -915,6 +916,22 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
         }
       },
     },
+    classifyContent: {
+      title: 'Classify Content',
+      message: 'Classify all items by content type (idea/code/debug/paste) and associate supporting items with ideas. Fast local operation using pattern matching.',
+      handler: async () => {
+        setIsClassifying(true);
+        setOperationResult(null);
+        try {
+          const [classified, associated] = await invoke<[number, number]>('classify_and_associate');
+          const msg = `Classified ${classified} items, associated ${associated} supporting items with ideas`;
+          setOperationResult(msg);
+          return msg;
+        } finally {
+          setIsClassifying(false);
+        }
+      },
+    },
   };
 
   const handleConfirmAction = async () => {
@@ -1263,8 +1280,8 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                     <div className="text-xs text-gray-500">Generate titles, summaries & embeddings</div>
                     {dbStats && dbStats.unprocessedItems > 0 && (
                       <div className="text-xs text-amber-400/80 mt-0.5">
-                        {dbStats.unprocessedItems} calls · Haiku {estimateCost(dbStats.unprocessedItems, 'haiku', 3500)}
-                        {openaiKeyStatus && ` + OpenAI ${estimateCost(dbStats.unprocessedItems, 'openai', 1500)}`}
+                        {dbStats.unprocessedItems} calls · Haiku {estimateCost(dbStats.unprocessedItems, 'haiku', 1200)}
+                        {openaiKeyStatus && ` + OpenAI ${estimateCost(dbStats.unprocessedItems, 'openai', 1000)}`}
                       </div>
                     )}
                     {dbStats && dbStats.unprocessedItems === 0 && (
@@ -1712,10 +1729,29 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   </div>
                   <button
                     onClick={() => setConfirmAction('tidyDatabase')}
-                    disabled={isTidying || isFullRebuilding || isFlattening || isConsolidating}
+                    disabled={isTidying || isFullRebuilding || isFlattening || isConsolidating || isClassifying}
                     className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-cyan-600 hover:bg-cyan-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isTidying ? <Loader2 className="w-5 h-5 animate-spin" /> : '🧹'}
+                  </button>
+                </div>
+
+                {/* Classify Content */}
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-violet-600 flex items-center justify-center text-white text-sm">
+                    <Zap className="w-3.5 h-3.5" />
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Classify Content</div>
+                    <div className="text-xs text-gray-500">Classify items as idea/code/debug/paste and link supporting items to ideas</div>
+                    <div className="text-xs text-gray-600 mt-0.5">No API calls · Pattern matching + embeddings</div>
+                  </div>
+                  <button
+                    onClick={() => setConfirmAction('classifyContent')}
+                    disabled={isClassifying || isFullRebuilding || isFlattening || isConsolidating || isTidying}
+                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-violet-600 hover:bg-violet-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                  >
+                    {isClassifying ? <Loader2 className="w-5 h-5 animate-spin" /> : '🏷️'}
                   </button>
                 </div>
 

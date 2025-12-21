@@ -1130,6 +1130,12 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
         }
       }
 
+      // Mini-clustering filter: hide supporting items (code/debug/paste) from graph
+      // They are accessed via the supporting panel instead
+      if (node.isItem && node.contentType && node.contentType !== 'idea' && node.contentType !== 'investigation') {
+        return false;
+      }
+
       // If we have a specific parent, show its children
       if (currentParentId) {
         return node.parentId === currentParentId;

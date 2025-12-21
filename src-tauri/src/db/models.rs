@@ -133,6 +133,12 @@ pub struct Node {
 
     // Import source tracking
     pub source: Option<String>,           // "claude", "googlekeep", "markdown", etc.
+
+    // Content classification (for mini-clustering)
+    #[serde(rename = "contentType")]
+    pub content_type: Option<String>,     // "idea" | "code" | "debug" | "paste" | NULL
+    #[serde(rename = "associatedIdeaId")]
+    pub associated_idea_id: Option<String>, // Links supporting item to specific idea node
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

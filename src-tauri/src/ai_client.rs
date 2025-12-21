@@ -12,7 +12,7 @@ pub struct AiAnalysisResult {
     pub title: String,
     pub summary: String,
     pub tags: Vec<String>,
-    pub emoji: String,
+    pub content_type: String,  // idea, code, debug, paste, trivial
 }
 
 /// Anthropic API message format
@@ -75,29 +75,34 @@ pub async fn analyze_node(raw_title: &str, content: &str) -> Result<AiAnalysisRe
     };
 
     let prompt = format!(
-        r#"Analyze this conversation content and provide a structured analysis.
-
-ORIGINAL TITLE: {}
+        r#"Analyze this conversation and provide JSON:
 
 CONTENT:
 {}
 
-Provide the following in JSON format:
-1. "title": A concise, descriptive title (5-10 words) - if the original title is good, keep it; otherwise create a better one
-2. "summary": A brief summary (50-100 words) of the main topic and key points
-3. "tags": 3-5 specific tags (technologies, concepts, task types)
-4. "emoji": A single emoji that best represents the topic (e.g., 🐍 for Python, 🦀 for Rust, 🤖 for AI, 🔧 for debugging)
+1. "content_type": Classify as:
+   - "idea": Substantial discussion, insight, decision, creative work
+   - "investigation": Incremental discoveries, working-out steps, "figured out X" moments
+   - "code": Primarily code blocks, scripts, implementation
+   - "debug": Error traces, troubleshooting, stack dumps
+   - "paste": Raw logs, data dumps, copied text without context
+   - "trivial": Acknowledgment, noise, no real substance
 
-Be specific with tags - use actual technology names (Python, React), specific concepts (state management), or task types (debugging).
-Choose an emoji that captures the primary topic or technology being discussed.
+2. "title": Captures what was discussed/accomplished.
+   - For idea: Personal note style, 3-6 words. "Found the clustering bug"
+   - For code/debug/paste: Technical label, 5-10 words
+   - Base on FULL exchange, not short user prompts like "yeah" or "fix it"
 
-Respond ONLY with valid JSON, no markdown:
-{{"title": "...", "summary": "...", "tags": ["tag1", "tag2", "tag3"], "emoji": "🔮"}}"#,
-        raw_title, content_preview
+3. "summary": 50-100 words
+
+4. "tags": 3-5 specific tags
+
+JSON only: {{"content_type":"...","title":"...","summary":"...","tags":[...]}}"#,
+        content_preview
     );
 
     let request = AnthropicRequest {
-        model: "claude-3-5-haiku-20241022".to_string(),
+        model: "claude-haiku-4-5-20251001".to_string(),
         max_tokens: 400,
         messages: vec![Message {
             role: "user".to_string(),
@@ -180,13 +185,13 @@ fn parse_ai_response(text: &str, fallback_title: &str) -> Result<AiAnalysisResul
                 })
                 .unwrap_or_default();
 
-            let emoji = json
-                .get("emoji")
+            let content_type = json
+                .get("content_type")
                 .and_then(|v| v.as_str())
-                .unwrap_or("💭")
+                .unwrap_or("idea")
                 .to_string();
 
-            Ok(AiAnalysisResult { title, summary, tags, emoji })
+            Ok(AiAnalysisResult { title, summary, tags, content_type })
         }
         Err(_) => {
             // Fallback: use raw title and extract what we can
@@ -194,7 +199,7 @@ fn parse_ai_response(text: &str, fallback_title: &str) -> Result<AiAnalysisResul
                 title: fallback_title.to_string(),
                 summary: String::new(),
                 tags: vec![],
-                emoji: "💭".to_string(),
+                content_type: "idea".to_string(),
             })
         }
     }
@@ -269,7 +274,7 @@ Return ONLY valid JSON, no markdown:
     );
 
     let request = AnthropicRequest {
-        model: "claude-3-5-haiku-20241022".to_string(),
+        model: "claude-haiku-4-5-20251001".to_string(),
         max_tokens: 1000,
         messages: vec![Message {
             role: "user".to_string(),
@@ -1275,10 +1280,85 @@ Return ONLY valid JSON, no markdown:
     parse_category_groupings(&text, topics)
 }
 
+/// Maximum categories per uber-grouping batch to prevent response truncation
+const UBER_GROUPING_BATCH_SIZE: usize = 75;
+
 /// Group categories into 4-8 uber-categories, preserving project names
 /// Used for consolidating Universe's direct children into navigable top-level domains
 /// Projects (Mycelica, etc.) stay as their own categories; generic topics get grouped by theme
 pub async fn group_into_uber_categories(
+    categories: &[TopicInfo],
+) -> Result<Vec<CategoryGrouping>, String> {
+    if categories.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // If small enough, do single call
+    if categories.len() <= UBER_GROUPING_BATCH_SIZE {
+        return group_into_uber_categories_single(categories).await;
+    }
+
+    // Batch processing for large category sets
+    let num_batches = (categories.len() + UBER_GROUPING_BATCH_SIZE - 1) / UBER_GROUPING_BATCH_SIZE;
+    println!("[AI] Grouping {} categories in {} batches of ~{}",
+             categories.len(), num_batches, UBER_GROUPING_BATCH_SIZE);
+
+    let mut all_groupings: Vec<CategoryGrouping> = Vec::new();
+
+    for (batch_idx, batch) in categories.chunks(UBER_GROUPING_BATCH_SIZE).enumerate() {
+        println!("[AI] Processing uber-category batch {}/{} ({} categories)",
+                 batch_idx + 1, num_batches, batch.len());
+
+        match group_into_uber_categories_single(batch).await {
+            Ok(batch_groupings) => {
+                // Merge with existing groupings
+                for new_grouping in batch_groupings {
+                    if let Some(existing) = find_similar_uber_category(&mut all_groupings, &new_grouping.name) {
+                        // Merge children into existing category
+                        existing.children.extend(new_grouping.children);
+                        println!("[AI] Merged '{}' into existing '{}'", new_grouping.name, existing.name);
+                    } else {
+                        all_groupings.push(new_grouping);
+                    }
+                }
+            }
+            Err(e) => {
+                println!("[AI] Batch {} failed: {}", batch_idx + 1, e);
+                // Continue with other batches
+            }
+        }
+    }
+
+    println!("[AI] Uber-grouping complete: {} total categories", all_groupings.len());
+    Ok(all_groupings)
+}
+
+/// Find an uber-category with a similar name for merging
+fn find_similar_uber_category<'a>(
+    categories: &'a mut [CategoryGrouping],
+    name: &str,
+) -> Option<&'a mut CategoryGrouping> {
+    let name_lower = name.to_lowercase();
+
+    for cat in categories.iter_mut() {
+        let cat_lower = cat.name.to_lowercase();
+
+        // Exact match (case-insensitive)
+        if cat_lower == name_lower {
+            return Some(cat);
+        }
+
+        // One contains the other
+        if cat_lower.contains(&name_lower) || name_lower.contains(&cat_lower) {
+            return Some(cat);
+        }
+    }
+
+    None
+}
+
+/// Single-batch uber-category grouping (internal)
+async fn group_into_uber_categories_single(
     categories: &[TopicInfo],
 ) -> Result<Vec<CategoryGrouping>, String> {
     let api_key = get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;

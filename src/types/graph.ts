@@ -84,6 +84,10 @@ export interface Node {
   // --- Privacy filtering ---
   isPrivate?: boolean;      // undefined = not scanned, true = private, false = safe
   privacyReason?: string;   // Why it was marked private (for review)
+
+  // --- Content classification (mini-clustering) ---
+  contentType?: 'idea' | 'investigation' | 'code' | 'debug' | 'paste' | 'trivial';  // Classification for graph filtering
+  associatedIdeaId?: string;  // Links supporting item to specific idea node
 }
 
 export interface Edge {

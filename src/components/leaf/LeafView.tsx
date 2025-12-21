@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import ReactMarkdown from 'react-markdown';
-import { ChevronLeft, ChevronRight, Pencil, Save, X } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Pencil, Save, X, Code, Bug, FileText } from 'lucide-react';
 import { useGraphStore } from '../../stores/graphStore';
 import { getEmojiForNode } from '../../utils/emojiMatcher';
 import { ConversationRenderer, isConversationContent } from './ConversationRenderer';
@@ -13,13 +13,14 @@ interface LeafViewProps {
 }
 
 export function LeafView({ nodeId, onBack }: LeafViewProps) {
-  const { nodes, navigateToBreadcrumb, closeLeaf, updateNode } = useGraphStore();
+  const { nodes, navigateToBreadcrumb, closeLeaf, updateNode, openLeaf } = useGraphStore();
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isEditing, setIsEditing] = useState(false);
   const [editContent, setEditContent] = useState<string>('');
   const [saving, setSaving] = useState(false);
+  const [associatedItems, setAssociatedItems] = useState<Node[]>([]);
 
   const node = nodes.get(nodeId);
 
@@ -45,6 +46,20 @@ export function LeafView({ nodeId, onBack }: LeafViewProps) {
 
     fetchContent();
   }, [nodeId, node?.content]);
+
+  // Fetch associated items (code/debug/paste linked to this idea)
+  useEffect(() => {
+    const fetchAssociated = async () => {
+      try {
+        const items = await invoke<Node[]>('get_associated_items', { ideaId: nodeId });
+        setAssociatedItems(items);
+      } catch (err) {
+        console.error('Failed to fetch associated items:', err);
+        setAssociatedItems([]);
+      }
+    };
+    fetchAssociated();
+  }, [nodeId]);
 
   // Build hierarchy path for breadcrumbs
   const getHierarchyPath = (): Node[] => {
@@ -211,59 +226,95 @@ export function LeafView({ nodeId, onBack }: LeafViewProps) {
         </div>
       </header>
 
-      {/* Content area */}
-      <main className="flex-1 overflow-y-auto">
-        {loading ? (
-          <div className="flex items-center justify-center h-64">
-            <div className="text-center text-gray-400">
-              <div className="text-3xl mb-2 animate-pulse">📄</div>
-              <p>Loading content...</p>
+      {/* Content area with optional right sidebar */}
+      <div className="flex-1 flex overflow-hidden">
+        {/* Main content */}
+        <main className="flex-1 overflow-y-auto">
+          {loading ? (
+            <div className="flex items-center justify-center h-64">
+              <div className="text-center text-gray-400">
+                <div className="text-3xl mb-2 animate-pulse">📄</div>
+                <p>Loading content...</p>
+              </div>
             </div>
-          </div>
-        ) : error && !content ? (
-          <div className="flex items-center justify-center h-64">
-            <div className="text-center text-red-400">
-              <div className="text-3xl mb-2">⚠️</div>
-              <p>{error}</p>
+          ) : error && !content ? (
+            <div className="flex items-center justify-center h-64">
+              <div className="text-center text-red-400">
+                <div className="text-3xl mb-2">⚠️</div>
+                <p>{error}</p>
+              </div>
             </div>
-          </div>
-        ) : isEditing ? (
-          // Edit mode - full-height textarea
-          <div className="h-full p-4">
-            <textarea
-              value={editContent}
-              onChange={(e) => setEditContent(e.target.value)}
-              className="w-full h-full bg-gray-800 text-gray-200 border border-gray-600 rounded-lg p-4 font-mono text-sm resize-none focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500"
-              placeholder="Enter content..."
-              autoFocus
-            />
-          </div>
-        ) : content && isConversationContent(content) ? (
-          // Conversation format - document style
-          <article className="max-w-4xl px-8 py-8">
-            <ConversationRenderer content={content} />
-          </article>
-        ) : (
-          // Markdown format - prose article
-          <article className="max-w-4xl mx-auto px-6 py-8">
-            <div className="prose prose-invert prose-lg max-w-none
-              prose-headings:text-white prose-headings:font-semibold
-              prose-p:text-gray-300 prose-p:leading-relaxed
-              prose-a:text-amber-400 prose-a:no-underline hover:prose-a:underline
-              prose-strong:text-white
-              prose-code:text-amber-300 prose-code:bg-gray-800 prose-code:px-1 prose-code:py-0.5 prose-code:rounded
-              prose-pre:bg-gray-800 prose-pre:border prose-pre:border-gray-700
-              prose-blockquote:border-l-amber-500 prose-blockquote:bg-gray-800/50 prose-blockquote:py-1 prose-blockquote:px-4
-              prose-li:text-gray-300
-              prose-hr:border-gray-700
-            ">
-              <ReactMarkdown>
-                {content || '*No content available*'}
-              </ReactMarkdown>
+          ) : isEditing ? (
+            // Edit mode - full-height textarea
+            <div className="h-full p-4">
+              <textarea
+                value={editContent}
+                onChange={(e) => setEditContent(e.target.value)}
+                className="w-full h-full bg-gray-800 text-gray-200 border border-gray-600 rounded-lg p-4 font-mono text-sm resize-none focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500"
+                placeholder="Enter content..."
+                autoFocus
+              />
             </div>
-          </article>
+          ) : content && isConversationContent(content) ? (
+            // Conversation format - document style
+            <article className="max-w-4xl px-8 py-8">
+              <ConversationRenderer content={content} />
+            </article>
+          ) : (
+            // Markdown format - prose article
+            <article className="max-w-4xl mx-auto px-6 py-8">
+              <div className="prose prose-invert prose-lg max-w-none
+                prose-headings:text-white prose-headings:font-semibold
+                prose-p:text-gray-300 prose-p:leading-relaxed
+                prose-a:text-amber-400 prose-a:no-underline hover:prose-a:underline
+                prose-strong:text-white
+                prose-code:text-amber-300 prose-code:bg-gray-800 prose-code:px-1 prose-code:py-0.5 prose-code:rounded
+                prose-pre:bg-gray-800 prose-pre:border prose-pre:border-gray-700
+                prose-blockquote:border-l-amber-500 prose-blockquote:bg-gray-800/50 prose-blockquote:py-1 prose-blockquote:px-4
+                prose-li:text-gray-300
+                prose-hr:border-gray-700
+              ">
+                <ReactMarkdown>
+                  {content || '*No content available*'}
+                </ReactMarkdown>
+              </div>
+            </article>
+          )}
+        </main>
+
+        {/* Right sidebar - Associated items */}
+        {associatedItems.length > 0 && (
+          <aside className="w-72 border-l border-gray-700 bg-gray-800/50 overflow-y-auto flex-shrink-0">
+            <div className="p-4">
+              <h3 className="text-sm font-medium text-gray-400 mb-3">
+                Associated Items ({associatedItems.length})
+              </h3>
+              <div className="space-y-2">
+                {associatedItems.map(item => (
+                  <button
+                    key={item.id}
+                    onClick={() => openLeaf(item.id)}
+                    className="w-full flex items-start gap-2 p-2 rounded hover:bg-gray-700/50 text-left transition-colors"
+                  >
+                    {item.contentType === 'code' && <Code className="w-4 h-4 text-blue-400 mt-0.5 shrink-0" />}
+                    {item.contentType === 'debug' && <Bug className="w-4 h-4 text-red-400 mt-0.5 shrink-0" />}
+                    {item.contentType === 'paste' && <FileText className="w-4 h-4 text-gray-400 mt-0.5 shrink-0" />}
+                    {!item.contentType && <FileText className="w-4 h-4 text-gray-400 mt-0.5 shrink-0" />}
+                    <div className="min-w-0">
+                      <div className="text-sm text-white truncate">
+                        {item.aiTitle || item.title}
+                      </div>
+                      <div className="text-xs text-gray-500">
+                        {item.contentType || 'item'}
+                      </div>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </aside>
         )}
-      </main>
+      </div>
     </div>
   );
 }

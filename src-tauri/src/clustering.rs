@@ -15,6 +15,16 @@ use crate::commands::{is_rebuild_cancelled, reset_rebuild_cancel};
 use serde::Serialize;
 use rand::seq::SliceRandom;
 
+/// Safely truncate a string at a UTF-8 boundary
+fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+    if max_bytes >= s.len() { return s; }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Result of clustering operation
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -122,6 +132,8 @@ fn capitalize(s: &str) -> String {
 
 /// Run clustering on items that need it
 /// Uses embedding-based clustering (primary), with TF-IDF fallback for items without embeddings
+/// NOTE: Only clusters items where content_type = 'idea' OR content_type IS NULL
+/// Items with content_type = 'code', 'debug', or 'paste' are skipped (supporting items)
 pub async fn run_clustering(db: &Database, _use_ai: bool) -> Result<ClusteringResult, String> {
     // Reset cancel flag at start
     reset_rebuild_cancel();
@@ -131,14 +143,32 @@ pub async fn run_clustering(db: &Database, _use_ai: bool) -> Result<ClusteringRe
 
     // Filter out protected items (Recent Notes and descendants)
     let protected_ids = db.get_protected_node_ids();
-    let items: Vec<Node> = all_items
+    let after_protected: Vec<Node> = all_items
         .into_iter()
         .filter(|item| !protected_ids.contains(&item.id))
         .collect();
 
-    let skipped = protected_ids.len();
-    if skipped > 0 {
-        println!("[Clustering] Skipping {} protected items (Recent Notes)", skipped);
+    let skipped_protected = protected_ids.len();
+    if skipped_protected > 0 {
+        println!("[Clustering] Skipping {} protected items (Recent Notes)", skipped_protected);
+    }
+
+    // Filter out supporting items (code/debug/paste/trivial) - only cluster ideas
+    let total_after_protected = after_protected.len();
+    let items: Vec<Node> = after_protected
+        .into_iter()
+        .filter(|item| {
+            match item.content_type.as_deref() {
+                None | Some("idea") | Some("investigation") => true,  // Include ideas, investigations, and unclassified
+                Some("code") | Some("debug") | Some("paste") | Some("trivial") => false,
+                _ => true,  // Include any unknown types
+            }
+        })
+        .collect();
+
+    let skipped_supporting_count = total_after_protected - items.len();
+    if skipped_supporting_count > 0 {
+        println!("[Clustering] Skipping {} supporting items (code/debug/paste)", skipped_supporting_count);
     }
 
     if items.is_empty() {
@@ -263,14 +293,21 @@ async fn ensure_embeddings(
         let embedding = match db.get_node_embedding(&item.id).map_err(|e| e.to_string())? {
             Some(emb) => emb,
             None => {
-                // Generate on-demand using title + summary
-                let text = format!(
-                    "{} {}",
-                    item.ai_title.as_ref().unwrap_or(&item.title),
-                    item.summary.as_deref().unwrap_or("")
-                );
+                // Generate embedding from CONTENT (truncated to ~1000 bytes for efficiency)
+                // Content is much more semantically meaningful than short titles
+                let text = if let Some(content) = &item.content {
+                    // Use actual conversation content, truncated safely
+                    safe_truncate(content, 1000).to_string()
+                } else {
+                    // Fallback for items without content (shouldn't happen for items)
+                    format!(
+                        "{} {}",
+                        item.ai_title.as_ref().unwrap_or(&item.title),
+                        item.summary.as_deref().unwrap_or("")
+                    )
+                };
 
-                println!("[Clustering] Generating embedding for item: {}", item.id);
+                println!("[Clustering] Generating embedding for item: {} ({}chars)", item.id, text.len());
                 let emb = ai_client::generate_embedding(&text).await?;
                 db.update_node_embedding(&item.id, &emb).map_err(|e| e.to_string())?;
                 emb
@@ -552,21 +589,25 @@ pub async fn cluster_with_embeddings(
     );
 
     // Step 7: Apply assignments using existing function
-    let (assigned, new_clusters, edges) = apply_multipath_assignments(db, &assignments, next_cluster_id)?;
+    let (assigned, _new_clusters, edges) = apply_multipath_assignments(db, &assignments, next_cluster_id)?;
+    let actual_cluster_count = cluster_data.len();
 
-    println!("[Clustering] Embedding clustering complete: {} items assigned, {} clusters, {} edges",
-             assigned, new_clusters, edges);
+    println!("[Clustering] Embedding clustering complete: {} items assigned to {} clusters, {} edges",
+             assigned, actual_cluster_count, edges);
 
     Ok(ClusteringResult {
         items_processed: items.len(),
-        clusters_created: new_clusters,
+        clusters_created: actual_cluster_count,
         items_assigned: assigned,
         edges_created: edges,
         method: "embedding".to_string(),
     })
 }
 
-/// Name clusters using AI (single call for all clusters)
+/// Maximum clusters per AI naming batch to prevent response truncation
+const NAMING_BATCH_SIZE: usize = 50;
+
+/// Name clusters using AI with batching to prevent response truncation
 async fn name_clusters_with_ai(
     _db: &Database,
     cluster_data: &[(i32, Vec<usize>, Vec<f32>)],
@@ -583,7 +624,7 @@ async fn name_clusters_with_ai(
     for (cluster_id, indices, _) in cluster_data {
         let titles: Vec<String> = indices
             .iter()
-            .take(15) // Sample up to 15 titles per cluster
+            .take(10) // Sample up to 10 titles per cluster (reduced from 15 for batching)
             .filter_map(|&i| {
                 items_with_embeddings.get(i).map(|(node, _)| {
                     node.ai_title.clone().unwrap_or_else(|| node.title.clone())
@@ -593,33 +634,48 @@ async fn name_clusters_with_ai(
         clusters_info.push((*cluster_id, titles));
     }
 
-    // Call AI to name clusters
-    match ai_client::name_clusters(&clusters_info).await {
-        Ok(ai_names) => {
-            for (cluster_id, name) in ai_names {
-                names.insert(cluster_id, name);
-            }
+    // Batch clusters for AI naming to prevent response truncation
+    let num_batches = (clusters_info.len() + NAMING_BATCH_SIZE - 1) / NAMING_BATCH_SIZE;
+    if num_batches > 1 {
+        println!("[Clustering] Naming {} clusters in {} batches of ~{}",
+                 clusters_info.len(), num_batches, NAMING_BATCH_SIZE);
+    }
+
+    for (batch_idx, batch) in clusters_info.chunks(NAMING_BATCH_SIZE).enumerate() {
+        if num_batches > 1 {
+            println!("[Clustering] Naming batch {}/{} ({} clusters)",
+                     batch_idx + 1, num_batches, batch.len());
         }
-        Err(e) => {
-            eprintln!("[Clustering] AI naming failed, using keyword fallback: {}", e);
-            // Fallback: use keywords from titles
-            for (cluster_id, titles) in &clusters_info {
-                let combined = titles.join(" ");
-                let keywords = extract_keywords(&combined, 3);
-                let name = if keywords.is_empty() {
-                    format!("Cluster {}", cluster_id)
-                } else {
-                    keywords.iter()
-                        .map(|(w, _)| capitalize(w))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                names.insert(*cluster_id, name);
+
+        // Call AI to name this batch of clusters
+        match ai_client::name_clusters(batch).await {
+            Ok(ai_names) => {
+                for (cluster_id, name) in ai_names {
+                    names.insert(cluster_id, name);
+                }
+            }
+            Err(e) => {
+                eprintln!("[Clustering] AI naming failed for batch {}, using keyword fallback: {}",
+                         batch_idx + 1, e);
+                // Fallback: use keywords from titles for this batch
+                for (cluster_id, titles) in batch {
+                    let combined = titles.join(" ");
+                    let keywords = extract_keywords(&combined, 3);
+                    let name = if keywords.is_empty() {
+                        format!("Cluster {}", cluster_id)
+                    } else {
+                        keywords.iter()
+                            .map(|(w, _)| capitalize(w))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    names.insert(*cluster_id, name);
+                }
             }
         }
     }
 
-    // Ensure all clusters have names
+    // Ensure all clusters have names (fallback for any missed)
     for (cluster_id, _, _) in cluster_data {
         names.entry(*cluster_id).or_insert_with(|| format!("Cluster {}", cluster_id));
     }
