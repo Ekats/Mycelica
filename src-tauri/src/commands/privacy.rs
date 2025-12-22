@@ -903,3 +903,297 @@ pub fn export_shareable_db(state: State<AppState>) -> Result<String, String> {
 
     Ok(shareable_path)
 }
+
+// ===== Privacy Scoring (continuous 0.0-1.0 scale) =====
+
+/// Result of privacy scoring operation
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrivacyScoringResult {
+    pub items_scored: usize,
+    pub batches_processed: usize,
+    pub error_count: usize,
+    pub cancelled: bool,
+}
+
+/// Progress event for privacy scoring
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrivacyScoringProgress {
+    pub current_batch: usize,
+    pub total_batches: usize,
+    pub items_scored: usize,
+    pub total_items: usize,
+    pub status: String, // "processing", "complete", "error", "cancelled"
+}
+
+fn emit_scoring_progress(app: &AppHandle, event: PrivacyScoringProgress) {
+    let _ = app.emit("privacy-scoring-progress", event);
+}
+
+const PRIVACY_SCORING_PROMPT: &str = r#"Score each item 0.0-1.0 for public shareability:
+
+0.0-0.2: Highly private — real names, health/mental state, finances, relationships, personal struggles, private contact info
+0.3-0.4: Personal — work grievances, emotional venting, private project details, identifiable personal situations
+0.5-0.6: Semi-private — named companies/projects in neutral context, work discussions, some identifiable context
+0.7-0.8: Low risk — technical content with minor project context, professional discussions
+0.9-1.0: Public — generic concepts, public knowledge, tutorials, no identifying context
+
+When content spans multiple levels, use the LOWEST applicable score.
+
+Items to score:
+{items_json}
+
+Return ONLY a JSON array:
+[{"id": "...", "privacy": 0.7}, {"id": "...", "privacy": 0.3}]"#;
+
+/// Score privacy for all unscored items using AI
+#[tauri::command]
+pub async fn score_privacy_all_items(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    force_rescore: bool,
+) -> Result<PrivacyScoringResult, String> {
+    CANCEL_PRIVACY_SCAN.store(false, Ordering::SeqCst);
+
+    let api_key = settings::get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
+
+    // Get items needing scoring
+    let items = if force_rescore {
+        // Get ALL items if force rescore
+        state.db.read().unwrap().get_all_nodes()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|n| n.is_item)
+            .collect::<Vec<_>>()
+    } else {
+        state.db.read().unwrap().get_items_needing_privacy_scoring()
+            .map_err(|e| e.to_string())?
+    };
+
+    let total_items = items.len();
+    if total_items == 0 {
+        emit_scoring_progress(&app, PrivacyScoringProgress {
+            current_batch: 0,
+            total_batches: 0,
+            items_scored: 0,
+            total_items: 0,
+            status: "complete".to_string(),
+        });
+        return Ok(PrivacyScoringResult {
+            items_scored: 0,
+            batches_processed: 0,
+            error_count: 0,
+            cancelled: false,
+        });
+    }
+
+    const BATCH_SIZE: usize = 25;
+    let batches: Vec<_> = items.chunks(BATCH_SIZE).collect();
+    let total_batches = batches.len();
+
+    let mut items_scored = 0;
+    let mut error_count = 0;
+    let client = reqwest::Client::new();
+
+    println!("[Privacy Scoring] Starting scoring for {} items in {} batches", total_items, total_batches);
+
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        // Check for cancellation
+        if CANCEL_PRIVACY_SCAN.load(Ordering::SeqCst) {
+            emit_scoring_progress(&app, PrivacyScoringProgress {
+                current_batch: batch_idx,
+                total_batches,
+                items_scored,
+                total_items,
+                status: "cancelled".to_string(),
+            });
+            return Ok(PrivacyScoringResult {
+                items_scored,
+                batches_processed: batch_idx,
+                error_count,
+                cancelled: true,
+            });
+        }
+
+        println!("[Privacy Scoring] Processing batch {}/{} ({} items)", batch_idx + 1, total_batches, batch.len());
+
+        emit_scoring_progress(&app, PrivacyScoringProgress {
+            current_batch: batch_idx + 1,
+            total_batches,
+            items_scored,
+            total_items,
+            status: "processing".to_string(),
+        });
+
+        // Build items JSON for prompt
+        let items_for_prompt: Vec<serde_json::Value> = batch.iter().map(|item| {
+            let title = item.ai_title.as_deref().unwrap_or(&item.title);
+            let summary = item.summary.as_deref().unwrap_or("");
+            let content = item.content.as_deref().unwrap_or("");
+            // Truncate content to 500 chars
+            let content_preview = if content.len() > 500 {
+                let truncate_at = content.char_indices()
+                    .take_while(|(i, _)| *i < 500)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0);
+                format!("{}...", &content[..truncate_at])
+            } else {
+                content.to_string()
+            };
+
+            serde_json::json!({
+                "id": item.id,
+                "title": title,
+                "summary": summary,
+                "content_preview": content_preview
+            })
+        }).collect();
+
+        let items_json = serde_json::to_string_pretty(&items_for_prompt)
+            .unwrap_or_else(|_| "[]".to_string());
+
+        let prompt = PRIVACY_SCORING_PROMPT.replace("{items_json}", &items_json);
+
+        let request = AnthropicRequest {
+            model: "claude-haiku-4-5-20251001".to_string(),
+            max_tokens: 2000,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: prompt,
+            }],
+        };
+
+        // Make API call
+        match client
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&request)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                if response.status().is_success() {
+                    if let Ok(api_response) = response.json::<AnthropicResponse>().await {
+                        // Track tokens
+                        if let Some(usage) = &api_response.usage {
+                            let _ = settings::add_anthropic_tokens(usage.input_tokens, usage.output_tokens);
+                        }
+
+                        let text = api_response
+                            .content
+                            .first()
+                            .map(|c| c.text.clone())
+                            .unwrap_or_default();
+
+                        // Parse JSON array response
+                        match parse_scoring_response(&text) {
+                            Ok(scores) => {
+                                let db = state.db.read().unwrap();
+                                for score in scores {
+                                    if let Err(e) = db.update_privacy_score(&score.id, score.privacy) {
+                                        eprintln!("  Failed to update privacy for {}: {}", score.id, e);
+                                        error_count += 1;
+                                    } else {
+                                        items_scored += 1;
+                                    }
+                                }
+                                println!("  Batch {}: scored {} items", batch_idx + 1, batch.len());
+                            }
+                            Err(e) => {
+                                eprintln!("  Batch {} parse error: {}", batch_idx + 1, e);
+                                eprintln!("  Raw response: {}", text);
+                                error_count += batch.len();
+                            }
+                        }
+                    } else {
+                        eprintln!("  Batch {} failed to parse API response", batch_idx + 1);
+                        error_count += batch.len();
+                    }
+                } else {
+                    let status = response.status();
+                    eprintln!("  Batch {} API error: {}", batch_idx + 1, status);
+                    error_count += batch.len();
+                }
+            }
+            Err(e) => {
+                eprintln!("  Batch {} request failed: {}", batch_idx + 1, e);
+                error_count += batch.len();
+            }
+        }
+
+        // Small delay to avoid rate limits
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    }
+
+    emit_scoring_progress(&app, PrivacyScoringProgress {
+        current_batch: total_batches,
+        total_batches,
+        items_scored,
+        total_items,
+        status: "complete".to_string(),
+    });
+
+    println!("[Privacy Scoring] Complete: scored {} items, {} errors", items_scored, error_count);
+
+    Ok(PrivacyScoringResult {
+        items_scored,
+        batches_processed: total_batches,
+        error_count,
+        cancelled: false,
+    })
+}
+
+/// Parse scoring response JSON array
+fn parse_scoring_response(text: &str) -> Result<Vec<PrivacyScore>, String> {
+    // Try to find JSON array in response
+    let text = text.trim();
+
+    // Handle markdown code blocks
+    let json_text = if text.starts_with("```") {
+        text.lines()
+            .skip(1)
+            .take_while(|line| !line.starts_with("```"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        text.to_string()
+    };
+
+    // Find array start/end
+    let start = json_text.find('[').ok_or("No JSON array found")?;
+    let end = json_text.rfind(']').ok_or("No JSON array end found")?;
+    let array_text = &json_text[start..=end];
+
+    // Fix common AI JSON issues: trailing commas before ]
+    // e.g., {"id": "...", "privacy": 0.5},\n] -> {"id": "...", "privacy": 0.5}\n]
+    let mut cleaned = array_text.to_string();
+    // Remove trailing comma with various whitespace patterns
+    while cleaned.contains(",]") || cleaned.contains(", ]") || cleaned.contains(",\n]") || cleaned.contains(",\r\n]") {
+        cleaned = cleaned
+            .replace(",\r\n]", "]")
+            .replace(",\n]", "]")
+            .replace(", ]", "]")
+            .replace(",]", "]");
+    }
+    // Also handle comma followed by multiple whitespace/newlines before ]
+    // Find pattern: , followed by whitespace until ]
+    if let Some(last_comma) = cleaned.rfind(',') {
+        let after_comma = &cleaned[last_comma + 1..];
+        if after_comma.trim() == "]" {
+            cleaned = format!("{}]", &cleaned[..last_comma]);
+        }
+    }
+
+    serde_json::from_str::<Vec<PrivacyScore>>(&cleaned)
+        .map_err(|e| format!("JSON parse error: {}", e))
+}
+
+#[derive(Deserialize)]
+struct PrivacyScore {
+    id: String,
+    privacy: f64,
+}

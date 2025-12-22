@@ -57,7 +57,7 @@ interface SettingsPanelProps {
   onDataChanged?: () => void;
 }
 
-type ConfirmAction = 'deleteAll' | 'resetAi' | 'resetClustering' | 'clearEmbeddings' | 'clearHierarchy' | 'resetPrivacy' | 'fullRebuild' | 'flattenHierarchy' | 'consolidateRoot' | 'tidyDatabase' | 'classifyContent' | null;
+type ConfirmAction = 'deleteAll' | 'resetAi' | 'resetClustering' | 'clearEmbeddings' | 'clearHierarchy' | 'resetPrivacy' | 'fullRebuild' | 'flattenHierarchy' | 'consolidateRoot' | 'tidyDatabase' | 'classifyContent' | 'scorePrivacy' | null;
 
 interface TidyReport {
   sameNameMerged: number;
@@ -140,6 +140,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const [isConsolidating, setIsConsolidating] = useState(false);
   const [isTidying, setIsTidying] = useState(false);
   const [isClassifying, setIsClassifying] = useState(false);
+  const [isScoringPrivacy, setIsScoringPrivacy] = useState(false);
   const [operationResult, setOperationResult] = useState<string | null>(null);
 
   // Setup flow operations
@@ -929,6 +930,22 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
           return msg;
         } finally {
           setIsClassifying(false);
+        }
+      },
+    },
+    scorePrivacy: {
+      title: 'Score Privacy',
+      message: `AI will score all items 0.0-1.0 for public shareability. Items < 0.3 are considered private and will be separated during clustering. Estimated cost: ~$0.30 for 4700 items.`,
+      handler: async () => {
+        setIsScoringPrivacy(true);
+        setOperationResult(null);
+        try {
+          const result = await invoke<{ itemsScored: number; batchesProcessed: number; errorCount: number }>('score_privacy_all_items', { forceRescore: false });
+          const msg = `Scored ${result.itemsScored} items in ${result.batchesProcessed} batches${result.errorCount > 0 ? ` (${result.errorCount} errors)` : ''}`;
+          setOperationResult(msg);
+          return msg;
+        } finally {
+          setIsScoringPrivacy(false);
         }
       },
     },
@@ -1748,10 +1765,29 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   </div>
                   <button
                     onClick={() => setConfirmAction('classifyContent')}
-                    disabled={isClassifying || isFullRebuilding || isFlattening || isConsolidating || isTidying}
+                    disabled={isClassifying || isFullRebuilding || isFlattening || isConsolidating || isTidying || isScoringPrivacy}
                     className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-violet-600 hover:bg-violet-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isClassifying ? <Loader2 className="w-5 h-5 animate-spin" /> : '🏷️'}
+                  </button>
+                </div>
+
+                {/* Score Privacy */}
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-rose-600 flex items-center justify-center text-white text-sm">
+                    <Shield className="w-3.5 h-3.5" />
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Score Privacy</div>
+                    <div className="text-xs text-gray-500">AI scores items 0.0 (private) to 1.0 (public) for clustering separation</div>
+                    <div className="text-xs text-amber-400 mt-0.5">~$0.30 for 4700 items · 25 items/batch</div>
+                  </div>
+                  <button
+                    onClick={() => setConfirmAction('scorePrivacy')}
+                    disabled={isScoringPrivacy || isFullRebuilding || isFlattening || isConsolidating || isTidying || isClassifying}
+                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-rose-600 hover:bg-rose-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                  >
+                    {isScoringPrivacy ? <Loader2 className="w-5 h-5 animate-spin" /> : '🔒'}
                   </button>
                 </div>
 

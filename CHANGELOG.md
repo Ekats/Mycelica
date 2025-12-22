@@ -5,6 +5,12 @@ All notable changes to Mycelica will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Privacy scoring system**: Continuous 0.0-1.0 privacy scores for items (0.0=private, 1.0=public) scored by AI via Haiku
+  - `score_privacy_all_items` command processes items in batches of 25
+  - "Score Privacy" button in Settings → Maintenance with cost estimation
+  - Privacy propagation: categories inherit minimum privacy of their children
+  - Private items (< 0.3) automatically moved to "Personal" category during hierarchy build
+  - `get_shareable_items(min_privacy)` export filter for sharing sanitized databases
 - **Content classification system**: Items are now classified by type (idea/code/debug/paste) using pattern matching. This separates conversational content from supporting artifacts.
 - **Mini-clustering associations**: Supporting items (code/debug/paste) are automatically associated with related idea nodes using embedding similarity (70%) + time proximity (30%).
 - **Associated items sidebar in Leaf View**: When viewing an idea, a right sidebar shows associated code snippets, debug logs, and pastes with clickable links.
@@ -37,6 +43,11 @@ All notable changes to Mycelica will be documented in this file.
 - **Expanded garbage word list**: Added "mixed", "assorted", "combined", "merged", "grouped", "sorted" to filter meaningless AI-generated names
 
 ### Technical
+- Added `privacy REAL` column to nodes table (0.0=private, 1.0=public, NULL=unscored)
+- Added `propagate_privacy_scores()` in hierarchy.rs - bottom-up propagation where category privacy = min(children)
+- Privacy filter in clustering.rs excludes items with privacy < 0.3 from main clustering
+- "Personal" category (🔒) auto-created during hierarchy build for private items
+- JSON parser for AI responses now handles trailing commas (common Haiku issue)
 - Added `GARBAGE_NAMES` constant and `is_garbage_name()` filter function in `hierarchy.rs` to reject meaningless AI-generated category names
 - Added `MAX_HIERARCHY_DEPTH` (15) constant to prevent runaway depth during recursive grouping
 - Uber-category consolidation (Step 4.5) now filters garbage names and protects project nodes from reparenting

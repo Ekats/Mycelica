@@ -360,6 +360,18 @@ impl Database {
             eprintln!("Migration: Added content_type and associated_idea_id columns for mini-clustering");
         }
 
+        // Migration: Add privacy score column (continuous 0.0-1.0 scale)
+        let has_privacy_score: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('nodes') WHERE name = 'privacy'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !has_privacy_score {
+            conn.execute("ALTER TABLE nodes ADD COLUMN privacy REAL", [])?;
+            eprintln!("Migration: Added privacy score column (0.0=private, 1.0=public)");
+        }
+
         // Create indexes for dynamic hierarchy columns (after migrations ensure columns exist)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_depth ON nodes(depth)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_is_item ON nodes(is_item)", [])?;
@@ -371,6 +383,7 @@ impl Database {
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_is_processed ON nodes(is_processed)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_content_type ON nodes(content_type)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_associated_idea ON nodes(associated_idea_id)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_privacy ON nodes(privacy)", [])?;
 
         // Rebuild FTS index to fix any corruption from interrupted writes (e.g., HMR during dev)
         // This is safe to run on every startup - it rebuilds from the content table
@@ -385,8 +398,8 @@ impl Database {
     pub fn insert_node(&self, node: &Node) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO nodes (id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, source, content_type, associated_idea_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+            "INSERT INTO nodes (id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, source, content_type, associated_idea_id, privacy)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
             params![
                 node.id,
                 node.node_type.as_str(),
@@ -416,6 +429,7 @@ impl Database {
                 node.source,
                 node.content_type,
                 node.associated_idea_id,
+                node.privacy,
             ],
         )?;
         Ok(())
@@ -560,11 +574,12 @@ impl Database {
             source: row.get(28)?,
             content_type: row.get(29)?,
             associated_idea_id: row.get(30)?,
+            privacy: row.get(31)?,
         })
     }
 
     /// Standard SELECT columns for nodes (excludes embedding - use dedicated functions)
-    const NODE_COLUMNS: &'static str = "id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date, is_private, privacy_reason, source, content_type, associated_idea_id";
+    const NODE_COLUMNS: &'static str = "id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date, is_private, privacy_reason, source, content_type, associated_idea_id, privacy";
 
     pub fn get_all_nodes(&self) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
@@ -585,7 +600,7 @@ impl Database {
              ai_title = ?11, summary = ?12, tags = ?13, emoji = ?14, is_processed = ?15,
              depth = ?16, is_item = ?17, is_universe = ?18, parent_id = ?19, child_count = ?20,
              conversation_id = ?21, sequence_index = ?22, is_pinned = ?23, last_accessed_at = ?24,
-             content_type = ?25, associated_idea_id = ?26 WHERE id = ?1",
+             content_type = ?25, associated_idea_id = ?26, privacy = ?27 WHERE id = ?1",
             params![
                 node.id,
                 node.node_type.as_str(),
@@ -613,6 +628,7 @@ impl Database {
                 node.last_accessed_at,
                 node.content_type,
                 node.associated_idea_id,
+                node.privacy,
             ],
         )?;
         Ok(())
@@ -634,7 +650,7 @@ impl Database {
         Ok(())
     }
 
-    // Privacy operations
+    // Privacy operations (legacy boolean is_private)
     pub fn update_node_privacy(&self, node_id: &str, is_private: bool, reason: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -642,6 +658,61 @@ impl Database {
             params![node_id, is_private as i32, reason],
         )?;
         Ok(())
+    }
+
+    // Privacy scoring operations (continuous 0.0-1.0 scale)
+    /// Update the privacy score for a node (0.0 = private, 1.0 = public)
+    pub fn update_privacy_score(&self, node_id: &str, privacy: f64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE nodes SET privacy = ?2 WHERE id = ?1",
+            params![node_id, privacy],
+        )?;
+        Ok(())
+    }
+
+    /// Get items that need privacy scoring (privacy IS NULL)
+    pub fn get_items_needing_privacy_scoring(&self) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE is_item = 1 AND privacy IS NULL ORDER BY created_at DESC",
+            Self::NODE_COLUMNS
+        ))?;
+        let nodes = stmt.query_map([], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
+        Ok(nodes)
+    }
+
+    /// Count items needing privacy scoring
+    pub fn count_items_needing_privacy_scoring(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND privacy IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// Get items with privacy score >= threshold (for export filtering)
+    pub fn get_shareable_items(&self, min_privacy: f64) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE is_item = 1 AND privacy >= ?1 ORDER BY created_at DESC",
+            Self::NODE_COLUMNS
+        ))?;
+        let nodes = stmt.query_map([min_privacy], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
+        Ok(nodes)
+    }
+
+    /// Count shareable items with privacy >= threshold
+    pub fn count_shareable_items(&self, min_privacy: f64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND privacy >= ?1",
+            [min_privacy],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
     }
 
     /// Reset all privacy flags to unscanned state (is_private = NULL)
@@ -1648,6 +1719,7 @@ impl Database {
             source: None,
             content_type: None,
             associated_idea_id: None,
+            privacy: None,
         };
 
         self.insert_node(&node)

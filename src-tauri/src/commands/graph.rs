@@ -153,6 +153,7 @@ pub fn add_note(state: State<AppState>, title: String, content: String) -> Resul
             source: None,
             content_type: None,
             associated_idea_id: None,
+            privacy: None,
         };
         state.db.read().unwrap().insert_node(&container_node).map_err(|e| e.to_string())?;
 
@@ -200,6 +201,7 @@ pub fn add_note(state: State<AppState>, title: String, content: String) -> Resul
         source: None,
         content_type: None,
         associated_idea_id: None,
+        privacy: None,
     };
 
     state.db.read().unwrap().insert_node(&note).map_err(|e| e.to_string())?;
@@ -1216,6 +1218,7 @@ pub async fn quick_add_to_hierarchy(
                 source: None,
                 content_type: None,
                 associated_idea_id: None,
+                privacy: None,
             };
             state.db.read().unwrap().insert_node(&inbox_node).map_err(|e| e.to_string())?;
             state.db.read().unwrap().increment_child_count(&universe.id).map_err(|e| e.to_string())?;
@@ -1303,6 +1306,7 @@ pub async fn quick_add_to_hierarchy(
                     source: None,
                     content_type: None,
                     associated_idea_id: None,
+                    privacy: None,
                 };
 
                 state.db.read().unwrap().insert_node(&topic_node).map_err(|e| e.to_string())?;
@@ -1477,6 +1481,7 @@ pub async fn consolidate_root(state: State<'_, AppState>) -> Result<ConsolidateR
             source: None,
             content_type: None,
             associated_idea_id: None,
+            privacy: None,
         };
 
         state.db.read().unwrap().insert_node(&uber_node).map_err(|e| e.to_string())?;

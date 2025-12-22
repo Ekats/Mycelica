@@ -135,8 +135,51 @@ fn compute_topic_centroids_from_items(
     centroids
 }
 
-/// Maximum children per node before we need to group them
-const MAX_CHILDREN_PER_LEVEL: usize = 15;
+/// Get maximum children allowed for a given depth level
+/// Tiered limits for clean navigation at top, more permissive at depth
+fn max_children_for_depth(depth: i32) -> usize {
+    match depth {
+        0 | 1 => 10,  // Universe + L1: strict navigation
+        2 => 25,      // L2: buffer layer
+        3 => 50,      // L3: topic groupings
+        4 => 100,     // L4: normal max depth
+        _ => 150,     // L5+: coherent mega-clusters only
+    }
+}
+
+/// Check if children are coherent enough to warrant deep splitting (L5+)
+/// Returns true if splitting makes sense, false if it would just create noise
+fn is_coherent_for_deep_split(children: &[Node]) -> bool {
+    // Separate items from categories
+    let items: Vec<_> = children.iter().filter(|c| c.is_item).collect();
+    let categories: Vec<_> = children.iter().filter(|c| !c.is_item).collect();
+
+    // If mostly categories → coherent (they're already grouped)
+    if categories.len() > items.len() {
+        return true;
+    }
+
+    // If mostly items → check cluster_id coherence
+    let mut cluster_counts: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+    for item in &items {
+        if let Some(cluster_id) = item.cluster_id {
+            *cluster_counts.entry(cluster_id).or_default() += 1;
+        }
+    }
+
+    if let Some(max_count) = cluster_counts.values().max() {
+        if *max_count as f32 / items.len() as f32 >= 0.8 {
+            return true; // 80%+ items from same cluster = coherent
+        }
+    }
+
+    // No cluster_ids at all? Default to coherent (can't prove incoherence)
+    if cluster_counts.is_empty() {
+        return true;
+    }
+
+    false // Diverse cluster_ids = incoherent noise
+}
 
 /// Names that indicate AI couldn't produce a meaningful grouping
 const GARBAGE_NAMES: &[&str] = &[
@@ -240,13 +283,22 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
     // Step 2: Get all items (excluding protected)
     let all_items = db.get_items().map_err(|e| e.to_string())?;
     let protected_ids = db.get_protected_node_ids();
-    let items: Vec<Node> = all_items
+    let after_protected: Vec<Node> = all_items
         .into_iter()
         .filter(|item| !protected_ids.contains(&item.id))
         .collect();
 
     if !protected_ids.is_empty() {
         println!("[Hierarchy] Excluding {} protected items (Recent Notes)", protected_ids.len());
+    }
+
+    // Step 2.5: Separate private items (privacy < 0.3) - they go to Personal category
+    let (private_items, items): (Vec<Node>, Vec<Node>) = after_protected
+        .into_iter()
+        .partition(|item| item.privacy.map(|p| p < 0.3).unwrap_or(false));
+
+    if !private_items.is_empty() {
+        println!("[Hierarchy] Found {} private items (privacy < 0.3) - will go to Personal category", private_items.len());
     }
 
     let item_count = items.len();
@@ -360,6 +412,7 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
             source: None,
             content_type: None,
             associated_idea_id: None,
+            privacy: None,
         };
 
         db.insert_node(&topic_node).map_err(|e| e.to_string())?;
@@ -384,17 +437,81 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
             .map_err(|e| e.to_string())?;
     }
 
-    // Update child count on Universe
-    db.update_child_count(&universe_id, topic_ids.len() as i32)
+    // Update child count on Universe (will be updated again if we add Personal)
+    let mut universe_child_count = topic_ids.len() as i32;
+    db.update_child_count(&universe_id, universe_child_count)
         .map_err(|e| e.to_string())?;
 
-    println!("Hierarchy complete: Universe -> {} topics -> {} items",
-             topics_created, item_count);
+    // Step 7: Handle private items - create Personal category
+    let mut private_count = 0;
+    if !private_items.is_empty() {
+        let personal_id = "category-personal".to_string();
+
+        // Create Personal category at depth 1 (same level as topics)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let personal_node = Node {
+            id: personal_id.clone(),
+            node_type: NodeType::Cluster,
+            title: "Personal".to_string(),
+            url: None,
+            content: None,
+            position: Position { x: 0.0, y: 0.0 },
+            created_at: now,
+            updated_at: now,
+            cluster_id: None,
+            cluster_label: Some("Personal".to_string()),
+            ai_title: Some("Personal".to_string()),
+            summary: Some("Private items (privacy score < 0.3)".to_string()),
+            tags: None,
+            emoji: Some("🔒".to_string()),
+            is_processed: true,
+            depth: topic_depth,
+            is_item: false,
+            is_universe: false,
+            parent_id: Some(universe_id.clone()),
+            child_count: private_items.len() as i32,
+            conversation_id: None,
+            sequence_index: None,
+            is_pinned: false,
+            last_accessed_at: None,
+            latest_child_date: None,
+            is_private: None,
+            privacy_reason: None,
+            source: None,
+            content_type: None,
+            associated_idea_id: None,
+            privacy: Some(0.0), // Category is private since it contains private items
+        };
+
+        db.insert_node(&personal_node).map_err(|e| e.to_string())?;
+
+        // Reparent private items under Personal
+        for item in &private_items {
+            db.update_node_hierarchy(&item.id, Some(&personal_id), item_depth)
+                .map_err(|e| e.to_string())?;
+            private_count += 1;
+        }
+
+        // Update Universe child count to include Personal
+        universe_child_count += 1;
+        db.update_child_count(&universe_id, universe_child_count)
+            .map_err(|e| e.to_string())?;
+
+        println!("[Hierarchy] Created Personal category with {} private items", private_count);
+    }
+
+    let total_items = item_count + private_count;
+    println!("Hierarchy complete: Universe -> {} topics + Personal -> {} items",
+             topics_created, total_items);
 
     Ok(HierarchyResult {
         levels_created: 3,  // Universe, Topics, Items
-        intermediate_nodes_created: topics_created + 1,  // topics + universe
-        items_organized: item_count,
+        intermediate_nodes_created: topics_created + 1 + (if private_count > 0 { 1 } else { 0 }),  // topics + universe + personal
+        items_organized: total_items,
         max_depth: item_depth,
     })
 }
@@ -540,6 +657,7 @@ fn create_parent_level(
             source: None,
             content_type: None,
             associated_idea_id: None,
+            privacy: None,
         };
 
         db.insert_node(&parent_node).map_err(|e| e.to_string())?;
@@ -601,6 +719,7 @@ fn create_universe(db: &Database, child_ids: &[String]) -> Result<String, String
         source: None,
         content_type: None,
         associated_idea_id: None,
+        privacy: None,
     };
 
     db.insert_node(&universe_node).map_err(|e| e.to_string())?;
@@ -756,7 +875,8 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 
 /// Cluster children of a specific parent into 8-15 groups using AI
 ///
-/// If parent has <= MAX_CHILDREN_PER_LEVEL children, returns Ok(false) - no grouping needed.
+/// If parent has <= max_children_for_depth(depth) children, returns Ok(false) - no grouping needed.
+/// Tiered limits: L0/L1=10, L2=25, L3=50, L4=100, L5+=150
 /// Otherwise, creates new intermediate nodes and reparents children.
 ///
 /// For large datasets (>200 children), splits into batches of 150, calls AI for each,
@@ -764,6 +884,14 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 /// max_groups: maximum number of categories to create (default 5 if None for manual splits)
 pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option<&AppHandle>, max_groups: Option<usize>) -> Result<bool, String> {
     let max_groups = max_groups.unwrap_or(5); // Default to 5 for manual splits
+    // 1. Get parent node info first (need depth for tiered limits)
+    let parent_node = db.get_node(parent_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Parent node {} not found", parent_id))?;
+
+    let parent_depth = parent_node.depth;
+    let max_for_depth = max_children_for_depth(parent_depth);
+
     // Get children of this parent (excluding protected)
     let all_children = db.get_children(parent_id).map_err(|e| e.to_string())?;
     let all_children_count = all_children.len();
@@ -778,20 +906,25 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
         emit_log(app, "info", &format!("Excluding {} protected nodes (Recent Notes) from grouping", excluded_count));
     }
 
-    if children.len() <= MAX_CHILDREN_PER_LEVEL {
-        emit_log(app, "info", &format!("Parent {} has {} children (≤{}), no grouping needed",
-                 parent_id, children.len(), MAX_CHILDREN_PER_LEVEL));
+    if children.len() <= max_for_depth {
+        emit_log(app, "info", &format!("Parent {} (depth {}) has {} children (≤{}), no grouping needed",
+                 parent_id, parent_depth, children.len(), max_for_depth));
         return Ok(false);
     }
 
-    emit_log(app, "info", &format!("Grouping {} children of {} into max {} categories", children.len(), parent_id, max_groups));
+    // L5+ coherence gate: don't split incoherent noise deeper
+    if parent_depth >= 4 && !is_coherent_for_deep_split(&children) {
+        emit_log(app, "warn", &format!(
+            "Parent {} (depth {}) has {} children but they're incoherent - skipping L5 split",
+            parent_id, parent_depth, children.len()
+        ));
+        return Ok(false);
+    }
+
+    emit_log(app, "info", &format!("Grouping {} children of {} (depth {}, max {}) into categories",
+             children.len(), parent_id, parent_depth, max_for_depth));
 
     // === Gather hierarchy context for AI ===
-
-    // 1. Get parent node info
-    let parent_node = db.get_node(parent_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Parent node {} not found", parent_id))?;
 
     // 2. Build hierarchy path (walk up to Universe)
     let hierarchy_path = build_hierarchy_path(db, parent_id)?;
@@ -973,6 +1106,26 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
         // Track max category size for pathological detection
         max_category_size = max_category_size.max(matching_children.len());
 
+        // Check for duplicate name: if a category with same name already exists under this parent, merge into it
+        let existing_siblings = db.get_children(parent_id).map_err(|e| e.to_string())?;
+        let existing_category = existing_siblings.iter()
+            .find(|c| !c.is_item && c.title.to_lowercase() == grouping.name.to_lowercase());
+
+        if let Some(existing) = existing_category {
+            // Merge into existing category instead of creating duplicate
+            emit_log(app, "info", &format!("Merging {} children into existing '{}'", matching_children.len(), existing.title));
+
+            for child in &matching_children {
+                db.update_parent(&child.id, &existing.id).map_err(|e| e.to_string())?;
+                all_children_to_update.push(child.id.clone());
+            }
+
+            // Update child_count on existing category
+            let new_count = existing.child_count + matching_children.len() as i32;
+            db.update_child_count(&existing.id, new_count).map_err(|e| e.to_string())?;
+            continue; // Skip creating new node
+        }
+
         // Create intermediate node with unique ID (timestamp prevents collision across iterations)
         let category_id = format!("{}-cat-{}-{}", parent_id, timestamp_suffix, idx);
 
@@ -1007,13 +1160,14 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
             source: None,
             content_type: None,
             associated_idea_id: None,
+            privacy: None,
         };
 
         db.insert_node(&category_node).map_err(|e| e.to_string())?;
         categories_created += 1;
 
         // Reparent children to this category and collect for batch depth update
-        for child in matching_children {
+        for child in &matching_children {
             db.update_parent(&child.id, &category_id).map_err(|e| e.to_string())?;
             all_children_to_update.push(child.id.clone());
         }
@@ -1242,6 +1396,7 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
                 source: None,
                 content_type: None,
                 associated_idea_id: None,
+                privacy: None,
             };
 
             // Insert umbrella node
@@ -1278,10 +1433,11 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
         .ok_or("No Universe found")?;
     let universe_children = db.get_children(&universe.id).map_err(|e| e.to_string())?;
     let mut uber_categories_created = 0;
+    let universe_max = max_children_for_depth(0); // L0 = 10
 
-    if universe_children.len() > 15 {
+    if universe_children.len() > universe_max {
         emit_log(app, "info", "");
-        emit_log(app, "info", &format!("▶ Consolidating Universe ({} direct children → uber-categories)", universe_children.len()));
+        emit_log(app, "info", &format!("▶ Consolidating Universe ({} direct children > {}, grouping into uber-categories)", universe_children.len(), universe_max));
         emit_log(app, "info", "───────────────────────────────────────────────────────────");
 
         // Build TopicInfo for uber-category grouping
@@ -1369,6 +1525,7 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
                         source: None,
                         content_type: None,
                         associated_idea_id: None,
+                        privacy: None,
                     };
 
                     db.insert_node(&uber_node).map_err(|e| e.to_string())?;
@@ -1667,6 +1824,17 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
         emit_log(app, "info", "  ✓ Latest dates propagated to all nodes");
     }
 
+    // Propagate privacy scores from items up to categories
+    emit_log(app, "info", "");
+    emit_log(app, "info", "───────────────────────────────────────────────────────────");
+    let privacy_propagated = match propagate_privacy_scores(db, app) {
+        Ok(count) => count,
+        Err(e) => {
+            emit_log(app, "warn", &format!("  Failed to propagate privacy: {}", e));
+            0
+        }
+    };
+
     emit_log(app, "info", "");
     emit_log(app, "info", "═══════════════════════════════════════════════════════════");
     emit_log(app, "info", "✓ HIERARCHY BUILD COMPLETE");
@@ -1675,6 +1843,7 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
     emit_log(app, "info", &format!("  • {} grouping iterations", grouping_iterations));
     emit_log(app, "info", &format!("  • {} hierarchy levels (depth 0-{})", final_max_depth + 1, final_max_depth));
     emit_log(app, "info", &format!("  • {} semantic edges", semantic_edges_created));
+    emit_log(app, "info", &format!("  • {} categories with propagated privacy", privacy_propagated));
     emit_log(app, "info", "═══════════════════════════════════════════════════════════");
 
     Ok(FullHierarchyResult {
@@ -1725,24 +1894,30 @@ fn find_node_needing_grouping_excluding(
 
             let children = db.get_children(&node_id).map_err(|e| e.to_string())?;
             let child_count = children.len();
+            let max_for_this_depth = max_children_for_depth(depth);
 
-            // Count non-item children (categories that could be grouped)
-            let non_item_children: Vec<_> = children.iter().filter(|c| !c.is_item).collect();
-            let non_item_count = non_item_children.len();
-
-            // Check if this node has too many children
-            if child_count > MAX_CHILDREN_PER_LEVEL && non_item_count > 0 {
-                emit_log(app, "debug", &format!(
-                    "Found node needing grouping: {} (depth {}, {} children, {} non-items)",
-                    node_id, depth, child_count, non_item_count
-                ));
-                return Ok(Some(node_id));
+            // Check if this node has too many children (items OR groups - fixes mega-topic bug)
+            if child_count > max_for_this_depth {
+                // L5+ coherence gate: don't split incoherent noise deeper
+                if depth >= 4 && !is_coherent_for_deep_split(&children) {
+                    emit_log(app, "debug", &format!(
+                        "Skipping {} (depth {}, {} children) - incoherent for L5 split",
+                        node_id, depth, child_count
+                    ));
+                } else {
+                    let non_item_count = children.iter().filter(|c| !c.is_item).count();
+                    emit_log(app, "debug", &format!(
+                        "Found node needing grouping: {} (depth {}, {} children, {} non-items, max {})",
+                        node_id, depth, child_count, non_item_count, max_for_this_depth
+                    ));
+                    return Ok(Some(node_id));
+                }
             }
 
             // Add non-item children to queue for BFS traversal
-            for child in children {
+            for child in &children {
                 if !child.is_item {
-                    queue.push((child.id, depth + 1));
+                    queue.push((child.id.clone(), depth + 1));
                 }
             }
         }
@@ -1773,4 +1948,51 @@ pub fn get_children_skip_single_chain(db: &Database, parent_id: &str) -> Result<
 
         return Ok(children);
     }
+}
+
+/// Propagate privacy scores from items up through the category hierarchy
+///
+/// Category privacy = minimum of children's privacy scores (most restrictive wins)
+/// This ensures a category is only as public as its most private child.
+pub fn propagate_privacy_scores(db: &Database, app: Option<&tauri::AppHandle>) -> Result<usize, String> {
+    emit_log(app, "info", "Propagating privacy scores to categories...");
+
+    let max_depth = db.get_max_depth().map_err(|e| e.to_string())?;
+    let mut categories_updated = 0;
+
+    // Bottom-up: start from deepest level (above items) and work to root
+    // Items are at max_depth, so categories start at max_depth - 1
+    for depth in (0..max_depth).rev() {
+        let nodes_at_depth = db.get_nodes_at_depth(depth).map_err(|e| e.to_string())?;
+
+        for node in nodes_at_depth {
+            // Skip items (they have their own scores from AI)
+            if node.is_item {
+                continue;
+            }
+
+            // Get children's privacy scores
+            let children = db.get_children(&node.id).map_err(|e| e.to_string())?;
+            if children.is_empty() {
+                continue;
+            }
+
+            // Category privacy = min of children (most restrictive wins)
+            // Only consider children that have privacy scores
+            let min_privacy: Option<f64> = children.iter()
+                .filter_map(|c| c.privacy)
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+            if let Some(privacy) = min_privacy {
+                if let Err(e) = db.update_privacy_score(&node.id, privacy) {
+                    emit_log(app, "warn", &format!("Failed to update privacy for {}: {}", node.id, e));
+                } else {
+                    categories_updated += 1;
+                }
+            }
+        }
+    }
+
+    emit_log(app, "info", &format!("✓ Privacy propagated to {} categories", categories_updated));
+    Ok(categories_updated)
 }

@@ -47,7 +47,7 @@ use commands::{
     // Processing stats commands
     get_processing_stats, add_ai_processing_time, add_rebuild_time,
     // Privacy filtering commands
-    analyze_node_privacy, analyze_all_privacy, analyze_categories_privacy, cancel_privacy_scan, reset_privacy_flags, get_privacy_stats, export_shareable_db, set_node_privacy,
+    analyze_node_privacy, analyze_all_privacy, analyze_categories_privacy, cancel_privacy_scan, reset_privacy_flags, get_privacy_stats, export_shareable_db, set_node_privacy, score_privacy_all_items,
     // Recent Notes protection commands
     get_protect_recent_notes, set_protect_recent_notes,
     // Local embeddings commands
@@ -247,6 +247,7 @@ pub fn run() {
             get_privacy_stats,
             export_shareable_db,
             set_node_privacy,
+            score_privacy_all_items,
             // Recent Notes protection
             get_protect_recent_notes,
             set_protect_recent_notes,

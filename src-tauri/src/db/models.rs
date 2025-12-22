@@ -139,6 +139,9 @@ pub struct Node {
     pub content_type: Option<String>,     // "idea" | "code" | "debug" | "paste" | NULL
     #[serde(rename = "associatedIdeaId")]
     pub associated_idea_id: Option<String>, // Links supporting item to specific idea node
+
+    // Privacy scoring (continuous scale)
+    pub privacy: Option<f64>,             // 0.0 = private, 1.0 = public, NULL = unscored
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

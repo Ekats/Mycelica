@@ -1193,9 +1193,29 @@ CRITICAL RULES:
    - FORBIDDEN: "Other", "Miscellaneous", "General", "Various", "Mixed", "Uncategorized"
    - For orphan topics: find a meaningful connector or use "{parent_name} Tangents"
 
-5. MEANINGFUL SPECIFIC NAMES (2-4 words):
-   - BAD: "Other Topics", "Misc Programming"
-   - GOOD: "Side Projects", "Exploratory Research", "Legacy Systems"
+5. NAMING PRINCIPLES (quality over length):
+
+   a) MAXIMIZE INFORMATION DENSITY
+      - Every word must add meaning. No filler words.
+      - BAD: "Technical Implementation Details" → GOOD: "React Hooks"
+
+   b) AVOID ANCESTOR WORDS
+      - Never repeat words already in the path: {hierarchy_path}
+      - Find synonyms or go more specific
+
+   c) DIFFERENTIATE FROM SIBLINGS
+      - Your names must be distinct from: {siblings}
+      - Each category occupies unique semantic space
+
+   d) PREFER CONCRETE NOUNS
+      - Concrete: "API Endpoints", "Database Migrations", "Auth Tokens"
+      - NOT abstract scaffolding: "Core Concepts", "Key Areas", "Main Topics"
+      - Name tells WHAT's inside, not that something IS inside
+
+   e) DEPTH-APPROPRIATE SPECIFICITY
+      - Depth 1: Broad domains — "AI & Data", "Career", "Creative"
+      - Depth 2-3: Sub-areas — "Machine Learning", "Interview Prep"
+      - Depth 4+: Specific — "BERT Fine-tuning", "System Design"
 
 TOPICS TO ORGANIZE ({count} total):
 {topics_section}

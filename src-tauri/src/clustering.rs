@@ -155,7 +155,7 @@ pub async fn run_clustering(db: &Database, _use_ai: bool) -> Result<ClusteringRe
 
     // Filter out supporting items (code/debug/paste/trivial) - only cluster ideas
     let total_after_protected = after_protected.len();
-    let items: Vec<Node> = after_protected
+    let after_content_filter: Vec<Node> = after_protected
         .into_iter()
         .filter(|item| {
             match item.content_type.as_deref() {
@@ -166,9 +166,18 @@ pub async fn run_clustering(db: &Database, _use_ai: bool) -> Result<ClusteringRe
         })
         .collect();
 
-    let skipped_supporting_count = total_after_protected - items.len();
+    let skipped_supporting_count = total_after_protected - after_content_filter.len();
     if skipped_supporting_count > 0 {
         println!("[Clustering] Skipping {} supporting items (code/debug/paste)", skipped_supporting_count);
+    }
+
+    // Filter out highly private items (privacy < 0.3) - they go to Personal category
+    let (private_items, items): (Vec<Node>, Vec<Node>) = after_content_filter
+        .into_iter()
+        .partition(|item| item.privacy.map(|p| p < 0.3).unwrap_or(false));
+
+    if !private_items.is_empty() {
+        println!("[Clustering] Excluding {} private items (privacy < 0.3) - will go to Personal category", private_items.len());
     }
 
     if items.is_empty() {
