@@ -153,22 +153,28 @@ pub async fn run_clustering(db: &Database, _use_ai: bool) -> Result<ClusteringRe
         println!("[Clustering] Skipping {} protected items (Recent Notes)", skipped_protected);
     }
 
-    // Filter out supporting items (code/debug/paste/trivial) - only cluster ideas
+    // Filter out non-visible items - only cluster VISIBLE tier (insight, exploration, synthesis, question, planning)
+    // SUPPORTING tier (investigation, discussion, reference, creative) and HIDDEN tier (debug, code, paste, trivial) are excluded
     let total_after_protected = after_protected.len();
     let after_content_filter: Vec<Node> = after_protected
         .into_iter()
         .filter(|item| {
             match item.content_type.as_deref() {
-                None | Some("idea") | Some("investigation") => true,  // Include ideas, investigations, and unclassified
+                // VISIBLE tier - cluster these
+                None | Some("insight") | Some("idea") | Some("exploration") |
+                Some("synthesis") | Some("question") | Some("planning") => true,
+                // SUPPORTING tier - exclude from clustering
+                Some("investigation") | Some("discussion") | Some("reference") | Some("creative") => false,
+                // HIDDEN tier - exclude from clustering
                 Some("code") | Some("debug") | Some("paste") | Some("trivial") => false,
-                _ => true,  // Include any unknown types
+                _ => true,  // Include any unknown types (backwards compat)
             }
         })
         .collect();
 
     let skipped_supporting_count = total_after_protected - after_content_filter.len();
     if skipped_supporting_count > 0 {
-        println!("[Clustering] Skipping {} supporting items (code/debug/paste)", skipped_supporting_count);
+        println!("[Clustering] Skipping {} non-visible items (supporting/hidden)", skipped_supporting_count);
     }
 
     // Filter out highly private items (privacy < 0.3) - they go to Personal category
@@ -329,11 +335,23 @@ async fn ensure_embeddings(
     Ok(result)
 }
 
+/// Conversation bonus for items from the same conversation
+/// Same conversation = same session of thought, provides cheap structural signal
+const CONVERSATION_BONUS: f32 = 0.1;
+
+/// Tag bonus per shared tag between items
+/// Persistent tags provide stable similarity anchors across rebuilds
+const TAG_BONUS_PER_TAG: f32 = 0.08;
+
 /// Agglomerative clustering using cosine similarity on embeddings
 /// Uses Union-Find for O(n²) complexity instead of O(n³)
+///
+/// Items from the same conversation get a small similarity bonus (0.1)
+/// Items with shared tags get additional bonus (+0.08 per shared tag)
 fn agglomerative_cluster_embeddings(
-    embeddings: &[(String, Vec<f32>)],
+    embeddings: &[(String, Vec<f32>, Option<String>)],  // (id, embedding, conversation_id)
     threshold: f32,
+    item_tags: &HashMap<String, Vec<String>>,  // Pre-loaded item -> tags mapping
 ) -> Vec<Vec<usize>> {
     let n = embeddings.len();
     if n == 0 {
@@ -346,7 +364,18 @@ fn agglomerative_cluster_embeddings(
     // Single pass: union all pairs above threshold - O(n²)
     for i in 0..n {
         for j in (i + 1)..n {
-            let sim = cosine_similarity(&embeddings[i].1, &embeddings[j].1);
+            let base_sim = cosine_similarity(&embeddings[i].1, &embeddings[j].1);
+
+            // Add conversation bonus if both items are from the same conversation
+            let same_conversation = embeddings[i].2.is_some()
+                && embeddings[i].2 == embeddings[j].2;
+            let conversation_bonus = if same_conversation { CONVERSATION_BONUS } else { 0.0 };
+
+            // Add tag bonus for shared persistent tags
+            let tag_bonus = compute_tag_bonus(&embeddings[i].0, &embeddings[j].0, item_tags);
+
+            let sim = (base_sim + conversation_bonus + tag_bonus).min(1.0);
+
             if sim >= threshold {
                 uf.union(i, j);
             }
@@ -363,18 +392,34 @@ fn agglomerative_cluster_embeddings(
     groups.into_values().collect()
 }
 
+/// Compute similarity bonus based on shared tags between two items
+fn compute_tag_bonus(item_a_id: &str, item_b_id: &str, item_tags: &HashMap<String, Vec<String>>) -> f32 {
+    let tags_a = item_tags.get(item_a_id);
+    let tags_b = item_tags.get(item_b_id);
+
+    match (tags_a, tags_b) {
+        (Some(a), Some(b)) => {
+            // Count shared tags
+            let shared_count = a.iter().filter(|t| b.contains(t)).count();
+            shared_count as f32 * TAG_BONUS_PER_TAG
+        }
+        _ => 0.0,
+    }
+}
+
 /// Cluster a single batch of items using agglomerative clustering
 /// Returns: Vec<(centroid, Vec<item_indices>)>
 fn cluster_batch(
-    embeddings: &[(String, Vec<f32>)],
+    embeddings: &[(String, Vec<f32>, Option<String>)],  // (id, embedding, conversation_id)
     threshold: f32,
+    item_tags: &HashMap<String, Vec<String>>,  // Pre-loaded item -> tags mapping
 ) -> Vec<(Vec<f32>, Vec<usize>)> {
     if embeddings.is_empty() {
         return vec![];
     }
 
     // Use existing agglomerative clustering for small batch
-    let cluster_groups = agglomerative_cluster_embeddings(embeddings, threshold);
+    let cluster_groups = agglomerative_cluster_embeddings(embeddings, threshold, item_tags);
 
     // Compute centroid for each cluster
     cluster_groups.iter().map(|indices| {
@@ -498,9 +543,20 @@ fn merge_similar_clusters(
 
 /// Cluster items using embedding similarity
 /// Returns cluster assignments in MultiClusterAssignment format
+///
+/// `use_ai_naming`: true = use AI for cluster names (costs $), false = use keywords (FREE)
 pub async fn cluster_with_embeddings(
     db: &Database,
     items: &[Node],
+) -> Result<ClusteringResult, String> {
+    cluster_with_embeddings_impl(db, items, true).await
+}
+
+/// Internal implementation with optional AI naming flag
+async fn cluster_with_embeddings_impl(
+    db: &Database,
+    items: &[Node],
+    use_ai_naming: bool,
 ) -> Result<ClusteringResult, String> {
     println!("[Clustering] Using embedding-based clustering for {} items", items.len());
 
@@ -521,10 +577,16 @@ pub async fn cluster_with_embeddings(
     let (primary_threshold, secondary_threshold) = get_adaptive_thresholds(items.len());
     println!("[Clustering] Using thresholds: primary={}, secondary={}", primary_threshold, secondary_threshold);
 
-    // Step 3: Prepare embeddings for clustering
-    let mut embeddings: Vec<(String, Vec<f32>)> = items_with_embeddings
+    // Step 2.5: Load persistent tag associations for similarity bonus
+    let item_tags = db.get_all_item_tags_map().unwrap_or_default();
+    if !item_tags.is_empty() {
+        println!("[Clustering] Loaded {} items with persistent tag associations", item_tags.len());
+    }
+
+    // Step 3: Prepare embeddings for clustering (with conversation_id for bonus)
+    let mut embeddings: Vec<(String, Vec<f32>, Option<String>)> = items_with_embeddings
         .iter()
-        .map(|(node, emb)| (node.id.clone(), emb.clone()))
+        .map(|(node, emb)| (node.id.clone(), emb.clone(), node.conversation_id.clone()))
         .collect();
 
     // Shuffle to spread similar items across batches
@@ -540,7 +602,7 @@ pub async fn cluster_with_embeddings(
     // Cluster each batch independently
     for batch_start in (0..embeddings.len()).step_by(BATCH_SIZE) {
         let batch_end = (batch_start + BATCH_SIZE).min(embeddings.len());
-        let batch: Vec<(String, Vec<f32>)> = embeddings[batch_start..batch_end]
+        let batch: Vec<(String, Vec<f32>, Option<String>)> = embeddings[batch_start..batch_end]
             .iter()
             .cloned()
             .collect();
@@ -549,7 +611,7 @@ pub async fn cluster_with_embeddings(
                  batch_start, batch_end, embeddings.len(),
                  batch_start / BATCH_SIZE + 1, num_batches);
 
-        let batch_clusters = cluster_batch(&batch, primary_threshold);
+        let batch_clusters = cluster_batch(&batch, primary_threshold, &item_tags);
 
         // Adjust indices to global offset
         for (centroid, local_indices) in batch_clusters {
@@ -586,8 +648,13 @@ pub async fn cluster_with_embeddings(
 
     println!("[Clustering] Formed {} clusters", cluster_groups.len());
 
-    // Step 5: Name clusters with AI
-    let cluster_names = name_clusters_with_ai(db, &cluster_data, &items_with_embeddings).await?;
+    // Step 5: Name clusters (AI or reuse existing names)
+    let cluster_names = if use_ai_naming {
+        name_clusters_with_ai(db, &cluster_data, &items_with_embeddings).await?
+    } else {
+        // LITE mode: reuse existing cluster_label from items, fallback to keywords
+        reuse_existing_cluster_names(&cluster_data, &items_with_embeddings)
+    };
 
     // Step 6: Build multi-path assignments
     let assignments = build_multipath_assignments(
@@ -765,6 +832,156 @@ fn build_multipath_assignments(
             }
         })
         .collect()
+}
+
+// ==================== Lite Clustering (No AI) ====================
+
+/// Reuse existing cluster labels from items using majority voting (FREE)
+///
+/// - If >50% of members share the same cluster_label → cluster is stable, use that label
+/// - If no majority → cluster merged/split, generate keyword name
+pub fn reuse_existing_cluster_names(
+    cluster_data: &[(i32, Vec<usize>, Vec<f32>)],
+    items_with_embeddings: &[(Node, Vec<f32>)],
+) -> HashMap<i32, String> {
+    let mut names: HashMap<i32, String> = HashMap::new();
+
+    for (cluster_id, indices, _) in cluster_data {
+        // Count label occurrences
+        let mut label_counts: HashMap<String, usize> = HashMap::new();
+        for &i in indices {
+            if let Some((node, _)) = items_with_embeddings.get(i) {
+                if let Some(label) = &node.cluster_label {
+                    if !label.is_empty() {
+                        *label_counts.entry(label.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        // Find majority label (>50% of cluster members)
+        let majority_threshold = indices.len() / 2;
+        let majority_label = label_counts.iter()
+            .filter(|(_, count)| **count > majority_threshold)
+            .max_by_key(|(_, count)| *count)
+            .map(|(label, _)| label.clone());
+
+        let name = if let Some(label) = majority_label {
+            // Cluster is stable - keep existing AI name
+            label
+        } else {
+            // Cluster merged/split - generate keyword name
+            let titles: Vec<String> = indices
+                .iter()
+                .take(15)
+                .filter_map(|&i| {
+                    items_with_embeddings.get(i).map(|(node, _)| {
+                        node.ai_title.clone().unwrap_or_else(|| node.title.clone())
+                    })
+                })
+                .collect();
+
+            let combined = titles.join(" ");
+            let keywords = extract_keywords(&combined, 3);
+
+            if keywords.is_empty() {
+                titles.first()
+                    .and_then(|t| t.split_whitespace().find(|w| w.len() > 3))
+                    .map(|w| capitalize(w))
+                    .unwrap_or_else(|| format!("Cluster {}", cluster_id))
+            } else {
+                keywords.iter()
+                    .map(|(w, _)| capitalize(w))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        };
+
+        names.insert(*cluster_id, name);
+    }
+
+    names
+}
+
+/// Name clusters using keywords only (no AI) - FREE
+/// Extracts top keywords from member titles to generate cluster names
+pub fn name_clusters_from_keywords(
+    cluster_data: &[(i32, Vec<usize>, Vec<f32>)],
+    items_with_embeddings: &[(Node, Vec<f32>)],
+) -> HashMap<i32, String> {
+    let mut names: HashMap<i32, String> = HashMap::new();
+
+    for (cluster_id, indices, _) in cluster_data {
+        // Collect titles from cluster members
+        let titles: Vec<String> = indices
+            .iter()
+            .take(15) // Sample up to 15 titles
+            .filter_map(|&i| {
+                items_with_embeddings.get(i).map(|(node, _)| {
+                    node.ai_title.clone().unwrap_or_else(|| node.title.clone())
+                })
+            })
+            .collect();
+
+        // Combine titles and extract keywords
+        let combined = titles.join(" ");
+        let keywords = extract_keywords(&combined, 3);
+
+        let name = if keywords.is_empty() {
+            // Fallback to first significant word from first title
+            titles.first()
+                .and_then(|t| t.split_whitespace().find(|w| w.len() > 3))
+                .map(|w| capitalize(w))
+                .unwrap_or_else(|| format!("Cluster {}", cluster_id))
+        } else {
+            keywords.iter()
+                .map(|(w, _)| capitalize(w))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        names.insert(*cluster_id, name);
+    }
+
+    names
+}
+
+/// Cluster with embeddings using keyword-based naming (NO AI) - FREE
+///
+/// Same as cluster_with_embeddings but uses keyword extraction instead of AI for naming.
+/// Use this for Rebuild Lite mode.
+pub async fn cluster_with_embeddings_lite(db: &Database) -> Result<ClusteringResult, String> {
+    // Reset cancel flag
+    reset_rebuild_cancel();
+
+    // Step 1: Get items that need clustering (VISIBLE tier only)
+    let items = db.get_items_needing_clustering().map_err(|e| e.to_string())?;
+
+    if items.is_empty() {
+        return Ok(ClusteringResult {
+            items_processed: 0,
+            clusters_created: 0,
+            items_assigned: 0,
+            edges_created: 0,
+            method: "embedding-lite".to_string(),
+        });
+    }
+
+    println!("[Clustering LITE] Processing {} items with embedding similarity (no AI)...", items.len());
+
+    // Use the regular embedding clustering flow
+    let result = cluster_with_embeddings_impl(db, &items, false).await?;
+
+    println!("[Clustering LITE] Complete: {} items → {} clusters, {} edges (keyword naming)",
+             result.items_assigned, result.clusters_created, result.edges_created);
+
+    Ok(ClusteringResult {
+        items_processed: result.items_processed,
+        clusters_created: result.clusters_created,
+        items_assigned: result.items_assigned,
+        edges_created: result.edges_created,
+        method: "embedding-lite".to_string(),
+    })
 }
 
 /// Force re-clustering of all items (clears existing assignments)

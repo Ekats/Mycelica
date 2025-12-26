@@ -33,6 +33,10 @@ interface GraphState {
   breadcrumbs: BreadcrumbEntry[];   // Navigation history for back button
   visibleNodes: Node[];             // Nodes currently visible at this depth
 
+  // Privacy filter state
+  privacyThreshold: number;         // 0.0-1.0, nodes with privacy < threshold are hidden
+  hidePrivate: boolean;             // Toggle for privacy filtering
+
   // Actions
   setNodes: (nodes: Map<string, Node>) => void;
   addNode: (node: Node) => void;
@@ -59,6 +63,10 @@ interface GraphState {
   navigateToRoot: () => void;  // Go back to Universe (depth 0)
   navigateToBreadcrumb: (nodeId: string) => void;  // Navigate to existing breadcrumb
   jumpToNode: (node: Node, fromNode?: Node) => void;  // Jump to any node (from similar nodes)
+
+  // Privacy actions
+  setPrivacyThreshold: (threshold: number) => void;
+  setHidePrivate: (hide: boolean) => void;
 }
 
 export const useGraphStore = create<GraphState>((set, get) => ({
@@ -77,6 +85,10 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   currentParentId: null,
   breadcrumbs: [],
   visibleNodes: [],
+
+  // Privacy filter state - default threshold 0.3 (keeps most content)
+  privacyThreshold: 0.3,
+  hidePrivate: false,
 
   setNodes: (nodes) => set({ nodes }),
 
@@ -259,4 +271,8 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       activeNodeId: node.id,  // Highlight the jumped-to node
     };
   }),
+
+  // Privacy actions
+  setPrivacyThreshold: (threshold) => set({ privacyThreshold: threshold }),
+  setHidePrivate: (hide) => set({ hidePrivate: hide }),
 }));

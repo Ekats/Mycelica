@@ -184,14 +184,14 @@ pub fn cancel_privacy_scan() -> Result<(), String> {
 /// Reset all privacy flags (to re-scan with different settings)
 #[tauri::command]
 pub fn reset_privacy_flags(state: State<AppState>) -> Result<usize, String> {
-    state.db.read().unwrap().reset_all_privacy_flags()
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.reset_all_privacy_flags()
         .map_err(|e| e.to_string())
 }
 
 /// Get privacy statistics
 #[tauri::command]
 pub fn get_privacy_stats(state: State<AppState>) -> Result<PrivacyStats, String> {
-    let (total, scanned, unscanned, private, safe, total_categories, scanned_categories) = state.db.read().unwrap()
+    let (total, scanned, unscanned, private, safe, total_categories, scanned_categories) = state.db.read().map_err(|e| format!("DB lock error: {}", e))?
         .get_privacy_stats_extended()
         .map_err(|e| e.to_string())?;
 
@@ -203,6 +203,60 @@ pub fn get_privacy_stats(state: State<AppState>) -> Result<PrivacyStats, String>
         safe,
         total_categories,
         scanned_categories,
+    })
+}
+
+/// Preview counts for export at a given threshold
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportPreview {
+    pub included: usize,
+    pub excluded: usize,
+    pub unscored: usize,
+}
+
+/// Get preview of how many items would be included/excluded at a threshold
+/// include_tags: optional whitelist - if provided, also filters by tag
+#[tauri::command]
+pub fn get_export_preview(
+    state: State<AppState>,
+    min_privacy: f64,
+    include_tags: Option<Vec<String>>,
+) -> Result<ExportPreview, String> {
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+
+    // Get base counts from privacy threshold
+    let (mut included, mut excluded, unscored) = db
+        .get_export_preview(min_privacy)
+        .map_err(|e| e.to_string())?;
+
+    // If tag filtering, adjust counts
+    if let Some(ref tags) = include_tags {
+        if !tags.is_empty() {
+            let tagged_items = db.get_items_with_any_tags(tags)
+                .map_err(|e| e.to_string())?;
+
+            // Get all items that pass privacy threshold
+            let items = db.get_items().map_err(|e| e.to_string())?;
+            let passing_privacy: Vec<_> = items.iter()
+                .filter(|n| n.privacy.map(|p| p >= min_privacy).unwrap_or(false))
+                .collect();
+
+            // Count how many also have required tags
+            let passing_both = passing_privacy.iter()
+                .filter(|n| tagged_items.contains(&n.id))
+                .count();
+
+            // Items excluded = those passing privacy but not tags + those failing privacy
+            excluded = passing_privacy.len() - passing_both + excluded;
+            included = passing_both;
+        }
+    }
+
+    Ok(ExportPreview {
+        included,
+        excluded,
+        unscored,
     })
 }
 
@@ -227,16 +281,16 @@ pub fn set_node_privacy(
     };
 
     // Update the node itself
-    state.db.read().unwrap().update_node_privacy(&node_id, is_private, reason)
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.update_node_privacy(&node_id, is_private, reason)
         .map_err(|e| e.to_string())?;
 
     // Propagate to all descendants
     let descendant_ids = if is_private {
         let propagation_reason = "Inherited from manually marked private parent";
-        state.db.read().unwrap().force_propagate_privacy_to_descendants(&node_id, propagation_reason)
+        state.db.read().map_err(|e| format!("DB lock error: {}", e))?.force_propagate_privacy_to_descendants(&node_id, propagation_reason)
             .map_err(|e| e.to_string())?
     } else {
-        state.db.read().unwrap().clear_privacy_from_descendants(&node_id)
+        state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clear_privacy_from_descendants(&node_id)
             .map_err(|e| e.to_string())?
     };
 
@@ -259,7 +313,7 @@ pub async fn analyze_node_privacy(
     let api_key = settings::get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
 
     // Get node from db
-    let node = state.db.read().unwrap().get_node(&node_id)
+    let node = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_node(&node_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Node {} not found", node_id))?;
 
@@ -334,7 +388,7 @@ pub async fn analyze_node_privacy(
     let (is_private, reason) = parse_privacy_response(&text)?;
 
     // Update node in database
-    state.db.read().unwrap().update_node_privacy(&node_id, is_private, reason.as_deref())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.update_node_privacy(&node_id, is_private, reason.as_deref())
         .map_err(|e| e.to_string())?;
 
     Ok(PrivacyResult { is_private, reason })
@@ -391,7 +445,7 @@ pub async fn analyze_all_privacy(
     };
 
     // Get all items that haven't been scanned
-    let nodes = state.db.read().unwrap().get_items_needing_privacy_scan()
+    let nodes = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_items_needing_privacy_scan()
         .map_err(|e| e.to_string())?;
 
     let total = nodes.len();
@@ -514,7 +568,7 @@ pub async fn analyze_all_privacy(
                             .unwrap_or((true, Some("Parse error".to_string())));
 
                         // Update database
-                        if let Err(e) = state.db.read().unwrap().update_node_privacy(&node.id, is_private, reason.as_deref()) {
+                        if let Err(e) = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.update_node_privacy(&node.id, is_private, reason.as_deref()) {
                             eprintln!("Failed to update node {}: {}", node.id, e);
                             error_count += 1;
                         } else {
@@ -622,7 +676,7 @@ pub async fn analyze_categories_privacy(
     };
 
     // Get all category nodes (non-items with children) that haven't been scanned
-    let categories = state.db.read().unwrap().get_category_nodes_needing_privacy_scan()
+    let categories = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_category_nodes_needing_privacy_scan()
         .map_err(|e| e.to_string())?;
 
     let total = categories.len();
@@ -751,7 +805,7 @@ pub async fn analyze_categories_privacy(
                             .unwrap_or((true, Some("Parse error".to_string())));
 
                         // Update the category node itself
-                        if let Err(e) = state.db.read().unwrap().update_node_privacy(&category.id, is_private, reason.as_deref()) {
+                        if let Err(e) = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.update_node_privacy(&category.id, is_private, reason.as_deref()) {
                             eprintln!("Failed to update category {}: {}", category.id, e);
                             error_count += 1;
                             continue;
@@ -762,7 +816,7 @@ pub async fn analyze_categories_privacy(
 
                             // PROPAGATE to all descendants!
                             let propagation_reason = format!("Inherited from private category: {}", title);
-                            match state.db.read().unwrap().propagate_privacy_to_descendants(&category.id, &propagation_reason) {
+                            match state.db.read().map_err(|e| format!("DB lock error: {}", e))?.propagate_privacy_to_descendants(&category.id, &propagation_reason) {
                                 Ok(count) => {
                                     items_propagated += count;
                                     println!("Category '{}' marked private, propagated to {} descendants", title, count);
@@ -862,18 +916,45 @@ pub async fn analyze_categories_privacy(
 }
 
 /// Export a shareable database with private nodes removed
+/// min_privacy: threshold for inclusion (0.0 = private, 1.0 = public)
+/// include_tags: optional whitelist - if provided, items must have at least one matching tag
+/// Nodes with privacy < min_privacy are removed
+/// If include_tags provided: items must ALSO have at least one of those tags
 #[tauri::command]
-pub fn export_shareable_db(state: State<AppState>) -> Result<String, String> {
+pub fn export_shareable_db(
+    state: State<AppState>,
+    min_privacy: f64,
+    include_tags: Option<Vec<String>>,
+) -> Result<String, String> {
     use rusqlite::Connection;
 
     // Get current db path
-    let db_path = state.db.read().unwrap().get_path();
+    let db_path = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_path();
 
-    // Generate shareable path
-    let shareable_path = if db_path.ends_with(".db") {
-        db_path.replace(".db", "-shareable.db")
+    // Generate shareable path with threshold in name
+    let threshold_str = format!("{:.1}", min_privacy).replace(".", "");
+    let tag_suffix = if let Some(ref tags) = include_tags {
+        if !tags.is_empty() {
+            format!("-tags-{}", tags.len())
+        } else {
+            String::new()
+        }
     } else {
-        format!("{}-shareable.db", db_path)
+        String::new()
+    };
+    let shareable_path = if db_path.ends_with(".db") {
+        db_path.replace(".db", &format!("-shareable-{}{}.db", threshold_str, tag_suffix))
+    } else {
+        format!("{}-shareable-{}{}.db", db_path, threshold_str, tag_suffix)
+    };
+
+    // If tag filtering requested, get the allowed item IDs first
+    let allowed_items: Option<std::collections::HashSet<String>> = match &include_tags {
+        Some(tags) if !tags.is_empty() => {
+            Some(state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_items_with_any_tags(tags)
+                .map_err(|e| format!("Failed to get tagged items: {}", e))?)
+        }
+        _ => None,
     };
 
     // Copy the file
@@ -884,9 +965,41 @@ pub fn export_shareable_db(state: State<AppState>) -> Result<String, String> {
     let conn = Connection::open(&shareable_path)
         .map_err(|e| format!("Failed to open shareable db: {}", e))?;
 
-    // Delete private nodes
-    let deleted_nodes = conn.execute("DELETE FROM nodes WHERE is_private = 1", [])
-        .map_err(|e| format!("Failed to delete private nodes: {}", e))?;
+    // Delete nodes below privacy threshold (privacy < min_privacy OR unscored with old is_private = 1)
+    let deleted_privacy = conn.execute(
+        "DELETE FROM nodes WHERE (privacy IS NOT NULL AND privacy < ?1) OR (privacy IS NULL AND is_private = 1)",
+        [min_privacy]
+    ).map_err(|e| format!("Failed to delete private nodes: {}", e))?;
+
+    // If tag filtering, also delete items that don't have required tags
+    let deleted_tags = if let Some(ref allowed) = allowed_items {
+        // Build list of allowed IDs for SQL
+        if allowed.is_empty() {
+            // No items have the tags - delete all items
+            conn.execute(
+                "DELETE FROM nodes WHERE is_item = 1",
+                []
+            ).map_err(|e| format!("Failed to delete non-tagged items: {}", e))?
+        } else {
+            // Delete items NOT in the allowed set
+            let placeholders: String = allowed.iter().enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "DELETE FROM nodes WHERE is_item = 1 AND id NOT IN ({})",
+                placeholders
+            );
+            let params: Vec<&str> = allowed.iter().map(|s| s.as_str()).collect();
+            let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter()
+                .map(|s| s as &dyn rusqlite::ToSql)
+                .collect();
+            conn.execute(&query, param_refs.as_slice())
+                .map_err(|e| format!("Failed to delete non-tagged items: {}", e))?
+        }
+    } else {
+        0
+    };
 
     // Delete orphaned edges
     let deleted_edges = conn.execute(
@@ -898,8 +1011,13 @@ pub fn export_shareable_db(state: State<AppState>) -> Result<String, String> {
     conn.execute("VACUUM", [])
         .map_err(|e| format!("Failed to vacuum database: {}", e))?;
 
-    println!("Exported shareable database: {} (removed {} nodes, {} edges)",
-             shareable_path, deleted_nodes, deleted_edges);
+    let tag_info = if let Some(ref tags) = include_tags {
+        format!(", tags {:?} filtered {} items", tags, deleted_tags)
+    } else {
+        String::new()
+    };
+    println!("Exported shareable database: {} (threshold {:.1}, removed {} private nodes, {} edges{})",
+             shareable_path, min_privacy, deleted_privacy, deleted_edges, tag_info);
 
     Ok(shareable_path)
 }
@@ -961,13 +1079,13 @@ pub async fn score_privacy_all_items(
     // Get items needing scoring
     let items = if force_rescore {
         // Get ALL items if force rescore
-        state.db.read().unwrap().get_all_nodes()
+        state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_all_nodes()
             .map_err(|e| e.to_string())?
             .into_iter()
             .filter(|n| n.is_item)
             .collect::<Vec<_>>()
     } else {
-        state.db.read().unwrap().get_items_needing_privacy_scoring()
+        state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_items_needing_privacy_scoring()
             .map_err(|e| e.to_string())?
     };
 
@@ -1092,7 +1210,7 @@ pub async fn score_privacy_all_items(
                         // Parse JSON array response
                         match parse_scoring_response(&text) {
                             Ok(scores) => {
-                                let db = state.db.read().unwrap();
+                                let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
                                 for score in scores {
                                     if let Err(e) = db.update_privacy_score(&score.id, score.privacy) {
                                         eprintln!("  Failed to update privacy for {}: {}", score.id, e);

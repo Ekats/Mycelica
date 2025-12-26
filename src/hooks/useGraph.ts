@@ -48,6 +48,7 @@ interface BackendNode {
   latestChildDate: number | null;  // Rust uses #[serde(rename = "latestChildDate")]
   // Privacy filtering
   isPrivate: boolean | null;  // Rust uses #[serde(rename = "isPrivate")]
+  privacy: number | null;  // Float score 0.0-1.0 (no serde rename - field name matches)
   privacyReason: string | null;  // Rust uses #[serde(rename = "privacyReason")]
   // Content classification (mini-clustering)
   contentType: string | null;  // Rust uses #[serde(rename = "contentType")]: "idea" | "code" | "debug" | "paste"
@@ -105,6 +106,7 @@ function mapBackendNode(n: BackendNode): Node {
     latestChildDate: n.latestChildDate ?? undefined,
     // Privacy filtering
     isPrivate: n.isPrivate ?? undefined,
+    privacy: n.privacy ?? undefined,
     privacyReason: n.privacyReason ?? undefined,
     // Content classification (mini-clustering)
     contentType: n.contentType as Node['contentType'] ?? undefined,
@@ -162,7 +164,8 @@ export function useGraph() {
     }
   }, [setNodes, setEdges]);
 
-  // Lazy load children of a parent node (for future incremental loading)
+  // Lazy load children of a parent node (for graph navigation)
+  // Uses get_graph_children to exclude supporting items (code/debug/paste/trivial)
   const loadChildren = useCallback(async (parentId: string, _limit: number = 100) => {
     // Skip if already loaded
     if (loadedParents.has(parentId)) {
@@ -171,7 +174,7 @@ export function useGraph() {
 
     try {
       console.log(`Lazy loading children of ${parentId}...`);
-      const backendNodes = await invoke<BackendNode[]>('get_children', { parentId });
+      const backendNodes = await invoke<BackendNode[]>('get_graph_children', { parentId });
 
       // Merge new nodes into existing map
       const newNodes = new Map(nodes);

@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 use crate::settings;
 use crate::local_embeddings;
+use crate::classification::{classify_content, ContentType};
 
 /// Result of AI analysis for a node
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,7 +60,20 @@ fn get_api_key() -> Option<String> {
 }
 
 /// Analyze a node's content to generate title, summary, and tags
+///
+/// Uses tiered processing:
+/// - HIDDEN items (debug, code, paste, trivial): Skip API, extract simple title
+/// - VISIBLE/SUPPORTING items: Full API analysis
 pub async fn analyze_node(raw_title: &str, content: &str) -> Result<AiAnalysisResult, String> {
+    // === Tiered processing: classify first to determine processing depth ===
+    let content_type = classify_content(content);
+
+    // HIDDEN tier: skip expensive API call, just extract title
+    if content_type.is_hidden() {
+        return Ok(extract_basic_metadata(raw_title, content, content_type));
+    }
+
+    // VISIBLE/SUPPORTING: proceed with full API analysis
     let api_key = get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
 
     // Truncate content for API efficiency (find safe UTF-8 boundary)
@@ -80,21 +94,33 @@ pub async fn analyze_node(raw_title: &str, content: &str) -> Result<AiAnalysisRe
 CONTENT:
 {}
 
-1. "content_type": Classify as:
-   - "idea": Substantial discussion, insight, decision, creative work
-   - "investigation": Incremental discoveries, working-out steps, "figured out X" moments
-   - "code": Primarily code blocks, scripts, implementation
-   - "debug": Error traces, troubleshooting, stack dumps
-   - "paste": Raw logs, data dumps, copied text without context
-   - "trivial": Acknowledgment, noise, no real substance
+1. "content_type": Classify by PRIMARY purpose:
 
-2. "title": Captures what was discussed/accomplished.
-   - For idea: Personal note style, 3-6 words. "Found the clustering bug"
-   - For code/debug/paste: Technical label, 5-10 words
-   - Base on FULL exchange, not short user prompts like "yeah" or "fix it"
+VISIBLE (original thought):
+- "insight": Realization, conclusion, crystallized understanding
+  Language: "I realized", "the answer is", "so basically", "the key is"
+- "exploration": Researching, thinking out loud, no firm conclusion
+  Language: "what if", "let me try", "I wonder", "maybe"
+- "synthesis": Summarizing, connecting previous understanding
+  Language: "to summarize", "overall", "the pattern is"
+- "question": Inquiry that frames investigation
+- "planning": Roadmaps, TODOs, intentions
 
+SUPPORTING (lower weight):
+- "investigation": Problem-solving focused on fixing
+  Language: "the issue was", "turns out", "fixed by"
+- "discussion": Back-and-forth Q&A without synthesis
+- "reference": Factual lookup, definitions, external info
+- "creative": Fiction, poetry, roleplay
+
+HIDDEN:
+- "debug": Error messages, stack traces, build failures
+- "code": Code blocks, implementations
+- "paste": Logs, terminal output, data dumps
+- "trivial": Greetings, acknowledgments, fragments
+
+2. "title": 3-6 words capturing the insight/topic
 3. "summary": 50-100 words
-
 4. "tags": 3-5 specific tags
 
 JSON only: {{"content_type":"...","title":"...","summary":"...","tags":[...]}}"#,
@@ -188,7 +214,7 @@ fn parse_ai_response(text: &str, fallback_title: &str) -> Result<AiAnalysisResul
             let content_type = json
                 .get("content_type")
                 .and_then(|v| v.as_str())
-                .unwrap_or("idea")
+                .unwrap_or("exploration")  // Default matches pattern matcher
                 .to_string();
 
             Ok(AiAnalysisResult { title, summary, tags, content_type })
@@ -199,10 +225,210 @@ fn parse_ai_response(text: &str, fallback_title: &str) -> Result<AiAnalysisResul
                 title: fallback_title.to_string(),
                 summary: String::new(),
                 tags: vec![],
-                content_type: "idea".to_string(),
+                content_type: "exploration".to_string(),  // Default matches pattern matcher
             })
         }
     }
+}
+
+// ==================== Cheap AI Classification ====================
+
+/// Classify content type using minimal AI prompt - CHEAP (~$0.00001 per item)
+///
+/// Only returns content_type, no title/summary/tags.
+/// Uses ~50 tokens per item with Haiku = ~$0.04 for 4000 items.
+pub async fn classify_content_ai(content: &str) -> Result<String, String> {
+    let api_key = get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
+
+    // Truncate content for API efficiency
+    let content_preview = if content.len() > 1500 {
+        let mut end = 1500;
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        &content[..end]
+    } else {
+        content
+    };
+
+    let prompt = format!(
+        r#"Classify this content. Return ONLY one word from this list:
+
+VISIBLE: insight, exploration, synthesis, question, planning
+SUPPORTING: investigation, discussion, reference, creative
+HIDDEN: debug, code, paste, trivial
+
+Content:
+{}
+
+Classification:"#,
+        content_preview
+    );
+
+    let request = AnthropicRequest {
+        model: "claude-haiku-4-5-20251001".to_string(),
+        max_tokens: 20,  // Minimal - just one word
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: prompt,
+        }],
+    };
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("API error {}: {}", status, body));
+    }
+
+    let api_response: AnthropicResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    // Track token usage
+    if let Some(usage) = &api_response.usage {
+        let _ = settings::add_anthropic_tokens(usage.input_tokens, usage.output_tokens);
+    }
+
+    let text = api_response
+        .content
+        .first()
+        .map(|c| c.text.trim().to_lowercase())
+        .unwrap_or_else(|| "exploration".to_string());
+
+    // Validate and normalize the response
+    let valid_types = [
+        "insight", "exploration", "synthesis", "question", "planning",
+        "investigation", "discussion", "reference", "creative",
+        "debug", "code", "paste", "trivial"
+    ];
+
+    if valid_types.contains(&text.as_str()) {
+        Ok(text)
+    } else {
+        // Default to exploration for unrecognized responses
+        Ok("exploration".to_string())
+    }
+}
+
+/// Batch classify multiple items using AI - CHEAP
+/// Returns a map of item_id -> content_type
+pub async fn classify_batch_ai(items: &[(String, String)]) -> Result<Vec<(String, String)>, String> {
+    let mut results = Vec::new();
+
+    for (id, content) in items {
+        match classify_content_ai(content).await {
+            Ok(content_type) => results.push((id.clone(), content_type)),
+            Err(e) => {
+                eprintln!("[AI Classify] Failed for {}: {}", id, e);
+                // Use pattern matcher fallback
+                let fallback = classify_content(content);
+                results.push((id.clone(), fallback.as_str().to_string()));
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Extract basic metadata for HIDDEN items without API call
+/// Returns a simple title and the pre-classified content type
+fn extract_basic_metadata(raw_title: &str, content: &str, content_type: ContentType) -> AiAnalysisResult {
+    // Clean up raw title or generate from content
+    let title = if raw_title.trim().is_empty() || raw_title.starts_with("claude_") {
+        // Generate title from first meaningful line of content
+        extract_title_from_content(content, content_type)
+    } else {
+        // Clean up existing title
+        clean_title(raw_title)
+    };
+
+    AiAnalysisResult {
+        title,
+        summary: String::new(),  // No summary for HIDDEN
+        tags: vec![],            // No tags for HIDDEN
+        content_type: content_type.as_str().to_string(),
+    }
+}
+
+/// Extract a reasonable title from content for HIDDEN items
+fn extract_title_from_content(content: &str, content_type: ContentType) -> String {
+    // Type-specific prefixes for context
+    let prefix = match content_type {
+        ContentType::Debug => "Debug:",
+        ContentType::Code => "Code:",
+        ContentType::Paste => "Paste:",
+        ContentType::Trivial => "",
+        _ => "",  // Shouldn't reach here for HIDDEN
+    };
+
+    // Find first meaningful line
+    let first_line = content
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() &&
+            !trimmed.starts_with("```") &&
+            !trimmed.starts_with('#') &&
+            !trimmed.starts_with("//") &&
+            trimmed.len() > 3
+        })
+        .next()
+        .unwrap_or("Untitled");
+
+    // Truncate to reasonable length
+    let truncated = if first_line.len() > 60 {
+        let mut end = 57;
+        while end > 0 && !first_line.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &first_line[..end])
+    } else {
+        first_line.to_string()
+    };
+
+    if prefix.is_empty() {
+        truncated
+    } else {
+        format!("{} {}", prefix, truncated)
+    }
+}
+
+/// Clean up a raw title (remove file extensions, clean special chars)
+fn clean_title(raw: &str) -> String {
+    let mut title = raw.to_string();
+
+    // Remove common file extensions from import filenames
+    for ext in &[".json", ".txt", ".md", ".html"] {
+        if title.ends_with(ext) {
+            title = title[..title.len() - ext.len()].to_string();
+        }
+    }
+
+    // Replace underscores with spaces
+    title = title.replace('_', " ");
+
+    // Truncate if too long
+    if title.len() > 80 {
+        let mut end = 77;
+        while end > 0 && !title.is_char_boundary(end) {
+            end -= 1;
+        }
+        title = format!("{}...", &title[..end]);
+    }
+
+    title
 }
 
 // ==================== Multi-Path Clustering Data Structures ====================
@@ -443,6 +669,12 @@ fn is_common_word(word: &str) -> bool {
         "Project", "Development", "Implementation", "Design", "Architecture",
         "System", "Application", "Service", "Module", "Component",
         "Claude", "Assistant", "User", "Human", "Model", "API",
+        // Category descriptors (not project names)
+        "Technical", "Scientific", "Audio", "Digital", "Visual",
+        "Mixed", "Diverse", "Various", "General", "Miscellaneous",
+        "Personal", "Professional", "Creative", "Academic", "Experimental",
+        "Interdisciplinary", "Language", "Estonian", "Regional",
+        "Theoretical", "Practical",
     ];
     common.iter().any(|c| c.eq_ignore_ascii_case(word))
 }
@@ -477,11 +709,12 @@ pub fn detect_major_projects_globally(db: &crate::db::Database) -> Vec<MajorProj
         total_count: usize,
     }
 
-    // Get all items
-    let items = match db.get_items() {
+    // Get only VISIBLE tier items for hierarchy decisions
+    // VISIBLE: insight, exploration, synthesis, question, planning
+    let items = match db.get_visible_items() {
         Ok(items) => items,
         Err(e) => {
-            eprintln!("[MajorProjects] Failed to get items: {}", e);
+            eprintln!("[MajorProjects] Failed to get visible items: {}", e);
             return vec![];
         }
     };
@@ -569,9 +802,10 @@ pub fn detect_major_projects_globally(db: &crate::db::Database) -> Vec<MajorProj
         }
 
         // Filter out title-starters: words that appear >75% as first word
+        // BUT only if they're generic words (not proper nouns like "Mycelica")
         let first_word_ratio = stats.first_word_count as f32 / stats.total_count as f32;
-        if first_word_ratio > 0.75 {
-            eprintln!("[MajorProjects] Filtered '{}' ({:.0}% first-word, {} items)",
+        if first_word_ratio > 0.75 && is_common_word(&name) {
+            eprintln!("[MajorProjects] Filtered '{}' ({:.0}% first-word + common word, {} items)",
                 name, first_word_ratio * 100.0, stats.item_ids.len());
             continue;
         }
@@ -1301,21 +1535,27 @@ Return ONLY valid JSON, no markdown:
 }
 
 /// Maximum categories per uber-grouping batch to prevent response truncation
-const UBER_GROUPING_BATCH_SIZE: usize = 75;
+/// Smaller batches = more coherent groupings (merge logic handles cross-batch duplicates)
+const UBER_GROUPING_BATCH_SIZE: usize = 40;
 
 /// Group categories into 4-8 uber-categories, preserving project names
 /// Used for consolidating Universe's direct children into navigable top-level domains
 /// Projects (Mycelica, etc.) stay as their own categories; generic topics get grouped by theme
+///
+/// tag_anchors: Optional list of persistent tag titles to use as preferred category names
 pub async fn group_into_uber_categories(
     categories: &[TopicInfo],
+    tag_anchors: Option<&[String]>,
 ) -> Result<Vec<CategoryGrouping>, String> {
     if categories.is_empty() {
         return Ok(vec![]);
     }
 
+    let anchors = tag_anchors.unwrap_or(&[]);
+
     // If small enough, do single call
     if categories.len() <= UBER_GROUPING_BATCH_SIZE {
-        return group_into_uber_categories_single(categories).await;
+        return group_into_uber_categories_single(categories, &[], anchors).await;
     }
 
     // Batch processing for large category sets
@@ -1326,10 +1566,11 @@ pub async fn group_into_uber_categories(
     let mut all_groupings: Vec<CategoryGrouping> = Vec::new();
 
     for (batch_idx, batch) in categories.chunks(UBER_GROUPING_BATCH_SIZE).enumerate() {
-        println!("[AI] Processing uber-category batch {}/{} ({} categories)",
-                 batch_idx + 1, num_batches, batch.len());
+        println!("[AI] Processing uber-category batch {}/{} ({} categories, {} existing uber-categories)",
+                 batch_idx + 1, num_batches, batch.len(), all_groupings.len());
 
-        match group_into_uber_categories_single(batch).await {
+        // Pass existing uber-categories so AI prefers assigning to them
+        match group_into_uber_categories_single(batch, &all_groupings, anchors).await {
             Ok(batch_groupings) => {
                 // Merge with existing groupings
                 for new_grouping in batch_groupings {
@@ -1380,6 +1621,8 @@ fn find_similar_uber_category<'a>(
 /// Single-batch uber-category grouping (internal)
 async fn group_into_uber_categories_single(
     categories: &[TopicInfo],
+    existing_uber_categories: &[CategoryGrouping],
+    tag_anchors: &[String],
 ) -> Result<Vec<CategoryGrouping>, String> {
     let api_key = get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
 
@@ -1394,14 +1637,56 @@ async fn group_into_uber_categories_single(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let prompt = format!(
-        r#"You are consolidating a knowledge graph's top-level categories into 4-8 uber-categories.
+    // Build existing uber-categories section if we have any from previous batches
+    let existing_section = if existing_uber_categories.is_empty() {
+        String::new()
+    } else {
+        let existing_list = existing_uber_categories
+            .iter()
+            .map(|c| format!("- \"{}\" ({})", c.name, c.description.as_deref().unwrap_or("")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            r#"EXISTING UBER-CATEGORIES FROM PREVIOUS BATCHES:
+{existing_list}
+→ Prefer assigning to these when a good match exists
+→ Only create new uber-categories if nothing fits
 
-CURRENT CATEGORIES ({count} total):
+"#,
+            existing_list = existing_list
+        )
+    };
+
+    // Build tag anchors section if we have persistent tags
+    let tag_anchors_section = if tag_anchors.is_empty() {
+        String::new()
+    } else {
+        let tags_list = tag_anchors.join(", ");
+        format!(
+            r#"PREFERRED CATEGORY NAMES (from user's established tags):
+{tags_list}
+→ Use these exact names when they fit the content well
+→ These represent stable categories the user has built up over time
+
+"#,
+            tags_list = tags_list
+        )
+    };
+
+    let task_description = if existing_uber_categories.is_empty() {
+        "Group these into 4-8 top-level categories that make the graph navigable."
+    } else {
+        "Group these into the existing uber-categories above, OR create new ones (target 4-8 new max)."
+    };
+
+    let prompt = format!(
+        r#"You are consolidating a knowledge graph's top-level categories into uber-categories.
+
+{existing_section}{tag_anchors_section}CURRENT CATEGORIES ({count} total):
 {categories_section}
 
 YOUR TASK:
-Group these into 4-8 top-level categories that make the graph navigable.
+{task_description}
 
 CRITICAL RULES:
 
@@ -1449,8 +1734,11 @@ Return ONLY valid JSON, no markdown:
   ]
 }}
 "#,
+        existing_section = existing_section,
+        tag_anchors_section = tag_anchors_section,
         count = categories.len(),
-        categories_section = categories_section
+        categories_section = categories_section,
+        task_description = task_description
     );
 
     // Try Claude first, fall back to OpenAI if overloaded

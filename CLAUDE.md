@@ -47,7 +47,7 @@ npm run tauri build    # Production build
 
 - **Frontend:** React + TypeScript + Tailwind + Zustand
 - **Backend:** Rust (Tauri) + SQLite + rusqlite
-- **Rendering:** Canvas-based graph
+- **Rendering:** SVG-based graph (D3.js)
 - **Icons:** Lucide React
 
 ---
@@ -226,10 +226,10 @@ interface ViewState {
 |------|------|
 | Understanding hierarchy | `docs/specs/HIERARCHY.md` |
 | Data types | `docs/specs/TYPES.md` |
-| Tauri commands | `docs/specs/COMMANDS.md` |
-| Database schema | `docs/specs/SCHEMA.md` |
-| Search/clustering logic | `docs/specs/ALGORITHMS.md` |
-| Import pipeline | `docs/specs/IMPORT.md` |
+| Tauri commands (85+) | `docs/specs/COMMANDS.md` |
+| Database schema (6 tables) | `docs/specs/SCHEMA.md` |
+| Privacy & content classification | `docs/specs/PRIVACY.md` |
+| Full architecture overview | `docs/ARCHITECTURE.md` |
 
 ---
 
@@ -247,4 +247,36 @@ interface ViewState {
 ❌ Fixed L0/L1/L2/L3 levels (depth is dynamic)
 ❌ Building hierarchy before clustering
 ❌ Importing to wrong depth (items have `is_item=true`)
-- we have a frontend GUI dev console we made
+❌ Using `is_private` boolean (use `privacy` float 0.0-1.0)
+❌ Ignoring content classification (affects graph visibility)
+
+---
+
+## Key Systems
+
+### Content Classification
+- 13 content types across 3 visibility tiers
+- **Visible**: insight, exploration, synthesis, question, planning
+- **Supporting**: investigation, discussion, reference, creative
+- **Hidden**: debug, code, paste, trivial
+
+### Privacy Scoring
+- Scale: 0.0 (private) → 1.0 (public)
+- Propagates from categories to descendants
+- Used for shareable exports
+
+### Multi-Path Associations
+- Items can belong to multiple categories via `belongs_to` edges
+- Weight field indicates association strength
+
+### Recent Notes Protection
+- Notes in "Recent Notes" can be excluded from AI processing
+- Toggle via `set_protect_recent_notes()`
+
+### Local Embeddings
+- Option to generate embeddings on-device vs OpenAI API
+- Toggle via `set_use_local_embeddings()`
+
+### Dev Console
+- Built-in frontend dev console for debugging
+- Logs hierarchy operations, AI progress, errors

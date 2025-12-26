@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useDeferredValue, useMemo } from 'react';
 import { Search, X, ChevronRight, ChevronDown, Settings, Pin, Clock, PinOff } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -112,18 +112,21 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
     }
   }, []);
 
-  // Filter nodes by search query (only when search tab is active)
-  const searchResults = activeTab === 'search' && searchQuery
-    ? Array.from(nodes.values()).filter(node => {
-        const query = searchQuery.toLowerCase();
-        return (
-          node.title.toLowerCase().includes(query) ||
-          node.aiTitle?.toLowerCase().includes(query) ||
-          node.content?.toLowerCase().includes(query) ||
-          node.summary?.toLowerCase().includes(query)
-        );
-      })
-    : [];
+  // Debounced search query (React 18's useDeferredValue defers updates during typing)
+  const deferredQuery = useDeferredValue(searchQuery);
+
+  // Memoized search results to prevent unnecessary recalculations
+  const searchResults = useMemo(() => {
+    if (activeTab !== 'search' || !deferredQuery) return [];
+
+    const query = deferredQuery.toLowerCase();
+    return Array.from(nodes.values()).filter(node =>
+      node.title.toLowerCase().includes(query) ||
+      node.aiTitle?.toLowerCase().includes(query) ||
+      node.content?.toLowerCase().includes(query) ||
+      node.summary?.toLowerCase().includes(query)
+    );
+  }, [activeTab, deferredQuery, nodes]);
 
   // Render a single node item
   const renderNodeItem = (node: Node, showPinButton = true) => {

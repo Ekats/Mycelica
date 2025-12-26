@@ -8,6 +8,7 @@ mod import;
 mod similarity;
 mod local_embeddings;
 pub mod classification;
+mod tags;
 
 use commands::{
     AppState,
@@ -17,9 +18,11 @@ use commands::{
     // Clustering commands
     run_clustering, recluster_all, get_clustering_status,
     // AI processing commands
-    process_nodes, get_ai_status, cancel_processing, cancel_rebuild,
+    process_nodes, get_ai_status, cancel_processing, cancel_rebuild, cancel_all,
     get_api_key_status, save_api_key, clear_api_key,
     get_learned_emojis, save_learned_emoji,
+    // Pipeline state commands
+    get_pipeline_state, set_pipeline_state, get_db_metadata,
     // Hierarchy commands
     get_nodes_at_depth, get_children, get_universe, get_items, get_max_depth,
     build_hierarchy, build_full_hierarchy, cluster_hierarchy_level, unsplit_node, get_children_flat,
@@ -29,6 +32,8 @@ use commands::{
     // Mini-clustering commands
     get_graph_children, get_supporting_items, get_associated_items, get_supporting_counts,
     classify_and_associate, classify_and_associate_children,
+    // Rebuild Lite commands
+    reclassify_pattern, reclassify_ai, rebuild_lite, rebuild_hierarchy_only,
     // Conversation context commands
     get_conversation_context,
     // Import commands
@@ -42,12 +47,12 @@ use commands::{
     // Leaf view commands
     get_leaf_content,
     // Settings panel commands
-    delete_all_data, reset_ai_processing, reset_clustering, clear_embeddings, clear_hierarchy, delete_empty_nodes, flatten_hierarchy, consolidate_root, get_db_stats,
+    delete_all_data, reset_ai_processing, reset_clustering, clear_embeddings, clear_hierarchy, clear_tags, delete_empty_nodes, flatten_hierarchy, consolidate_root, get_db_stats,
     get_db_path, switch_database, tidy_database,
     // Processing stats commands
     get_processing_stats, add_ai_processing_time, add_rebuild_time,
     // Privacy filtering commands
-    analyze_node_privacy, analyze_all_privacy, analyze_categories_privacy, cancel_privacy_scan, reset_privacy_flags, get_privacy_stats, export_shareable_db, set_node_privacy, score_privacy_all_items,
+    analyze_node_privacy, analyze_all_privacy, analyze_categories_privacy, cancel_privacy_scan, reset_privacy_flags, get_privacy_stats, export_shareable_db, set_node_privacy, score_privacy_all_items, get_export_preview,
     // Recent Notes protection commands
     get_protect_recent_notes, set_protect_recent_notes,
     // Local embeddings commands
@@ -142,9 +147,11 @@ pub fn run() {
                 }
             }
 
+            // Use configurable cache TTL from settings
+            let cache_ttl = settings::similarity_cache_ttl_secs();
             app.manage(AppState {
                 db: std::sync::RwLock::new(Arc::new(db)),
-                similarity_cache: std::sync::RwLock::new(commands::SimilarityCache::new(300)), // 5 minute TTL
+                similarity_cache: std::sync::RwLock::new(commands::SimilarityCache::new(cache_ttl)),
             });
 
             Ok(())
@@ -171,11 +178,16 @@ pub fn run() {
             get_ai_status,
             cancel_processing,
             cancel_rebuild,
+            cancel_all,
             get_api_key_status,
             save_api_key,
             clear_api_key,
             get_learned_emojis,
             save_learned_emoji,
+            // Pipeline state
+            get_pipeline_state,
+            set_pipeline_state,
+            get_db_metadata,
             // Hierarchy
             get_nodes_at_depth,
             get_children,
@@ -200,6 +212,11 @@ pub fn run() {
             get_supporting_counts,
             classify_and_associate,
             classify_and_associate_children,
+            // Rebuild Lite
+            reclassify_pattern,
+            reclassify_ai,
+            rebuild_lite,
+            rebuild_hierarchy_only,
             // Conversation context
             get_conversation_context,
             // Import
@@ -227,6 +244,7 @@ pub fn run() {
             reset_clustering,
             clear_embeddings,
             clear_hierarchy,
+            clear_tags,
             delete_empty_nodes,
             flatten_hierarchy,
             consolidate_root,
@@ -248,6 +266,7 @@ pub fn run() {
             export_shareable_db,
             set_node_privacy,
             score_privacy_all_items,
+            get_export_preview,
             // Recent Notes protection
             get_protect_recent_notes,
             set_protect_recent_notes,

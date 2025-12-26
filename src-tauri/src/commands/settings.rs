@@ -93,3 +93,30 @@ pub fn get_use_local_embeddings() -> bool {
 pub fn set_use_local_embeddings(enabled: bool) -> Result<(), String> {
     settings::set_use_local_embeddings(enabled)
 }
+
+// ==================== Pipeline State ====================
+
+use tauri::State;
+use crate::AppState;
+
+/// Get the current database pipeline state
+/// Returns: fresh, imported, processed, clustered, hierarchized, complete
+#[tauri::command]
+pub fn get_pipeline_state(state: State<AppState>) -> Result<String, String> {
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+    Ok(db.get_pipeline_state())
+}
+
+/// Set the database pipeline state
+#[tauri::command]
+pub fn set_pipeline_state(state: State<AppState>, pipeline_state: String) -> Result<(), String> {
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+    db.set_pipeline_state(&pipeline_state).map_err(|e| e.to_string())
+}
+
+/// Get all database metadata
+#[tauri::command]
+pub fn get_db_metadata(state: State<AppState>) -> Result<Vec<(String, String, i64)>, String> {
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+    db.get_all_metadata().map_err(|e| e.to_string())
+}

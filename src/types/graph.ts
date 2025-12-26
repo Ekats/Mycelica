@@ -27,7 +27,7 @@ export type NodeType =
   | 'thought'       // Legacy: treat as note
   | 'context';      // Legacy: treat as note
 
-export type EdgeType = 'reference' | 'because' | 'related' | 'contains';
+export type EdgeType = 'reference' | 'because' | 'related' | 'contains' | 'belongs_to';
 
 // =============================================================================
 // NODE INTERFACE
@@ -82,11 +82,18 @@ export interface Node {
   sequenceIndex?: number;   // Position in original conversation (0, 1, 2...)
 
   // --- Privacy filtering ---
-  isPrivate?: boolean;      // undefined = not scanned, true = private, false = safe
+  isPrivate?: boolean;      // undefined = not scanned, true = private, false = safe (legacy)
+  privacy?: number;         // 0.0 = private, 1.0 = public, undefined = unscored
   privacyReason?: string;   // Why it was marked private (for review)
 
-  // --- Content classification (mini-clustering) ---
-  contentType?: 'idea' | 'investigation' | 'code' | 'debug' | 'paste' | 'trivial';  // Classification for graph filtering
+  // --- Content classification (3 visibility tiers) ---
+  // VISIBLE (shown in graph): insight, idea, exploration, synthesis, question, planning
+  // SUPPORTING (lazy-loaded): investigation, discussion, reference, creative
+  // HIDDEN (excluded): debug, code, paste, trivial
+  contentType?:
+    | 'insight' | 'idea' | 'exploration' | 'synthesis' | 'question' | 'planning'  // VISIBLE
+    | 'investigation' | 'discussion' | 'reference' | 'creative'  // SUPPORTING
+    | 'debug' | 'code' | 'paste' | 'trivial';  // HIDDEN
   associatedIdeaId?: string;  // Links supporting item to specific idea node
 }
 

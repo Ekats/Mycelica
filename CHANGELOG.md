@@ -5,6 +5,15 @@ All notable changes to Mycelica will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Persistent tags system**: Tags that survive hierarchy rebuilds and guide clustering
+  - Tags generated from existing `nodes.tags` JSON field (AI-assigned item tags)
+  - Similar tag strings clustered (cosine > 0.75) and canonicalized (e.g., "rust", "Rust", "rust-lang" → "rust")
+  - Controlled vocabulary: only tags appearing in 10+ items (ln-scaled threshold)
+  - Tag hierarchy built from semantic similarity between canonical tags
+  - +0.08 similarity bonus per shared tag\ during clustering
+  - Tag anchors passed to uber-category AI as preferred category names
+  - "Clear Tags" button in Settings → Maintenance to regenerate
+- **Conversation clustering bonus**: Items from the same conversation get +0.1 similarity boost during clustering, keeping related exchanges together
 - **Privacy scoring system**: Continuous 0.0-1.0 privacy scores for items (0.0=private, 1.0=public) scored by AI via Haiku
   - `score_privacy_all_items` command processes items in batches of 25
   - "Score Privacy" button in Settings → Maintenance with cost estimation
@@ -25,6 +34,10 @@ All notable changes to Mycelica will be documented in this file.
 - **Preview database**: Added `mycelica-testing-preview.db` as a sanitized sample database for demos
 
 ### Changed
+- **Tag generation approach**: Refactored from cluster-based to vocabulary-based
+  - Old: Promoted large clusters to tags, assigned items via centroid similarity (>0.35)
+  - New: Extracts tags from `nodes.tags` field, clusters similar strings, maps items directly to canonical tags
+  - More accurate: items get the tags they actually have, just deduplicated and canonicalized
 - **Graph view filtering**: Only idea nodes are now shown in the graph. Code/debug/paste items are hidden and accessible via the Leaf View sidebar.
 - **Clustering optimization**: Clustering now only processes idea items, skipping code/debug/paste. This produces cleaner topic groupings focused on conversational content.
 - **Hierarchy build order**: Classification now runs before clustering (Step 1/7), associations run after hierarchy is built (Step 7/7).
@@ -43,6 +56,12 @@ All notable changes to Mycelica will be documented in this file.
 - **Expanded garbage word list**: Added "mixed", "assorted", "combined", "merged", "grouped", "sorted" to filter meaningless AI-generated names
 
 ### Technical
+- Added `tags` and `item_tags` tables for persistent tag storage with centroids (BLOB)
+- Added `tags.rs` module with `generate_tags_from_item_vocabulary()` - extracts, embeds, clusters, and canonicalizes item tags
+- Tag embedding uses local model (`local_embeddings::generate_batch`) for fast batch processing
+- Union-find algorithm for clustering similar tag strings
+- Pre-loaded `item_tags` map in `clustering.rs` for O(1) tag bonus lookup during O(n²) similarity calculation
+- Added `clear_tags` Tauri command and Settings button
 - Added `privacy REAL` column to nodes table (0.0=private, 1.0=public, NULL=unscored)
 - Added `propagate_privacy_scores()` in hierarchy.rs - bottom-up propagation where category privacy = min(children)
 - Privacy filter in clustering.rs excludes items with privacy < 0.3 from main clustering

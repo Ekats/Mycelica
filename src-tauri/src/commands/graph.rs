@@ -63,12 +63,12 @@ pub struct AppState {
 
 #[tauri::command]
 pub fn get_nodes(state: State<AppState>) -> Result<Vec<Node>, String> {
-    state.db.read().unwrap().get_all_nodes().map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_all_nodes().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn get_node(state: State<AppState>, id: String) -> Result<Option<Node>, String> {
-    state.db.read().unwrap().get_node(&id).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_node(&id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -85,6 +85,21 @@ pub fn cancel_rebuild() -> Result<(), String> {
     Ok(())
 }
 
+/// Cancel ALL operations (AI processing, clustering, hierarchy, embeddings)
+/// Use this for a single "Stop" button that halts everything
+#[tauri::command]
+pub fn cancel_all() -> Result<(), String> {
+    println!("[Cancel] ALL operations cancel requested");
+    CANCEL_PROCESSING.store(true, Ordering::SeqCst);
+    CANCEL_REBUILD.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Check if any operation was cancelled
+pub fn is_cancelled() -> bool {
+    CANCEL_PROCESSING.load(Ordering::SeqCst) || CANCEL_REBUILD.load(Ordering::SeqCst)
+}
+
 /// Check if rebuild was cancelled (for use in other modules)
 pub fn is_rebuild_cancelled() -> bool {
     CANCEL_REBUILD.load(Ordering::SeqCst)
@@ -95,9 +110,15 @@ pub fn reset_rebuild_cancel() {
     CANCEL_REBUILD.store(false, Ordering::SeqCst);
 }
 
+/// Reset all cancel flags (call at start of any operation)
+pub fn reset_all_cancel() {
+    CANCEL_PROCESSING.store(false, Ordering::SeqCst);
+    CANCEL_REBUILD.store(false, Ordering::SeqCst);
+}
+
 #[tauri::command]
 pub fn create_node(state: State<AppState>, node: Node) -> Result<(), String> {
-    state.db.read().unwrap().insert_node(&node).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.insert_node(&node).map_err(|e| e.to_string())
 }
 
 /// Add a quick note - creates note under "Recent Notes" container
@@ -113,11 +134,11 @@ pub fn add_note(state: State<AppState>, title: String, content: String) -> Resul
 
     // 1. Find or create "Recent Notes" container
     let container_id = "container-recent-notes";
-    let container_exists = state.db.read().unwrap().get_node(container_id).ok().flatten().is_some();
+    let container_exists = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_node(container_id).ok().flatten().is_some();
 
     if !container_exists {
         // Get Universe to set as parent
-        let universe = state.db.read().unwrap().get_universe()
+        let universe = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_universe()
             .map_err(|e| e.to_string())?
             .ok_or("No Universe found")?;
 
@@ -155,10 +176,10 @@ pub fn add_note(state: State<AppState>, title: String, content: String) -> Resul
             associated_idea_id: None,
             privacy: None,
         };
-        state.db.read().unwrap().insert_node(&container_node).map_err(|e| e.to_string())?;
+        state.db.read().map_err(|e| format!("DB lock error: {}", e))?.insert_node(&container_node).map_err(|e| e.to_string())?;
 
         // Update Universe child_count
-        state.db.read().unwrap().update_child_count(&universe.id, universe.child_count + 1)
+        state.db.read().map_err(|e| format!("DB lock error: {}", e))?.update_child_count(&universe.id, universe.child_count + 1)
             .map_err(|e| e.to_string())?;
     }
 
@@ -204,11 +225,11 @@ pub fn add_note(state: State<AppState>, title: String, content: String) -> Resul
         privacy: None,
     };
 
-    state.db.read().unwrap().insert_node(&note).map_err(|e| e.to_string())?;
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.insert_node(&note).map_err(|e| e.to_string())?;
 
     // 3. Update container child_count
-    let children = state.db.read().unwrap().get_children(container_id).map_err(|e| e.to_string())?;
-    state.db.read().unwrap().update_child_count(container_id, children.len() as i32)
+    let children = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_children(container_id).map_err(|e| e.to_string())?;
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.update_child_count(container_id, children.len() as i32)
         .map_err(|e| e.to_string())?;
 
     Ok(note_id)
@@ -216,43 +237,43 @@ pub fn add_note(state: State<AppState>, title: String, content: String) -> Resul
 
 #[tauri::command]
 pub fn update_node(state: State<AppState>, node: Node) -> Result<(), String> {
-    state.db.read().unwrap().update_node(&node).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.update_node(&node).map_err(|e| e.to_string())
 }
 
 /// Update just the content of a node (simpler API for editing)
 #[tauri::command]
 pub fn update_node_content(state: State<AppState>, node_id: String, content: String) -> Result<(), String> {
-    state.db.read().unwrap().update_node_content(&node_id, &content).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.update_node_content(&node_id, &content).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn delete_node(state: State<AppState>, id: String) -> Result<(), String> {
-    state.db.read().unwrap().delete_node(&id).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.delete_node(&id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn get_edges(state: State<AppState>) -> Result<Vec<Edge>, String> {
-    state.db.read().unwrap().get_all_edges().map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_all_edges().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn get_edges_for_node(state: State<AppState>, node_id: String) -> Result<Vec<Edge>, String> {
-    state.db.read().unwrap().get_edges_for_node(&node_id).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_edges_for_node(&node_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn create_edge(state: State<AppState>, edge: Edge) -> Result<(), String> {
-    state.db.read().unwrap().insert_edge(&edge).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.insert_edge(&edge).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn delete_edge(state: State<AppState>, id: String) -> Result<(), String> {
-    state.db.read().unwrap().delete_edge(&id).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.delete_edge(&id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn search_nodes(state: State<AppState>, query: String) -> Result<Vec<Node>, String> {
-    state.db.read().unwrap().search_nodes(&query).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.search_nodes(&query).map_err(|e| e.to_string())
 }
 
 // ==================== Clustering Commands ====================
@@ -269,8 +290,8 @@ pub struct ClusteringStatus {
 /// Get clustering status
 #[tauri::command]
 pub fn get_clustering_status(state: State<AppState>) -> Result<ClusteringStatus, String> {
-    let needs_clustering = state.db.read().unwrap().count_items_needing_clustering().map_err(|e| e.to_string())?;
-    let all_items = state.db.read().unwrap().get_items().map_err(|e| e.to_string())?;
+    let needs_clustering = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.count_items_needing_clustering().map_err(|e| e.to_string())?;
+    let all_items = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_items().map_err(|e| e.to_string())?;
 
     Ok(ClusteringStatus {
         items_needing_clustering: needs_clustering,
@@ -284,7 +305,7 @@ pub fn get_clustering_status(state: State<AppState>) -> Result<ClusteringStatus,
 #[tauri::command]
 pub async fn run_clustering(state: State<'_, AppState>, use_ai: Option<bool>) -> Result<ClusterResult, String> {
     let use_ai = use_ai.unwrap_or(true); // Default to using AI
-    let db = state.db.read().unwrap().clone();
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clone();
     clustering::run_clustering(&db, use_ai).await
 }
 
@@ -292,7 +313,7 @@ pub async fn run_clustering(state: State<'_, AppState>, use_ai: Option<bool>) ->
 #[tauri::command]
 pub async fn recluster_all(state: State<'_, AppState>, use_ai: Option<bool>) -> Result<ClusterResult, String> {
     let use_ai = use_ai.unwrap_or(true);
-    let db = state.db.read().unwrap().clone();
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clone();
     clustering::recluster_all(&db, use_ai).await
 }
 
@@ -306,8 +327,8 @@ pub struct AiStatus {
 
 #[tauri::command]
 pub fn get_ai_status(state: State<AppState>) -> Result<AiStatus, String> {
-    let all_nodes = state.db.read().unwrap().get_all_nodes().map_err(|e| e.to_string())?;
-    let unprocessed = state.db.read().unwrap().get_unprocessed_nodes().map_err(|e| e.to_string())?;
+    let all_nodes = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_all_nodes().map_err(|e| e.to_string())?;
+    let unprocessed = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_unprocessed_nodes().map_err(|e| e.to_string())?;
 
     Ok(AiStatus {
         available: ai_client::is_available(),
@@ -361,7 +382,7 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
     }
 
     // Clone the Arc to use across await points
-    let db = state.db.read().unwrap().clone();
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clone();
 
     // Get unprocessed nodes, excluding protected (Recent Notes)
     let all_unprocessed = db.get_unprocessed_nodes().map_err(|e| e.to_string())?;
@@ -553,12 +574,12 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
 
 #[tauri::command]
 pub fn get_learned_emojis(state: State<AppState>) -> Result<std::collections::HashMap<String, String>, String> {
-    state.db.read().unwrap().get_learned_emojis().map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_learned_emojis().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn save_learned_emoji(state: State<AppState>, keyword: String, emoji: String) -> Result<(), String> {
-    state.db.read().unwrap().save_learned_emoji(&keyword, &emoji).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.save_learned_emoji(&keyword, &emoji).map_err(|e| e.to_string())
 }
 
 // ==================== Hierarchy Navigation Commands ====================
@@ -566,31 +587,31 @@ pub fn save_learned_emoji(state: State<AppState>, keyword: String, emoji: String
 /// Get nodes at a specific depth (0=Universe, increases toward items)
 #[tauri::command]
 pub fn get_nodes_at_depth(state: State<AppState>, depth: i32) -> Result<Vec<Node>, String> {
-    state.db.read().unwrap().get_nodes_at_depth(depth).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_nodes_at_depth(depth).map_err(|e| e.to_string())
 }
 
 /// Get children of a specific parent node
 #[tauri::command]
 pub fn get_children(state: State<AppState>, parent_id: String) -> Result<Vec<Node>, String> {
-    state.db.read().unwrap().get_children(&parent_id).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_children(&parent_id).map_err(|e| e.to_string())
 }
 
 /// Get the Universe node (single root, is_universe = true)
 #[tauri::command]
 pub fn get_universe(state: State<AppState>) -> Result<Option<Node>, String> {
-    state.db.read().unwrap().get_universe().map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_universe().map_err(|e| e.to_string())
 }
 
 /// Get all items (is_item = true) - openable content
 #[tauri::command]
 pub fn get_items(state: State<AppState>) -> Result<Vec<Node>, String> {
-    state.db.read().unwrap().get_items().map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_items().map_err(|e| e.to_string())
 }
 
 /// Get the maximum depth in the hierarchy
 #[tauri::command]
 pub fn get_max_depth(state: State<AppState>) -> Result<i32, String> {
-    state.db.read().unwrap().get_max_depth().map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_max_depth().map_err(|e| e.to_string())
 }
 
 // ==================== Hierarchy Generation Commands ====================
@@ -599,7 +620,7 @@ pub fn get_max_depth(state: State<AppState>) -> Result<i32, String> {
 /// Creates intermediate grouping nodes based on collection size
 #[tauri::command]
 pub fn build_hierarchy(state: State<'_, AppState>) -> Result<hierarchy::HierarchyResult, String> {
-    let db = state.db.read().unwrap();
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
     hierarchy::build_hierarchy(&db)
 }
 
@@ -616,15 +637,16 @@ pub async fn build_full_hierarchy(
     run_clustering: Option<bool>,
 ) -> Result<hierarchy::FullHierarchyResult, String> {
     let should_cluster = run_clustering.unwrap_or(false);
-    let db = state.db.read().unwrap().clone();
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clone();
     hierarchy::build_full_hierarchy(&db, should_cluster, Some(&app)).await
 }
 
 /// Cluster children of a specific parent node into groups using AI
 ///
-/// Returns true if grouping was performed, false if already has ≤15 children.
+/// Returns true if grouping was performed, false if node has <2 children.
 /// Use this for manual/targeted hierarchy adjustment.
 /// max_groups: optional maximum number of groups to create (default 5)
+/// This is a manual split, so force=true bypasses automatic threshold checks.
 #[tauri::command]
 pub async fn cluster_hierarchy_level(
     app: AppHandle,
@@ -632,63 +654,62 @@ pub async fn cluster_hierarchy_level(
     parent_id: String,
     max_groups: Option<usize>,
 ) -> Result<bool, String> {
-    let db = state.db.read().unwrap().clone();
-    hierarchy::cluster_hierarchy_level(&db, &parent_id, Some(&app), max_groups).await
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clone();
+    // force=true: manual split from UI bypasses automatic thresholds
+    hierarchy::cluster_hierarchy_level(&db, &parent_id, Some(&app), max_groups, true).await
 }
 
-/// Unsplit a node - flatten intermediate categories back into the parent
+/// Split a node - delete it and move its children up to its parent
 ///
-/// Moves all grandchildren up to be direct children and deletes the intermediate category nodes.
-/// Returns the number of nodes that were flattened.
+/// The selected node is deleted, and all its children become children of the node's parent.
+/// Returns the number of children that were moved up.
 #[tauri::command]
 pub fn unsplit_node(state: State<AppState>, parent_id: String) -> Result<usize, String> {
-    let db = state.db.read().unwrap();
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+
+    // Get the node to be split (deleted)
+    let node = db.get_node(&parent_id).map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Node {} not found", parent_id))?;
+
+    // Can't split the Universe
+    if node.is_universe {
+        return Err("Cannot split the Universe node".to_string());
+    }
+
+    // Can't split items
+    if node.is_item {
+        return Err("Cannot split an item node".to_string());
+    }
+
+    // Get the node's parent (where children will go)
+    let grandparent_id = node.parent_id.clone()
+        .ok_or_else(|| "Cannot split a node without a parent".to_string())?;
 
     // Get direct children of this node
     let children = db.get_children(&parent_id).map_err(|e| e.to_string())?;
+    let moved_count = children.len();
 
-    let mut flattened_count = 0;
-    let mut categories_to_delete: Vec<String> = Vec::new();
-
+    // Reparent all children to the grandparent
     for child in &children {
-        // Only process category nodes (not items)
-        if child.is_item {
-            continue;
-        }
-
-        // Get grandchildren (children of this category)
-        let grandchildren = db.get_children(&child.id).map_err(|e| e.to_string())?;
-
-        if grandchildren.is_empty() {
-            // Empty category - just delete it
-            categories_to_delete.push(child.id.clone());
-            continue;
-        }
-
-        // Reparent grandchildren to the parent node
-        for grandchild in &grandchildren {
-            db.update_node_parent(&grandchild.id, &parent_id)
-                .map_err(|e| e.to_string())?;
-            flattened_count += 1;
-        }
-
-        // Mark this intermediate category for deletion
-        categories_to_delete.push(child.id.clone());
+        db.update_node_parent(&child.id, &grandparent_id)
+            .map_err(|e| e.to_string())?;
+        // Decrement depth of child and all its descendants
+        db.decrement_subtree_depth(&child.id).map_err(|e| e.to_string())?;
     }
 
-    // Delete the intermediate categories
-    for cat_id in &categories_to_delete {
-        db.delete_node(cat_id).map_err(|e| e.to_string())?;
-    }
+    // Delete the node itself
+    db.delete_node(&parent_id).map_err(|e| e.to_string())?;
 
-    // Update child count of parent
-    let new_child_count = db.get_children(&parent_id)
+    // Update child count of grandparent
+    let new_child_count = db.get_children(&grandparent_id)
         .map_err(|e| e.to_string())?
         .len() as i32;
-    db.update_child_count(&parent_id, new_child_count)
+    db.update_child_count(&grandparent_id, new_child_count)
         .map_err(|e| e.to_string())?;
 
-    Ok(flattened_count)
+    println!("[Split] Deleted '{}', moved {} children up to parent", node.title, moved_count);
+
+    Ok(moved_count)
 }
 
 /// Get children of a node, automatically skipping single-child chains
@@ -696,7 +717,7 @@ pub fn unsplit_node(state: State<AppState>, parent_id: String) -> Result<usize, 
 /// Useful for navigation - if a level has exactly 1 child, skip to that child's children.
 #[tauri::command]
 pub fn get_children_flat(state: State<AppState>, parent_id: String) -> Result<Vec<Node>, String> {
-    let db = state.db.read().unwrap();
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
     hierarchy::get_children_skip_single_chain(&db, &parent_id)
 }
 
@@ -705,19 +726,19 @@ pub fn get_children_flat(state: State<AppState>, parent_id: String) -> Result<Ve
 /// Get only idea nodes for graph rendering (filters out code/debug/paste)
 #[tauri::command]
 pub fn get_graph_children(state: State<AppState>, parent_id: String) -> Result<Vec<Node>, String> {
-    state.db.read().unwrap().get_graph_children(&parent_id).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_graph_children(&parent_id).map_err(|e| e.to_string())
 }
 
 /// Get supporting items (code/debug/paste) under a parent
 #[tauri::command]
 pub fn get_supporting_items(state: State<AppState>, parent_id: String) -> Result<Vec<Node>, String> {
-    state.db.read().unwrap().get_supporting_items(&parent_id).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_supporting_items(&parent_id).map_err(|e| e.to_string())
 }
 
 /// Get items associated with a specific idea
 #[tauri::command]
 pub fn get_associated_items(state: State<AppState>, idea_id: String) -> Result<Vec<Node>, String> {
-    state.db.read().unwrap().get_associated_items(&idea_id).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_associated_items(&idea_id).map_err(|e| e.to_string())
 }
 
 /// Supporting item counts for badge display
@@ -731,7 +752,7 @@ pub struct SupportingCounts {
 /// Get counts of supporting items for badge display
 #[tauri::command]
 pub fn get_supporting_counts(state: State<AppState>, parent_id: String) -> Result<SupportingCounts, String> {
-    let (code, debug, paste) = state.db.read().unwrap().get_supporting_counts(&parent_id).map_err(|e| e.to_string())?;
+    let (code, debug, paste) = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_supporting_counts(&parent_id).map_err(|e| e.to_string())?;
     Ok(SupportingCounts { code, debug, paste })
 }
 
@@ -740,7 +761,7 @@ pub fn get_supporting_counts(state: State<AppState>, parent_id: String) -> Resul
 pub fn classify_and_associate(state: State<AppState>) -> Result<(usize, usize), String> {
     use crate::classification;
 
-    let db = state.db.read().unwrap();
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
 
     // Step 1: Classify all unclassified items
     let classified = classification::classify_all_items(&db)?;
@@ -756,7 +777,7 @@ pub fn classify_and_associate(state: State<AppState>) -> Result<(usize, usize), 
 pub fn classify_and_associate_children(state: State<AppState>, parent_id: String) -> Result<(usize, usize), String> {
     use crate::classification;
 
-    let db = state.db.read().unwrap();
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
 
     // Step 1: Classify children
     let classified = classification::classify_children(&db, &parent_id)?;
@@ -773,7 +794,7 @@ pub fn classify_and_associate_children(state: State<AppState>, parent_id: String
 /// Leaves get their created_at, groups get MAX of their children's latest_child_date.
 #[tauri::command]
 pub fn propagate_latest_dates(state: State<AppState>) -> Result<(), String> {
-    state.db.read().unwrap().propagate_latest_dates().map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.propagate_latest_dates().map_err(|e| e.to_string())
 }
 
 // ==================== Multi-Path Association Commands ====================
@@ -782,7 +803,7 @@ pub fn propagate_latest_dates(state: State<AppState>) -> Result<(), String> {
 /// Returns edges sorted by weight (highest first)
 #[tauri::command]
 pub fn get_item_associations(state: State<AppState>, item_id: String) -> Result<Vec<Edge>, String> {
-    state.db.read().unwrap().get_belongs_to_edges(&item_id).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_belongs_to_edges(&item_id).map_err(|e| e.to_string())
 }
 
 /// Get items that share categories with this item
@@ -792,7 +813,7 @@ pub fn get_related_items(state: State<AppState>, item_id: String, min_weight: Op
     let min_w = min_weight.unwrap_or(0.3);
 
     // Get this item's category associations
-    let associations = state.db.read().unwrap().get_belongs_to_edges(&item_id).map_err(|e| e.to_string())?;
+    let associations = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_belongs_to_edges(&item_id).map_err(|e| e.to_string())?;
 
     if associations.is_empty() {
         return Ok(vec![]);
@@ -821,7 +842,7 @@ pub fn get_related_items(state: State<AppState>, item_id: String, min_weight: Op
 
         if let Some(cid) = cluster_id {
             // Get all items in this cluster via edges
-            if let Ok(items) = state.db.read().unwrap().get_items_in_cluster_via_edges(cid, Some(min_w)) {
+            if let Ok(items) = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_items_in_cluster_via_edges(cid, Some(min_w)) {
                 for item in items {
                     if item.id != item_id { // Don't include self
                         related_ids.insert(item.id);
@@ -834,7 +855,7 @@ pub fn get_related_items(state: State<AppState>, item_id: String, min_weight: Op
     // Fetch full node data for related items
     let mut related_nodes: Vec<Node> = Vec::new();
     for id in related_ids {
-        if let Ok(Some(node)) = state.db.read().unwrap().get_node(&id) {
+        if let Ok(Some(node)) = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_node(&id) {
             related_nodes.push(node);
         }
     }
@@ -849,7 +870,7 @@ pub fn get_related_items(state: State<AppState>, item_id: String, min_weight: Op
 /// More comprehensive than hierarchy navigation - includes secondary associations
 #[tauri::command]
 pub fn get_category_items(state: State<AppState>, cluster_id: i32, min_weight: Option<f64>) -> Result<Vec<Node>, String> {
-    state.db.read().unwrap().get_items_in_cluster_via_edges(cluster_id, min_weight).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_items_in_cluster_via_edges(cluster_id, min_weight).map_err(|e| e.to_string())
 }
 
 // ==================== Conversation Context Commands ====================
@@ -858,7 +879,7 @@ pub fn get_category_items(state: State<AppState>, cluster_id: i32, min_weight: O
 /// Traces message Leafs back to their parent conversation
 #[tauri::command]
 pub fn get_conversation_context(state: State<AppState>, conversation_id: String) -> Result<Vec<Node>, String> {
-    state.db.read().unwrap().get_conversation_messages(&conversation_id).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_conversation_messages(&conversation_id).map_err(|e| e.to_string())
 }
 
 // ==================== Import Commands ====================
@@ -872,7 +893,7 @@ pub fn get_conversation_context(state: State<AppState>, conversation_id: String)
 /// Each message gets conversation_id and sequence_index for context reconstruction.
 #[tauri::command]
 pub fn import_claude_conversations(state: State<AppState>, json_content: String) -> Result<import::ImportResult, String> {
-    let db = state.db.read().unwrap();
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
     import::import_claude_conversations(&db, &json_content)
 }
 
@@ -882,7 +903,7 @@ pub fn import_claude_conversations(state: State<AppState>, json_content: String)
 /// Title is extracted from first # heading or filename.
 #[tauri::command]
 pub fn import_markdown_files(state: State<AppState>, file_paths: Vec<String>) -> Result<import::ImportResult, String> {
-    let db = state.db.read().unwrap();
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
     import::import_markdown_files(&db, &file_paths)
 }
 
@@ -892,7 +913,7 @@ pub fn import_markdown_files(state: State<AppState>, file_paths: Vec<String>) ->
 /// and creates thought nodes with is_item=true and source="googlekeep".
 #[tauri::command]
 pub fn import_google_keep(state: State<AppState>, zip_path: String) -> Result<import::GoogleKeepImportResult, String> {
-    let db = state.db.read().unwrap();
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
     import::import_google_keep(&db, &zip_path)
 }
 
@@ -901,31 +922,31 @@ pub fn import_google_keep(state: State<AppState>, zip_path: String) -> Result<im
 /// Pin or unpin a node for quick access
 #[tauri::command]
 pub fn set_node_pinned(state: State<AppState>, node_id: String, pinned: bool) -> Result<(), String> {
-    state.db.read().unwrap().set_node_pinned(&node_id, pinned).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.set_node_pinned(&node_id, pinned).map_err(|e| e.to_string())
 }
 
 /// Update last accessed timestamp for a node (call when opening in Leaf)
 #[tauri::command]
 pub fn touch_node(state: State<AppState>, node_id: String) -> Result<(), String> {
-    state.db.read().unwrap().touch_node(&node_id).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.touch_node(&node_id).map_err(|e| e.to_string())
 }
 
 /// Get all pinned nodes for Sidebar Pinned tab
 #[tauri::command]
 pub fn get_pinned_nodes(state: State<AppState>) -> Result<Vec<Node>, String> {
-    state.db.read().unwrap().get_pinned_nodes().map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_pinned_nodes().map_err(|e| e.to_string())
 }
 
 /// Get recently accessed nodes for Sidebar Recent tab
 #[tauri::command]
 pub fn get_recent_nodes(state: State<AppState>, limit: Option<i32>) -> Result<Vec<Node>, String> {
-    state.db.read().unwrap().get_recent_nodes(limit.unwrap_or(15)).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_recent_nodes(limit.unwrap_or(15)).map_err(|e| e.to_string())
 }
 
 /// Remove a node from recents (clear last_accessed_at)
 #[tauri::command]
 pub fn clear_recent(state: State<AppState>, node_id: String) -> Result<(), String> {
-    state.db.read().unwrap().clear_recent(&node_id).map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clear_recent(&node_id).map_err(|e| e.to_string())
 }
 
 // ==================== Semantic Similarity Commands ====================
@@ -954,7 +975,7 @@ pub fn get_similar_nodes(
     let min_similarity = min_similarity.unwrap_or(0.0);
 
     // Check cache first
-    let cached = state.similarity_cache.read().unwrap().get(&node_id);
+    let cached = state.similarity_cache.read().map_err(|e| format!("Cache lock error: {}", e))?.get(&node_id);
 
     let similar = if let Some(cached_results) = cached {
         // Use cached results, but filter and limit
@@ -964,13 +985,13 @@ pub fn get_similar_nodes(
             .collect::<Vec<_>>()
     } else {
         // Get the target node's embedding - return empty if none (e.g., category nodes)
-        let target_embedding = match state.db.read().unwrap().get_node_embedding(&node_id) {
+        let target_embedding = match state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_node_embedding(&node_id) {
             Ok(Some(emb)) => emb,
             _ => return Ok(vec![]), // No embedding = no similar nodes, but not an error
         };
 
         // Get all embeddings
-        let all_embeddings = state.db.read().unwrap().get_nodes_with_embeddings()
+        let all_embeddings = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_nodes_with_embeddings()
             .map_err(|e| e.to_string())?;
 
         if all_embeddings.is_empty() {
@@ -982,7 +1003,7 @@ pub fn get_similar_nodes(
         let similar = similarity::find_similar(&target_embedding, &all_embeddings, &node_id, max_cache_results, 0.0);
 
         // Cache the full results
-        state.similarity_cache.write().unwrap().insert(node_id.clone(), similar.clone());
+        state.similarity_cache.write().map_err(|e| format!("Cache lock error: {}", e))?.insert(node_id.clone(), similar.clone());
 
         // Filter and limit for this request
         similar.into_iter()
@@ -994,7 +1015,7 @@ pub fn get_similar_nodes(
     // Fetch full node data for results
     let mut results: Vec<SimilarNode> = Vec::new();
     for (id, sim_score) in similar {
-        if let Ok(Some(node)) = state.db.read().unwrap().get_node(&id) {
+        if let Ok(Some(node)) = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_node(&id) {
             results.push(SimilarNode {
                 id: node.id,
                 title: node.ai_title.unwrap_or(node.title),
@@ -1019,9 +1040,9 @@ pub struct EmbeddingStatus {
 
 #[tauri::command]
 pub fn get_embedding_status(state: State<AppState>) -> Result<EmbeddingStatus, String> {
-    let nodes_with_embeddings = state.db.read().unwrap().count_nodes_with_embeddings()
+    let nodes_with_embeddings = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.count_nodes_with_embeddings()
         .map_err(|e| e.to_string())?;
-    let all_items = state.db.read().unwrap().get_items().map_err(|e| e.to_string())?;
+    let all_items = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_items().map_err(|e| e.to_string())?;
 
     Ok(EmbeddingStatus {
         nodes_with_embeddings,
@@ -1053,7 +1074,7 @@ pub fn clear_openai_api_key() -> Result<(), String> {
 /// Get the full content of a node for Leaf view rendering
 #[tauri::command]
 pub fn get_leaf_content(state: State<AppState>, node_id: String) -> Result<String, String> {
-    let node = state.db.read().unwrap().get_node(&node_id)
+    let node = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_node(&node_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Node {} not found", node_id))?;
 
@@ -1087,43 +1108,49 @@ pub struct DbStats {
 /// Delete all data (nodes + edges)
 #[tauri::command]
 pub fn delete_all_data(state: State<AppState>) -> Result<DeleteResult, String> {
-    let edges_deleted = state.db.read().unwrap().delete_all_edges().map_err(|e| e.to_string())?;
-    let nodes_deleted = state.db.read().unwrap().delete_all_nodes().map_err(|e| e.to_string())?;
+    let edges_deleted = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.delete_all_edges().map_err(|e| e.to_string())?;
+    let nodes_deleted = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.delete_all_nodes().map_err(|e| e.to_string())?;
     Ok(DeleteResult { nodes_deleted, edges_deleted })
 }
 
 /// Reset AI processing flag on all items
 #[tauri::command]
 pub fn reset_ai_processing(state: State<AppState>) -> Result<usize, String> {
-    state.db.read().unwrap().reset_ai_processing().map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.reset_ai_processing().map_err(|e| e.to_string())
 }
 
 /// Reset clustering flag on all items
 #[tauri::command]
 pub fn reset_clustering(state: State<AppState>) -> Result<usize, String> {
-    state.db.read().unwrap().mark_all_items_need_clustering().map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.mark_all_items_need_clustering().map_err(|e| e.to_string())
 }
 
 /// Clear all embeddings
 #[tauri::command]
 pub fn clear_embeddings(state: State<AppState>) -> Result<usize, String> {
     // Also delete semantic edges since they depend on embeddings
-    let _ = state.db.read().unwrap().delete_semantic_edges();
-    state.db.read().unwrap().clear_all_embeddings().map_err(|e| e.to_string())
+    let _ = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.delete_semantic_edges();
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clear_all_embeddings().map_err(|e| e.to_string())
 }
 
 /// Clear hierarchy (delete intermediate nodes, keep items)
 #[tauri::command]
 pub fn clear_hierarchy(state: State<AppState>) -> Result<usize, String> {
     // Also clear parent_id on items
-    let _ = state.db.read().unwrap().clear_item_parents();
-    state.db.read().unwrap().delete_hierarchy_nodes().map_err(|e| e.to_string())
+    let _ = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clear_item_parents();
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.delete_hierarchy_nodes().map_err(|e| e.to_string())
+}
+
+/// Clear all tags and item_tags (for tag regeneration)
+#[tauri::command]
+pub fn clear_tags(state: State<AppState>) -> Result<usize, String> {
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.delete_all_tags().map_err(|e| e.to_string())
 }
 
 /// Delete empty nodes (items with no content/raw data)
 #[tauri::command]
 pub fn delete_empty_nodes(state: State<AppState>) -> Result<usize, String> {
-    state.db.read().unwrap().delete_empty_items().map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.delete_empty_items().map_err(|e| e.to_string())
 }
 
 /// Result of quick_add_to_hierarchy
@@ -1149,11 +1176,11 @@ pub async fn quick_add_to_hierarchy(
     const INBOX_TITLE: &str = "📥 Inbox";
 
     // Get orphaned items that have been clustered but not added to hierarchy
-    let orphans = state.db.read().unwrap().get_orphaned_clustered_items().map_err(|e| e.to_string())?;
+    let orphans = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_orphaned_clustered_items().map_err(|e| e.to_string())?;
 
     if orphans.is_empty() {
         // Still return inbox count for UI
-        let inbox_count = match state.db.read().unwrap().get_node(INBOX_ID) {
+        let inbox_count = match state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_node(INBOX_ID) {
             Ok(Some(inbox)) => inbox.child_count as usize,
             _ => 0,
         };
@@ -1172,7 +1199,7 @@ pub async fn quick_add_to_hierarchy(
     let mut items_skipped = 0;
 
     // Get Universe for fallback parent
-    let universe = state.db.read().unwrap().get_universe()
+    let universe = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_universe()
         .map_err(|e| e.to_string())?
         .ok_or("No Universe node found - run full hierarchy build first")?;
 
@@ -1183,7 +1210,7 @@ pub async fn quick_add_to_hierarchy(
 
     // Get or create Inbox category for new topics
     let inbox_depth = universe.depth + 1;
-    let inbox = match state.db.read().unwrap().get_node(INBOX_ID).map_err(|e| e.to_string())? {
+    let inbox = match state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_node(INBOX_ID).map_err(|e| e.to_string())? {
         Some(existing) => existing,
         None => {
             // Create Inbox category
@@ -1220,8 +1247,8 @@ pub async fn quick_add_to_hierarchy(
                 associated_idea_id: None,
                 privacy: None,
             };
-            state.db.read().unwrap().insert_node(&inbox_node).map_err(|e| e.to_string())?;
-            state.db.read().unwrap().increment_child_count(&universe.id).map_err(|e| e.to_string())?;
+            state.db.read().map_err(|e| format!("DB lock error: {}", e))?.insert_node(&inbox_node).map_err(|e| e.to_string())?;
+            state.db.read().map_err(|e| format!("DB lock error: {}", e))?.increment_child_count(&universe.id).map_err(|e| e.to_string())?;
             println!("[QuickAdd] Created 📥 Inbox category");
             inbox_node
         }
@@ -1239,16 +1266,16 @@ pub async fn quick_add_to_hierarchy(
         };
 
         // Try to find existing topic with matching cluster_label
-        let topic = state.db.read().unwrap().find_topic_by_cluster_label(&cluster_label)
+        let topic = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.find_topic_by_cluster_label(&cluster_label)
             .map_err(|e| e.to_string())?;
 
         match topic {
             Some(existing_topic) => {
                 // Add item to existing topic
                 let item_depth = existing_topic.depth + 1;
-                state.db.read().unwrap().set_node_parent(&item.id, &existing_topic.id, item_depth)
+                state.db.read().map_err(|e| format!("DB lock error: {}", e))?.set_node_parent(&item.id, &existing_topic.id, item_depth)
                     .map_err(|e| e.to_string())?;
-                state.db.read().unwrap().increment_child_count(&existing_topic.id)
+                state.db.read().map_err(|e| format!("DB lock error: {}", e))?.increment_child_count(&existing_topic.id)
                     .map_err(|e| e.to_string())?;
 
                 println!("[QuickAdd] Added '{}' to existing topic '{}'",
@@ -1261,13 +1288,13 @@ pub async fn quick_add_to_hierarchy(
                 let topic_id = format!("topic-quick-{}", item.cluster_id.unwrap_or(0));
 
                 // Check if this topic already exists (might have been created in this batch)
-                if let Ok(Some(_)) = state.db.read().unwrap().get_node(&topic_id) {
+                if let Ok(Some(_)) = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_node(&topic_id) {
                     // Topic was just created, add item to it
                     let topic_depth = inbox_depth + 1;
                     let item_depth = topic_depth + 1;
-                    state.db.read().unwrap().set_node_parent(&item.id, &topic_id, item_depth)
+                    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.set_node_parent(&item.id, &topic_id, item_depth)
                         .map_err(|e| e.to_string())?;
-                    state.db.read().unwrap().increment_child_count(&topic_id)
+                    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.increment_child_count(&topic_id)
                         .map_err(|e| e.to_string())?;
                     items_added += 1;
                     continue;
@@ -1309,13 +1336,13 @@ pub async fn quick_add_to_hierarchy(
                     privacy: None,
                 };
 
-                state.db.read().unwrap().insert_node(&topic_node).map_err(|e| e.to_string())?;
-                state.db.read().unwrap().increment_child_count(&inbox.id).map_err(|e| e.to_string())?;
+                state.db.read().map_err(|e| format!("DB lock error: {}", e))?.insert_node(&topic_node).map_err(|e| e.to_string())?;
+                state.db.read().map_err(|e| format!("DB lock error: {}", e))?.increment_child_count(&inbox.id).map_err(|e| e.to_string())?;
                 topics_created += 1;
 
                 // Add item to new topic
                 let item_depth = topic_depth + 1;
-                state.db.read().unwrap().set_node_parent(&item.id, &topic_id, item_depth)
+                state.db.read().map_err(|e| format!("DB lock error: {}", e))?.set_node_parent(&item.id, &topic_id, item_depth)
                     .map_err(|e| e.to_string())?;
 
                 println!("[QuickAdd] Created new topic '{}' under Inbox for '{}'",
@@ -1327,7 +1354,7 @@ pub async fn quick_add_to_hierarchy(
     }
 
     // Get final inbox count
-    let inbox_count = match state.db.read().unwrap().get_node(INBOX_ID) {
+    let inbox_count = match state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_node(INBOX_ID) {
         Ok(Some(inbox)) => inbox.child_count as usize,
         _ => 0,
     };
@@ -1347,7 +1374,7 @@ pub async fn quick_add_to_hierarchy(
 /// Removes single-child chains and "Uncategorized" passthrough nodes
 #[tauri::command]
 pub fn flatten_hierarchy(state: State<AppState>) -> Result<usize, String> {
-    state.db.read().unwrap().flatten_empty_levels().map_err(|e| e.to_string())
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.flatten_empty_levels().map_err(|e| e.to_string())
 }
 
 /// Consolidate Universe's direct children into 4-8 uber-categories
@@ -1358,13 +1385,13 @@ pub async fn consolidate_root(state: State<'_, AppState>) -> Result<ConsolidateR
     use crate::db::{Node, NodeType, Position};
 
     // Get Universe
-    let universe = state.db.read().unwrap().get_universe()
+    let universe = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_universe()
         .map_err(|e| e.to_string())?
         .ok_or("No Universe node found")?;
 
     // Get Universe's direct children (excluding protected)
-    let all_children = state.db.read().unwrap().get_children(&universe.id).map_err(|e| e.to_string())?;
-    let protected_ids = state.db.read().unwrap().get_protected_node_ids();
+    let all_children = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_children(&universe.id).map_err(|e| e.to_string())?;
+    let protected_ids = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_protected_node_ids();
     let children: Vec<Node> = all_children
         .into_iter()
         .filter(|child| !protected_ids.contains(&child.id))
@@ -1397,8 +1424,8 @@ pub async fn consolidate_root(state: State<'_, AppState>) -> Result<ConsolidateR
         })
         .collect();
 
-    // Call AI to group into uber-categories
-    let groupings = ai_client::group_into_uber_categories(&categories).await?;
+    // Call AI to group into uber-categories (without tag anchors for manual consolidation)
+    let groupings = ai_client::group_into_uber_categories(&categories, None).await?;
 
     if groupings.is_empty() {
         return Err("AI returned no uber-categories".to_string());
@@ -1484,12 +1511,12 @@ pub async fn consolidate_root(state: State<'_, AppState>) -> Result<ConsolidateR
             privacy: None,
         };
 
-        state.db.read().unwrap().insert_node(&uber_node).map_err(|e| e.to_string())?;
+        state.db.read().map_err(|e| format!("DB lock error: {}", e))?.insert_node(&uber_node).map_err(|e| e.to_string())?;
         uber_categories_created += 1;
 
         // Reparent children to this uber-category
         for child in &matching_children {
-            state.db.read().unwrap().update_parent(&child.id, &uber_id).map_err(|e| e.to_string())?;
+            state.db.read().map_err(|e| format!("DB lock error: {}", e))?.update_parent(&child.id, &uber_id).map_err(|e| e.to_string())?;
             all_children_to_update.push(child.id.clone());
             children_reparented += 1;
         }
@@ -1500,13 +1527,13 @@ pub async fn consolidate_root(state: State<'_, AppState>) -> Result<ConsolidateR
     // Batch update depths
     if !all_children_to_update.is_empty() {
         println!("[Consolidate] Updating depths for {} reparented nodes...", all_children_to_update.len());
-        state.db.read().unwrap().increment_multiple_subtrees_depth(&all_children_to_update).map_err(|e| e.to_string())?;
+        state.db.read().map_err(|e| format!("DB lock error: {}", e))?.increment_multiple_subtrees_depth(&all_children_to_update).map_err(|e| e.to_string())?;
     }
 
     // Update Universe's child count (new uber-categories + children that stayed at top level)
     let children_stayed_at_top = children.len().saturating_sub(children_reparented);
     let new_universe_child_count = uber_categories_created + children_stayed_at_top;
-    state.db.read().unwrap().update_child_count(&universe.id, new_universe_child_count as i32)
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.update_child_count(&universe.id, new_universe_child_count as i32)
         .map_err(|e| e.to_string())?;
 
     println!("[Consolidate] Complete: {} uber-categories, {} children reparented, {} stayed at top level",
@@ -1547,7 +1574,7 @@ pub struct TidyReport {
 #[tauri::command]
 pub fn tidy_database(state: State<AppState>) -> Result<TidyReport, String> {
     let start = std::time::Instant::now();
-    let db = state.db.read().unwrap();
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
 
     // Run operations in order (logging done in schema.rs)
     let same_name_merged = db.merge_same_name_children().map_err(|e| e.to_string())?;
@@ -1579,7 +1606,7 @@ pub fn tidy_database(state: State<AppState>) -> Result<TidyReport, String> {
 pub fn get_db_stats(state: State<AppState>) -> Result<DbStats, String> {
     let (total_nodes, total_items, processed_items, items_with_embeddings,
          unprocessed_items, unclustered_items, orphan_items, topics_count) =
-        state.db.read().unwrap().get_stats().map_err(|e| e.to_string())?;
+        state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_stats().map_err(|e| e.to_string())?;
     Ok(DbStats {
         total_nodes,
         total_items,
@@ -1595,7 +1622,7 @@ pub fn get_db_stats(state: State<AppState>) -> Result<DbStats, String> {
 /// Get current database path
 #[tauri::command]
 pub fn get_db_path(state: State<AppState>) -> Result<String, String> {
-    Ok(state.db.read().unwrap().get_path())
+    Ok(state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_path())
 }
 
 /// Switch to a different database file (hot-swap without restart)
@@ -1631,7 +1658,7 @@ pub fn switch_database(_app: AppHandle, state: State<AppState>, db_path: String)
 
     // Hot-swap the database connection
     {
-        let mut db_guard = state.db.write().unwrap();
+        let mut db_guard = state.db.write().map_err(|e| format!("DB lock error: {}", e))?;
         *db_guard = Arc::new(new_db);
     }
 
@@ -1689,7 +1716,7 @@ pub async fn regenerate_all_embeddings(
     use crate::local_embeddings;
 
     let start = std::time::Instant::now();
-    let db = state.db.read().unwrap().clone();
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clone();
 
     let use_local = settings::use_local_embeddings();
     let embedding_source = if use_local {
@@ -1837,5 +1864,263 @@ pub async fn regenerate_all_embeddings(
         count: success_count,
         embedding_source: embedding_source.to_string(),
         duration_secs,
+    })
+}
+
+// ==================== Rebuild Lite Commands ====================
+
+/// Result of lite rebuild operations
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RebuildLiteResult {
+    pub items_classified: usize,
+    pub clusters_created: usize,
+    pub hierarchy_levels: usize,
+    pub method: String,  // "pattern" or "ai"
+}
+
+/// Reclassify all items using pattern matching (FREE, instant)
+///
+/// Updates content_type based on pattern detection.
+/// Does NOT use AI - completely free and instant.
+#[tauri::command]
+pub fn reclassify_pattern(state: State<AppState>) -> Result<usize, String> {
+    use crate::classification;
+
+    println!("[Reclassify Pattern] === STARTING ===");
+    println!("[Reclassify Pattern] Mode: Pattern matching (FREE)");
+
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+
+    // First, clear all existing content_type so they get reclassified
+    println!("[Reclassify Pattern] Clearing existing classifications...");
+    db.clear_all_content_types().map_err(|e| e.to_string())?;
+
+    // Now classify all items (this function logs the detailed breakdown)
+    let classified = classification::classify_all_items(&db)?;
+
+    println!("[Reclassify Pattern] === COMPLETE ===");
+    println!("  Total classified: {}", classified);
+    println!("  Cost: FREE");
+
+    Ok(classified)
+}
+
+/// Reclassify all items using AI (CHEAP, ~$0.04 for 4000 items)
+///
+/// Uses minimal AI prompt that only returns content_type.
+/// ~50 tokens per item with Haiku.
+/// Note: API calls are sequential (no batching) but cheap.
+#[tauri::command]
+pub async fn reclassify_ai(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    use std::collections::HashMap;
+
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clone();
+
+    // Get all items
+    let items = db.get_items().map_err(|e| e.to_string())?;
+    let total = items.len();
+
+    if total == 0 {
+        println!("[Reclassify AI] No items to classify");
+        return Ok(0);
+    }
+
+    println!("[Reclassify AI] === STARTING ===");
+    println!("[Reclassify AI] Processing {} items with Haiku...", total);
+    println!("[Reclassify AI] Estimated cost: ~${:.2}", total as f64 * 0.00001);
+
+    // Emit progress
+    let _ = app.emit("reclassify-progress", serde_json::json!({
+        "current": 0,
+        "total": total,
+        "status": "Starting AI classification..."
+    }));
+
+    let mut classified = 0;
+    let mut skipped_empty = 0;
+    let mut api_errors = 0;
+    let mut type_counts: HashMap<String, usize> = HashMap::new();
+
+    for (idx, item) in items.iter().enumerate() {
+        // Check cancellation
+        if CANCEL_PROCESSING.load(Ordering::SeqCst) {
+            println!("[Reclassify AI] Cancelled at {}/{}", idx, total);
+            CANCEL_PROCESSING.store(false, Ordering::SeqCst);
+            break;
+        }
+
+        let content = item.content.as_deref().unwrap_or("");
+        if content.is_empty() {
+            skipped_empty += 1;
+            continue;
+        }
+
+        let content_type = match ai_client::classify_content_ai(content).await {
+            Ok(ct) => ct,
+            Err(e) => {
+                api_errors += 1;
+                if api_errors <= 3 {
+                    eprintln!("[Reclassify AI] API error for {}: {}", item.id, e);
+                }
+                // Use pattern matcher fallback
+                use crate::classification::classify_content;
+                classify_content(content).as_str().to_string()
+            }
+        };
+
+        *type_counts.entry(content_type.clone()).or_insert(0) += 1;
+        db.set_content_type(&item.id, &content_type)
+            .map_err(|e| e.to_string())?;
+        classified += 1;
+
+        // Emit progress every 10 items, log every 100
+        if idx % 100 == 0 && idx > 0 {
+            println!("[Reclassify AI] Progress: {}/{} ({:.1}%)", idx, total, (idx as f64 / total as f64) * 100.0);
+        }
+        if idx % 10 == 0 || idx == total - 1 {
+            let _ = app.emit("reclassify-progress", serde_json::json!({
+                "current": idx + 1,
+                "total": total,
+                "status": format!("Classifying {} of {}...", idx + 1, total)
+            }));
+        }
+    }
+
+    // Log results
+    println!("[Reclassify AI] === RESULTS ===");
+    println!("  Classified: {}", classified);
+    println!("  Skipped (empty): {}", skipped_empty);
+    println!("  API errors (used fallback): {}", api_errors);
+    println!("[Reclassify AI] === BY TYPE ===");
+
+    let mut sorted_counts: Vec<_> = type_counts.iter().collect();
+    sorted_counts.sort_by(|a, b| b.1.cmp(a.1));
+    for (content_type, count) in sorted_counts {
+        let tier = match content_type.as_str() {
+            "insight" | "exploration" | "synthesis" | "question" | "planning" => "VISIBLE",
+            "investigation" | "discussion" | "reference" | "creative" => "SUPPORTING",
+            "debug" | "code" | "paste" | "trivial" => "HIDDEN",
+            _ => "UNKNOWN",
+        };
+        println!("  {:12} {:5} ({})", content_type, count, tier);
+    }
+
+    Ok(classified)
+}
+
+/// Rebuild Lite: Reclassify + recluster only (FREE)
+///
+/// SAFE: Does NOT touch hierarchy structure.
+/// Only updates content_type and cluster_id on items.
+#[tauri::command]
+pub async fn rebuild_lite(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<RebuildLiteResult, String> {
+    use crate::classification;
+
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clone();
+
+    println!("[Rebuild Lite] === STARTING ===");
+    println!("[Rebuild Lite] SAFE: Only updating content_type + cluster_id (hierarchy untouched)");
+
+    // Step 1: Pattern classify all items (FREE)
+    println!("[Rebuild Lite] Step 1/2: Classifying items...");
+    let _ = app.emit("rebuild-lite-progress", serde_json::json!({
+        "step": 1,
+        "total_steps": 2,
+        "status": "Classifying items..."
+    }));
+
+    let classified = classification::classify_all_items(&db)?;
+
+    // Step 2: Recluster with existing embeddings (FREE)
+    println!("[Rebuild Lite] Step 2/2: Reclustering...");
+    let _ = app.emit("rebuild-lite-progress", serde_json::json!({
+        "step": 2,
+        "total_steps": 2,
+        "status": "Reclustering..."
+    }));
+
+    let items_marked = db.mark_all_items_need_clustering().map_err(|e| e.to_string())?;
+    println!("[Rebuild Lite] Marked {} items for clustering", items_marked);
+
+    let cluster_result = clustering::cluster_with_embeddings_lite(&db).await?;
+
+    let _ = app.emit("rebuild-lite-progress", serde_json::json!({
+        "step": 2,
+        "total_steps": 2,
+        "status": "Complete!"
+    }));
+
+    println!("[Rebuild Lite] === COMPLETE ===");
+    println!("  Items classified: {}", classified);
+    println!("  Clusters: {}", cluster_result.clusters_created);
+    println!("  Hierarchy: UNTOUCHED");
+    println!("  Cost: FREE");
+
+    Ok(RebuildLiteResult {
+        items_classified: classified,
+        clusters_created: cluster_result.clusters_created,
+        hierarchy_levels: 0,
+        method: "lite-safe".to_string(),
+    })
+}
+
+/// Rebuild Hierarchy Only: Regroup existing topics into uber-categories (CHEAP)
+///
+/// PRESERVES: Items, clusters, cluster assignments
+/// REBUILDS: Only the hierarchy grouping (Universe → categories → topics → items)
+///
+/// Use this when you have good clusters but want better organization.
+#[tauri::command]
+pub async fn rebuild_hierarchy_only(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<RebuildLiteResult, String> {
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clone();
+
+    println!("[Rebuild Hierarchy] === STARTING ===");
+    println!("[Rebuild Hierarchy] Keeping items + clusters, only rebuilding hierarchy grouping");
+
+    let _ = app.emit("rebuild-hierarchy-progress", serde_json::json!({
+        "step": 1,
+        "total_steps": 2,
+        "status": "Clearing old hierarchy..."
+    }));
+
+    // Clear hierarchy but keep items and their cluster assignments
+    hierarchy::clear_hierarchy(&db)?;
+    println!("[Rebuild Hierarchy] Cleared old hierarchy (items + clusters preserved)");
+
+    let _ = app.emit("rebuild-hierarchy-progress", serde_json::json!({
+        "step": 2,
+        "total_steps": 2,
+        "status": "Building hierarchy with AI grouping..."
+    }));
+
+    // Build full hierarchy with AI grouping
+    let result = hierarchy::build_full_hierarchy(&db, false, Some(&app)).await?;
+
+    let _ = app.emit("rebuild-hierarchy-progress", serde_json::json!({
+        "step": 2,
+        "total_steps": 2,
+        "status": "Complete!"
+    }));
+
+    println!("[Rebuild Hierarchy] === COMPLETE ===");
+    println!("  Levels created: {}", result.levels_created);
+    println!("  Grouping iterations: {}", result.grouping_iterations);
+    println!("  Cost: ~$0.05-0.15 (AI grouping only)");
+
+    Ok(RebuildLiteResult {
+        items_classified: 0,
+        clusters_created: 0,
+        hierarchy_levels: result.levels_created,
+        method: "hierarchy-only".to_string(),
     })
 }

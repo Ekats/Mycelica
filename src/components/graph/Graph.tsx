@@ -8,6 +8,11 @@ import type { Node } from '../../types/graph';
 import { getEmojiForNode, initLearnedMappings } from '../../utils/emojiMatcher';
 import { ChevronRight, AlertTriangle, X, Lock, LockOpen } from 'lucide-react';
 import { SimilarNodesPanel, SimilarNodesLoading } from './SimilarNodesPanel';
+import { ComponentErrorBoundary } from '../ErrorBoundary';
+import { DevConsole, DevConsoleLog } from './DevConsole';
+import { GraphStatusBar } from './GraphStatusBar';
+import { NoteModal } from './NoteModal';
+import { NodeContextMenu } from './NodeContextMenu';
 
 // Confirmation dialog types
 type ConfirmAction = 'deleteNode' | null;
@@ -75,12 +80,6 @@ interface GraphNode extends Node {
   displayTitle: string;    // AI title or fallback to raw title
   displayContent: string;  // Summary or fallback to raw content
   displayEmoji: string;    // Topic emoji
-}
-
-interface DevConsoleLog {
-  time: string;
-  type: 'info' | 'warn' | 'error';
-  message: string;
 }
 
 interface SimilarNode {
@@ -179,6 +178,10 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     addNode,
     updateNode,
     removeNode,
+    // Privacy filtering from store
+    hidePrivate,
+    setHidePrivate,
+    privacyThreshold,
   } = useGraphStore();
   const [hoveredNode, setHoveredNode] = useState<GraphNode | null>(null);
   const [zoomLevel, setZoomLevel] = useState(1);
@@ -186,10 +189,7 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
   const [showDevConsole, setShowDevConsole] = useState(false);
   const [showPanels, setShowPanels] = useState(true); // Hamburger menu toggle for all panels
   const [showDetails, setShowDetails] = useState(true); // Toggle for details panel
-  const [hidePrivate, setHidePrivate] = useState(false); // Privacy filter toggle
   const [showNoteModal, setShowNoteModal] = useState(false);
-  const [noteTitle, setNoteTitle] = useState('');
-  const [noteContent, setNoteContent] = useState('');
   const [nodeMenuId, setNodeMenuId] = useState<string | null>(null); // Which node's menu is open
   const [nodeMenuPos, setNodeMenuPos] = useState<{ x: number; y: number } | null>(null);
   const [nodeToDelete, setNodeToDelete] = useState<string | null>(null); // Node pending deletion
@@ -235,8 +235,34 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     current: number;
     total: number;
     remainingSecs?: number;
+    elapsedSecs?: number;
+    stepName?: string;      // e.g., "Step 3/7: Building hierarchy"
+    stepDetail?: string;    // e.g., "Organizing Mycelica into categories..."
     status: 'idle' | 'processing' | 'complete';
   }>({ current: 0, total: 0, status: 'idle' });
+  const progressStartRef = useRef<number | null>(null);
+
+  // Tick elapsed time every second while processing
+  useEffect(() => {
+    if (aiProgress.status !== 'processing') {
+      progressStartRef.current = null;
+      return;
+    }
+
+    // Set start time on first processing event
+    if (progressStartRef.current === null) {
+      progressStartRef.current = Date.now();
+    }
+
+    const interval = setInterval(() => {
+      if (progressStartRef.current !== null) {
+        const elapsed = (Date.now() - progressStartRef.current) / 1000;
+        setAiProgress(prev => prev.status === 'processing' ? { ...prev, elapsedSecs: elapsed } : prev);
+      }
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [aiProgress.status]);
 
   // Confirmation dialog configs
   const confirmConfigs: Record<NonNullable<ConfirmAction>, ConfirmConfig> = {
@@ -466,34 +492,14 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     else console.log(`[Graph] ${message}`);
   }, []);
 
-  // Handle splitting a node's children into sub-categories (max 5 groups)
+  // Handle splitting a node - destroy it and move its children up to parent level
   const handleSplitNode = useCallback(async (nodeId: string) => {
     const node = nodes.get(nodeId);
     const nodeName = node?.aiTitle || node?.title || nodeId.slice(0, 8);
     try {
-      devLog('info', `Splitting children of "${nodeName}" into max 5 sub-categories...`);
-      await invoke('cluster_hierarchy_level', { parentId: nodeId, maxGroups: 5 });
-      devLog('info', `Split complete! Refreshing graph...`);
-      // Clear the panel and refresh the graph data
-      setSimilarNodesMap(new Map());
-      if (onDataChanged) {
-        await onDataChanged();
-        devLog('info', `Graph refreshed. Navigate into "${nodeName}" to see new structure.`);
-      }
-    } catch (err) {
-      console.error('Failed to split node:', err);
-      devLog('error', `Failed to split: ${err}`);
-    }
-  }, [nodes, devLog, onDataChanged]);
-
-  // Handle unsplitting a node - flatten intermediate categories back into parent
-  const handleUnsplitNode = useCallback(async (nodeId: string) => {
-    const node = nodes.get(nodeId);
-    const nodeName = node?.aiTitle || node?.title || nodeId.slice(0, 8);
-    try {
-      devLog('info', `Unsplitting "${nodeName}" - flattening intermediate categories...`);
+      devLog('info', `Splitting "${nodeName}" - moving children up to parent level...`);
       const flattened = await invoke<number>('unsplit_node', { parentId: nodeId });
-      devLog('info', `Unsplit complete! Moved ${flattened} nodes up. Refreshing...`);
+      devLog('info', `Split complete! Moved ${flattened} nodes up. Refreshing...`);
       // Clear the panel and refresh the graph data
       setSimilarNodesMap(new Map());
       if (onDataChanged) {
@@ -501,8 +507,28 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
         devLog('info', `Graph refreshed.`);
       }
     } catch (err) {
-      console.error('Failed to unsplit node:', err);
-      devLog('error', `Failed to unsplit: ${err}`);
+      console.error('Failed to split node:', err);
+      devLog('error', `Failed to split: ${err}`);
+    }
+  }, [nodes, devLog, onDataChanged]);
+
+  // Handle grouping a node's children into sub-categories (max 5 groups)
+  const handleGroupNode = useCallback(async (nodeId: string) => {
+    const node = nodes.get(nodeId);
+    const nodeName = node?.aiTitle || node?.title || nodeId.slice(0, 8);
+    try {
+      devLog('info', `Grouping children of "${nodeName}" into categories...`);
+      await invoke('cluster_hierarchy_level', { parentId: nodeId, maxGroups: 5 });
+      devLog('info', `Group complete! Refreshing graph...`);
+      // Clear the panel and refresh the graph data
+      setSimilarNodesMap(new Map());
+      if (onDataChanged) {
+        await onDataChanged();
+        devLog('info', `Graph refreshed. Navigate into "${nodeName}" to see new structure.`);
+      }
+    } catch (err) {
+      console.error('Failed to group node:', err);
+      devLog('error', `Failed to group: ${err}`);
     }
   }, [nodes, devLog, onDataChanged]);
 
@@ -709,11 +735,26 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     const unlisten = listen<AiProgressEvent>('ai-progress', (event) => {
       const { current, total, nodeTitle, newTitle, status, errorMessage, elapsedSecs, remainingSecs } = event.payload;
 
-      // Update floating progress indicator
+      // Update floating progress indicator with step info
       if (status === 'processing' || status === 'success') {
-        setAiProgress({ current, total, remainingSecs, status: 'processing' });
+        setAiProgress({
+          current,
+          total,
+          remainingSecs,
+          elapsedSecs,
+          stepName: nodeTitle,      // Use nodeTitle as step name (e.g., "Step 3/7: Building hierarchy")
+          stepDetail: newTitle,     // Use newTitle as detail (e.g., "Creating Universe and topics...")
+          status: 'processing'
+        });
       } else if (status === 'complete') {
-        setAiProgress({ current: total, total, status: 'complete' });
+        setAiProgress({
+          current: total,
+          total,
+          elapsedSecs,
+          stepName: nodeTitle || 'Complete',
+          stepDetail: newTitle,
+          status: 'complete'
+        });
         // Hide after 3 seconds
         setTimeout(() => setAiProgress(prev => prev.status === 'complete' ? { ...prev, status: 'idle' } : prev), 3000);
       }
@@ -965,8 +1006,9 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
 
   // List full hierarchy tree (up to maxDisplayDepth levels)
   const listHierarchy = useCallback(async () => {
-    const maxDisplayDepth = 2; // Cut off after this many levels from universe
-    devLog('info', `=== HIERARCHY TREE (max ${maxDisplayDepth} levels) ===`);
+    const maxDisplayDepth = 4; // Cut off after this many levels from universe
+    const maxItemsPerLevel = 6; // Max items to show at each level
+    devLog('info', `=== HIERARCHY TREE (max ${maxDisplayDepth} levels, ${maxItemsPerLevel} items/level) ===`);
 
     try {
       // Get universe node
@@ -980,12 +1022,14 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
       const printNode = async (nodeId: string, depth: number, prefix: string, _isLast: boolean) => {
         if (depth > maxDisplayDepth) return;
 
-        const children = await invoke<Node[]>('get_children', { parentId: nodeId });
+        const children = await invoke<Node[]>('get_graph_children', { parentId: nodeId });
         const sortedChildren = [...children].sort((a, b) => (b.childCount || 0) - (a.childCount || 0));
+        const displayChildren = sortedChildren.slice(0, maxItemsPerLevel);
+        const hiddenCount = sortedChildren.length - displayChildren.length;
 
-        for (let i = 0; i < sortedChildren.length; i++) {
-          const child = sortedChildren[i];
-          const isLastChild = i === sortedChildren.length - 1;
+        for (let i = 0; i < displayChildren.length; i++) {
+          const child = displayChildren[i];
+          const isLastChild = i === displayChildren.length - 1 && hiddenCount === 0;
           const connector = isLastChild ? '└── ' : '├── ';
           const emoji = child.emoji || (child.isItem ? '📄' : '📁');
           const title = child.clusterLabel || child.aiTitle || child.title || 'Untitled';
@@ -1008,6 +1052,11 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
             const truncPrefix = prefix + (isLastChild ? '    ' : '│   ');
             devLog('info', `${truncPrefix}└── ... (${childCount} more)`);
           }
+        }
+
+        // Show hidden siblings indicator
+        if (hiddenCount > 0) {
+          devLog('info', `${prefix}└── ... (+${hiddenCount} more siblings)`);
         }
       };
 
@@ -1068,7 +1117,7 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
 
       // List children of current view
       if (currentViewParentId) {
-        const children = await invoke<Node[]>('get_children', { parentId: currentViewParentId });
+        const children = await invoke<Node[]>('get_graph_children', { parentId: currentViewParentId });
         const sortedChildren = [...children].sort((a, b) => (b.childCount || 0) - (a.childCount || 0));
 
         const childIndent = '    '.repeat(baseIndent);
@@ -1115,26 +1164,33 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     const allNodes = Array.from(nodes.values());
     const universeNode = allNodes.find(n => n.isUniverse);
 
+    // Helper to check if a node passes privacy filter
+    const passesPrivacy = (n: Node): boolean => {
+      // Use float privacy score if available, otherwise fall back to boolean isPrivate
+      if (n.privacy !== undefined) {
+        return n.privacy >= privacyThreshold;
+      }
+      // Legacy: undefined privacy with isPrivate=true means private
+      return n.isPrivate !== true;
+    };
+
     const nodeArray = allNodes.filter(node => {
       // Privacy filter: hide private nodes AND categories with no visible children
       if (hidePrivate) {
-        // Hide explicitly private nodes
-        if (node.isPrivate === true) return false;
+        // Hide nodes below privacy threshold
+        if (!passesPrivacy(node)) return false;
 
-        // For categories (non-items with children), check if they have any non-private children
+        // For categories (non-items with children), check if they have any visible children
         // If ALL children are private, hide the category too
         if (!node.isItem && node.childCount > 0) {
           const children = allNodes.filter(n => n.parentId === node.id);
-          const hasVisibleChild = children.some(c => c.isPrivate !== true);
+          const hasVisibleChild = children.some(c => passesPrivacy(c));
           if (!hasVisibleChild && children.length > 0) return false;
         }
       }
 
-      // Mini-clustering filter: hide supporting items (code/debug/paste) from graph
-      // They are accessed via the supporting panel instead
-      if (node.isItem && node.contentType && node.contentType !== 'idea' && node.contentType !== 'investigation') {
-        return false;
-      }
+      // Note: Supporting items (code/debug/paste/trivial) are now filtered at backend level
+      // via get_all_nodes() and get_graph_children() - they're not loaded into the store at all
 
       // If we have a specific parent, show its children
       if (currentParentId) {
@@ -1342,7 +1398,110 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     // Position all nodes sequentially (already sorted by importance)
     const finalRing = positionTierNodes(sortedByImportance, 0, 0);
 
-    devLog('info', `Layout complete: ${graphNodes.length} nodes in ${finalRing} rings`);
+    devLog('info', `Ring layout complete: ${graphNodes.length} nodes in ${finalRing} rings`);
+
+    // ==========================================================================
+    // FORCE-DIRECTED LAYOUT REFINEMENT
+    // Uses semantic similarity edges to pull related nodes together
+    // ==========================================================================
+
+    // Get semantic edges (type === 'related') from the edges store
+    const semanticEdges: Array<{source: string, target: string, weight: number}> = [];
+    edges.forEach(edge => {
+      if (edge.type === 'related' && edge.weight !== undefined) {
+        // Only include edges between nodes in current view
+        const sourceInView = graphNodes.some(n => n.id === edge.source);
+        const targetInView = graphNodes.some(n => n.id === edge.target);
+        if (sourceInView && targetInView) {
+          semanticEdges.push({
+            source: edge.source,
+            target: edge.target,
+            weight: edge.weight
+          });
+        }
+      }
+    });
+
+    // Find nodes that have semantic edges (connected nodes)
+    const connectedNodeIds = new Set<string>();
+    semanticEdges.forEach(e => {
+      connectedNodeIds.add(e.source);
+      connectedNodeIds.add(e.target);
+    });
+
+    devLog('info', `Force-directed: ${semanticEdges.length} edges, ${connectedNodeIds.size} connected, ${graphNodes.length - connectedNodeIds.size} unconnected`);
+
+    // Run force simulation on ALL nodes, but with different behaviors:
+    // - Connected nodes: pulled together by semantic links
+    // - Unconnected nodes: anchored to their ring positions (importance-based)
+    // - All nodes: collision avoidance
+    if (graphNodes.length >= 2) {
+      // Store original ring positions for anchoring unconnected nodes
+      const originalPositions = new Map(graphNodes.map(n => [n.id, { x: n.x, y: n.y }]));
+
+      // Create simulation nodes with current positions
+      const simNodes = graphNodes.map(n => ({
+        id: n.id,
+        x: n.x,
+        y: n.y,
+        isConnected: connectedNodeIds.has(n.id),
+        origX: n.x,
+        origY: n.y,
+      }));
+
+      // Create simulation links with strength based on weight
+      const simLinks = semanticEdges.map(e => ({
+        source: e.source,
+        target: e.target,
+        strength: e.weight * 0.5
+      }));
+
+      // Create force simulation
+      const simulation = d3.forceSimulation(simNodes)
+        // Pull similar nodes together based on edge weight
+        .force('link', d3.forceLink(simLinks)
+          .id((d: any) => d.id)
+          .distance(noteWidth * 2.5)
+          .strength((d: any) => d.strength * 0.4)
+        )
+        // Repulsion between all nodes
+        .force('charge', d3.forceManyBody()
+          .strength(-noteWidth * 6)
+          .distanceMax(noteWidth * 15)
+        )
+        // Anchor unconnected nodes to their original ring positions
+        .force('anchorX', d3.forceX((d: any) => d.origX)
+          .strength((d: any) => d.isConnected ? 0.01 : 0.3) // Strong anchor for unconnected
+        )
+        .force('anchorY', d3.forceY((d: any) => d.origY)
+          .strength((d: any) => d.isConnected ? 0.01 : 0.3) // Strong anchor for unconnected
+        )
+        // Prevent node overlap - generous spacing
+        .force('collide', d3.forceCollide()
+          .radius(Math.max(noteWidth, noteHeight) * 1.5)
+          .strength(1.0)
+          .iterations(3)
+        )
+        .stop();
+
+      // Run simulation synchronously
+      const numTicks = Math.min(300, 50 + graphNodes.length * 2);
+      for (let i = 0; i < numTicks; i++) {
+        simulation.tick();
+      }
+
+      // Update graphNodes with new positions
+      const posMap = new Map(simNodes.map(n => [n.id, { x: n.x, y: n.y }]));
+      graphNodes.forEach(node => {
+        const newPos = posMap.get(node.id);
+        if (newPos) {
+          node.x = newPos.x;
+          node.y = newPos.y;
+        }
+      });
+
+      devLog('info', `Force simulation: ${numTicks} ticks complete`);
+    }
 
     // Calculate graph bounds for pan limiting (with generous padding)
     const boundsPadding = noteWidth * 40; // 40x node width padding
@@ -2165,7 +2324,10 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
           openLeaf(d.id);
         } else if (d.childCount > 0) {
           devLog('info', `Drilling into "${d.displayTitle}" (depth ${d.depth} → ${d.depth + 1})`);
-          setActiveNode(null); // Clear selection when navigating
+          // Clear selection refs AND state when navigating to new level
+          activeNodeIdRef.current = null;
+          connectionMapRef.current = new Map();
+          setActiveNode(null);
           navigateToNode(d);
         }
       })
@@ -2393,7 +2555,10 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
           openLeaf(d.id);
         } else if (d.childCount > 0) {
           devLog('info', `Drilling into "${d.displayTitle}" (depth ${d.depth} → ${d.depth + 1})`);
-          setActiveNode(null); // Clear selection when navigating (keep this one)
+          // Clear selection refs AND state when navigating to new level
+          activeNodeIdRef.current = null;
+          connectionMapRef.current = new Map();
+          setActiveNode(null);
           navigateToNode(d);
         }
       })
@@ -2767,7 +2932,7 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
 
   // Note: activeNodeId removed from deps - color updates handled by separate useEffect below
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodes, edges, width, height, setActiveNode, devLog, getNodeEmoji, currentDepth, maxDepth, currentParentId, navigateToNode, hidePrivate]);
+  }, [nodes, edges, width, height, setActiveNode, devLog, getNodeEmoji, currentDepth, maxDepth, currentParentId, navigateToNode, hidePrivate, privacyThreshold]);
 
   // Update connection colors when activeNodeId changes (without full re-render)
   useEffect(() => {
@@ -2918,12 +3083,6 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     // Edge opacity is now applied at render time in main useEffect
 
   }, [activeNodeId, nodes, edges]);
-
-  const logColors = {
-    info: 'text-blue-400',
-    warn: 'text-yellow-400',
-    error: 'text-red-400',
-  };
 
   // Build breadcrumb display: Universe + navigation path + current level
   const currentLevelInfo = getLevelName(currentDepth, maxDepth);
@@ -3088,90 +3247,75 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
 
       {/* Similar nodes panel - memoized for performance */}
       {showPanels && showDetails && (
-        <SimilarNodesPanel
-          similarNodesMap={similarNodesMap}
-          nodes={nodes}
-          currentParentId={currentParentId}
-          stackNodes={stackNodes}
-          detailsPanelSize={detailsPanelSize}
-          isResizingDetails={isResizingDetails}
-          pinnedIds={pinnedIds}
-          getNodeEmoji={getNodeEmoji}
-          onJumpToNode={jumpToNode}
-          onFetchDetails={fetchSimilarNodes}
-          onRemoveNode={(nodeId) => setSimilarNodesMap(prev => {
-            const next = new Map(prev);
-            next.delete(nodeId);
-            return next;
-          })}
-          onTogglePin={handleTogglePin}
-          onTogglePrivacy={handleTogglePrivacy}
-          onSplitNode={handleSplitNode}
-          onUnsplitNode={handleUnsplitNode}
-          onClearAll={() => setSimilarNodesMap(new Map())}
-          onToggleStack={() => setStackNodes(!stackNodes)}
-          onStartResize={() => setIsResizingDetails(true)}
-          devLog={devLog}
-        />
+        <ComponentErrorBoundary fallbackTitle="Similar Nodes">
+          <SimilarNodesPanel
+            similarNodesMap={similarNodesMap}
+            nodes={nodes}
+            currentParentId={currentParentId}
+            stackNodes={stackNodes}
+            detailsPanelSize={detailsPanelSize}
+            isResizingDetails={isResizingDetails}
+            pinnedIds={pinnedIds}
+            getNodeEmoji={getNodeEmoji}
+            onJumpToNode={jumpToNode}
+            onFetchDetails={fetchSimilarNodes}
+            onRemoveNode={(nodeId) => setSimilarNodesMap(prev => {
+              const next = new Map(prev);
+              next.delete(nodeId);
+              return next;
+            })}
+            onTogglePin={handleTogglePin}
+            onTogglePrivacy={handleTogglePrivacy}
+            onSplitNode={handleSplitNode}
+            onGroupNode={handleGroupNode}
+            onClearAll={() => setSimilarNodesMap(new Map())}
+            onToggleStack={() => setStackNodes(!stackNodes)}
+            onStartResize={() => setIsResizingDetails(true)}
+            devLog={devLog}
+          />
+        </ComponentErrorBoundary>
       )}
 
       {/* Loading indicator for similar nodes */}
       <SimilarNodesLoading loadingSimilar={loadingSimilar} />
 
-      {/* Status bar */}
-      <div className="absolute bottom-4 left-4 bg-gray-800/90 backdrop-blur-sm rounded-lg px-4 py-2 text-sm text-gray-300 flex items-center gap-4">
-        <span>{nodes.size} nodes</span>
-        <span className="text-gray-500">|</span>
-        <span>{edges.size} edges</span>
-        <span className="text-gray-500">|</span>
-        <span className="text-amber-400">Zoom: {(zoomLevel * 100).toFixed(0)}%</span>
-      </div>
-
-      {/* Color legend */}
-      <div className="absolute bottom-16 right-4 bg-gray-800/90 backdrop-blur-sm rounded-lg px-3 py-2 text-xs text-gray-300">
-        <div className="flex items-center gap-2 mb-1">
-          <span className="text-gray-400">Age / Similarity:</span>
-        </div>
-        <div className="flex items-center gap-1">
-          <span style={{ color: 'hsl(0, 75%, 65%)' }}>Old/Weak</span>
-          <div
-            className="h-4 w-24 rounded"
-            style={{
-              background: 'linear-gradient(to right, hsl(0, 75%, 65%), hsl(60, 75%, 65%), hsl(210, 75%, 65%), hsl(180, 75%, 65%))'
-            }}
-          />
-          <span style={{ color: 'hsl(180, 75%, 65%)' }}>New/Strong</span>
-        </div>
-      </div>
-
-      <div className="absolute bottom-4 right-4 bg-gray-800/80 backdrop-blur-sm rounded-lg px-3 py-2 text-xs text-gray-400">
-        Scroll to zoom - Click and drag to pan
-      </div>
+      {/* Status bar, color legend, and help text */}
+      <GraphStatusBar
+        nodeCount={nodes.size}
+        edgeCount={edges.size}
+        zoomLevel={zoomLevel}
+      />
 
       {/* AI Progress floating indicator */}
       {aiProgress.status !== 'idle' && (
-        <div className="absolute bottom-16 right-4 bg-gray-900/95 backdrop-blur-sm rounded-lg border border-gray-700 px-4 py-3 z-40 min-w-48">
+        <div className="absolute bottom-16 right-4 bg-gray-900/95 backdrop-blur-sm rounded-lg border border-gray-700 px-4 py-3 z-40 min-w-56">
           <div className="flex items-center gap-3">
             {aiProgress.status === 'processing' && (
               <div className="w-4 h-4 border-2 border-purple-400 border-t-transparent rounded-full animate-spin" />
             )}
             {aiProgress.status === 'complete' && (
-              <span className="text-green-400">✓</span>
+              <span className="text-green-400 text-lg">✓</span>
             )}
-            <div className="flex-1">
-              <div className="text-sm text-white font-medium">
-                {aiProgress.status === 'complete' ? 'Complete' : 'Processing AI'}
+            <div className="flex-1 min-w-0">
+              {/* Step name (e.g., "Step 3/7: Building hierarchy") */}
+              <div className="text-sm text-white font-medium truncate">
+                {aiProgress.stepName || (aiProgress.status === 'complete' ? 'Complete' : 'Processing')}
               </div>
-              <div className="text-xs text-gray-400">
-                {aiProgress.current}/{aiProgress.total} nodes
-                {aiProgress.total > 0 && (
-                  <span className="ml-2 text-amber-400">
-                    {((aiProgress.current / aiProgress.total) * 100).toFixed(0)}%
-                  </span>
-                )}
-              </div>
+              {/* Step detail (e.g., "Creating Universe and topics...") */}
+              {aiProgress.stepDetail && (
+                <div className="text-xs text-gray-400 truncate">
+                  {aiProgress.stepDetail}
+                </div>
+              )}
+              {/* Elapsed time */}
+              {aiProgress.elapsedSecs !== undefined && (
+                <div className="text-xs text-cyan-400 mt-0.5">
+                  Elapsed: {formatTime(aiProgress.elapsedSecs)}
+                </div>
+              )}
+              {/* Remaining time estimate */}
               {aiProgress.remainingSecs !== undefined && aiProgress.remainingSecs > 0 && (
-                <div className="text-xs text-gray-500 mt-0.5">
+                <div className="text-xs text-gray-500">
                   ~{formatTime(aiProgress.remainingSecs)} remaining
                 </div>
               )}
@@ -3280,30 +3424,15 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
       </div>
 
       {/* Node context menu */}
-      {nodeMenuId && nodeMenuPos && (
-        <>
-          <div
-            className="fixed inset-0 z-[55]"
-            onClick={() => setNodeMenuId(null)}
-          />
-          <div
-            className="fixed z-[56] bg-gray-800 border border-gray-700 rounded-lg shadow-xl py-1 min-w-[120px]"
-            style={{ left: nodeMenuPos.x, top: nodeMenuPos.y }}
-          >
-            <button
-              onClick={() => {
-                setNodeToDelete(nodeMenuId);
-                setNodeMenuId(null);
-                setConfirmAction('deleteNode');
-              }}
-              className="w-full px-4 py-2 text-left text-sm text-red-400 hover:bg-gray-700 flex items-center gap-2"
-            >
-              <span>🗑️</span>
-              <span>Delete</span>
-            </button>
-          </div>
-        </>
-      )}
+      <NodeContextMenu
+        nodeId={nodeMenuId}
+        position={nodeMenuPos}
+        onClose={() => setNodeMenuId(null)}
+        onDelete={(id) => {
+          setNodeToDelete(id);
+          setConfirmAction('deleteNode');
+        }}
+      />
 
       {/* Add Note Button - Bottom Center */}
       <button
@@ -3316,97 +3445,23 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
 
       {/* Dev Console */}
       {showPanels && showDevConsole && (
-        <div
-          className={`absolute bg-gray-900/95 backdrop-blur-sm rounded-lg border border-gray-700 overflow-hidden flex flex-col ${
-            showDetails && similarNodesMap.size > 0
-              ? 'bottom-4 right-4'
-              : 'top-14 right-4'
-          }`}
-          style={{ width: consoleSize.width, height: consoleSize.height }}
-        >
-          <div className="px-3 py-2 bg-gray-800/80 border-b border-gray-700 flex items-center justify-between flex-shrink-0">
-            <span className="text-xs font-semibold text-gray-300">Dev Console</span>
-            <div className="flex items-center gap-3 text-xs">
-              <span className="text-gray-500">Nodes: {nodes.size}</span>
-              <span className="text-gray-500">Edges: {edges.size}</span>
-              <span className="text-amber-400">{(zoomLevel * 100).toFixed(0)}%</span>
-            </div>
-          </div>
-          <div ref={consoleRef} className="flex-1 overflow-y-auto p-2 font-mono text-xs space-y-0.5 min-h-0">
-            {devLogs.length === 0 ? (
-              <div className="text-gray-600 text-center py-4">No logs yet</div>
-            ) : (
-              devLogs.map((log, i) => (
-                <div key={i} className="flex gap-2">
-                  <span className="text-gray-600 flex-shrink-0">{log.time}</span>
-                  <span className={logColors[log.type]}>[{log.type.toUpperCase()}]</span>
-                  <span className="text-gray-300 break-all">{log.message}</span>
-                </div>
-              ))
-            )}
-          </div>
-          <div className="px-3 py-2 bg-gray-800/50 border-t border-gray-700 flex items-center justify-between text-xs flex-shrink-0">
-            <span className="text-gray-500">{devLogs.length} logs</span>
-            <div className="flex items-center gap-3">
-              <button
-                onClick={listCurrentNodes}
-                className="text-blue-400 hover:text-blue-300 transition-colors"
-                title="List all nodes in current view"
-              >
-                Nodes
-              </button>
-              <button
-                onClick={listCurrentPath}
-                className="text-green-400 hover:text-green-300 transition-colors"
-                title="Show current view's hierarchy path"
-              >
-                Path
-              </button>
-              <button
-                onClick={listHierarchy}
-                className="text-purple-400 hover:text-purple-300 transition-colors"
-                title="List full hierarchy tree (up to 4 levels)"
-              >
-                Tree
-              </button>
-              <button
-                onClick={() => setAutoScroll(!autoScroll)}
-                className={`transition-colors ${autoScroll ? 'text-green-400' : 'text-gray-500 hover:text-gray-300'}`}
-                title={autoScroll ? 'Auto-scroll ON' : 'Auto-scroll OFF'}
-              >
-                {autoScroll ? 'Auto' : 'Off'}
-              </button>
-              <button
-                onClick={() => setDevLogs([])}
-                className="text-gray-500 hover:text-red-400 transition-colors"
-              >
-                Clear
-              </button>
-            </div>
-          </div>
-          {/* Resize handle - top-left when at bottom, bottom-left when at top */}
-          <div
-            onMouseDown={handleResizeStart}
-            className={`absolute w-4 h-4 group ${isResizing ? 'bg-amber-500/30' : ''} ${
-              consoleAtBottom
-                ? 'top-0 left-0 cursor-nw-resize'
-                : 'bottom-0 left-0 cursor-sw-resize'
-            }`}
-            title="Drag to resize"
-          >
-            <svg
-              className={`w-3 h-3 absolute text-gray-500 group-hover:text-amber-400 transition-colors ${
-                consoleAtBottom
-                  ? 'top-0.5 left-0.5 rotate-90'
-                  : 'bottom-0.5 left-0.5'
-              }`}
-              viewBox="0 0 12 12"
-              fill="currentColor"
-            >
-              <path d="M0 12L12 0v3L3 12H0zm0-5l7-7v3L3 10v2H0V7z" />
-            </svg>
-          </div>
-        </div>
+        <DevConsole
+          logs={devLogs}
+          nodeCount={nodes.size}
+          edgeCount={edges.size}
+          zoomLevel={zoomLevel}
+          autoScroll={autoScroll}
+          setAutoScroll={setAutoScroll}
+          consoleSize={consoleSize}
+          consoleRef={consoleRef}
+          onClear={() => setDevLogs([])}
+          onListNodes={listCurrentNodes}
+          onListPath={listCurrentPath}
+          onListHierarchy={listHierarchy}
+          isResizing={isResizing}
+          onResizeStart={handleResizeStart}
+          positionAtBottom={consoleAtBottom}
+        />
       )}
 
       {/* Confirmation Dialog */}
@@ -3457,114 +3512,13 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
       )}
 
       {/* Note Modal */}
-      {showNoteModal && (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center">
-          <div
-            className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-            onClick={() => setShowNoteModal(false)}
-          />
-          <div className="relative bg-gray-800 rounded-lg border border-gray-700 shadow-xl max-w-lg w-full mx-4 p-6">
-            <h2 className="text-lg font-medium text-white mb-4">Add Note</h2>
-            <input
-              type="text"
-              placeholder="Title (optional)"
-              value={noteTitle}
-              onChange={(e) => setNoteTitle(e.target.value)}
-              className="w-full bg-gray-700 text-white rounded px-3 py-2 mb-3 border border-gray-600 focus:border-amber-500 focus:outline-none"
-            />
-            <textarea
-              placeholder="What's on your mind?"
-              value={noteContent}
-              onChange={(e) => setNoteContent(e.target.value)}
-              rows={6}
-              className="w-full bg-gray-700 text-white rounded px-3 py-2 mb-4 resize-none border border-gray-600 focus:border-amber-500 focus:outline-none"
-              autoFocus
-            />
-            <div className="flex gap-2 justify-end">
-              <button
-                onClick={() => {
-                  setShowNoteModal(false);
-                  setNoteTitle('');
-                  setNoteContent('');
-                }}
-                className="px-4 py-2 text-gray-400 hover:text-white"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={async () => {
-                  if (noteContent.trim()) {
-                    const title = noteTitle.trim() || 'Untitled Note';
-                    const content = noteContent.trim();
-                    const containerId = 'container-recent-notes';
-
-                    // Save to database and get the ID
-                    const noteId = await invoke<string>('add_note', { title, content });
-
-                    const now = Date.now();
-
-                    // Check if Recent Notes container exists in local state
-                    let container = nodes.get(containerId);
-                    if (!container) {
-                      // Container was just created in backend - add to local state
-                      const universe = Array.from(nodes.values()).find(n => n.isUniverse);
-                      addNode({
-                        id: containerId,
-                        type: 'cluster',
-                        title: 'Recent Notes',
-                        emoji: '📝',
-                        depth: 1,
-                        isItem: false,
-                        isUniverse: false,
-                        parentId: universe?.id,
-                        childCount: 1,
-                        position: { x: 0, y: 0 },
-                        createdAt: now,
-                        updatedAt: now,
-                        latestChildDate: now,
-                        isProcessed: true,
-                        isPinned: false,
-                      });
-                    } else {
-                      // Update existing container's childCount and latestChildDate
-                      updateNode(containerId, {
-                        childCount: container.childCount + 1,
-                        latestChildDate: now,
-                      });
-                    }
-
-                    // Add note to local state
-                    addNode({
-                      id: noteId,
-                      type: 'thought',
-                      title,
-                      content,
-                      depth: 2,
-                      isItem: true,
-                      isUniverse: false,
-                      parentId: containerId,
-                      childCount: 0,
-                      position: { x: 0, y: 0 },
-                      createdAt: now,
-                      updatedAt: now,
-                      isProcessed: false,
-                      isPinned: false,
-                    });
-
-                    setShowNoteModal(false);
-                    setNoteTitle('');
-                    setNoteContent('');
-                  }
-                }}
-                disabled={!noteContent.trim()}
-                className="px-4 py-2 bg-amber-600 hover:bg-amber-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded"
-              >
-                Save
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <NoteModal
+        isOpen={showNoteModal}
+        onClose={() => setShowNoteModal(false)}
+        nodes={nodes}
+        addNode={addNode}
+        updateNode={updateNode}
+      />
     </div>
   );
 }

@@ -49,6 +49,12 @@ pub struct Settings {
     pub protect_recent_notes: bool,
     #[serde(default = "default_true")]
     pub use_local_embeddings: bool,
+    #[serde(default = "default_cache_ttl")]
+    pub similarity_cache_ttl_secs: u64,
+}
+
+fn default_cache_ttl() -> u64 {
+    300 // 5 minutes
 }
 
 fn default_true() -> bool {
@@ -64,6 +70,7 @@ impl Default for Settings {
             custom_db_path: None,
             protect_recent_notes: true,
             use_local_embeddings: true, // Local embeddings are optimized for clustering
+            similarity_cache_ttl_secs: 300, // 5 minutes
         }
     }
 }
@@ -410,4 +417,16 @@ pub fn set_use_local_embeddings(enabled: bool) -> Result<(), String> {
 
     println!("Local embeddings set to: {}", enabled);
     Ok(())
+}
+
+// ==================== Similarity Cache ====================
+
+/// Get similarity cache TTL in seconds (default: 300 = 5 minutes)
+pub fn similarity_cache_ttl_secs() -> u64 {
+    let guard = SETTINGS.read().ok();
+    guard
+        .as_ref()
+        .and_then(|g| g.as_ref())
+        .map(|s| s.similarity_cache_ttl_secs)
+        .unwrap_or(300)
 }

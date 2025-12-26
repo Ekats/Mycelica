@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Code, Bug, FileText, Lightbulb, ChevronDown, ChevronRight } from 'lucide-react';
+import { Lightbulb, Search, MessageSquare, BookOpen, Palette, ChevronDown, ChevronRight } from 'lucide-react';
 import type { Node } from '../../types/graph';
 
 interface SupportingItemsPanelProps {
@@ -8,42 +8,34 @@ interface SupportingItemsPanelProps {
   onSelectItem?: (nodeId: string) => void;
 }
 
-interface SupportingCounts {
-  code: number;
-  debug: number;
-  paste: number;
-}
+// SUPPORTING tier content types (lazy-loaded in leaf view)
+// HIDDEN tier (code, debug, paste, trivial) is excluded entirely
+type ContentTab = 'ideas' | 'investigation' | 'discussion' | 'reference' | 'creative';
 
-type ContentTab = 'ideas' | 'code' | 'debug' | 'paste';
-
-const TAB_CONFIG: Record<ContentTab, { label: string; emoji: string }> = {
-  ideas: { label: 'Ideas', emoji: '💡' },
-  code: { label: 'Code', emoji: '📝' },
-  debug: { label: 'Debug', emoji: '🐛' },
-  paste: { label: 'Pastes', emoji: '📋' },
+const TAB_CONFIG: Record<ContentTab, { label: string; emoji: string; icon: typeof Lightbulb }> = {
+  ideas: { label: 'Ideas', emoji: '💡', icon: Lightbulb },
+  investigation: { label: 'Investigation', emoji: '🔍', icon: Search },
+  discussion: { label: 'Discussion', emoji: '💬', icon: MessageSquare },
+  reference: { label: 'Reference', emoji: '📚', icon: BookOpen },
+  creative: { label: 'Creative', emoji: '🎨', icon: Palette },
 };
 
 export function SupportingItemsPanel({ parentId, onSelectItem }: SupportingItemsPanelProps) {
   const [activeTab, setActiveTab] = useState<ContentTab>('ideas');
-  const [counts, setCounts] = useState<SupportingCounts>({ code: 0, debug: 0, paste: 0 });
   const [ideas, setIdeas] = useState<Node[]>([]);
   const [supportingItems, setSupportingItems] = useState<Node[]>([]);
   const [expandedIdeas, setExpandedIdeas] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
 
-  // Fetch counts and items
+  // Fetch items
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
-      // Fetch supporting counts
-      const countsResult = await invoke<SupportingCounts>('get_supporting_counts', { parentId });
-      setCounts(countsResult);
-
-      // Fetch graph children (ideas only)
+      // Fetch graph children (VISIBLE tier only)
       const graphChildren = await invoke<Node[]>('get_graph_children', { parentId });
       setIdeas(graphChildren.filter(n => n.isItem));
 
-      // Fetch supporting items
+      // Fetch supporting items (SUPPORTING tier only - investigation, discussion, reference, creative)
       const supporting = await invoke<Node[]>('get_supporting_items', { parentId });
       setSupportingItems(supporting);
     } catch (err) {
@@ -83,22 +75,31 @@ export function SupportingItemsPanel({ parentId, onSelectItem }: SupportingItems
     switch (activeTab) {
       case 'ideas':
         return ideas;
-      case 'code':
-        return supportingItems.filter(n => n.contentType === 'code');
-      case 'debug':
-        return supportingItems.filter(n => n.contentType === 'debug');
-      case 'paste':
-        return supportingItems.filter(n => n.contentType === 'paste');
+      case 'investigation':
+        return supportingItems.filter(n => n.contentType === 'investigation');
+      case 'discussion':
+        return supportingItems.filter(n => n.contentType === 'discussion');
+      case 'reference':
+        return supportingItems.filter(n => n.contentType === 'reference');
+      case 'creative':
+        return supportingItems.filter(n => n.contentType === 'creative');
       default:
         return [];
     }
   };
 
+  // Get count for a specific tab
+  const getTabCount = (tab: ContentTab): number => {
+    if (tab === 'ideas') return ideas.length;
+    return supportingItems.filter(n => n.contentType === tab).length;
+  };
+
   const renderContentTypeIcon = (contentType: string | undefined) => {
     switch (contentType) {
-      case 'code': return <Code className="w-4 h-4 text-blue-400" />;
-      case 'debug': return <Bug className="w-4 h-4 text-red-400" />;
-      case 'paste': return <FileText className="w-4 h-4 text-gray-400" />;
+      case 'investigation': return <Search className="w-4 h-4 text-blue-400" />;
+      case 'discussion': return <MessageSquare className="w-4 h-4 text-green-400" />;
+      case 'reference': return <BookOpen className="w-4 h-4 text-purple-400" />;
+      case 'creative': return <Palette className="w-4 h-4 text-pink-400" />;
       default: return <Lightbulb className="w-4 h-4 text-yellow-400" />;
     }
   };
@@ -111,7 +112,7 @@ export function SupportingItemsPanel({ parentId, onSelectItem }: SupportingItems
     );
   }
 
-  const totalSupporting = counts.code + counts.debug + counts.paste;
+  const totalSupporting = supportingItems.length;
   if (ideas.length === 0 && totalSupporting === 0) {
     return null; // No items to show
   }
@@ -121,10 +122,7 @@ export function SupportingItemsPanel({ parentId, onSelectItem }: SupportingItems
       {/* Tabs */}
       <div className="flex border-b border-gray-700 overflow-x-auto">
         {Object.entries(TAB_CONFIG).map(([tab, config]) => {
-          const count = tab === 'ideas' ? ideas.length :
-                        tab === 'code' ? counts.code :
-                        tab === 'debug' ? counts.debug :
-                        counts.paste;
+          const count = getTabCount(tab as ContentTab);
 
           if (count === 0 && tab !== 'ideas') return null;
 

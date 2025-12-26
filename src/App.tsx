@@ -3,6 +3,7 @@ import { Graph } from './components/graph/Graph';
 import { LeafView } from './components/leaf/LeafView';
 import { Sidebar } from './components/sidebar/Sidebar';
 import { SettingsPanel } from './components/settings/SettingsPanel';
+import { ComponentErrorBoundary } from './components/ErrorBoundary';
 import { useGraph } from './hooks/useGraph';
 import { useGraphStore } from './stores/graphStore';
 import './App.css';
@@ -138,16 +139,22 @@ function App() {
       <Sidebar onOpenSettings={() => setShowSettings(true)} />
       <main ref={containerRef} className="flex-1 relative overflow-hidden">
         {viewMode === 'leaf' && leafNodeId ? (
-          <LeafView nodeId={leafNodeId} onBack={closeLeaf} />
+          <ComponentErrorBoundary fallbackTitle="Leaf View">
+            <LeafView nodeId={leafNodeId} onBack={closeLeaf} />
+          </ComponentErrorBoundary>
         ) : (
-          <Graph width={dimensions.width} height={dimensions.height} onDataChanged={reload} />
+          <ComponentErrorBoundary fallbackTitle="Graph">
+            <Graph width={dimensions.width} height={dimensions.height} onDataChanged={reload} />
+          </ComponentErrorBoundary>
         )}
       </main>
-      <SettingsPanel
-        open={showSettings}
-        onClose={() => setShowSettings(false)}
-        onDataChanged={reload}
-      />
+      <ComponentErrorBoundary fallbackTitle="Settings">
+        <SettingsPanel
+          open={showSettings}
+          onClose={() => setShowSettings(false)}
+          onDataChanged={reload}
+        />
+      </ComponentErrorBoundary>
     </div>
   );
 }

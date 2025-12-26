@@ -1,6 +1,7 @@
 import { memo, useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { Pin, PinOff, Lock, LockOpen, GitBranch, GitMerge, MoreHorizontal } from 'lucide-react';
-import type { Node } from '../../types/graph';
+import { invoke } from '@tauri-apps/api/core';
+import type { Node, Edge } from '../../types/graph';
 
 interface SimilarNode {
   id: string;
@@ -35,8 +36,8 @@ interface SimilarNodesPanelProps {
   onRemoveNode: (nodeId: string) => void;
   onTogglePin: (nodeId: string, currentlyPinned: boolean) => void;
   onTogglePrivacy: (nodeId: string, currentlyPrivate: boolean) => void;
-  onSplitNode?: (nodeId: string) => void;  // Split node's children into sub-categories
-  onUnsplitNode?: (nodeId: string) => void;  // Flatten intermediate categories back into parent
+  onSplitNode?: (nodeId: string) => void;  // Flatten node - move children up to parent level
+  onGroupNode?: (nodeId: string) => void;  // Group children into AI-generated categories
   onClearAll: () => void;
   onToggleStack: () => void;
   onStartResize: () => void;
@@ -75,7 +76,7 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
   onTogglePin,
   onTogglePrivacy,
   onSplitNode,
-  onUnsplitNode,
+  onGroupNode,
   onClearAll,
   onToggleStack,
   onStartResize,
@@ -90,6 +91,32 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
   const [expandedHierarchyNodes, setExpandedHierarchyNodes] = useState<Set<string>>(new Set());
   const [moreMenuOpen, setMoreMenuOpen] = useState<string | null>(null);
   const moreMenuRef = useRef<HTMLDivElement>(null);
+
+  // State for "Also Connects To" associations (BelongsTo edges)
+  const [associations, setAssociations] = useState<Map<string, Edge[]>>(new Map());
+  const [collapsedAssociations, setCollapsedAssociations] = useState<Set<string>>(new Set());
+  const fetchedAssociationsRef = useRef<Set<string>>(new Set());
+
+  // Fetch associations for items when they're selected
+  useEffect(() => {
+    const nodeIds = Array.from(similarNodesMap.keys());
+    for (const nodeId of nodeIds) {
+      const node = nodes.get(nodeId);
+      // Only fetch for items (leaf nodes), skip if already fetched
+      if (node?.isItem && !fetchedAssociationsRef.current.has(nodeId)) {
+        fetchedAssociationsRef.current.add(nodeId);
+        invoke<Edge[]>('get_item_associations', { itemId: nodeId })
+          .then(edges => {
+            if (edges.length > 0) {
+              setAssociations(prev => new Map(prev).set(nodeId, edges));
+            }
+          })
+          .catch(e => {
+            devLog('warn', `Failed to fetch associations for ${nodeId}: ${e}`);
+          });
+      }
+    }
+  }, [similarNodesMap, nodes, devLog]);
 
   // Close more menu when clicking outside
   useEffect(() => {
@@ -617,16 +644,16 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
                               Split
                             </button>
                           )}
-                          {sourceNode && sourceNode.childCount > 0 && onUnsplitNode && (
+                          {sourceNode && sourceNode.childCount > 0 && onGroupNode && (
                             <button
                               onClick={() => {
-                                onUnsplitNode(sourceId);
+                                onGroupNode(sourceId);
                                 setMoreMenuOpen(null);
                               }}
-                              className="w-full px-3 py-1.5 text-left text-sm flex items-center gap-2 text-gray-400 hover:bg-gray-600 hover:text-orange-400 transition-colors"
+                              className="w-full px-3 py-1.5 text-left text-sm flex items-center gap-2 text-gray-400 hover:bg-gray-600 hover:text-purple-400 transition-colors"
                             >
                               <GitMerge className="w-4 h-4" />
-                              Unsplit
+                              Group
                             </button>
                           )}
                         </div>
@@ -716,6 +743,61 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
                       {getDirectChildren(sourceId).map(child =>
                         renderHierarchyNode(child, sourceId, 0)
                       )}
+                    </div>
+                  )}
+                </>
+              )}
+
+              {/* Also Connects To section - shows BelongsTo edges for items */}
+              {sourceNode && sourceNode.isItem && associations.has(sourceId) && (associations.get(sourceId)?.length ?? 0) > 0 && (
+                <>
+                  <button
+                    onClick={() => setCollapsedAssociations(prev => {
+                      const next = new Set(prev);
+                      if (next.has(sourceId)) {
+                        next.delete(sourceId);
+                      } else {
+                        next.add(sourceId);
+                      }
+                      return next;
+                    })}
+                    className="w-full px-3 py-1.5 bg-gray-700/20 text-xs text-gray-400 border-t border-gray-700/50 flex items-center justify-between hover:bg-gray-700/40 transition-colors"
+                  >
+                    <span className="flex items-center gap-1">
+                      <span>{collapsedAssociations.has(sourceId) ? '▶' : '▼'}</span>
+                      <span>🔗 Also Connects To ({associations.get(sourceId)?.length ?? 0})</span>
+                    </span>
+                  </button>
+                  {!collapsedAssociations.has(sourceId) && (
+                    <div className="py-1 max-h-48 overflow-y-auto">
+                      {associations.get(sourceId)?.map(edge => {
+                        const targetNode = nodes.get(edge.target);
+                        const weight = edge.weight ?? 0;
+                        return (
+                          <button
+                            key={edge.id}
+                            onClick={() => {
+                              if (targetNode) {
+                                onJumpToNode(targetNode, sourceNode);
+                                devLog('info', `Navigating to associated category: ${targetNode.aiTitle || targetNode.title}`);
+                              }
+                            }}
+                            className="w-full px-3 py-1.5 text-left hover:bg-gray-700/50 transition-colors flex items-center justify-between gap-2"
+                          >
+                            <span className="text-sm truncate flex items-center gap-1.5">
+                              <span className="text-gray-600">•</span>
+                              <span>{targetNode?.emoji || '📁'}</span>
+                              <span className="truncate">{targetNode?.aiTitle || targetNode?.title || edge.target}</span>
+                            </span>
+                            <span
+                              className="text-xs shrink-0 font-medium"
+                              style={{ color: `hsl(${weight * 120}, 70%, 50%)` }}
+                            >
+                              {(weight * 100).toFixed(0)}%
+                            </span>
+                          </button>
+                        );
+                      })}
                     </div>
                   )}
                 </>

@@ -167,3 +167,32 @@ pub struct Edge {
     #[serde(rename = "createdAt")]
     pub created_at: i64,
 }
+
+/// Persistent tag for guiding clustering across rebuilds
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tag {
+    pub id: String,
+    pub title: String,
+    #[serde(rename = "parentTagId")]
+    pub parent_tag_id: Option<String>,
+    pub depth: i32,
+    // Note: centroid stored in DB as BLOB, not loaded into struct (too large)
+    #[serde(rename = "itemCount")]
+    pub item_count: i32,
+    pub pinned: bool,
+    #[serde(rename = "createdAt")]
+    pub created_at: i64,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: i64,
+}
+
+/// Item-to-tag assignment with confidence score
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ItemTag {
+    #[serde(rename = "itemId")]
+    pub item_id: String,
+    #[serde(rename = "tagId")]
+    pub tag_id: String,
+    pub confidence: f64,
+    pub source: String,  // "ai" or "user"
+}

@@ -18,6 +18,7 @@ import {
   Shield,
   Download,
   Cpu,
+  Network,
 } from 'lucide-react';
 import { ConfirmDialog } from './ConfirmDialog';
 
@@ -57,7 +58,7 @@ interface SettingsPanelProps {
   onDataChanged?: () => void;
 }
 
-type ConfirmAction = 'deleteAll' | 'resetAi' | 'resetClustering' | 'clearEmbeddings' | 'clearHierarchy' | 'resetPrivacy' | 'fullRebuild' | 'flattenHierarchy' | 'consolidateRoot' | 'tidyDatabase' | 'classifyContent' | 'scorePrivacy' | null;
+type ConfirmAction = 'deleteAll' | 'resetAi' | 'resetClustering' | 'clearEmbeddings' | 'clearHierarchy' | 'clearTags' | 'resetPrivacy' | 'fullRebuild' | 'rebuildStructure' | 'flattenHierarchy' | 'consolidateRoot' | 'tidyDatabase' | 'scorePrivacy' | 'reclassifyPattern' | 'reclassifyAi' | 'rebuildLite' | 'rebuildHierarchyOnly' | null;
 
 interface TidyReport {
   sameNameMerged: number;
@@ -82,11 +83,17 @@ interface PrivacyStats {
   scannedCategories: number;
 }
 
+interface ExportPreview {
+  included: number;
+  excluded: number;
+  unscored: number;
+}
+
 type SettingsTab = 'setup' | 'keys' | 'maintenance' | 'privacy' | 'info';
 
 export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelProps) {
-  // Navigation reset for database switches
-  const { navigateToRoot } = useGraphStore();
+  // Navigation reset for database switches + shared privacy threshold
+  const { navigateToRoot, privacyThreshold, setPrivacyThreshold } = useGraphStore();
 
   // Active tab
   const [activeTab, setActiveTab] = useState<SettingsTab>('setup');
@@ -136,11 +143,15 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
 
   // Operations
   const [isFullRebuilding, setIsFullRebuilding] = useState(false);
+  const [isRebuildingStructure, setIsRebuildingStructure] = useState(false);
   const [isFlattening, setIsFlattening] = useState(false);
   const [isConsolidating, setIsConsolidating] = useState(false);
   const [isTidying, setIsTidying] = useState(false);
-  const [isClassifying, setIsClassifying] = useState(false);
   const [isScoringPrivacy, setIsScoringPrivacy] = useState(false);
+  const [isReclassifyingPattern, setIsReclassifyingPattern] = useState(false);
+  const [isReclassifyingAi, setIsReclassifyingAi] = useState(false);
+  const [isRebuildingLite, setIsRebuildingLite] = useState(false);
+  const [isRebuildingHierarchyOnly, setIsRebuildingHierarchyOnly] = useState(false);
   const [operationResult, setOperationResult] = useState<string | null>(null);
 
   // Setup flow operations
@@ -158,12 +169,10 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const [isQuickProcessing, setIsQuickProcessing] = useState(false);
   const [quickProcessStep, setQuickProcessStep] = useState('');
 
-  // Privacy scanning
+  // Privacy scanning (privacyThreshold is shared via store with Graph.tsx)
   const [privacyStats, setPrivacyStats] = useState<PrivacyStats | null>(null);
-  const [isScanning, setIsScanning] = useState(false);
-  const [scanProgress, setScanProgress] = useState<{ current: number; total: number; status: string } | null>(null);
   const [privacyResult, setPrivacyResult] = useState<string | null>(null);
-  const [showcaseMode, setShowcaseMode] = useState(false);
+  const [exportPreview, setExportPreview] = useState<ExportPreview | null>(null);
 
   // Protection settings
   const [protectRecentNotes, setProtectRecentNotes] = useState(true);
@@ -243,6 +252,22 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
       console.error('Failed to load privacy stats:', err);
     }
   };
+
+  const loadExportPreview = async (threshold: number) => {
+    try {
+      const preview = await invoke<ExportPreview>('get_export_preview', { minPrivacy: threshold });
+      setExportPreview(preview);
+    } catch (err) {
+      console.error('Failed to load export preview:', err);
+    }
+  };
+
+  // Update export preview when threshold changes
+  useEffect(() => {
+    if (open && activeTab === 'privacy') {
+      loadExportPreview(privacyThreshold);
+    }
+  }, [open, activeTab, privacyThreshold]);
 
   const loadProtectionSettings = async () => {
     try {
@@ -566,121 +591,11 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     }
   };
 
-  // Privacy scan handlers
-  const handlePrivacyScan = async () => {
-    setIsScanning(true);
-    setScanProgress({ current: 0, total: 0, status: 'starting' });
-    setPrivacyResult(null);
-
-    // Listen for progress events
-    const { listen } = await import('@tauri-apps/api/event');
-    const unlisten = await listen<{
-      current: number;
-      total: number;
-      nodeTitle: string;
-      isPrivate: boolean;
-      reason: string | null;
-      status: string;
-      errorMessage: string | null;
-    }>('privacy-progress', (event) => {
-      const { current, total, status } = event.payload;
-      setScanProgress({ current, total, status });
-
-      if (status === 'complete' || status === 'cancelled') {
-        unlisten();
-        setIsScanning(false);
-        loadPrivacyStats();
-      }
-    });
-
-    try {
-      const result = await invoke<{
-        total: number;
-        privateCount: number;
-        safeCount: number;
-        errorCount: number;
-        cancelled: boolean;
-      }>('analyze_all_privacy', { showcaseMode });
-
-      if (result.cancelled) {
-        setPrivacyResult('Scan cancelled');
-      } else {
-        const modeLabel = showcaseMode ? ' (showcase mode)' : '';
-        setPrivacyResult(`Scanned ${result.total} items: ${result.privateCount} private, ${result.safeCount} safe${result.errorCount > 0 ? `, ${result.errorCount} errors` : ''}${modeLabel}`);
-      }
-    } catch (err) {
-      setPrivacyResult(`Error: ${err}`);
-      unlisten();
-    } finally {
-      setIsScanning(false);
-      setScanProgress(null);
-      await loadPrivacyStats();
-    }
-  };
-
-  const handleCancelPrivacyScan = async () => {
-    try {
-      await invoke('cancel_privacy_scan');
-    } catch (err) {
-      console.error('Failed to cancel privacy scan:', err);
-    }
-  };
-
-  const handleCategoryScan = async () => {
-    setIsScanning(true);
-    setScanProgress({ current: 0, total: 0, status: 'starting' });
-    setPrivacyResult(null);
-
-    const { listen } = await import('@tauri-apps/api/event');
-    const unlisten = await listen<{
-      current: number;
-      total: number;
-      nodeTitle: string;
-      isPrivate: boolean;
-      reason: string | null;
-      status: string;
-      errorMessage: string | null;
-    }>('privacy-progress', (event) => {
-      const { current, total, status } = event.payload;
-      setScanProgress({ current, total, status });
-
-      if (status === 'complete' || status === 'cancelled') {
-        unlisten();
-        setIsScanning(false);
-        loadPrivacyStats();
-      }
-    });
-
-    try {
-      const result = await invoke<{
-        categoriesScanned: number;
-        categoriesPrivate: number;
-        categoriesSafe: number;
-        itemsPropagated: number;
-        errorCount: number;
-        cancelled: boolean;
-      }>('analyze_categories_privacy', { showcaseMode });
-
-      if (result.cancelled) {
-        setPrivacyResult('Scan cancelled');
-      } else {
-        const modeLabel = showcaseMode ? ' (showcase)' : '';
-        setPrivacyResult(`Scanned ${result.categoriesScanned} categories: ${result.categoriesPrivate} private, ${result.categoriesSafe} safe → ${result.itemsPropagated} items filtered${modeLabel}`);
-      }
-    } catch (err) {
-      setPrivacyResult(`Error: ${err}`);
-      unlisten();
-    } finally {
-      setIsScanning(false);
-      setScanProgress(null);
-      await loadPrivacyStats();
-    }
-  };
-
+  // Privacy export handler
   const handleExportShareable = async () => {
     setPrivacyResult(null);
     try {
-      const path = await invoke<string>('export_shareable_db');
+      const path = await invoke<string>('export_shareable_db', { minPrivacy: privacyThreshold });
       setPrivacyResult(`Exported: ${path}`);
     } catch (err) {
       setPrivacyResult(`Error: ${err}`);
@@ -820,6 +735,14 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
         return `Deleted ${count} hierarchy nodes`;
       },
     },
+    clearTags: {
+      title: 'Clear Tags',
+      message: 'This will delete all persistent tags and item-tag assignments. Tags will regenerate on next rebuild.',
+      handler: async () => {
+        const count = await invoke<number>('clear_tags');
+        return `Deleted ${count} tags`;
+      },
+    },
     resetPrivacy: {
       title: 'Reset Privacy Flags',
       message: 'This will clear all privacy scan results, marking all items as unscanned. Use this before re-scanning with different settings (e.g., showcase mode).',
@@ -853,6 +776,31 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
           return msg;
         } finally {
           setIsFullRebuilding(false);
+        }
+      },
+    },
+    rebuildStructure: {
+      title: 'Rebuild Structure',
+      message: 'This rebuilds the hierarchy without re-clustering. Uses existing cluster assignments. Faster than Full Rebuild.',
+      handler: async () => {
+        setIsRebuildingStructure(true);
+        setOperationResult(null);
+        try {
+          const result = await invoke<{
+            clusteringResult: null;
+            hierarchyResult: { levelsCreated: number; intermediateNodesCreated: number; itemsOrganized: number; maxDepth: number };
+            levelsCreated: number;
+            groupingIterations: number;
+          }>('build_full_hierarchy', { runClustering: false });
+
+          // Flatten empty passthrough levels
+          const flattenCount = await invoke<number>('flatten_hierarchy');
+
+          const msg = `Created ${result.hierarchyResult.intermediateNodesCreated} nodes, ${result.groupingIterations} grouping iterations, flattened ${flattenCount}`;
+          setOperationResult(msg);
+          return msg;
+        } finally {
+          setIsRebuildingStructure(false);
         }
       },
     },
@@ -917,22 +865,6 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
         }
       },
     },
-    classifyContent: {
-      title: 'Classify Content',
-      message: 'Classify all items by content type (idea/code/debug/paste) and associate supporting items with ideas. Fast local operation using pattern matching.',
-      handler: async () => {
-        setIsClassifying(true);
-        setOperationResult(null);
-        try {
-          const [classified, associated] = await invoke<[number, number]>('classify_and_associate');
-          const msg = `Classified ${classified} items, associated ${associated} supporting items with ideas`;
-          setOperationResult(msg);
-          return msg;
-        } finally {
-          setIsClassifying(false);
-        }
-      },
-    },
     scorePrivacy: {
       title: 'Score Privacy',
       message: `AI will score all items 0.0-1.0 for public shareability. Items < 0.3 are considered private and will be separated during clustering. Estimated cost: ~$0.30 for 4700 items.`,
@@ -946,6 +878,70 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
           return msg;
         } finally {
           setIsScoringPrivacy(false);
+        }
+      },
+    },
+    reclassifyPattern: {
+      title: 'Reclassify (Pattern)',
+      message: 'Re-classify all items using pattern matching. This is FREE and instant. Does not use AI.',
+      handler: async () => {
+        setIsReclassifyingPattern(true);
+        setOperationResult(null);
+        try {
+          const count = await invoke<number>('reclassify_pattern');
+          const msg = `Reclassified ${count} items using patterns (FREE)`;
+          setOperationResult(msg);
+          return msg;
+        } finally {
+          setIsReclassifyingPattern(false);
+        }
+      },
+    },
+    reclassifyAi: {
+      title: 'Reclassify (AI)',
+      message: 'Re-classify all items using AI. Very cheap (~$0.04 for 4000 items). Uses minimal Haiku prompt.',
+      handler: async () => {
+        setIsReclassifyingAi(true);
+        setOperationResult(null);
+        try {
+          const count = await invoke<number>('reclassify_ai');
+          const msg = `Reclassified ${count} items using AI (cheap)`;
+          setOperationResult(msg);
+          return msg;
+        } finally {
+          setIsReclassifyingAi(false);
+        }
+      },
+    },
+    rebuildLite: {
+      title: 'Rebuild Lite',
+      message: 'Reclassify items + recluster with existing embeddings. SAFE: Hierarchy untouched. FREE.',
+      handler: async () => {
+        setIsRebuildingLite(true);
+        setOperationResult(null);
+        try {
+          const result = await invoke<{ itemsClassified: number; clustersCreated: number; hierarchyLevels: number; method: string }>('rebuild_lite');
+          const msg = `Rebuilt: ${result.itemsClassified} items classified, ${result.clustersCreated} clusters (hierarchy untouched)`;
+          setOperationResult(msg);
+          return msg;
+        } finally {
+          setIsRebuildingLite(false);
+        }
+      },
+    },
+    rebuildHierarchyOnly: {
+      title: 'Rebuild Hierarchy Only',
+      message: 'Keeps items + clusters, only rebuilds hierarchy grouping (Universe → categories → topics). Uses AI for grouping. ~$0.05-0.15.',
+      handler: async () => {
+        setIsRebuildingHierarchyOnly(true);
+        setOperationResult(null);
+        try {
+          const result = await invoke<{ itemsClassified: number; clustersCreated: number; hierarchyLevels: number; method: string }>('rebuild_hierarchy_only');
+          const msg = `Hierarchy rebuilt: ${result.hierarchyLevels} levels created`;
+          setOperationResult(msg);
+          return msg;
+        } finally {
+          setIsRebuildingHierarchyOnly(false);
         }
       },
     },
@@ -1687,10 +1683,29 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   </div>
                   <button
                     onClick={() => setConfirmAction('fullRebuild')}
-                    disabled={isFullRebuilding || isFlattening || isConsolidating || isTidying}
+                    disabled={isFullRebuilding || isRebuildingStructure || isFlattening || isConsolidating || isTidying}
                     className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-green-600 hover:bg-green-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isFullRebuilding ? <Loader2 className="w-5 h-5 animate-spin" /> : '🔄'}
+                  </button>
+                </div>
+
+                {/* Rebuild Structure (no clustering) */}
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-blue-600 flex items-center justify-center text-white text-sm">
+                    <RefreshCw className="w-3.5 h-3.5" />
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Rebuild Structure</div>
+                    <div className="text-xs text-gray-500">Rebuild hierarchy without re-clustering. Uses existing clusters.</div>
+                    <div className="text-xs text-cyan-400/80 mt-0.5">Faster · No embedding cost</div>
+                  </div>
+                  <button
+                    onClick={() => setConfirmAction('rebuildStructure')}
+                    disabled={isRebuildingStructure || isFullRebuilding || isFlattening || isConsolidating || isTidying}
+                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-blue-600 hover:bg-blue-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                  >
+                    {isRebuildingStructure ? <Loader2 className="w-5 h-5 animate-spin" /> : '🏗️'}
                   </button>
                 </div>
 
@@ -1734,6 +1749,87 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   </button>
                 </div>
 
+                {/* Budget Options Section */}
+                <div className="mt-4 mb-2">
+                  <h4 className="text-xs font-semibold text-gray-400 uppercase tracking-wide">Budget Options</h4>
+                </div>
+
+                {/* Rebuild Lite - SAFE */}
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3 border border-green-500/30">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-green-700 flex items-center justify-center text-white text-sm">
+                    <RefreshCw className="w-3.5 h-3.5" />
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Rebuild Lite <span className="text-green-400">(SAFE)</span></div>
+                    <div className="text-xs text-gray-500">Reclassify + recluster. Hierarchy untouched.</div>
+                    <div className="text-xs text-green-400 mt-0.5">FREE · Reuses embeddings</div>
+                  </div>
+                  <button
+                    onClick={() => setConfirmAction('rebuildLite')}
+                    disabled={isRebuildingLite || isFullRebuilding || isRebuildingStructure || isFlattening || isConsolidating || isTidying}
+                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-green-700 hover:bg-green-800 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                  >
+                    {isRebuildingLite ? <Loader2 className="w-5 h-5 animate-spin" /> : '🔄'}
+                  </button>
+                </div>
+
+                {/* Rebuild Hierarchy Only */}
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3 border border-amber-500/30">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-amber-600 flex items-center justify-center text-white text-sm">
+                    <Network className="w-3.5 h-3.5" />
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Rebuild Hierarchy Only</div>
+                    <div className="text-xs text-gray-500">Keeps clusters, regroups into categories</div>
+                    <div className="text-xs text-amber-400 mt-0.5">~$0.05-0.15 · AI grouping only</div>
+                  </div>
+                  <button
+                    onClick={() => setConfirmAction('rebuildHierarchyOnly')}
+                    disabled={isRebuildingHierarchyOnly || isFullRebuilding || isRebuildingStructure || isFlattening || isConsolidating || isTidying}
+                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-amber-600 hover:bg-amber-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                  >
+                    {isRebuildingHierarchyOnly ? <Loader2 className="w-5 h-5 animate-spin" /> : '🏗️'}
+                  </button>
+                </div>
+
+                {/* Reclassify (Pattern) */}
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-emerald-600 flex items-center justify-center text-white text-sm">
+                    <Zap className="w-3.5 h-3.5" />
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Reclassify (Pattern)</div>
+                    <div className="text-xs text-gray-500">Re-run content_type classification using pattern matching</div>
+                    <div className="text-xs text-green-400 mt-0.5">FREE · Instant · No AI</div>
+                  </div>
+                  <button
+                    onClick={() => setConfirmAction('reclassifyPattern')}
+                    disabled={isReclassifyingPattern || isReclassifyingAi || isFullRebuilding || isRebuildingLite}
+                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                  >
+                    {isReclassifyingPattern ? <Loader2 className="w-5 h-5 animate-spin" /> : '🏷️'}
+                  </button>
+                </div>
+
+                {/* Reclassify (AI) */}
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-teal-600 flex items-center justify-center text-white text-sm">
+                    <Cpu className="w-3.5 h-3.5" />
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Reclassify (AI)</div>
+                    <div className="text-xs text-gray-500">Re-run content_type classification using AI (Haiku)</div>
+                    <div className="text-xs text-cyan-400 mt-0.5">~$0.04 for 4000 items · Better accuracy</div>
+                  </div>
+                  <button
+                    onClick={() => setConfirmAction('reclassifyAi')}
+                    disabled={isReclassifyingAi || isReclassifyingPattern || isFullRebuilding || isRebuildingLite}
+                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-teal-600 hover:bg-teal-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                  >
+                    {isReclassifyingAi ? <Loader2 className="w-5 h-5 animate-spin" /> : '🤖'}
+                  </button>
+                </div>
+
                 {/* Tidy Database */}
                 <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
                   <span className="flex-shrink-0 w-7 h-7 rounded-full bg-cyan-600 flex items-center justify-center text-white text-sm">
@@ -1746,29 +1842,10 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   </div>
                   <button
                     onClick={() => setConfirmAction('tidyDatabase')}
-                    disabled={isTidying || isFullRebuilding || isFlattening || isConsolidating || isClassifying}
+                    disabled={isTidying || isFullRebuilding || isFlattening || isConsolidating}
                     className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-cyan-600 hover:bg-cyan-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isTidying ? <Loader2 className="w-5 h-5 animate-spin" /> : '🧹'}
-                  </button>
-                </div>
-
-                {/* Classify Content */}
-                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
-                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-violet-600 flex items-center justify-center text-white text-sm">
-                    <Zap className="w-3.5 h-3.5" />
-                  </span>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm font-medium text-gray-200">Classify Content</div>
-                    <div className="text-xs text-gray-500">Classify items as idea/code/debug/paste and link supporting items to ideas</div>
-                    <div className="text-xs text-gray-600 mt-0.5">No API calls · Pattern matching + embeddings</div>
-                  </div>
-                  <button
-                    onClick={() => setConfirmAction('classifyContent')}
-                    disabled={isClassifying || isFullRebuilding || isFlattening || isConsolidating || isTidying || isScoringPrivacy}
-                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-violet-600 hover:bg-violet-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
-                  >
-                    {isClassifying ? <Loader2 className="w-5 h-5 animate-spin" /> : '🏷️'}
                   </button>
                 </div>
 
@@ -1784,7 +1861,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   </div>
                   <button
                     onClick={() => setConfirmAction('scorePrivacy')}
-                    disabled={isScoringPrivacy || isFullRebuilding || isFlattening || isConsolidating || isTidying || isClassifying}
+                    disabled={isScoringPrivacy || isFullRebuilding || isFlattening || isConsolidating || isTidying}
                     className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-rose-600 hover:bg-rose-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isScoringPrivacy ? <Loader2 className="w-5 h-5 animate-spin" /> : '🔒'}
@@ -1838,6 +1915,14 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                 </button>
 
                 <button
+                  onClick={() => setConfirmAction('clearTags')}
+                  className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
+                >
+                  <span className="text-sm font-medium text-gray-200">Clear Tags</span>
+                  <span className="text-xs text-gray-500">Regenerate on rebuild</span>
+                </button>
+
+                <button
                   onClick={() => setConfirmAction('resetPrivacy')}
                   className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
                 >
@@ -1874,23 +1959,22 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
             <section>
               <div className="flex items-center gap-2 mb-4">
                 <Shield className="w-5 h-5 text-rose-400" />
-                <h3 className="text-lg font-medium text-white">Privacy Filter</h3>
+                <h3 className="text-lg font-medium text-white">Privacy Export</h3>
               </div>
 
               {/* Description */}
               <div className="bg-gray-900/50 rounded-lg p-4 mb-4 text-sm text-gray-400 space-y-2">
                 <p>
-                  Uses AI to scan your items for sensitive content (personal info, credentials, private conversations, etc.) and marks them as <span className="text-rose-400">private</span> or <span className="text-green-400">safe</span>.
+                  Items are scored on a <span className="text-rose-400">0.0</span> (private) to <span className="text-green-400">1.0</span> (public) scale by AI.
+                  Use the slider to set your export threshold — items below the threshold are excluded.
                 </p>
                 <p className="text-xs text-gray-500">
-                  <strong className="text-gray-400">How it works:</strong> Categories automatically inherit privacy status — a category is hidden only when <em>all</em> its children are private. Use the 🔒 lock button in the top-right menu to toggle private content visibility. Export creates a shareable database with private items removed.
-                </p>
-                <p className="text-xs text-gray-500">
-                  <strong className="text-gray-400">Adjusting sensitivity:</strong> Edit the <code className="text-gray-400 bg-gray-800 px-1 rounded">PRIVACY_PROMPT</code> in <code className="text-gray-400 bg-gray-800 px-1 rounded">src-tauri/src/commands/privacy.rs</code> (lines 15-45) to customize what's considered private. Add/remove categories, change "when uncertain" behavior, or adjust examples.
+                  <strong className="text-gray-400">Score Privacy</strong> in Maintenance tab to score unscored items.
+                  Categories inherit the minimum privacy of their children.
                 </p>
               </div>
 
-              <div className="space-y-3">
+              <div className="space-y-4">
                 {/* Privacy Stats */}
                 {privacyStats && (
                   <div className="bg-gray-900/50 rounded-lg p-4 text-sm">
@@ -1900,124 +1984,89 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                         <span className="ml-2 text-white font-medium">{privacyStats.total}</span>
                       </div>
                       <div>
-                        <span className="text-gray-400">Scanned:</span>
+                        <span className="text-gray-400">Scored:</span>
                         <span className="ml-2 text-white font-medium">{privacyStats.scanned}</span>
                       </div>
                       <div>
-                        <span className="text-gray-400">🔒 Private:</span>
+                        <span className="text-gray-400">🔒 Private (&lt;0.3):</span>
                         <span className="ml-2 text-rose-400 font-medium">{privacyStats.private}</span>
                       </div>
                       <div>
-                        <span className="text-gray-400">✓ Safe:</span>
+                        <span className="text-gray-400">✓ Public (&gt;0.7):</span>
                         <span className="ml-2 text-green-400 font-medium">{privacyStats.safe}</span>
                       </div>
                     </div>
                     {privacyStats.unscanned > 0 && (
                       <div className="mt-2 text-xs text-amber-400">
-                        {privacyStats.unscanned} items not yet scanned
+                        {privacyStats.unscanned} items not yet scored — use Score Privacy in Maintenance
                       </div>
                     )}
                   </div>
                 )}
 
-                {/* Scan Progress */}
-                {scanProgress && (
-                  <div className="bg-gray-900/50 rounded-lg p-4">
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-sm text-gray-300">
-                        Scanning... {scanProgress.current}/{scanProgress.total}
-                      </span>
-                      <span className="text-xs text-amber-400">
-                        {scanProgress.total > 0 ? ((scanProgress.current / scanProgress.total) * 100).toFixed(0) : 0}%
-                      </span>
-                    </div>
-                    <div className="h-2 bg-gray-700 rounded-full overflow-hidden">
-                      <div
-                        className="h-full bg-rose-500 transition-all duration-300"
-                        style={{ width: scanProgress.total > 0 ? `${(scanProgress.current / scanProgress.total) * 100}%` : '0%' }}
-                      />
-                    </div>
-                  </div>
-                )}
-
-                {/* Showcase Mode Toggle */}
+                {/* Privacy Threshold Slider */}
                 <div className="bg-gray-900/50 rounded-lg p-4">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <div className="text-sm font-medium text-gray-200">Showcase Mode</div>
-                      <div className="text-xs text-gray-500 mt-1">
-                        Stricter filtering for demo databases — keeps only Mycelica, philosophy, and pure tech content
-                      </div>
-                    </div>
-                    <button
-                      onClick={() => setShowcaseMode(!showcaseMode)}
-                      className={`relative w-12 h-6 rounded-full transition-colors ${
-                        showcaseMode ? 'bg-amber-500' : 'bg-gray-600'
-                      }`}
-                    >
-                      <div
-                        className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-all ${
-                          showcaseMode ? 'left-7' : 'left-1'
-                        }`}
-                      />
-                    </button>
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="text-sm font-medium text-gray-200">Export Threshold</div>
+                    <div className="text-lg font-mono text-white">{privacyThreshold.toFixed(1)}</div>
                   </div>
-                </div>
-
-                {/* Scan Buttons */}
-                <div className="bg-gray-900/50 rounded-lg p-4 space-y-3">
-                  <div className="flex gap-2">
-                    <button
-                      onClick={handleCategoryScan}
-                      disabled={isScanning || !apiKeyStatus?.hasKey}
-                      className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-medium transition-colors disabled:opacity-50"
-                    >
-                      {isScanning ? (
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                      ) : (
-                        <Zap className="w-4 h-4" />
-                      )}
-                      Scan Categories
-                    </button>
-                    <button
-                      onClick={handlePrivacyScan}
-                      disabled={isScanning || !apiKeyStatus?.hasKey || privacyStats?.unscanned === 0}
-                      className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-rose-600 hover:bg-rose-700 text-white rounded-lg font-medium transition-colors disabled:opacity-50"
-                    >
-                      {isScanning ? (
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                      ) : (
-                        <Shield className="w-4 h-4" />
-                      )}
-                      Scan Items
-                    </button>
-                    {isScanning && (
-                      <button
-                        onClick={handleCancelPrivacyScan}
-                        className="px-4 py-2.5 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition-colors"
-                      >
-                        Cancel
-                      </button>
-                    )}
+                  <input
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.1"
+                    value={privacyThreshold}
+                    onChange={(e) => setPrivacyThreshold(parseFloat(e.target.value))}
+                    className="w-full h-2 rounded-lg appearance-none cursor-pointer"
+                    style={{
+                      background: `linear-gradient(to right,
+                        rgb(34, 197, 94) 0%,
+                        rgb(245, 158, 11) 50%,
+                        rgb(244, 63, 94) 100%)`
+                    }}
+                  />
+                  <div className="flex justify-between text-xs text-gray-500 mt-1">
+                    <span className="text-green-400">Permissive</span>
+                    <span>Moderate</span>
+                    <span className="text-rose-400">Strict</span>
                   </div>
-                  <p className="text-xs text-gray-500">
-                    <strong className="text-amber-400">Categories</strong> = fast, filters by topic name (~{privacyStats?.totalCategories || 0} calls).
-                    <strong className="text-rose-400 ml-2">Items</strong> = thorough, scans content ({privacyStats?.unscanned || 0} remaining).
+                  <p className="mt-3 text-xs text-gray-500">
+                    {privacyThreshold <= 0.3 && <span className="text-green-400">Keeps most content, only removes very private items.</span>}
+                    {privacyThreshold > 0.3 && privacyThreshold <= 0.5 && <span className="text-amber-400">Removes clearly private content.</span>}
+                    {privacyThreshold > 0.5 && privacyThreshold <= 0.7 && <span className="text-amber-400">Removes private and borderline content.</span>}
+                    {privacyThreshold > 0.7 && <span className="text-rose-400">Only keeps clearly public content.</span>}
                   </p>
+
+                  {/* Export Preview Counts */}
+                  {exportPreview && (
+                    <div className="mt-3 p-2 bg-gray-800/50 rounded flex justify-between text-sm">
+                      <span className="text-green-400">
+                        ✓ {exportPreview.included} included
+                      </span>
+                      <span className="text-rose-400">
+                        🔒 {exportPreview.excluded} excluded
+                      </span>
+                      {exportPreview.unscored > 0 && (
+                        <span className="text-gray-400">
+                          ⚠ {exportPreview.unscored} unscored
+                        </span>
+                      )}
+                    </div>
+                  )}
                 </div>
 
                 {/* Export Button */}
                 <div className="bg-gray-900/50 rounded-lg p-4">
                   <button
                     onClick={handleExportShareable}
-                    disabled={isScanning || privacyStats?.scanned === 0}
+                    disabled={privacyStats?.scanned === 0}
                     className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-medium transition-colors disabled:opacity-50"
                   >
                     <Download className="w-4 h-4" />
-                    Export Shareable DB
+                    Export Shareable DB (threshold {privacyThreshold.toFixed(1)})
                   </button>
                   <p className="mt-2 text-xs text-gray-500">
-                    Creates a copy with private nodes removed
+                    Creates a copy excluding items with privacy &lt; {privacyThreshold.toFixed(1)}
                   </p>
                 </div>
 

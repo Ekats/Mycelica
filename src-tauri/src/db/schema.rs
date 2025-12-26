@@ -1,7 +1,7 @@
-use rusqlite::{Connection, Result, params};
+use rusqlite::{Connection, Result, params, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
-use super::models::{Node, Edge, NodeType, EdgeType, Position};
+use super::models::{Node, Edge, NodeType, EdgeType, Position, Tag};
 
 pub struct Database {
     conn: Mutex<Connection>,
@@ -91,10 +91,44 @@ impl Database {
                 created_at INTEGER NOT NULL
             );
 
+            -- Persistent tags for guiding clustering across rebuilds
+            CREATE TABLE IF NOT EXISTS tags (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                parent_tag_id TEXT REFERENCES tags(id),
+                depth INTEGER NOT NULL DEFAULT 0,
+                centroid BLOB,  -- Embedding for matching items to this tag
+                item_count INTEGER NOT NULL DEFAULT 0,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            -- Item-to-tag assignments (persists across rebuilds)
+            CREATE TABLE IF NOT EXISTS item_tags (
+                item_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                confidence REAL NOT NULL DEFAULT 1.0,
+                source TEXT NOT NULL DEFAULT 'ai',
+                PRIMARY KEY (item_id, tag_id)
+            );
+
+            -- Database metadata for tracking pipeline state
+            -- States: fresh, imported, processed, clustered, hierarchized, complete
+            CREATE TABLE IF NOT EXISTS db_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
             CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(type);
             CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
+            CREATE INDEX IF NOT EXISTS idx_tags_parent ON tags(parent_tag_id);
+            CREATE INDEX IF NOT EXISTS idx_tags_depth ON tags(depth);
+            CREATE INDEX IF NOT EXISTS idx_item_tags_item ON item_tags(item_id);
+            CREATE INDEX IF NOT EXISTS idx_item_tags_tag ON item_tags(tag_id);
 
             -- Hierarchy indexes for fast traversal with 4k+ nodes
             CREATE INDEX IF NOT EXISTS idx_nodes_parent_id ON nodes(parent_id);
@@ -500,6 +534,7 @@ impl Database {
 
     /// Get all protected node IDs (Recent Notes and descendants)
     /// Returns empty set if protection is disabled
+    /// Uses a single recursive CTE query for O(1) database calls instead of O(n) traversals
     pub fn get_protected_node_ids(&self) -> std::collections::HashSet<String> {
         use crate::settings;
 
@@ -509,36 +544,36 @@ impl Database {
             return protected;
         }
 
-        // Add the container itself
-        protected.insert(settings::RECENT_NOTES_CONTAINER_ID.to_string());
+        let container_id = settings::RECENT_NOTES_CONTAINER_ID;
 
-        // Recursively get all descendants
-        self.collect_descendants(settings::RECENT_NOTES_CONTAINER_ID, &mut protected);
-
-        protected
-    }
-
-    /// Recursively collect all descendant IDs of a node
-    fn collect_descendants(&self, parent_id: &str, ids: &mut std::collections::HashSet<String>) {
+        // Single recursive CTE query to get all descendants in one DB call
         let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn.prepare("SELECT id FROM nodes WHERE parent_id = ?1") {
+        let mut stmt = match conn.prepare(
+            "WITH RECURSIVE descendants AS (
+                SELECT id FROM nodes WHERE id = ?1
+                UNION ALL
+                SELECT n.id FROM nodes n
+                JOIN descendants d ON n.parent_id = d.id
+            )
+            SELECT id FROM descendants"
+        ) {
             Ok(s) => s,
-            Err(_) => return,
+            Err(e) => {
+                eprintln!("Failed to prepare protected nodes query: {}", e);
+                // Fallback: just return the container ID
+                protected.insert(container_id.to_string());
+                return protected;
+            }
         };
 
-        let children: Vec<String> = stmt
-            .query_map(params![parent_id], |row| row.get(0))
+        let ids: Vec<String> = stmt
+            .query_map(params![container_id], |row| row.get(0))
             .ok()
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default();
 
-        drop(stmt);
-        drop(conn);
-
-        for child_id in children {
-            ids.insert(child_id.clone());
-            self.collect_descendants(&child_id, ids);
-        }
+        protected.extend(ids);
+        protected
     }
 
     /// Helper to convert a row to Node (reduces duplication)
@@ -581,10 +616,16 @@ impl Database {
     /// Standard SELECT columns for nodes (excludes embedding - use dedicated functions)
     const NODE_COLUMNS: &'static str = "id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date, is_private, privacy_reason, source, content_type, associated_idea_id, privacy";
 
+    /// Get nodes for graph view (only VISIBLE tier + unclassified)
+    /// SUPPORTING (investigation, discussion, reference, creative) and
+    /// HIDDEN (debug, code, paste, trivial) are lazy-loaded in leaf view
     pub fn get_all_nodes(&self) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {} FROM nodes ORDER BY created_at DESC",
+            "SELECT {} FROM nodes
+             WHERE content_type IS NULL
+                OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning')
+             ORDER BY created_at DESC",
             Self::NODE_COLUMNS
         ))?;
 
@@ -650,12 +691,14 @@ impl Database {
         Ok(())
     }
 
-    // Privacy operations (legacy boolean is_private)
+    // Privacy operations - sets both legacy is_private AND new privacy score
     pub fn update_node_privacy(&self, node_id: &str, is_private: bool, reason: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        // Map boolean to score: is_private=true → 0.0 (private), is_private=false → 1.0 (public)
+        let privacy_score = if is_private { 0.0 } else { 1.0 };
         conn.execute(
-            "UPDATE nodes SET is_private = ?2, privacy_reason = ?3 WHERE id = ?1",
-            params![node_id, is_private as i32, reason],
+            "UPDATE nodes SET is_private = ?2, privacy_reason = ?3, privacy = ?4 WHERE id = ?1",
+            params![node_id, is_private as i32, reason, privacy_score],
         )?;
         Ok(())
     }
@@ -776,8 +819,9 @@ impl Database {
         let conn = self.conn.lock().unwrap();
 
         // Use recursive CTE to find all descendants - only update unscanned
+        // Set both is_private=1 and privacy=0.0 (private)
         let count = conn.execute(
-            "UPDATE nodes SET is_private = 1, privacy_reason = ?2
+            "UPDATE nodes SET is_private = 1, privacy_reason = ?2, privacy = 0.0
              WHERE id IN (
                  WITH RECURSIVE descendants AS (
                      SELECT id FROM nodes WHERE parent_id = ?1
@@ -811,11 +855,11 @@ impl Database {
         let ids: Vec<String> = stmt.query_map(params![node_id], |row| row.get(0))?
             .collect::<Result<Vec<_>>>()?;
 
-        // Update all descendants
+        // Update all descendants - set both is_private=1 and privacy=0.0
         if !ids.is_empty() {
             conn.execute(
                 &format!(
-                    "UPDATE nodes SET is_private = 1, privacy_reason = ?1
+                    "UPDATE nodes SET is_private = 1, privacy_reason = ?1, privacy = 0.0
                      WHERE id IN ({})",
                     ids.iter().map(|_| "?").collect::<Vec<_>>().join(",")
                 ),
@@ -846,11 +890,11 @@ impl Database {
         let ids: Vec<String> = stmt.query_map(params![node_id], |row| row.get(0))?
             .collect::<Result<Vec<_>>>()?;
 
-        // Clear privacy from all descendants
+        // Clear privacy from all descendants - sets both is_private=0 AND privacy=1.0 (public)
         if !ids.is_empty() {
             conn.execute(
                 &format!(
-                    "UPDATE nodes SET is_private = 0, privacy_reason = NULL
+                    "UPDATE nodes SET is_private = 0, privacy_reason = NULL, privacy = 1.0
                      WHERE id IN ({})",
                     ids.iter().map(|_| "?").collect::<Vec<_>>().join(",")
                 ),
@@ -865,19 +909,24 @@ impl Database {
     pub fn get_privacy_stats_extended(&self) -> Result<(usize, usize, usize, usize, usize, usize, usize)> {
         let conn = self.conn.lock().unwrap();
 
-        // Item stats
+        // Item stats using new continuous privacy column (0.0 = private, 1.0 = public)
         let total_items: i32 = conn.query_row(
             "SELECT COUNT(*) FROM nodes WHERE is_item = 1",
             [],
             |r| r.get(0),
         ).unwrap_or(0);
-        let scanned_items: i32 = conn.query_row(
-            "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND is_private IS NOT NULL",
+        let scored_items: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND privacy IS NOT NULL",
             [],
             |r| r.get(0),
         ).unwrap_or(0);
         let private_items: i32 = conn.query_row(
-            "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND is_private = 1",
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND privacy IS NOT NULL AND privacy < 0.3",
+            [],
+            |r| r.get(0),
+        ).unwrap_or(0);
+        let public_items: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND privacy IS NOT NULL AND privacy > 0.7",
             [],
             |r| r.get(0),
         ).unwrap_or(0);
@@ -888,24 +937,51 @@ impl Database {
             [],
             |r| r.get(0),
         ).unwrap_or(0);
-        let scanned_categories: i32 = conn.query_row(
-            "SELECT COUNT(*) FROM nodes WHERE is_item = 0 AND child_count > 0 AND is_private IS NOT NULL",
+        let scored_categories: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 0 AND child_count > 0 AND privacy IS NOT NULL",
             [],
             |r| r.get(0),
         ).unwrap_or(0);
 
-        let unscanned_items = total_items - scanned_items;
-        let safe_items = scanned_items - private_items;
+        let unscored_items = total_items - scored_items;
 
         Ok((
             total_items as usize,
-            scanned_items as usize,
-            unscanned_items as usize,
+            scored_items as usize,
+            unscored_items as usize,
             private_items as usize,
-            safe_items as usize,
+            public_items as usize,
             total_categories as usize,
-            scanned_categories as usize,
+            scored_categories as usize,
         ))
+    }
+
+    /// Get preview of how many items would be included/excluded at a given privacy threshold
+    pub fn get_export_preview(&self, min_privacy: f64) -> Result<(usize, usize, usize)> {
+        let conn = self.conn.lock().unwrap();
+
+        // Items that would be INCLUDED (privacy >= threshold OR unscored)
+        let included: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND (privacy IS NULL OR privacy >= ?1)",
+            [min_privacy],
+            |r| r.get(0),
+        ).unwrap_or(0);
+
+        // Items that would be EXCLUDED (privacy < threshold)
+        let excluded: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND privacy IS NOT NULL AND privacy < ?1",
+            [min_privacy],
+            |r| r.get(0),
+        ).unwrap_or(0);
+
+        // Unscored items (will be included by default)
+        let unscored: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND privacy IS NULL",
+            [],
+            |r| r.get(0),
+        ).unwrap_or(0);
+
+        Ok((included as usize, excluded as usize, unscored as usize))
     }
 
     // Edge operations
@@ -1094,26 +1170,38 @@ impl Database {
         Ok(nodes)
     }
 
-    // ==================== Mini-Clustering Query Methods ====================
+    // ==================== Content Visibility Query Methods ====================
+    //
+    // VISIBLE tier: insight, idea, exploration, synthesis, question, planning
+    // SUPPORTING tier: investigation, discussion, reference, creative
+    // HIDDEN tier: debug, code, paste, trivial
 
-    /// Get only idea nodes for graph rendering (filters out code/debug/paste)
-    /// Returns items with content_type = 'idea' OR content_type IS NULL (legacy/unclassified)
+    /// SQL fragment for VISIBLE content types (for graph rendering)
+    const VISIBLE_CONTENT_TYPES: &'static str =
+        "content_type IS NULL OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning')";
+
+    /// Get only VISIBLE tier nodes for graph rendering
+    /// Categories (is_item = 0) are always included
     pub fn get_graph_children(&self, parent_id: &str) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {} FROM nodes WHERE parent_id = ?1 AND (content_type = 'idea' OR content_type IS NULL OR is_item = 0) ORDER BY child_count DESC, title",
-            Self::NODE_COLUMNS
+            "SELECT {} FROM nodes WHERE parent_id = ?1 AND (is_item = 0 OR ({})) ORDER BY child_count DESC, title",
+            Self::NODE_COLUMNS, Self::VISIBLE_CONTENT_TYPES
         ))?;
 
         let nodes = stmt.query_map(params![parent_id], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
         Ok(nodes)
     }
 
-    /// Get supporting items (code/debug/paste) under a parent
+    /// Get SUPPORTING tier items under a parent (for lazy-loading in leaf view)
+    /// Returns only SUPPORTING tier: investigation, discussion, reference, creative
+    /// HIDDEN tier (code, debug, paste, trivial) is excluded entirely
     pub fn get_supporting_items(&self, parent_id: &str) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {} FROM nodes WHERE parent_id = ?1 AND content_type IN ('code', 'debug', 'paste') ORDER BY content_type, created_at DESC",
+            "SELECT {} FROM nodes WHERE parent_id = ?1
+             AND content_type IN ('investigation', 'discussion', 'reference', 'creative')
+             ORDER BY content_type, created_at DESC",
             Self::NODE_COLUMNS
         ))?;
 
@@ -1134,21 +1222,11 @@ impl Database {
     }
 
     /// Get counts of supporting items for badge display
-    pub fn get_supporting_counts(&self, parent_id: &str) -> Result<(i32, i32, i32)> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT
-                COALESCE(SUM(CASE WHEN content_type = 'code' THEN 1 ELSE 0 END), 0) as code_count,
-                COALESCE(SUM(CASE WHEN content_type = 'debug' THEN 1 ELSE 0 END), 0) as debug_count,
-                COALESCE(SUM(CASE WHEN content_type = 'paste' THEN 1 ELSE 0 END), 0) as paste_count
-            FROM nodes WHERE parent_id = ?1"
-        )?;
-
-        let (code, debug, paste) = stmt.query_row(params![parent_id], |row| {
-            Ok((row.get::<_, i32>(0)?, row.get::<_, i32>(1)?, row.get::<_, i32>(2)?))
-        })?;
-
-        Ok((code, debug, paste))
+    /// HIDDEN tier (code, debug, paste) returns 0 - they are excluded from UI
+    pub fn get_supporting_counts(&self, _parent_id: &str) -> Result<(i32, i32, i32)> {
+        // HIDDEN tier items (code, debug, paste) are excluded from the UI entirely
+        // Return 0 for all counts so the tabs don't appear
+        Ok((0, 0, 0))
     }
 
     /// Get count of items associated with a specific idea
@@ -1183,6 +1261,23 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE is_item = 1 ORDER BY created_at DESC",
+            Self::NODE_COLUMNS
+        ))?;
+
+        let nodes = stmt.query_map([], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
+        Ok(nodes)
+    }
+
+    /// Get only VISIBLE tier items for hierarchy building
+    /// VISIBLE: insight, exploration, synthesis, question, planning
+    /// Excludes SUPPORTING (investigation, discussion, reference, creative)
+    /// Excludes HIDDEN (debug, code, paste, trivial)
+    pub fn get_visible_items(&self) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE is_item = 1
+             AND content_type IN ('insight', 'exploration', 'synthesis', 'question', 'planning')
+             ORDER BY created_at DESC",
             Self::NODE_COLUMNS
         ))?;
 
@@ -1643,6 +1738,11 @@ impl Database {
 
     /// Update parent_id for a node
     pub fn update_parent(&self, node_id: &str, parent_id: &str) -> Result<()> {
+        // Safety: prevent self-referential nodes (causes infinite loops)
+        if node_id == parent_id {
+            println!("[DB] WARNING: Prevented self-referential parent_id for node '{}'", node_id);
+            return Ok(());
+        }
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE nodes SET parent_id = ?2 WHERE id = ?1",
@@ -1818,6 +1918,34 @@ impl Database {
         Ok(())
     }
 
+    /// Batch set content_type for multiple nodes (uses transaction for speed)
+    pub fn set_content_types_batch(&self, updates: &[(String, String)]) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+
+        let mut updated = 0;
+        for (node_id, content_type) in updates {
+            tx.execute(
+                "UPDATE nodes SET content_type = ?2 WHERE id = ?1",
+                params![node_id, content_type],
+            )?;
+            updated += 1;
+        }
+
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Clear all content_type values (for reclassification)
+    pub fn clear_all_content_types(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE nodes SET content_type = NULL WHERE is_item = 1",
+            [],
+        )?;
+        Ok(())
+    }
+
     /// Set the associated idea ID for a supporting item
     pub fn set_associated_idea(&self, node_id: &str, idea_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -1840,6 +1968,11 @@ impl Database {
 
     /// Update a node's parent_id (reparent a node)
     pub fn update_node_parent(&self, node_id: &str, new_parent_id: &str) -> Result<()> {
+        // Safety: prevent self-referential nodes (causes infinite loops)
+        if node_id == new_parent_id {
+            println!("[DB] WARNING: Prevented self-referential parent_id for node '{}'", node_id);
+            return Ok(());
+        }
         let conn = self.conn.lock().unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1896,11 +2029,14 @@ impl Database {
     }
 
     /// Get pinned nodes (for Sidebar Pinned tab)
+    /// Only returns VISIBLE tier items
     pub fn get_pinned_nodes(&self) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {} FROM nodes WHERE is_pinned = 1 ORDER BY last_accessed_at DESC",
-            Self::NODE_COLUMNS
+            "SELECT {} FROM nodes
+             WHERE is_pinned = 1 AND ({})
+             ORDER BY last_accessed_at DESC",
+            Self::NODE_COLUMNS, Self::VISIBLE_CONTENT_TYPES
         ))?;
 
         let nodes = stmt.query_map([], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
@@ -1908,11 +2044,14 @@ impl Database {
     }
 
     /// Get recently accessed nodes (for Sidebar Recent tab)
+    /// Only returns VISIBLE tier items
     pub fn get_recent_nodes(&self, limit: i32) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {} FROM nodes WHERE last_accessed_at IS NOT NULL ORDER BY last_accessed_at DESC LIMIT ?1",
-            Self::NODE_COLUMNS
+            "SELECT {} FROM nodes
+             WHERE last_accessed_at IS NOT NULL AND ({})
+             ORDER BY last_accessed_at DESC LIMIT ?1",
+            Self::NODE_COLUMNS, Self::VISIBLE_CONTENT_TYPES
         ))?;
 
         let nodes = stmt.query_map(params![limit], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
@@ -1949,10 +2088,13 @@ impl Database {
 
     /// Get all nodes that have embeddings (for similarity search)
     /// Returns (node_id, embedding) pairs
+    /// Only returns VISIBLE tier items for similar node suggestions
     pub fn get_nodes_with_embeddings(&self) -> Result<Vec<(String, Vec<f32>)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, embedding FROM nodes WHERE embedding IS NOT NULL"
+            "SELECT id, embedding FROM nodes
+             WHERE embedding IS NOT NULL
+               AND (content_type IS NULL OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning'))"
         )?;
 
         let results = stmt.query_map([], |row| {
@@ -2496,17 +2638,22 @@ impl Database {
         }
     }
 
-    /// Fix all child_count fields by actually counting children
+    /// Fix all child_count fields by actually counting VISIBLE tier children
     pub fn fix_all_child_counts(&self) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
 
         // Find all mismatches
+        // Count only VISIBLE tier children (insight, idea, exploration, synthesis, question, planning)
         let mismatches: Vec<(String, i32, i32)> = {
             let mut stmt = conn.prepare(
                 "SELECT n.id, n.child_count,
-                        (SELECT COUNT(*) FROM nodes c WHERE c.parent_id = n.id) as actual
+                        (SELECT COUNT(*) FROM nodes c
+                         WHERE c.parent_id = n.id
+                           AND (c.content_type IS NULL OR c.content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning'))) as actual
                  FROM nodes n
-                 WHERE n.child_count != (SELECT COUNT(*) FROM nodes c WHERE c.parent_id = n.id)"
+                 WHERE n.child_count != (SELECT COUNT(*) FROM nodes c
+                                         WHERE c.parent_id = n.id
+                                           AND (c.content_type IS NULL OR c.content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning')))"
             )?;
             let results: Vec<_> = stmt.query_map([], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -2523,7 +2670,7 @@ impl Database {
             )?;
         }
 
-        println!("[Tidy] Fixed {} child counts", count);
+        println!("[Tidy] Fixed {} child counts (excludes supporting items)", count);
         Ok(count)
     }
 
@@ -2662,8 +2809,26 @@ impl Database {
         Ok(())
     }
 
-    /// Increment depth of multiple subtrees by 1 in a SINGLE query
-    /// Much more efficient than calling increment_subtree_depth multiple times
+    /// Decrement depth of a subtree by 1 (used when moving nodes up a level)
+    pub fn decrement_subtree_depth(&self, node_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+
+        // Use recursive CTE to find all descendants and decrement their depth
+        conn.execute(
+            "WITH RECURSIVE subtree(id) AS (
+                SELECT ?1
+                UNION ALL
+                SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+            )
+            UPDATE nodes SET depth = depth - 1 WHERE id IN (SELECT id FROM subtree)",
+            params![node_id],
+        )?;
+
+        Ok(())
+    }
+
+    /// Increment depth of multiple subtrees by 1
+    /// Uses level-by-level iteration instead of recursive CTE (much faster with many roots)
     pub fn increment_multiple_subtrees_depth(&self, root_ids: &[String]) -> Result<()> {
         if root_ids.is_empty() {
             return Ok(());
@@ -2671,33 +2836,455 @@ impl Database {
 
         let conn = self.conn.lock().unwrap();
 
-        // Build a single recursive CTE that finds all nodes in ANY of the subtrees
-        // Using a temp table approach for the root IDs
-        let placeholders: Vec<String> = root_ids.iter().enumerate()
-            .map(|(i, _)| format!("(?{})", i + 1))
-            .collect();
-        let placeholders_str = placeholders.join(", ");
+        // Level-by-level: update roots, then their children, then grandchildren, etc.
+        // Each level uses indexed parent_id lookups instead of recursive CTE traversal
+        let mut current_ids = root_ids.to_vec();
+        let mut total_updated = 0;
+        let mut level = 0;
+        let start = std::time::Instant::now();
 
-        let sql = format!(
-            "WITH RECURSIVE
-             roots(id) AS (VALUES {}),
-             subtree(id) AS (
-                SELECT id FROM roots
-                UNION ALL
-                SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
-             )
-             UPDATE nodes SET depth = depth + 1 WHERE id IN (SELECT id FROM subtree)",
-            placeholders_str
+        const MAX_LEVELS: usize = 20;
+        while !current_ids.is_empty() && level < MAX_LEVELS {
+            let level_start = std::time::Instant::now();
+            let level_count = current_ids.len();
+
+            // Batch updates to avoid SQLite variable limits (max ~999 params)
+            for batch in current_ids.chunks(500) {
+                let placeholders: String = (1..=batch.len())
+                    .map(|i| format!("?{}", i))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                let update_sql = format!(
+                    "UPDATE nodes SET depth = depth + 1 WHERE id IN ({})",
+                    placeholders
+                );
+
+                let params: Vec<&dyn rusqlite::ToSql> = batch.iter()
+                    .map(|s| s as &dyn rusqlite::ToSql)
+                    .collect();
+
+                total_updated += conn.execute(&update_sql, params.as_slice())?;
+            }
+
+            // Get children IDs for next level (also batched)
+            let mut next_level = Vec::new();
+            for batch in current_ids.chunks(500) {
+                let placeholders: String = (1..=batch.len())
+                    .map(|i| format!("?{}", i))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                let select_sql = format!(
+                    "SELECT id FROM nodes WHERE parent_id IN ({})",
+                    placeholders
+                );
+
+                let params: Vec<&dyn rusqlite::ToSql> = batch.iter()
+                    .map(|s| s as &dyn rusqlite::ToSql)
+                    .collect();
+
+                let mut stmt = conn.prepare(&select_sql)?;
+                let children: Vec<String> = stmt.query_map(params.as_slice(), |row| row.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                next_level.extend(children);
+            }
+
+            // Log progress for this level
+            let level_elapsed = level_start.elapsed().as_millis();
+            println!("[DepthUpdate] Level {}: {} nodes updated, {} children found ({} ms)",
+                level, level_count, next_level.len(), level_elapsed);
+
+            current_ids = next_level;
+            level += 1;
+        }
+
+        if level >= MAX_LEVELS {
+            println!("[DepthUpdate] WARNING: Hit max level limit ({}) - possible cycle in parent_id references!", MAX_LEVELS);
+        }
+
+        let total_elapsed = start.elapsed().as_millis();
+        println!("[DepthUpdate] Complete: {} levels, {} total nodes in {} ms",
+            level, total_updated, total_elapsed);
+
+        Ok(())
+    }
+
+    // ========== Tag Operations ==========
+
+    /// Count total tags
+    pub fn count_tags(&self) -> Result<i32> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))
+    }
+
+    /// Insert a new tag
+    pub fn insert_tag(&self, tag: &Tag) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tags (id, title, parent_tag_id, depth, item_count, pinned, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                tag.id,
+                tag.title,
+                tag.parent_tag_id,
+                tag.depth,
+                tag.item_count,
+                tag.pinned as i32,
+                tag.created_at,
+                tag.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get a tag by ID
+    pub fn get_tag(&self, id: &str) -> Result<Option<Tag>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, parent_tag_id, depth, item_count, pinned, created_at, updated_at
+             FROM tags WHERE id = ?1"
+        )?;
+        let tag = stmt.query_row(params![id], |row| {
+            Ok(Tag {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                parent_tag_id: row.get(2)?,
+                depth: row.get(3)?,
+                item_count: row.get(4)?,
+                pinned: row.get::<_, i32>(5)? != 0,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
+        }).optional()?;
+        Ok(tag)
+    }
+
+    /// Get all tags
+    pub fn get_all_tags(&self) -> Result<Vec<Tag>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, parent_tag_id, depth, item_count, pinned, created_at, updated_at
+             FROM tags ORDER BY depth, item_count DESC"
+        )?;
+        let tags = stmt.query_map([], |row| {
+            Ok(Tag {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                parent_tag_id: row.get(2)?,
+                depth: row.get(3)?,
+                item_count: row.get(4)?,
+                pinned: row.get::<_, i32>(5)? != 0,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
+        })?.filter_map(|r| r.ok()).collect();
+        Ok(tags)
+    }
+
+    /// Get tags by depth range (e.g., 0..=1 for L0 and L1 tags)
+    pub fn get_tags_by_depth(&self, min_depth: i32, max_depth: i32) -> Result<Vec<Tag>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, parent_tag_id, depth, item_count, pinned, created_at, updated_at
+             FROM tags WHERE depth >= ?1 AND depth <= ?2
+             ORDER BY item_count DESC"
+        )?;
+        let tags = stmt.query_map(params![min_depth, max_depth], |row| {
+            Ok(Tag {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                parent_tag_id: row.get(2)?,
+                depth: row.get(3)?,
+                item_count: row.get(4)?,
+                pinned: row.get::<_, i32>(5)? != 0,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
+        })?.filter_map(|r| r.ok()).collect();
+        Ok(tags)
+    }
+
+    /// Update tag centroid (embedding)
+    pub fn update_tag_centroid(&self, tag_id: &str, centroid: &[f32]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let bytes: Vec<u8> = centroid.iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        conn.execute(
+            "UPDATE tags SET centroid = ?2, updated_at = ?3 WHERE id = ?1",
+            params![tag_id, bytes, chrono::Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// Get tag centroid (embedding)
+    pub fn get_tag_centroid(&self, tag_id: &str) -> Result<Option<Vec<f32>>> {
+        let conn = self.conn.lock().unwrap();
+        let bytes: Option<Vec<u8>> = conn.query_row(
+            "SELECT centroid FROM tags WHERE id = ?1",
+            params![tag_id],
+            |row| row.get(0),
+        ).optional()?.flatten();
+        Ok(bytes.map(|b| bytes_to_embedding(&b)))
+    }
+
+    /// Update tag item count
+    pub fn update_tag_item_count(&self, tag_id: &str) -> Result<i32> {
+        let conn = self.conn.lock().unwrap();
+        let count: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM item_tags WHERE tag_id = ?1",
+            params![tag_id],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "UPDATE tags SET item_count = ?2, updated_at = ?3 WHERE id = ?1",
+            params![tag_id, count, chrono::Utc::now().timestamp()],
+        )?;
+        Ok(count)
+    }
+
+    /// Insert an item-tag assignment
+    pub fn insert_item_tag(&self, item_id: &str, tag_id: &str, confidence: f64, source: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO item_tags (item_id, tag_id, confidence, source)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![item_id, tag_id, confidence, source],
+        )?;
+        Ok(())
+    }
+
+    /// Insert an item-tag assignment only if it doesn't already exist
+    /// Returns true if inserted, false if already exists
+    pub fn insert_item_tag_if_not_exists(&self, item_id: &str, tag_id: &str, confidence: f64, source: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "INSERT OR IGNORE INTO item_tags (item_id, tag_id, confidence, source)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![item_id, tag_id, confidence, source],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Get all tags for an item
+    pub fn get_item_tags(&self, item_id: &str) -> Result<Vec<(Tag, f64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.title, t.parent_tag_id, t.depth, t.item_count, t.pinned,
+                    t.created_at, t.updated_at, it.confidence
+             FROM item_tags it
+             JOIN tags t ON it.tag_id = t.id
+             WHERE it.item_id = ?1
+             ORDER BY it.confidence DESC"
+        )?;
+        let tags = stmt.query_map(params![item_id], |row| {
+            Ok((
+                Tag {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    parent_tag_id: row.get(2)?,
+                    depth: row.get(3)?,
+                    item_count: row.get(4)?,
+                    pinned: row.get::<_, i32>(5)? != 0,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                },
+                row.get::<_, f64>(8)?,
+            ))
+        })?.filter_map(|r| r.ok()).collect();
+        Ok(tags)
+    }
+
+    /// Get shared tag IDs between two items (for similarity bonus)
+    pub fn get_shared_tag_ids(&self, item_a_id: &str, item_b_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT a.tag_id FROM item_tags a
+             INNER JOIN item_tags b ON a.tag_id = b.tag_id
+             WHERE a.item_id = ?1 AND b.item_id = ?2"
+        )?;
+        let tags = stmt.query_map(params![item_a_id, item_b_id], |row| {
+            row.get::<_, String>(0)
+        })?.filter_map(|r| r.ok()).collect();
+        Ok(tags)
+    }
+
+    /// Count shared tags between two items (faster than get_shared_tag_ids)
+    pub fn count_shared_tags(&self, item_a_id: &str, item_b_id: &str) -> Result<i32> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM item_tags a
+             INNER JOIN item_tags b ON a.tag_id = b.tag_id
+             WHERE a.item_id = ?1 AND b.item_id = ?2",
+            params![item_a_id, item_b_id],
+            |row| row.get(0),
+        )
+    }
+
+    /// Get all items for a tag
+    pub fn get_tag_items(&self, tag_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT item_id FROM item_tags WHERE tag_id = ?1 ORDER BY confidence DESC"
+        )?;
+        let items = stmt.query_map(params![tag_id], |row| {
+            row.get::<_, String>(0)
+        })?.filter_map(|r| r.ok()).collect();
+        Ok(items)
+    }
+
+    /// Get all item IDs that have any of the given tag titles (case-insensitive)
+    /// Used for tag-based export filtering
+    pub fn get_items_with_any_tags(&self, tag_titles: &[String]) -> Result<std::collections::HashSet<String>> {
+        if tag_titles.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+
+        let conn = self.conn.lock().unwrap();
+        // Build query with placeholders for each tag title
+        let placeholders: Vec<String> = tag_titles.iter().enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
+        let query = format!(
+            "SELECT DISTINCT it.item_id
+             FROM item_tags it
+             JOIN tags t ON it.tag_id = t.id
+             WHERE LOWER(t.title) IN ({})",
+            placeholders.join(", ")
         );
 
-        // Convert root_ids to params
-        let params: Vec<&dyn rusqlite::ToSql> = root_ids.iter()
+        let mut stmt = conn.prepare(&query)?;
+        let params: Vec<String> = tag_titles.iter().map(|t| t.to_lowercase()).collect();
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter()
             .map(|s| s as &dyn rusqlite::ToSql)
             .collect();
 
-        conn.execute(&sql, params.as_slice())?;
+        let items = stmt.query_map(param_refs.as_slice(), |row| {
+            row.get::<_, String>(0)
+        })?.filter_map(|r| r.ok()).collect();
+        Ok(items)
+    }
 
+    /// Delete all tags (for reset/rebuild)
+    pub fn delete_all_tags(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        // item_tags will cascade delete due to foreign key
+        let count = conn.execute("DELETE FROM tags", [])?;
+        Ok(count)
+    }
+
+    /// Get cluster statistics for bootstrap (cluster_id, cluster_label, item_count)
+    pub fn get_cluster_statistics(&self) -> Result<Vec<(i32, String, i32)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT cluster_id, cluster_label, COUNT(*) as item_count
+             FROM nodes
+             WHERE is_item = 1 AND cluster_id IS NOT NULL AND cluster_label IS NOT NULL
+             GROUP BY cluster_id, cluster_label
+             ORDER BY item_count DESC"
+        )?;
+        let stats = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i32>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i32>(2)?,
+            ))
+        })?.filter_map(|r| r.ok()).collect();
+        Ok(stats)
+    }
+
+    /// Get items by cluster_id (for computing centroids)
+    pub fn get_items_by_cluster(&self, cluster_id: i32) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let query = format!(
+            "SELECT {} FROM nodes WHERE is_item = 1 AND cluster_id = ?1",
+            Self::NODE_COLUMNS
+        );
+        let mut stmt = conn.prepare(&query)?;
+        let nodes = stmt.query_map(params![cluster_id], Self::row_to_node)?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(nodes)
+    }
+
+    /// Get all item-tag associations as a HashMap for efficient lookup during clustering
+    /// Returns HashMap<item_id, Vec<tag_id>>
+    pub fn get_all_item_tags_map(&self) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT item_id, tag_id FROM item_tags")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for row in rows.filter_map(|r| r.ok()) {
+            map.entry(row.0).or_default().push(row.1);
+        }
+        Ok(map)
+    }
+
+    // ==========================================================================
+    // Database Metadata / State Tracking
+    // ==========================================================================
+
+    /// Get a metadata value by key
+    pub fn get_metadata(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let result: std::result::Result<String, _> = conn.query_row(
+            "SELECT value FROM db_metadata WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Set a metadata value (insert or update)
+    pub fn set_metadata(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO db_metadata (key, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
+            params![key, value, now],
+        )?;
         Ok(())
+    }
+
+    /// Get the current pipeline state
+    /// Returns: fresh, imported, processed, clustered, hierarchized, complete
+    pub fn get_pipeline_state(&self) -> String {
+        self.get_metadata("pipeline_state")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "fresh".to_string())
+    }
+
+    /// Set the pipeline state
+    pub fn set_pipeline_state(&self, state: &str) -> Result<()> {
+        self.set_metadata("pipeline_state", state)
+    }
+
+    /// Get all metadata as key-value pairs
+    pub fn get_all_metadata(&self) -> Result<Vec<(String, String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT key, value, updated_at FROM db_metadata ORDER BY key")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 }
 
