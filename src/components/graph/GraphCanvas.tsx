@@ -232,6 +232,10 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
   const pendingFetchRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingDeselectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const zoomTransformRef = useRef<{ k: number; x: number; y: number }>({ k: 1, x: 0, y: 0 });
+  const rafPendingRef = useRef<number | null>(null);
+  const lastProcessedZoomRef = useRef<number>(1);
+  const zoomSettleTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const dotPositionsRef = useRef<{ x: number; y: number }[]>([]);
 
   // ==========================================================================
   // STATE
@@ -469,59 +473,104 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       .attr('y', 70).attr('width', NOTE_WIDTH).attr('height', 10)
       .attr('fill', 'rgba(0,0,0,0.4)');
 
+    // Virtual DOM: Track node indices for limiting detailed content
+    const nodeIndexMap = new Map(graphNodes.map((n, i) => [n.id, i]));
+    const MAX_DETAILED_NODES = 150; // Only create full content for first N nodes
+
     // Large emoji
     cardGroups.append('text')
       .attr('x', 14).attr('y', 52)
       .attr('font-size', '42px')
       .text(d => d.displayEmoji);
 
-    // Title - foreignObject for wrapping
-    cardGroups.append('foreignObject')
-      .attr('x', 58).attr('y', 0)
-      .attr('width', NOTE_WIDTH - 68).attr('height', 80)
-      .style('pointer-events', 'none') // Let clicks pass through to card group
-      .append('xhtml:div')
-      .style('font-family', CARD_FONT)
-      .style('font-size', '22px')
-      .style('font-weight', '600')
-      .style('color', '#ffffff')
-      .style('line-height', '1.3')
-      .style('text-align', 'center')
-      .style('height', '80px')
-      .style('display', 'flex')
-      .style('align-items', 'center')
-      .style('justify-content', 'center')
-      .style('user-select', 'none') // Prevent text selection on double-click
-      .html(d => {
-        const title = d.displayTitle || '';
-        return `<div style="display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; pointer-events: none; user-select: none;">${title}</div>`;
-      });
+    // Title - SVG text (replaces slow foreignObject)
+    // Helper to truncate and wrap title into 2 lines
+    const wrapTitle = (title: string, maxCharsPerLine: number = 18): string[] => {
+      if (!title) return [''];
+      if (title.length <= maxCharsPerLine) return [title];
+      // Try to break at word boundary
+      const words = title.split(' ');
+      const lines: string[] = [];
+      let currentLine = '';
+      for (const word of words) {
+        if (currentLine.length + word.length + 1 <= maxCharsPerLine) {
+          currentLine += (currentLine ? ' ' : '') + word;
+        } else if (lines.length === 0) {
+          if (currentLine) lines.push(currentLine);
+          currentLine = word;
+        } else {
+          break; // Already have 2 lines
+        }
+      }
+      if (currentLine) lines.push(currentLine.slice(0, maxCharsPerLine));
+      // Truncate second line if needed
+      if (lines.length > 1 && lines[1].length > maxCharsPerLine - 3) {
+        lines[1] = lines[1].slice(0, maxCharsPerLine - 3) + '...';
+      }
+      return lines.slice(0, 2);
+    };
 
-    // Synopsis area
+    // Create title text group for each card
+    const titleGroups = cardGroups.append('g')
+      .attr('class', 'title-group')
+      .attr('transform', `translate(${58 + (NOTE_WIDTH - 68) / 2}, 40)`);
+
+    titleGroups.each(function(d) {
+      const g = d3.select(this);
+      const lines = wrapTitle(d.displayTitle);
+      const lineHeight = 26;
+      const startY = lines.length === 1 ? 0 : -lineHeight / 2;
+
+      lines.forEach((line, i) => {
+        g.append('text')
+          .attr('class', 'title-text')
+          .attr('x', 0)
+          .attr('y', startY + i * lineHeight)
+          .attr('text-anchor', 'middle')
+          .attr('font-family', CARD_FONT)
+          .attr('font-size', '22px')
+          .attr('font-weight', '600')
+          .attr('fill', '#ffffff')
+          .style('pointer-events', 'none')
+          .text(line);
+      });
+    });
+
+    // Synopsis area background
     const synopsisHeight = NOTE_HEIGHT - 148;
-    cardGroups.append('foreignObject')
+    cardGroups.append('rect')
+      .attr('class', 'synopsis-bg')
       .attr('x', 0).attr('y', 80)
       .attr('width', NOTE_WIDTH).attr('height', synopsisHeight)
-      .style('pointer-events', 'none') // Let clicks pass through to card group
-      .append('xhtml:div')
-      .style('background', 'rgba(0,0,0,0.2)')
-      .style('width', '100%')
-      .style('height', '100%')
-      .style('padding', '4px 14px')
-      .style('box-sizing', 'border-box')
-      .style('font-family', CARD_FONT)
-      .style('font-size', '20px')
-      .style('font-weight', '500')
-      .style('color', '#ffffff')
-      .style('line-height', '1.5')
-      .style('overflow', 'hidden')
-      .style('user-select', 'none') // Prevent text selection on double-click
-      .html(d => {
-        if (!d.displayContent) return '';
-        const items = d.displayContent.split(', ').filter(s => s.trim()).slice(0, 5);
-        const bullets = items.map(item => `<div>• ${item}</div>`).join('');
-        return `<div style="max-height: 150px; overflow: hidden; line-height: 1.5; pointer-events: none; user-select: none;">${bullets}</div>`;
+      .attr('fill', 'rgba(0,0,0,0.2)');
+
+    // Synopsis - SVG text (only for first N nodes - virtual DOM optimization)
+    const synopsisGroups = cardGroups
+      .filter(d => (nodeIndexMap.get(d.id) ?? 0) < MAX_DETAILED_NODES)
+      .append('g')
+      .attr('class', 'synopsis-group')
+      .attr('transform', 'translate(14, 100)');
+
+    synopsisGroups.each(function(d) {
+      if (!d.displayContent) return;
+      const g = d3.select(this);
+      const items = d.displayContent.split(', ').filter(s => s.trim()).slice(0, 5);
+      const maxChars = 24;
+      const lineHeight = 28;
+
+      items.forEach((item, i) => {
+        const truncated = item.length > maxChars ? item.slice(0, maxChars - 3) + '...' : item;
+        g.append('text')
+          .attr('x', 0)
+          .attr('y', i * lineHeight)
+          .attr('font-family', CARD_FONT)
+          .attr('font-size', '20px')
+          .attr('font-weight', '500')
+          .attr('fill', '#ffffff')
+          .style('pointer-events', 'none')
+          .text(`• ${truncated}`);
       });
+    });
 
     // Footer background
     cardGroups.append('rect')
@@ -861,108 +910,145 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
         return true;
       })
       .on('zoom', (event) => {
-        const { k, x, y } = event.transform;
-        zoomTransformRef.current = { k, x, y };
-        container.attr('transform', event.transform);
+        // Store transform in ref - actual DOM update happens in RAF
+        zoomTransformRef.current = { k: event.transform.k, x: event.transform.x, y: event.transform.y };
 
-        // Viewport culling
-        const viewportBuffer = 400;
-        cardGroups.style('visibility', (d: GraphNode) => {
-          const screenX = d.x * k + x;
-          const screenY = d.y * k + y;
-          const isVisible = screenX > -viewportBuffer && screenX < width + viewportBuffer &&
-                           screenY > -viewportBuffer && screenY < height + viewportBuffer;
-          return isVisible ? 'visible' : 'hidden';
-        });
-        dotGroups.style('visibility', (d: GraphNode) => {
-          const screenX = d.x * k + x;
-          const screenY = d.y * k + y;
-          const isVisible = screenX > -viewportBuffer && screenX < width + viewportBuffer &&
-                           screenY > -viewportBuffer && screenY < height + viewportBuffer;
-          return isVisible ? 'visible' : 'hidden';
-        });
-
-        if (k >= bubbleThreshold) {
-          // Card mode
-          dotsGroup.style('display', 'none');
-          cardsGroup.style('display', 'block');
-
-          const smoothstep = (edge0: number, edge1: number, val: number) => {
-            const t = Math.max(0, Math.min(1, (val - edge0) / (edge1 - edge0)));
-            return t * t * (3 - 2 * t);
-          };
-          const blendFactor = smoothstep(curveStart, curveEnd, k);
-          const effectiveMinSize = sparseMinApparentSize + blendFactor * (minApparentSize - sparseMinApparentSize);
-          const positionScale = k < curveEnd ? Math.sqrt(curveEnd / k) : 1;
-
-          let cardScale = 1;
-          if (k < 1) {
-            const targetApparent = Math.max(effectiveMinSize, Math.sqrt(k));
-            cardScale = targetApparent / k;
-          }
-
-          cardGroups.attr('transform', d =>
-            `translate(${d.x * positionScale}, ${d.y * positionScale}) scale(${cardScale}) translate(${-NOTE_WIDTH/2}, ${-NOTE_HEIGHT/2})`
-          );
-
-          // Update edge positions
-          const scaledWidth = NOTE_WIDTH * cardScale;
-          const scaledHeight = NOTE_HEIGHT * cardScale;
-          edgePaths.attr('d', (d: EdgeData) => {
-            const scaledSource = { x: d.source.x * positionScale, y: d.source.y * positionScale };
-            const scaledTarget = { x: d.target.x * positionScale, y: d.target.y * positionScale };
-            const points = getEdgePoints(scaledSource, scaledTarget, scaledWidth, scaledHeight);
-            const dx = points.target.x - points.source.x;
-            const dy = points.target.y - points.source.y;
-            const dr = Math.sqrt(dx * dx + dy * dy) * 1.5;
-            return `M${points.source.x},${points.source.y} A${dr},${dr} 0 0,1 ${points.target.x},${points.target.y}`;
-          });
-
-          // Update connection dot positions
-          const dotPositions: { x: number; y: number }[] = [];
-          edgeData.forEach(d => {
-            const scaledSource = { x: d.source.x * positionScale, y: d.source.y * positionScale };
-            const scaledTarget = { x: d.target.x * positionScale, y: d.target.y * positionScale };
-            const points = getEdgePoints(scaledSource, scaledTarget, scaledWidth, scaledHeight);
-            dotPositions.push({ x: points.source.x, y: points.source.y });
-            dotPositions.push({ x: points.target.x, y: points.target.y });
-          });
-          connectionDots
-            .style('display', 'block')
-            .attr('r', 4 * cardScale)
-            .attr('cx', (_d: unknown, i: number) => dotPositions[i]?.x ?? 0)
-            .attr('cy', (_d: unknown, i: number) => dotPositions[i]?.y ?? 0);
-
-        } else {
-          // Bubble mode
-          cardsGroup.style('display', 'none');
-          dotsGroup.style('display', 'block');
-
-          const positionScale = Math.sqrt(curveEnd / k);
-          const targetScreenSize = 40;
-          const bubbleScale = targetScreenSize / (DOT_SIZE * 2 * k);
-
-          dotGroups.attr('transform', d =>
-            `translate(${d.x * positionScale}, ${d.y * positionScale}) scale(${bubbleScale})`
-          );
-
-          // Update edge positions for bubble mode
-          const bubbleDiameter = DOT_SIZE * bubbleScale * 2;
-          edgePaths.attr('d', (d: EdgeData) => {
-            const scaledSource = { x: d.source.x * positionScale, y: d.source.y * positionScale };
-            const scaledTarget = { x: d.target.x * positionScale, y: d.target.y * positionScale };
-            const points = getEdgePoints(scaledSource, scaledTarget, bubbleDiameter, bubbleDiameter);
-            const dx = points.target.x - points.source.x;
-            const dy = points.target.y - points.source.y;
-            const dr = Math.sqrt(dx * dx + dy * dy) * 1.5;
-            return `M${points.source.x},${points.source.y} A${dr},${dr} 0 0,1 ${points.target.x},${points.target.y}`;
-          });
-
-          // Hide connection dots in bubble mode
-          connectionDots.style('display', 'none');
+        // Batch ALL DOM updates into requestAnimationFrame (max 60fps)
+        if (rafPendingRef.current !== null) {
+          cancelAnimationFrame(rafPendingRef.current);
         }
 
-        onZoomChange(k);
+        rafPendingRef.current = requestAnimationFrame(() => {
+          rafPendingRef.current = null;
+          const { k, x, y } = zoomTransformRef.current;
+
+          // Apply container transform (now batched with other updates)
+          container.attr('transform', `translate(${x},${y}) scale(${k})`);
+
+          // === OPTIMIZATION 1: Skip ALL work if zoom delta < 2% ===
+          const zoomDelta = Math.abs(k - lastProcessedZoomRef.current) / lastProcessedZoomRef.current;
+          if (zoomDelta < 0.02) {
+            return; // Skip everything for tiny zoom changes - no React re-renders
+          }
+          lastProcessedZoomRef.current = k;
+
+          // === OPTIMIZATION 2: Merge viewport culling into single pass ===
+          const viewportBuffer = 400;
+          const visibleIds = new Set<string>();
+          graphNodes.forEach(node => {
+            const screenX = node.x * k + x;
+            const screenY = node.y * k + y;
+            if (screenX > -viewportBuffer && screenX < width + viewportBuffer &&
+                screenY > -viewportBuffer && screenY < height + viewportBuffer) {
+              visibleIds.add(node.id);
+            }
+          });
+
+          // Determine mode once, then only update the active mode's elements
+          const isCardMode = k >= bubbleThreshold;
+
+          if (isCardMode) {
+            // Card mode - only update cards, not dots
+            dotsGroup.style('display', 'none');
+            cardsGroup.style('display', null);
+
+            // Viewport culling for cards only
+            cardGroups.style('display', d => visibleIds.has(d.id) ? null : 'none');
+
+            const smoothstep = (edge0: number, edge1: number, val: number) => {
+              const t = Math.max(0, Math.min(1, (val - edge0) / (edge1 - edge0)));
+              return t * t * (3 - 2 * t);
+            };
+            const blendFactor = smoothstep(curveStart, curveEnd, k);
+            const effectiveMinSize = sparseMinApparentSize + blendFactor * (minApparentSize - sparseMinApparentSize);
+            const positionScale = k < curveEnd ? Math.sqrt(curveEnd / k) : 1;
+
+            let cardScale = 1;
+            if (k < 1) {
+              const targetApparent = Math.max(effectiveMinSize, Math.sqrt(k));
+              cardScale = targetApparent / k;
+            }
+
+            cardGroups.attr('transform', d =>
+              `translate(${d.x * positionScale}, ${d.y * positionScale}) scale(${cardScale}) translate(${-NOTE_WIDTH/2}, ${-NOTE_HEIGHT/2})`
+            );
+
+            // === OPTIMIZATION 3: Fade edges during active zoom, recalc on settle ===
+            linksGroup.style('opacity', 0.15);
+            connectionDots.style('opacity', 0.15);
+
+            // Clear existing settle timeout
+            if (zoomSettleTimeoutRef.current) {
+              clearTimeout(zoomSettleTimeoutRef.current);
+            }
+
+            // Schedule edge update for when zoom settles
+            zoomSettleTimeoutRef.current = setTimeout(() => {
+              const scaledWidth = NOTE_WIDTH * cardScale;
+              const scaledHeight = NOTE_HEIGHT * cardScale;
+
+              // Pre-calculate all edge points once
+              const edgePointsCache = edgeData.map(d => {
+                const scaledSource = { x: d.source.x * positionScale, y: d.source.y * positionScale };
+                const scaledTarget = { x: d.target.x * positionScale, y: d.target.y * positionScale };
+                return getEdgePoints(scaledSource, scaledTarget, scaledWidth, scaledHeight);
+              });
+
+              // Use cached points for edge paths
+              edgePaths.attr('d', (_d: EdgeData, i: number) => {
+                const points = edgePointsCache[i];
+                const dx = points.target.x - points.source.x;
+                const dy = points.target.y - points.source.y;
+                const dr = Math.sqrt(dx * dx + dy * dy) * 1.5;
+                return `M${points.source.x},${points.source.y} A${dr},${dr} 0 0,1 ${points.target.x},${points.target.y}`;
+              });
+
+              // === OPTIMIZATION 4: Reuse dot positions array ===
+              const neededLength = edgeData.length * 2;
+              if (dotPositionsRef.current.length !== neededLength) {
+                dotPositionsRef.current = new Array(neededLength).fill(null).map(() => ({ x: 0, y: 0 }));
+              }
+              edgePointsCache.forEach((points, i) => {
+                dotPositionsRef.current[i * 2].x = points.source.x;
+                dotPositionsRef.current[i * 2].y = points.source.y;
+                dotPositionsRef.current[i * 2 + 1].x = points.target.x;
+                dotPositionsRef.current[i * 2 + 1].y = points.target.y;
+              });
+
+              connectionDots
+                .attr('r', 4 * cardScale)
+                .attr('cx', (_d: unknown, i: number) => dotPositionsRef.current[i]?.x ?? 0)
+                .attr('cy', (_d: unknown, i: number) => dotPositionsRef.current[i]?.y ?? 0);
+
+              // Fade edges back in
+              linksGroup.transition().duration(100).style('opacity', 1);
+              connectionDots.transition().duration(100).style('opacity', 1);
+            }, 120); // Recalculate edges after 120ms of no zoom
+
+            // Show links group but faded
+            linksGroup.style('display', null);
+
+          } else {
+            // Bubble mode - only update dots, not cards
+            cardsGroup.style('display', 'none');
+            dotsGroup.style('display', null);
+            linksGroup.style('display', 'none');
+            connectionDots.style('display', 'none');
+
+            // Viewport culling for dots only
+            dotGroups.style('display', d => visibleIds.has(d.id) ? null : 'none');
+
+            const positionScale = Math.sqrt(curveEnd / k);
+            const targetScreenSize = 40;
+            const bubbleScale = targetScreenSize / (DOT_SIZE * 2 * k);
+
+            dotGroups.attr('transform', d =>
+              `translate(${d.x * positionScale}, ${d.y * positionScale}) scale(${bubbleScale})`
+            );
+          }
+
+          onZoomChange(k);
+        });
       });
 
     svg.call(zoom as any);
@@ -1062,7 +1148,7 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
         return data.id === activeNodeId ? 2 : 1;
       });
 
-    // Update shadow strokes
+    // Update shadow-violet strokes (main violet layer)
     svg.selectAll<SVGRectElement, GraphNode>('.shadow-violet')
       .transition().duration(150)
       .attr('stroke', function(this: SVGRectElement) {
@@ -1078,6 +1164,7 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
         return data.id === activeNodeId ? 2 : 1;
       });
 
+    // Update shadow-cluster strokes (depth layers)
     svg.selectAll<SVGRectElement, GraphNode>('.shadow-cluster')
       .transition().duration(150)
       .attr('stroke', function(this: SVGRectElement) {
@@ -1132,7 +1219,7 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       <svg
         ref={svgRef}
         className="bg-gray-900 w-full h-full"
-        style={{ cursor: 'grab' }}
+        style={{ cursor: 'grab', willChange: 'transform' }}
       />
 
       {/* Hovered node tooltip */}

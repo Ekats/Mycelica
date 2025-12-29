@@ -1288,6 +1288,23 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     setNodeMenuPos(pos);
   }, []);
 
+  // Memoized callbacks for GraphCanvas to prevent unnecessary re-renders
+  const handleSelectNode = useCallback((id: string | null) => {
+    setActiveNode(id);
+  }, [setActiveNode]);
+
+  const handleZoomChange = useCallback((k: number) => {
+    setZoomLevel(k);
+  }, []);
+
+  const handleNavigateToNode = useCallback((node: Node) => {
+    navigateToNode(node);
+  }, [navigateToNode]);
+
+  const handleOpenLeaf = useCallback((id: string) => {
+    openLeaf(id);
+  }, [openLeaf]);
+
   return (
     <div className="relative w-full h-full">
       {/* GraphCanvas renders the D3 graph (currently empty, D3 logic to be moved) */}
@@ -1298,12 +1315,12 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
         connectionMap={memoizedConnectionMap}
         width={width}
         height={height}
-        onSelectNode={setActiveNode}
-        onNavigateToNode={navigateToNode}
-        onOpenLeaf={openLeaf}
+        onSelectNode={handleSelectNode}
+        onNavigateToNode={handleNavigateToNode}
+        onOpenLeaf={handleOpenLeaf}
         onFetchSimilarNodes={fetchSimilarNodes}
         onShowContextMenu={handleShowContextMenu}
-        onZoomChange={setZoomLevel}
+        onZoomChange={handleZoomChange}
         devLog={devLog}
         getNodeEmoji={getNodeEmoji}
         hidePrivate={hidePrivate}
