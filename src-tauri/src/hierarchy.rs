@@ -15,8 +15,11 @@ use crate::ai_client::{self, TopicInfo};
 use crate::settings;
 use crate::commands::is_rebuild_cancelled;
 use crate::classification;
+use crate::similarity::cosine_similarity;
+use rand::Rng;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::time::Instant;
 
 /// Safely truncate a string at a UTF-8 boundary
@@ -513,8 +516,60 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
         println!("[Hierarchy] Created Personal category with {} private items", private_count);
     }
 
+    // Step 8: Ensure Recent Notes container exists (for in-app notes)
+    let notes_container_id = crate::settings::RECENT_NOTES_CONTAINER_ID;
+    if db.get_node(notes_container_id).map_err(|e| e.to_string())?.is_none() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let notes_node = Node {
+            id: notes_container_id.to_string(),
+            node_type: NodeType::Cluster,
+            title: "Recent Notes".to_string(),
+            url: None,
+            content: None,
+            position: Position { x: 0.0, y: 0.0 },
+            created_at: now,
+            updated_at: now,
+            cluster_id: None,
+            cluster_label: Some("Recent Notes".to_string()),
+            ai_title: Some("Recent Notes".to_string()),
+            summary: Some("User-created notes".to_string()),
+            tags: None,
+            emoji: Some("📝".to_string()),
+            is_processed: true,
+            depth: topic_depth,
+            is_item: false,
+            is_universe: false,
+            parent_id: Some(universe_id.clone()),
+            child_count: 0,
+            conversation_id: None,
+            sequence_index: None,
+            is_pinned: false,
+            last_accessed_at: None,
+            latest_child_date: None,
+            is_private: None,
+            privacy_reason: None,
+            source: None,
+            content_type: None,
+            associated_idea_id: None,
+            privacy: Some(0.5), // Notes are semi-private by default
+        };
+
+        db.insert_node(&notes_node).map_err(|e| e.to_string())?;
+
+        // Update Universe child count to include Notes
+        universe_child_count += 1;
+        db.update_child_count(&universe_id, universe_child_count)
+            .map_err(|e| e.to_string())?;
+
+        println!("[Hierarchy] Created Notes container (protected)");
+    }
+
     let total_items = item_count + private_count;
-    println!("Hierarchy complete: Universe -> {} topics + Personal -> {} items",
+    println!("Hierarchy complete: Universe -> {} topics + Personal + Notes -> {} items",
              topics_created, total_items);
 
     Ok(HierarchyResult {
@@ -890,10 +945,10 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 ///
 /// For large datasets (>200 children), splits into batches of 150, calls AI for each,
 /// then merges similar categories across batches to prevent fragmentation.
-/// max_groups: maximum number of categories to create (default 5 if None for manual splits)
+/// max_groups: maximum number of categories to create (default 9 if None for manual splits)
 pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option<&AppHandle>, max_groups: Option<usize>, force: bool) -> Result<bool, String> {
     emit_log(app, "debug", &format!("cluster_hierarchy_level called: parent={}, force={}, max_groups={:?}", parent_id, force, max_groups));
-    let max_groups = max_groups.unwrap_or(5); // Default to 5 for manual splits
+    let max_groups = max_groups.unwrap_or(9); // Default to 9 for manual splits (Universe target: 9 + Notes = 10)
     // 1. Get parent node info first (need depth for tiered limits)
     let parent_node = db.get_node(parent_id)
         .map_err(|e| e.to_string())?
@@ -938,6 +993,16 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
         return Ok(false);
     }
 
+    // Check if ALL children are items (leaf nodes) - use embedding-based clustering
+    let non_item_count = children.iter().filter(|c| !c.is_item).count();
+    if non_item_count == 0 && children.len() > max_for_depth {
+        emit_log(app, "info", &format!(
+            "All {} children are items - using embedding-based clustering",
+            children.len()
+        ));
+        return cluster_items_by_embedding(db, parent_id, &children, app).await;
+    }
+
     emit_log(app, "info", &format!("Grouping {} children of {} (depth {}, max {}) into categories",
              children.len(), parent_id, parent_depth, max_for_depth));
 
@@ -961,15 +1026,24 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
     // 4. Collect all existing category names (forbidden for reuse)
     let forbidden_names = db.get_all_category_names().map_err(|e| e.to_string())?;
 
-    // Build topic info for AI
+    // Build topic info for AI - use same label logic as label_to_children
     let topics: Vec<TopicInfo> = children
         .iter()
         .map(|child| TopicInfo {
             id: child.id.clone(),
-            label: child.cluster_label
-                .clone()
-                .or_else(|| child.ai_title.clone())
-                .unwrap_or_else(|| child.title.clone()),
+            label: if child.is_item {
+                // Items: prefer ai_title (unique) over cluster_label (shared with siblings)
+                child.ai_title
+                    .clone()
+                    .or_else(|| child.cluster_label.clone())
+                    .unwrap_or_else(|| child.title.clone())
+            } else {
+                // Categories: use cluster_label as primary
+                child.cluster_label
+                    .clone()
+                    .or_else(|| child.ai_title.clone())
+                    .unwrap_or_else(|| child.title.clone())
+            },
             item_count: child.child_count.max(1),
         })
         .collect();
@@ -1080,14 +1154,25 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
     }
 
     // Create map from label -> ALL child nodes with that label
-    // (multiple topics can have the same cluster_label)
+    // For ITEMS: use ai_title or title (cluster_label is parent topic's label, not unique)
+    // For CATEGORIES: use cluster_label, ai_title, or title
     let mut label_to_children: HashMap<String, Vec<&Node>> = HashMap::new();
     for child in &children {
-        let label = child.cluster_label
-            .as_ref()
-            .or(child.ai_title.as_ref())
-            .unwrap_or(&child.title)
-            .clone();
+        let label = if child.is_item {
+            // Items: prefer ai_title (unique per item) over cluster_label (shared with siblings)
+            child.ai_title
+                .as_ref()
+                .or(child.cluster_label.as_ref())
+                .unwrap_or(&child.title)
+                .clone()
+        } else {
+            // Categories: use cluster_label as primary
+            child.cluster_label
+                .as_ref()
+                .or(child.ai_title.as_ref())
+                .unwrap_or(&child.title)
+                .clone()
+        };
         label_to_children.entry(label).or_default().push(child);
     }
 
@@ -1104,6 +1189,8 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
 
     // Collect all children that need depth updates for batch processing
     let mut all_children_to_update: Vec<String> = Vec::new();
+    // Track created category IDs to update their child_count after reparenting
+    let mut created_category_ids: Vec<String> = Vec::new();
 
     for (idx, grouping) in groupings.iter().enumerate() {
         // Find ALL child nodes matching this grouping's labels
@@ -1192,6 +1279,7 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
 
         db.insert_node(&category_node).map_err(|e| e.to_string())?;
         categories_created += 1;
+        created_category_ids.push(category_id.clone());
 
         // Reparent children to this category and collect for batch depth update
         for child in &matching_children {
@@ -1200,13 +1288,21 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
         }
     }
 
-    // Increment depths for reparented children and their descendants
-    // This is correct: we're inserting a new level, so everything below moves down by 1.
-    // The MAX_HIERARCHY_DEPTH check above prevents runaway depth explosion.
+    // Update child_count for all created categories to reflect ACTUAL children
+    // (matching_children may have been reassigned to other categories due to label overlap)
+    for category_id in &created_category_ids {
+        let actual_count = db.get_children(category_id).map_err(|e| e.to_string())?.len() as i32;
+        db.update_child_count(category_id, actual_count).map_err(|e| e.to_string())?;
+    }
+
+    // SET depths for reparented children to correct value (not increment!)
+    // Children are now under categories at new_intermediate_depth, so they should be at new_intermediate_depth + 1
+    // This prevents depth explosion from accumulated increments across multiple grouping iterations.
     if !all_children_to_update.is_empty() {
         let depth_start = std::time::Instant::now();
-        emit_log(app, "info", &format!("Updating depths for {} reparented nodes...", all_children_to_update.len()));
-        db.increment_multiple_subtrees_depth(&all_children_to_update).map_err(|e| e.to_string())?;
+        let child_depth = new_intermediate_depth + 1;
+        emit_log(app, "info", &format!("Setting depths for {} reparented nodes to {}...", all_children_to_update.len(), child_depth));
+        db.set_reparented_nodes_depth(&all_children_to_update, child_depth).map_err(|e| e.to_string())?;
         let depth_elapsed = depth_start.elapsed().as_secs_f64();
         emit_log(app, "info", &format!("  Depth update completed in {:.1}s", depth_elapsed));
     }
@@ -1262,6 +1358,435 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
     }
 
     Ok(true)
+}
+
+// ============================================================================
+// EMBEDDING-BASED CLUSTERING FOR ITEM-ONLY CONTAINERS
+// ============================================================================
+
+/// Calculate target cluster count based on dataset size
+/// Scales cap higher for large datasets to avoid re-subdivision
+fn calculate_target_k(n: usize) -> usize {
+    if n < 2 {
+        return n;
+    }
+    let sqrt_n = (n as f64).sqrt() as usize;
+
+    // Scale cap based on dataset size to avoid re-subdivision
+    // Target: ~40-50 items per cluster for large datasets
+    let cap = if n > 1000 { 35 }      // 1000+ items: up to 35 clusters
+              else if n > 500 { 25 }   // 500-1000: up to 25 clusters
+              else if n > 200 { 20 }   // 200-500: up to 20 clusters
+              else { 15 };             // <200: up to 15 clusters
+
+    sqrt_n.max(8).min(cap).min(n)
+}
+
+/// K-means clustering on embeddings
+/// Returns Vec<Vec<String>> - each inner vec is item IDs in that cluster
+fn kmeans_cluster(
+    embeddings: &[(String, Vec<f32>)],
+    k: usize,
+) -> Result<Vec<Vec<String>>, String> {
+    if embeddings.is_empty() || k == 0 {
+        return Ok(vec![]);
+    }
+
+    let n = embeddings.len();
+    let dim = embeddings[0].1.len();
+
+    if dim == 0 {
+        return Err("Embeddings have zero dimensions".into());
+    }
+
+    // k-means++ initialization
+    let mut centroids = kmeans_plusplus_init(embeddings, k);
+
+    let mut assignments: Vec<usize> = vec![0; n];
+    let max_iterations = 50;
+
+    for _ in 0..max_iterations {
+        // Assign each point to nearest centroid
+        let mut changed = false;
+        for (i, (_, emb)) in embeddings.iter().enumerate() {
+            let mut best_cluster = 0;
+            let mut best_sim = f32::MIN;
+
+            for (c, centroid) in centroids.iter().enumerate() {
+                let sim = cosine_similarity(emb, centroid);
+                if sim > best_sim {
+                    best_sim = sim;
+                    best_cluster = c;
+                }
+            }
+
+            if assignments[i] != best_cluster {
+                assignments[i] = best_cluster;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+
+        // Recompute centroids
+        centroids = recompute_centroids(embeddings, &assignments, k, dim);
+    }
+
+    // Group item IDs by cluster
+    let mut clusters: Vec<Vec<String>> = vec![vec![]; k];
+    for (i, (id, _)) in embeddings.iter().enumerate() {
+        clusters[assignments[i]].push(id.clone());
+    }
+
+    // Remove empty clusters
+    clusters.retain(|c| !c.is_empty());
+
+    Ok(clusters)
+}
+
+/// k-means++ initialization for better starting centroids
+fn kmeans_plusplus_init(embeddings: &[(String, Vec<f32>)], k: usize) -> Vec<Vec<f32>> {
+    let mut rng = rand::thread_rng();
+    let n = embeddings.len();
+
+    if n == 0 || k == 0 {
+        return vec![];
+    }
+
+    // First centroid: random
+    let mut centroids = vec![embeddings[rng.gen_range(0..n)].1.clone()];
+
+    // Remaining centroids: probability proportional to distance squared
+    while centroids.len() < k && centroids.len() < n {
+        let mut distances: Vec<f32> = Vec::with_capacity(n);
+
+        for (_, emb) in embeddings {
+            // Distance to nearest existing centroid
+            let min_dist = centroids.iter()
+                .map(|c| 1.0 - cosine_similarity(emb, c))
+                .fold(f32::MAX, |a, b| a.min(b));
+            distances.push(min_dist * min_dist);
+        }
+
+        // Weighted random selection
+        let total: f32 = distances.iter().sum();
+        if total <= 0.0 {
+            // All points are identical to existing centroids
+            break;
+        }
+
+        let threshold = rng.gen::<f32>() * total;
+        let mut cumsum = 0.0;
+
+        for (i, d) in distances.iter().enumerate() {
+            cumsum += d;
+            if cumsum >= threshold {
+                centroids.push(embeddings[i].1.clone());
+                break;
+            }
+        }
+    }
+
+    centroids
+}
+
+fn recompute_centroids(
+    embeddings: &[(String, Vec<f32>)],
+    assignments: &[usize],
+    k: usize,
+    dim: usize,
+) -> Vec<Vec<f32>> {
+    let mut rng = rand::thread_rng();
+
+    let mut centroids: Vec<Vec<f32>> = vec![vec![0.0; dim]; k];
+    let mut counts: Vec<usize> = vec![0; k];
+
+    for (i, (_, emb)) in embeddings.iter().enumerate() {
+        let c = assignments[i];
+        counts[c] += 1;
+        for (j, val) in emb.iter().enumerate() {
+            centroids[c][j] += val;
+        }
+    }
+
+    // Average first, then normalize
+    for c in 0..k {
+        if counts[c] > 0 {
+            // Step 1: Average (divide by count)
+            for j in 0..dim {
+                centroids[c][j] /= counts[c] as f32;
+            }
+            // Step 2: Normalize to unit vector
+            let norm: f32 = centroids[c].iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for j in 0..dim {
+                    centroids[c][j] /= norm;
+                }
+            }
+        } else {
+            // Empty cluster: reinitialize to random point to avoid NaN
+            let random_idx = rng.gen_range(0..embeddings.len());
+            centroids[c] = embeddings[random_idx].1.clone();
+        }
+    }
+
+    centroids
+}
+
+/// Extract common keywords from a list of titles
+fn find_common_keywords(titles: &[String]) -> Vec<String> {
+    let stop_words: HashSet<&str> = [
+        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
+        "of", "with", "by", "from", "as", "is", "was", "are", "were", "be",
+        "been", "being", "have", "has", "had", "do", "does", "did", "will",
+        "would", "could", "should", "may", "might", "must", "shall", "can",
+        "this", "that", "these", "those", "it", "its", "i", "you", "we", "they",
+        "my", "your", "our", "their", "what", "which", "who", "whom", "how",
+    ].iter().cloned().collect();
+
+    let mut word_counts: HashMap<String, usize> = HashMap::new();
+
+    for title in titles {
+        // Split into words, normalize
+        let words: Vec<String> = title
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() > 2 && !stop_words.contains(w))
+            .map(|w| w.to_string())
+            .collect();
+
+        // Count unique words per title (not total occurrences)
+        let unique: HashSet<_> = words.into_iter().collect();
+        for word in unique {
+            *word_counts.entry(word).or_insert(0) += 1;
+        }
+    }
+
+    // Find words appearing in >50% of titles
+    let threshold = titles.len() / 2;
+    let mut common: Vec<(String, usize)> = word_counts
+        .into_iter()
+        .filter(|(_, count)| *count > threshold)
+        .collect();
+
+    // Sort by frequency descending
+    common.sort_by(|a, b| b.1.cmp(&a.1));
+
+    common.into_iter().map(|(word, _)| word).collect()
+}
+
+/// Generate a name for a cluster of items using AI
+async fn name_cluster_from_items(
+    items: &[&Node],
+    forbidden_names: &[String],
+    app: Option<&AppHandle>,
+) -> Result<String, String> {
+    // Sample 8-10 items (diverse: first, middle, last, spread)
+    let sample_size = items.len().min(10);
+    let mut sample_indices: Vec<usize> = Vec::new();
+
+    if items.len() <= 10 {
+        sample_indices = (0..items.len()).collect();
+    } else {
+        // First, last, middle, then spread
+        sample_indices.push(0);
+        sample_indices.push(items.len() - 1);
+        sample_indices.push(items.len() / 2);
+
+        let step = items.len() / (sample_size - 3).max(1);
+        for i in (step..items.len()).step_by(step) {
+            if sample_indices.len() < sample_size && !sample_indices.contains(&i) {
+                sample_indices.push(i);
+            }
+        }
+    }
+
+    // Build titles list
+    let titles: Vec<String> = sample_indices.iter()
+        .map(|&i| items[i].ai_title.clone()
+            .or_else(|| items[i].cluster_label.clone())
+            .unwrap_or_else(|| items[i].title.clone()))
+        .collect();
+
+    // Try AI naming first
+    match crate::ai_client::name_cluster_from_samples(&titles, forbidden_names).await {
+        Ok(name) if !is_garbage_name(&name) => return Ok(name),
+        Ok(_) => {} // Garbage name, fall through
+        Err(e) => {
+            emit_log(app, "warn", &format!("AI naming failed: {}", e));
+        }
+    }
+
+    // Fallback: extract common words
+    let common = find_common_keywords(&titles);
+    if !common.is_empty() {
+        return Ok(common.into_iter().take(3).collect::<Vec<_>>().join(" "));
+    }
+
+    // Ultimate fallback
+    Ok(format!("Group ({} items)", items.len()))
+}
+
+/// Cluster items by embedding similarity when all children are items
+/// Returns true if grouping was successful
+async fn cluster_items_by_embedding(
+    db: &Database,
+    parent_id: &str,
+    items: &[Node],
+    app: Option<&AppHandle>,
+) -> Result<bool, String> {
+    let item_count = items.len();
+    emit_log(app, "info", &format!(
+        "Using embedding clustering for {} items under {}",
+        item_count, parent_id
+    ));
+
+    // 1. Fetch embeddings for all items
+    let mut embeddings: Vec<(String, Vec<f32>)> = Vec::new();
+    for item in items {
+        if let Ok(Some(emb)) = db.get_node_embedding(&item.id) {
+            embeddings.push((item.id.clone(), emb));
+        }
+    }
+
+    if embeddings.len() < items.len() / 2 {
+        emit_log(app, "warn", &format!(
+            "Only {}/{} items have embeddings, falling back to AI grouping",
+            embeddings.len(), items.len()
+        ));
+        return Ok(false); // Fall through to AI-based grouping
+    }
+
+    // 2. Determine target cluster count
+    let target_k = calculate_target_k(embeddings.len());
+    emit_log(app, "info", &format!("Target {} clusters for {} items with embeddings", target_k, embeddings.len()));
+
+    // 3. Cluster embeddings using k-means
+    let clusters = kmeans_cluster(&embeddings, target_k)?;
+
+    if clusters.len() < 2 {
+        emit_log(app, "warn", "Clustering produced < 2 groups, falling back to AI");
+        return Ok(false);
+    }
+
+    // 4. Name each cluster using AI
+    let parent_node = db.get_node(parent_id).map_err(|e| e.to_string())?
+        .ok_or("Parent not found")?;
+    let forbidden_names = db.get_all_category_names().map_err(|e| e.to_string())?;
+
+    let mut categories_created = 0;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let now = timestamp as i64;
+    let new_depth = parent_node.depth + 1;
+    let child_depth = new_depth + 1;
+
+    let mut all_reparented: Vec<String> = Vec::new();
+    let mut created_category_ids: Vec<String> = Vec::new();
+    let mut max_category_size = 0usize;
+
+    for (idx, cluster_item_ids) in clusters.iter().enumerate() {
+        if cluster_item_ids.is_empty() {
+            continue;
+        }
+
+        max_category_size = max_category_size.max(cluster_item_ids.len());
+
+        // Get items in this cluster
+        let cluster_items: Vec<&Node> = cluster_item_ids.iter()
+            .filter_map(|id| items.iter().find(|i| &i.id == id))
+            .collect();
+
+        // Generate name from cluster items
+        let name = name_cluster_from_items(&cluster_items, &forbidden_names, app).await?;
+
+        emit_log(app, "info", &format!(
+            "  Cluster {}: \"{}\" ({} items)",
+            idx, name, cluster_item_ids.len()
+        ));
+
+        // Create category node
+        let category_id = format!("{}-emb-{}-{}", parent_id, timestamp, idx);
+        let category_node = Node {
+            id: category_id.clone(),
+            node_type: NodeType::Cluster,
+            title: name.clone(),
+            cluster_label: Some(name.clone()),
+            depth: new_depth,
+            is_item: false,
+            is_universe: false,
+            parent_id: Some(parent_id.to_string()),
+            child_count: cluster_item_ids.len() as i32,
+            created_at: now,
+            updated_at: now,
+            ai_title: None,
+            summary: None,
+            tags: None,
+            emoji: None,
+            is_processed: false,
+            conversation_id: None,
+            sequence_index: None,
+            is_pinned: false,
+            last_accessed_at: None,
+            latest_child_date: None,
+            is_private: None,
+            privacy_reason: None,
+            source: None,
+            content_type: None,
+            associated_idea_id: None,
+            privacy: None,
+            cluster_id: None,
+            position: Position { x: 0.0, y: 0.0 },
+            url: None,
+            content: None,
+        };
+
+        db.insert_node(&category_node).map_err(|e| e.to_string())?;
+        created_category_ids.push(category_id.clone());
+        categories_created += 1;
+
+        // Reparent items to this category
+        for item_id in cluster_item_ids {
+            db.update_parent(item_id, &category_id).map_err(|e| e.to_string())?;
+            all_reparented.push(item_id.clone());
+        }
+    }
+
+    // 5. Set correct depths (not increment!)
+    if !all_reparented.is_empty() {
+        emit_log(app, "info", &format!("Setting depths for {} reparented items to {}", all_reparented.len(), child_depth));
+        db.set_reparented_nodes_depth(&all_reparented, child_depth).map_err(|e| e.to_string())?;
+    }
+
+    // 6. Update child counts
+    for category_id in &created_category_ids {
+        let actual = db.get_children(category_id).map_err(|e| e.to_string())?.len() as i32;
+        db.update_child_count(category_id, actual).map_err(|e| e.to_string())?;
+    }
+
+    // Update parent's child count
+    let parent_children = db.get_children(parent_id).map_err(|e| e.to_string())?.len() as i32;
+    db.update_child_count(parent_id, parent_children).map_err(|e| e.to_string())?;
+
+    emit_log(app, "info", &format!(
+        "Created {} embedding-based categories under {} (largest: {} items)",
+        categories_created, parent_id, max_category_size
+    ));
+
+    // Check if one category dominates (>80% of items) - same check as AI grouping
+    if max_category_size > item_count * 4 / 5 {
+        emit_log(app, "warn", &format!(
+            "Embedding clustering ineffective: largest category has {}/{} items (>80%)",
+            max_category_size, item_count
+        ));
+        return Ok(false);
+    }
+
+    Ok(categories_created >= 2)
 }
 
 /// Get emoji for a hierarchy depth level
@@ -2037,16 +2562,6 @@ fn find_node_needing_grouping_excluding(
             if child_count > max_for_this_depth {
                 let non_item_count = children.iter().filter(|c| !c.is_item).count();
 
-                // Skip if ALL children are items - nothing to group, items are leaf nodes
-                // This prevents wasting API calls on item-only containers
-                if non_item_count == 0 {
-                    emit_log(app, "debug", &format!(
-                        "Skipping {} (depth {}, {} items) - all children are items, nothing to group",
-                        node_id, depth, child_count
-                    ));
-                    continue;
-                }
-
                 // L5+ coherence gate: don't split incoherent noise deeper
                 if depth >= 4 && !is_coherent_for_deep_split(&children) {
                     emit_log(app, "debug", &format!(
@@ -2054,6 +2569,7 @@ fn find_node_needing_grouping_excluding(
                         node_id, depth, child_count
                     ));
                 } else {
+                    // Items CAN be grouped by creating subcategories and reparenting
                     emit_log(app, "debug", &format!(
                         "Found node needing grouping: {} (depth {}, {} children, {} non-items, max {})",
                         node_id, depth, child_count, non_item_count, max_for_this_depth

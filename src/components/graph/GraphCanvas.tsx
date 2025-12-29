@@ -251,13 +251,18 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
   // ==========================================================================
   useEffect(() => {
     devLog('info', 'GraphCanvas render effect running');
-    if (!svgRef.current || graphNodes.length === 0) return;
+    if (!svgRef.current) return;
+
+    const svg = d3.select(svgRef.current);
+    svg.selectAll('*').remove(); // Always clear first
+
+    if (graphNodes.length === 0) {
+      devLog('info', 'No nodes to render - cleared canvas');
+      return;
+    }
 
     // Reset click handled flag
     clickHandledRef.current = false;
-
-    const svg = d3.select(svgRef.current);
-    svg.selectAll('*').remove();
     svg.attr('width', width).attr('height', height);
 
     const container = svg.append('g').attr('class', 'graph-container');
@@ -354,7 +359,7 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       .attr('class', 'connection-dot')
       .attr('cx', d => d.x)
       .attr('cy', d => d.y)
-      .attr('r', 12)
+      .attr('r', 4)
       .attr('fill', d => d.color);
 
     // ==========================================================================
@@ -913,6 +918,21 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
             return `M${points.source.x},${points.source.y} A${dr},${dr} 0 0,1 ${points.target.x},${points.target.y}`;
           });
 
+          // Update connection dot positions
+          const dotPositions: { x: number; y: number }[] = [];
+          edgeData.forEach(d => {
+            const scaledSource = { x: d.source.x * positionScale, y: d.source.y * positionScale };
+            const scaledTarget = { x: d.target.x * positionScale, y: d.target.y * positionScale };
+            const points = getEdgePoints(scaledSource, scaledTarget, scaledWidth, scaledHeight);
+            dotPositions.push({ x: points.source.x, y: points.source.y });
+            dotPositions.push({ x: points.target.x, y: points.target.y });
+          });
+          connectionDots
+            .style('display', 'block')
+            .attr('r', 4 * cardScale)
+            .attr('cx', (_d: unknown, i: number) => dotPositions[i]?.x ?? 0)
+            .attr('cy', (_d: unknown, i: number) => dotPositions[i]?.y ?? 0);
+
         } else {
           // Bubble mode
           cardsGroup.style('display', 'none');
@@ -937,6 +957,9 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
             const dr = Math.sqrt(dx * dx + dy * dy) * 1.5;
             return `M${points.source.x},${points.source.y} A${dr},${dr} 0 0,1 ${points.target.x},${points.target.y}`;
           });
+
+          // Hide connection dots in bubble mode
+          connectionDots.style('display', 'none');
         }
 
         onZoomChange(k);

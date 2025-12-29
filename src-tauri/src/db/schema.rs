@@ -2911,6 +2911,102 @@ impl Database {
         Ok(())
     }
 
+    /// Set depth for reparented nodes to correct values (parent.depth + 1)
+    /// Unlike increment, this SETS the correct depth regardless of current value.
+    /// For items (leaf nodes), just sets depth. For categories, cascades to descendants.
+    pub fn set_reparented_nodes_depth(&self, node_ids: &[String], new_depth: i32) -> Result<()> {
+        if node_ids.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let start = std::time::Instant::now();
+
+        // First, set depth for the root nodes
+        for batch in node_ids.chunks(500) {
+            let placeholders: String = (1..=batch.len())
+                .map(|i| format!("?{}", i))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let update_sql = format!(
+                "UPDATE nodes SET depth = {} WHERE id IN ({})",
+                new_depth, placeholders
+            );
+
+            let params: Vec<&dyn rusqlite::ToSql> = batch.iter()
+                .map(|s| s as &dyn rusqlite::ToSql)
+                .collect();
+
+            conn.execute(&update_sql, params.as_slice())?;
+        }
+
+        // Now cascade to descendants level by level
+        let mut current_ids = node_ids.to_vec();
+        let mut current_depth = new_depth;
+        let mut level = 0;
+        const MAX_LEVELS: usize = 20;
+
+        while !current_ids.is_empty() && level < MAX_LEVELS {
+            // Get children IDs
+            let mut next_level = Vec::new();
+            for batch in current_ids.chunks(500) {
+                let placeholders: String = (1..=batch.len())
+                    .map(|i| format!("?{}", i))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                let select_sql = format!(
+                    "SELECT id FROM nodes WHERE parent_id IN ({})",
+                    placeholders
+                );
+
+                let params: Vec<&dyn rusqlite::ToSql> = batch.iter()
+                    .map(|s| s as &dyn rusqlite::ToSql)
+                    .collect();
+
+                let mut stmt = conn.prepare(&select_sql)?;
+                let children: Vec<String> = stmt.query_map(params.as_slice(), |row| row.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                next_level.extend(children);
+            }
+
+            if next_level.is_empty() {
+                break;
+            }
+
+            // Set depth for children = current_depth + 1
+            current_depth += 1;
+            for batch in next_level.chunks(500) {
+                let placeholders: String = (1..=batch.len())
+                    .map(|i| format!("?{}", i))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                let update_sql = format!(
+                    "UPDATE nodes SET depth = {} WHERE id IN ({})",
+                    current_depth, placeholders
+                );
+
+                let params: Vec<&dyn rusqlite::ToSql> = batch.iter()
+                    .map(|s| s as &dyn rusqlite::ToSql)
+                    .collect();
+
+                conn.execute(&update_sql, params.as_slice())?;
+            }
+
+            current_ids = next_level;
+            level += 1;
+        }
+
+        let total_elapsed = start.elapsed().as_millis();
+        println!("[SetDepth] Set {} nodes to depth {}, cascaded {} levels in {} ms",
+            node_ids.len(), new_depth, level, total_elapsed);
+
+        Ok(())
+    }
+
     // ========== Tag Operations ==========
 
     /// Count total tags

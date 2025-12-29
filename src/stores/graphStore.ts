@@ -196,8 +196,11 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       ? newBreadcrumbs[newBreadcrumbs.length - 1].id
       : null;
 
-    // Determine new depth: the popped item's depth (we're going back to that depth)
-    const newDepth = popped.depth;
+    // Determine new depth: if going to root (no breadcrumbs), depth is 0
+    // Otherwise, depth is the previous breadcrumb's depth + 1 (viewing its children)
+    const newDepth = newBreadcrumbs.length > 0
+      ? newBreadcrumbs[newBreadcrumbs.length - 1].depth + 1
+      : 0;
 
     set({
       currentDepth: newDepth,

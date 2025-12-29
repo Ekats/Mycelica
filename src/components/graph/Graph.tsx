@@ -1125,14 +1125,32 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
       return n.isPrivate !== true;
     };
 
+    // Recursive check: does this node have any visible descendants?
+    const hasVisibleDescendants = (parentId: string): boolean => {
+      const children = allNodes.filter(n => n.parentId === parentId);
+      if (children.length === 0) return false; // No children = no visible descendants
+      return children.some(child => {
+        if (child.isItem) {
+          // Items must pass privacy themselves
+          return passesPrivacy(child);
+        } else {
+          // Categories: recurse without checking category's own privacy
+          // (category privacy is derived from children, so we check the actual items)
+          return hasVisibleDescendants(child.id);
+        }
+      });
+    };
+
     // Filter nodes for current view
     const nodeArray = allNodes.filter(node => {
       if (hidePrivate) {
-        if (!passesPrivacy(node)) return false;
-        if (!node.isItem && node.childCount > 0) {
-          const children = allNodes.filter(n => n.parentId === node.id);
-          const hasVisibleChild = children.some(c => passesPrivacy(c));
-          if (!hasVisibleChild && children.length > 0) return false;
+        if (node.isItem) {
+          // Items must pass privacy themselves
+          if (!passesPrivacy(node)) return false;
+        } else {
+          // Categories: visible if they have visible descendants
+          // (don't check category's own privacy - it's derived from children's min)
+          if (!hasVisibleDescendants(node.id)) return false;
         }
       }
       if (currentParentId) return node.parentId === currentParentId;

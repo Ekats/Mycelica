@@ -588,6 +588,96 @@ fn parse_cluster_names_response(
     }
 }
 
+/// Ask AI to name a cluster based on sample item titles (for embedding clustering)
+pub async fn name_cluster_from_samples(
+    titles: &[String],
+    forbidden_names: &[String],
+) -> Result<String, String> {
+    let api_key = get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
+
+    if titles.is_empty() {
+        return Err("No titles provided".into());
+    }
+
+    let forbidden_str = if forbidden_names.is_empty() {
+        "None".to_string()
+    } else {
+        forbidden_names.iter().take(20).cloned().collect::<Vec<_>>().join(", ")
+    };
+
+    let titles_list = titles.iter()
+        .take(12)
+        .map(|t| format!("- {}", t.chars().take(80).collect::<String>()))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let prompt = format!(
+        r#"These items belong to the same semantic cluster. Generate a 2-4 word category name.
+
+Items:
+{titles_list}
+
+Forbidden names (already used): {forbidden_str}
+
+RULES:
+1. Be specific and descriptive (e.g., "Rust Development", "Game Physics", "API Design")
+2. Avoid generic names like "General", "Various", "Miscellaneous", "Items"
+3. Focus on the common theme across items
+4. Respond with ONLY the category name, nothing else"#,
+        titles_list = titles_list,
+        forbidden_str = forbidden_str
+    );
+
+    let request = AnthropicRequest {
+        model: "claude-haiku-4-5-20251001".to_string(),
+        max_tokens: 50,
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: prompt,
+        }],
+    };
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("API error {}: {}", status, body));
+    }
+
+    let api_response: AnthropicResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    // Track token usage
+    if let Some(usage) = &api_response.usage {
+        let _ = settings::add_anthropic_tokens(usage.input_tokens, usage.output_tokens);
+    }
+
+    let name = api_response
+        .content
+        .first()
+        .map(|c| c.text.trim().to_string())
+        .unwrap_or_default();
+
+    // Validate
+    if name.len() < 3 || name.len() > 50 {
+        return Err(format!("Invalid name length: {} chars", name.len()));
+    }
+
+    Ok(name)
+}
+
 // ==================== Recursive Hierarchy Grouping ====================
 
 /// Context for AI grouping - provides hierarchy awareness
@@ -1674,9 +1764,9 @@ async fn group_into_uber_categories_single(
     };
 
     let task_description = if existing_uber_categories.is_empty() {
-        "Group these into 4-8 top-level categories that make the graph navigable."
+        "Group these into 8-10 top-level categories that make the graph navigable."
     } else {
-        "Group these into the existing uber-categories above, OR create new ones (target 4-8 new max)."
+        "Group these into the existing uber-categories above, OR create new ones (target 8-10 new max)."
     };
 
     let prompt = format!(
@@ -1707,10 +1797,10 @@ CRITICAL RULES:
    - Theme groups: 1-3 descriptive words (e.g., "AI & Machine Learning", "Life & Health")
    - FORBIDDEN: "Other", "Miscellaneous", "General", "Various", "Mixed"
 
-4. TARGET 4-8 CATEGORIES:
+4. TARGET 8-10 CATEGORIES:
    - Each project gets its own category (even if small)
    - Non-project categories can be merged into themes
-   - Result should have 4-8 total uber-categories
+   - Result should have 8-10 total uber-categories
 
 5. WHAT COUNTS AS A PROJECT:
    - Named software/apps (Mycelica, VSCode extensions, specific tools)
