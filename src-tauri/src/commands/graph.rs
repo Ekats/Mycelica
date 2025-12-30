@@ -1424,8 +1424,23 @@ pub async fn consolidate_root(state: State<'_, AppState>) -> Result<ConsolidateR
         })
         .collect();
 
-    // Call AI to group into uber-categories (without tag anchors for manual consolidation)
-    let groupings = ai_client::group_into_uber_categories(&categories, None).await?;
+    // Pre-fetch embeddings for similarity-sorted batching (before async call to avoid lock issues)
+    let embeddings_map: std::collections::HashMap<String, Vec<f32>> = {
+        let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+        categories
+            .iter()
+            .filter_map(|c| {
+                db.get_node_embedding(&c.id)
+                    .ok()
+                    .flatten()
+                    .map(|emb| (c.id.clone(), emb))
+            })
+            .collect()
+    };
+    println!("[Consolidate] Fetched {}/{} topic embeddings for similarity sorting", embeddings_map.len(), categories.len());
+
+    // Call AI to group into uber-categories (similarity-sorted batching for coherent groups)
+    let groupings = ai_client::group_into_uber_categories(&categories, &embeddings_map, None).await?;
 
     if groupings.is_empty() {
         return Err("AI returned no uber-categories".to_string());

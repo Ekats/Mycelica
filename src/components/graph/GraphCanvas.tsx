@@ -227,7 +227,6 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
   const svgRef = useRef<SVGSVGElement>(null);
   const activeNodeIdRef = useRef<string | null>(null);
   const connectionMapRef = useRef<Map<string, { weight: number; distance: number }>>(new Map());
-  const clickHandledRef = useRef(false);
   const lastClickTimeRef = useRef(0);
   const pendingFetchRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingDeselectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -265,8 +264,6 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       return;
     }
 
-    // Reset click handled flag
-    clickHandledRef.current = false;
     svg.attr('width', width).attr('height', height);
 
     const container = svg.append('g').attr('class', 'graph-container');
@@ -718,7 +715,6 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
     // Card click - select node
     cardGroups.on('click', function(event, d) {
       event.stopPropagation();
-      clickHandledRef.current = true;
 
       // If clicking already-selected node, defer deselection to allow double-click
       if (activeNodeIdRef.current === d.id) {
@@ -773,7 +769,6 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
     // Dot click - same as card
     dotGroups.on('click', function(event, d) {
       event.stopPropagation();
-      clickHandledRef.current = true;
 
       // If clicking already-selected node, defer deselection to allow double-click
       if (activeNodeIdRef.current === d.id) {
@@ -1095,22 +1090,15 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       devLog('warn', 'No nodes to display');
     }
 
-  // Note: activeNodeId removed from dependencies - color updates handled by separate effect
-  // This prevents double-click from being broken when clicking an already-selected node
-  // (which would trigger a full re-render, destroying D3 elements before dblclick fires)
-  }, [graphNodes, edgeData, width, height, connectionMap, devLog, onSelectNode, onZoomChange, onNavigateToNode, onOpenLeaf, onFetchSimilarNodes, onShowContextMenu]);
+  // Note: activeNodeId and connectionMap removed from dependencies - color updates handled by separate effect
+  // This prevents clicking a node from resetting the viewport (connectionMap changes on selection)
+  }, [graphNodes, edgeData, width, height, devLog, onSelectNode, onZoomChange, onNavigateToNode, onOpenLeaf, onFetchSimilarNodes, onShowContextMenu]);
 
   // ==========================================================================
   // COLOR UPDATE EFFECT - Updates colors when selection changes
   // ==========================================================================
   useEffect(() => {
     if (!svgRef.current || graphNodes.length === 0) return;
-
-    // Skip if click handler already did the D3 update
-    if (clickHandledRef.current) {
-      clickHandledRef.current = false;
-      return;
-    }
 
     const svg = d3.select(svgRef.current);
 

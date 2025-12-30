@@ -750,10 +750,16 @@ fn detect_project_names(topics: &[TopicInfo]) -> Vec<String> {
 /// Check if a word is too common to be a project name
 fn is_common_word(word: &str) -> bool {
     let common = [
+        // Articles, pronouns, question words
         "The", "This", "That", "What", "How", "Why", "When", "Where",
         "New", "Old", "First", "Last", "Some", "All", "Any", "More",
+        // Action verbs (often start titles)
         "Using", "Building", "Creating", "Making", "Adding", "Fixing",
+        "Working", "Testing", "Running", "Setting", "Getting", "Trying",
+        "Looking", "Finding", "Checking", "Moving", "Starting", "Finishing",
+        // Prepositions
         "About", "With", "From", "Into", "Over", "Under", "Between",
+        // Generic tech terms
         "Discussion", "Conversation", "Chat", "Talk", "Help", "Question",
         "Code", "Debug", "Error", "Issue", "Bug", "Feature", "Update",
         "Project", "Development", "Implementation", "Design", "Architecture",
@@ -765,11 +771,31 @@ fn is_common_word(word: &str) -> bool {
         "Personal", "Professional", "Creative", "Academic", "Experimental",
         "Interdisciplinary", "Language", "Estonian", "Regional",
         "Theoretical", "Practical",
+        // STATUS/PROGRESS WORDS - common false positives for project detection
+        // These often appear capitalized at title start: "Progress on X", "Update about Y"
+        "Progress", "Status", "Update", "Updates", "Work", "Changes", "Change",
+        "Fix", "Fixes", "Problem", "Problems", "Solution", "Solutions",
+        "Notes", "Note", "Ideas", "Idea", "Thoughts", "Thought",
+        "Summary", "Overview", "Review", "Analysis", "Research",
+        "Plan", "Plans", "Planning", "Task", "Tasks", "Todo", "Todos",
+        "Draft", "Drafts", "Version", "Versions", "Revision", "Revisions",
+        "Session", "Sessions", "Meeting", "Meetings", "Discussion",
+        "Exploration", "Exploring", "Investigation", "Investigating",
+        "Debugging", "Troubleshooting", "Refactoring", "Optimization",
+        // Common English words that slip through
+        "Today", "Yesterday", "Tomorrow", "Week", "Month", "Year",
+        "Morning", "Evening", "Night", "Day", "Time", "Date",
+        "Part", "Parts", "Section", "Sections", "Chapter", "Chapters",
+        "Step", "Steps", "Phase", "Phases", "Stage", "Stages",
+        "Test", "Tests", "Example", "Examples", "Sample", "Samples",
+        "Data", "Info", "Information", "Details", "Context", "Background",
+        "Quick", "Simple", "Basic", "Advanced", "Final", "Initial",
+        "Main", "Core", "Key", "Important", "Critical", "Essential",
     ];
     common.iter().any(|c| c.eq_ignore_ascii_case(word))
 }
 
-/// A major project detected from global item title frequency
+/// A major project detected from item titles
 #[derive(Debug, Clone)]
 pub struct MajorProject {
     /// Project name (proper noun)
@@ -782,29 +808,26 @@ pub struct MajorProject {
     pub item_ids: Vec<String>,
 }
 
-/// Detect major projects from global proper noun frequency in item titles
+/// Candidate word collected from titles (before AI filtering)
+#[derive(Debug, Clone)]
+pub struct CandidateWord {
+    pub word: String,
+    pub count: usize,
+    pub item_ids: Vec<String>,
+}
+
+/// Collect ALL capitalized words from item titles
 ///
-/// Scans ALL items' ai_title fields for proper nouns (capitalized, 3+ chars).
-/// Returns nouns appearing in 2%+ of items (min 20 occurrences).
-/// Filters out "title-starter" words that appear >70% as first word (e.g., "Strategy", "Analysis").
-/// These represent major projects that should become umbrella categories.
-pub fn detect_major_projects_globally(db: &crate::db::Database) -> Vec<MajorProject> {
+/// Very loose collection - just capitalized words with 5+ occurrences.
+/// No heuristic filtering - let AI decide what's a project.
+pub fn collect_capitalized_words(db: &crate::db::Database) -> Vec<CandidateWord> {
     use std::collections::HashMap;
 
-    // Track noun statistics including position
-    #[derive(Default)]
-    struct NounStats {
-        item_ids: Vec<String>,
-        first_word_count: usize,
-        total_count: usize,
-    }
-
-    // Get only VISIBLE tier items for hierarchy decisions
-    // VISIBLE: insight, exploration, synthesis, question, planning
-    let items = match db.get_visible_items() {
+    // Get all items (not just visible - projects might span content types)
+    let items = match db.get_items() {
         Ok(items) => items,
         Err(e) => {
-            eprintln!("[MajorProjects] Failed to get visible items: {}", e);
+            eprintln!("[ProjectDetection] Failed to get items: {}", e);
             return vec![];
         }
     };
@@ -813,101 +836,182 @@ pub fn detect_major_projects_globally(db: &crate::db::Database) -> Vec<MajorProj
         return vec![];
     }
 
-    let total_items = items.len();
-
-    // Count proper nouns across all item titles, tracking position
-    let mut noun_stats: HashMap<String, NounStats> = HashMap::new();
+    // Count all capitalized words
+    let mut word_stats: HashMap<String, Vec<String>> = HashMap::new();
 
     for item in &items {
         // Use ai_title if available, fallback to title
         let title = item.ai_title.as_ref().unwrap_or(&item.title);
 
-        // Also check cluster_label for additional signal
-        let texts = if let Some(label) = &item.cluster_label {
-            vec![title.as_str(), label.as_str()]
-        } else {
-            vec![title.as_str()]
-        };
-
-        // Track which nouns we've seen in THIS item (avoid double counting)
+        // Track which words we've seen in THIS item (avoid double counting)
         let mut seen_in_item: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        for text in texts {
-            let words: Vec<&str> = text.split_whitespace().collect();
-            for (pos, word) in words.iter().enumerate() {
-                // Clean punctuation
-                let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+        for word in title.split_whitespace() {
+            // Clean punctuation
+            let word = word.trim_matches(|c: char| !c.is_alphanumeric());
 
-                // Must be proper noun: capitalized, 3+ chars, not common
-                if word.len() >= 3
-                    && word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
-                    && !is_common_word(word)
-                    && !seen_in_item.contains(word)
-                {
-                    seen_in_item.insert(word.to_string());
-                    let stats = noun_stats.entry(word.to_string()).or_default();
-                    stats.item_ids.push(item.id.clone());
-                    stats.total_count += 1;
-                    if pos == 0 {
-                        stats.first_word_count += 1;
-                    }
-                }
+            // Must be: capitalized, 2+ chars
+            if word.len() >= 2
+                && word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                && !seen_in_item.contains(word)
+            {
+                seen_in_item.insert(word.to_string());
+                word_stats.entry(word.to_string())
+                    .or_default()
+                    .push(item.id.clone());
             }
         }
     }
 
-    // Filter to nouns appearing in 2%+ of items (min 20 occurrences)
-    // Also filter out title-starters (>70% appear as first word)
-    let min_percentage = 0.02;
-    let min_occurrences = 20;
-    let threshold = ((total_items as f64 * min_percentage).ceil() as usize).max(min_occurrences);
+    // Return words with 5+ occurrences, sorted by count descending
+    let mut candidates: Vec<CandidateWord> = word_stats
+        .into_iter()
+        .filter(|(_, ids)| ids.len() >= 5)
+        .map(|(word, item_ids)| CandidateWord {
+            word,
+            count: item_ids.len(),
+            item_ids,
+        })
+        .collect();
 
-    let mut projects: Vec<MajorProject> = Vec::new();
+    candidates.sort_by(|a, b| b.count.cmp(&a.count));
 
-    // Check if word has generic noun suffix (not a project name)
-    fn is_generic_noun_suffix(word: &str) -> bool {
-        let lower = word.to_lowercase();
-        lower.ends_with("tion") ||  // Configuration, Communication
-        lower.ends_with("ment") ||  // Management, Development
-        lower.ends_with("ness") ||  // Awareness
-        lower.ends_with("ity") ||   // Complexity, Activity
-        lower.ends_with("ence") ||  // Experience, Reference
-        lower.ends_with("ance") ||  // Performance, Guidance
-        lower.ends_with("ing") ||   // Processing, Debugging, Mapping
-        lower.ends_with("ics") ||   // Techniques, Graphics
-        lower.ends_with("sis") ||   // Analysis
-        lower.ends_with("egy")      // Strategy
+    eprintln!("[ProjectDetection] Collected {} capitalized words with 5+ occurrences", candidates.len());
+    candidates
+}
+
+/// Detect user's software projects using AI
+///
+/// Sends all capitalized words to Haiku, which identifies actual project names.
+/// Returns MajorProject structs for projects the user built.
+pub async fn detect_projects_with_ai(
+    db: &crate::db::Database,
+    candidates: Vec<CandidateWord>,
+) -> Vec<MajorProject> {
+    if candidates.is_empty() {
+        return vec![];
     }
 
-    for (name, stats) in noun_stats {
-        if stats.item_ids.len() < threshold {
-            continue;
+    // Get API key
+    let api_key = match get_api_key() {
+        Some(key) => key,
+        None => {
+            eprintln!("[ProjectDetection] No API key, skipping project detection");
+            return vec![];
         }
+    };
 
-        // Filter out generic noun suffixes (not project names)
-        if is_generic_noun_suffix(&name) {
-            eprintln!("[MajorProjects] Filtered '{}' (generic noun suffix, {} items)",
-                name, stats.item_ids.len());
-            continue;
+    // Get total item count for percentage calculation
+    let total_items = db.get_items().map(|i| i.len()).unwrap_or(1);
+
+    // Build the word list for AI (top 100 by count)
+    let mut word_list = String::new();
+    for candidate in candidates.iter().take(100) {
+        word_list.push_str(&format!("{}: {} occurrences\n", candidate.word, candidate.count));
+    }
+
+    let prompt = format!(r#"Here are capitalized words found in a developer's knowledge base:
+
+{}
+Which of these are names of SOFTWARE PROJECTS the user BUILT or WORKS ON (not libraries/frameworks they used, not generic English words)?
+
+Look for:
+- Unique/invented names (Mycelica, Tartubus, Breax)
+- Names that appear frequently and consistently
+- Proper nouns that aren't common tech terms
+
+Exclude:
+- Libraries/frameworks (React, Node, Python, Rust)
+- Generic words (Progress, Status, Update, Debug, Error)
+- Technical terms (Implementation, Architecture, Configuration)
+- Common nouns that happen to be capitalized
+
+Return ONLY a JSON array of project names the user likely built.
+Example: ["Mycelica", "Tartubus"]
+If no user projects found: []"#, word_list);
+
+    let request = AnthropicRequest {
+        model: "claude-haiku-4-5-20251001".to_string(),
+        max_tokens: 200,
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: prompt,
+        }],
+    };
+
+    let client = reqwest::Client::new();
+    let response = match client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&request)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[ProjectDetection] HTTP error: {}", e);
+            return vec![];
         }
+    };
 
-        // Filter out title-starters: words that appear >75% as first word
-        // BUT only if they're generic words (not proper nouns like "Mycelica")
-        let first_word_ratio = stats.first_word_count as f32 / stats.total_count as f32;
-        if first_word_ratio > 0.75 && is_common_word(&name) {
-            eprintln!("[MajorProjects] Filtered '{}' ({:.0}% first-word + common word, {} items)",
-                name, first_word_ratio * 100.0, stats.item_ids.len());
-            continue;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        eprintln!("[ProjectDetection] API error {}: {}", status, body);
+        return vec![];
+    }
+
+    let api_response: AnthropicResponse = match response.json().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[ProjectDetection] Parse error: {}", e);
+            return vec![];
         }
+    };
 
-        let item_count = stats.item_ids.len();
-        let percentage = (item_count as f32 / total_items as f32) * 100.0;
-        projects.push(MajorProject {
-            name,
-            item_count,
-            percentage,
-            item_ids: stats.item_ids,
-        });
+    // Track token usage
+    if let Some(usage) = &api_response.usage {
+        let _ = crate::settings::add_anthropic_tokens(usage.input_tokens, usage.output_tokens);
+    }
+
+    // Parse the JSON array response
+    let text = api_response
+        .content
+        .first()
+        .map(|c| c.text.trim())
+        .unwrap_or("[]");
+
+    // Extract project names from JSON array
+    let project_names: Vec<String> = match serde_json::from_str::<Vec<String>>(text) {
+        Ok(names) => names,
+        Err(_) => {
+            // Try to extract names manually if JSON parsing fails
+            text.trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        }
+    };
+
+    eprintln!("[ProjectDetection] AI detected {} projects: {:?}", project_names.len(), project_names);
+
+    // Build MajorProject structs from AI-detected names
+    let mut projects: Vec<MajorProject> = Vec::new();
+
+    for name in project_names {
+        // Find the candidate with this name (case-insensitive)
+        if let Some(candidate) = candidates.iter().find(|c| c.word.eq_ignore_ascii_case(&name)) {
+            let percentage = (candidate.count as f32 / total_items as f32) * 100.0;
+            projects.push(MajorProject {
+                name: candidate.word.clone(), // Use original casing
+                item_count: candidate.count,
+                percentage,
+                item_ids: candidate.item_ids.clone(),
+            });
+        }
     }
 
     // Sort by item count descending
@@ -1628,13 +1732,82 @@ Return ONLY valid JSON, no markdown:
 /// Smaller batches = more coherent groupings (merge logic handles cross-batch duplicates)
 const UBER_GROUPING_BATCH_SIZE: usize = 40;
 
+/// Sort topics by embedding similarity using greedy nearest-neighbor
+/// Returns sorted TopicInfo vector so adjacent topics are semantically related
+///
+/// embeddings_map: Pre-fetched embeddings keyed by topic ID (avoids async lock issues)
+fn sort_by_embedding_similarity(
+    categories: &[TopicInfo],
+    embeddings_map: &std::collections::HashMap<String, Vec<f32>>,
+) -> Vec<TopicInfo> {
+    use crate::similarity::cosine_similarity;
+
+    // Get embeddings for all categories from the pre-fetched map
+    let embeddings: Vec<Option<&Vec<f32>>> = categories
+        .iter()
+        .map(|c| embeddings_map.get(&c.id))
+        .collect();
+
+    // Count how many have embeddings
+    let with_embeddings = embeddings.iter().filter(|e| e.is_some()).count();
+    if with_embeddings < categories.len() / 2 {
+        println!("[AI] Only {}/{} topics have embeddings, using original order",
+                 with_embeddings, categories.len());
+        return categories.to_vec();
+    }
+
+    // Greedy nearest-neighbor ordering
+    let mut remaining: std::collections::HashSet<usize> = (0..categories.len()).collect();
+    let mut sorted_indices: Vec<usize> = Vec::with_capacity(categories.len());
+
+    // Start with first topic that has an embedding
+    let start = (0..categories.len())
+        .find(|&i| embeddings[i].is_some())
+        .unwrap_or(0);
+    sorted_indices.push(start);
+    remaining.remove(&start);
+
+    // Greedily add nearest neighbor
+    while !remaining.is_empty() {
+        let last_idx = *sorted_indices.last().unwrap();
+        let last_emb = embeddings[last_idx];
+
+        // Find nearest remaining topic
+        let nearest = remaining
+            .iter()
+            .max_by(|&&a, &&b| {
+                let sim_a = match (last_emb, embeddings[a]) {
+                    (Some(e1), Some(e2)) => cosine_similarity(e1, e2),
+                    _ => -1.0,
+                };
+                let sim_b = match (last_emb, embeddings[b]) {
+                    (Some(e1), Some(e2)) => cosine_similarity(e1, e2),
+                    _ => -1.0,
+                };
+                sim_a.partial_cmp(&sim_b).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .copied()
+            .unwrap();
+
+        sorted_indices.push(nearest);
+        remaining.remove(&nearest);
+    }
+
+    println!("[AI] Sorted {} topics by embedding similarity for coherent batching", categories.len());
+
+    // Return sorted categories
+    sorted_indices.iter().map(|&i| categories[i].clone()).collect()
+}
+
 /// Group categories into 4-8 uber-categories, preserving project names
 /// Used for consolidating Universe's direct children into navigable top-level domains
 /// Projects (Mycelica, etc.) stay as their own categories; generic topics get grouped by theme
 ///
+/// embeddings_map: Pre-fetched embeddings for sorting (pass empty HashMap to skip sorting)
 /// tag_anchors: Optional list of persistent tag titles to use as preferred category names
 pub async fn group_into_uber_categories(
     categories: &[TopicInfo],
+    embeddings_map: &std::collections::HashMap<String, Vec<f32>>,
     tag_anchors: Option<&[String]>,
 ) -> Result<Vec<CategoryGrouping>, String> {
     if categories.is_empty() {
@@ -1648,14 +1821,23 @@ pub async fn group_into_uber_categories(
         return group_into_uber_categories_single(categories, &[], anchors).await;
     }
 
+    // Sort categories by embedding similarity BEFORE batching
+    // This ensures each batch contains semantically related topics
+    let sorted_categories = if embeddings_map.is_empty() {
+        println!("[AI] No embeddings provided, using original order");
+        categories.to_vec()
+    } else {
+        sort_by_embedding_similarity(categories, embeddings_map)
+    };
+
     // Batch processing for large category sets
-    let num_batches = (categories.len() + UBER_GROUPING_BATCH_SIZE - 1) / UBER_GROUPING_BATCH_SIZE;
-    println!("[AI] Grouping {} categories in {} batches of ~{}",
-             categories.len(), num_batches, UBER_GROUPING_BATCH_SIZE);
+    let num_batches = (sorted_categories.len() + UBER_GROUPING_BATCH_SIZE - 1) / UBER_GROUPING_BATCH_SIZE;
+    println!("[AI] Grouping {} categories in {} similarity-sorted batches of ~{}",
+             sorted_categories.len(), num_batches, UBER_GROUPING_BATCH_SIZE);
 
     let mut all_groupings: Vec<CategoryGrouping> = Vec::new();
 
-    for (batch_idx, batch) in categories.chunks(UBER_GROUPING_BATCH_SIZE).enumerate() {
+    for (batch_idx, batch) in sorted_categories.chunks(UBER_GROUPING_BATCH_SIZE).enumerate() {
         println!("[AI] Processing uber-category batch {}/{} ({} categories, {} existing uber-categories)",
                  batch_idx + 1, num_batches, batch.len(), all_groupings.len());
 

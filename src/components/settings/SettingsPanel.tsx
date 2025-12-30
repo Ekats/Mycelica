@@ -364,15 +364,26 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
 
   // Estimate API cost (returns formatted string)
   // Pricing: Haiku 4.5 $0.80/$4.00 MTok, Sonnet 4 $3/$15 MTok, OpenAI embed $0.02/MTok
-  const estimateCost = (calls: number, model: 'haiku' | 'sonnet' | 'openai', avgTokensPerCall: number = 1200): string => {
+  // Token usage (measured from actual runs):
+  //   - Haiku classification: ~105 tokens/item (reclassify_ai, score_privacy)
+  //   - Haiku generation: ~1200 tokens/item (process_ai titles/summaries)
+  //   - Sonnet grouping: ~3000 tokens/call (hierarchy)
+  // Grouping calls formula: Math.max(3, Math.ceil(topicsCount / 100) + 2)
+  type HaikuOp = 'classify' | 'generate';
+  const estimateCost = (calls: number, model: 'haiku' | 'sonnet' | 'openai', avgTokensPerCall: number = 1200, haikuOp: HaikuOp = 'generate'): string => {
     if (calls === 0) return '$0.00';
     const totalTokens = calls * avgTokensPerCall;
     let cost = 0;
     if (model === 'haiku') {
-      // ~83% input (~1000 tokens), ~17% output (~200 tokens) for title/summary generation
-      cost = (totalTokens * 0.83 / 1_000_000) * 0.80 + (totalTokens * 0.17 / 1_000_000) * 4.00;
+      // classify: 95% input / 5% output (single word/number)
+      // generate: 83% input / 17% output (titles/summaries)
+      const r = haikuOp === 'classify'
+        ? { input: 0.95, output: 0.05 }
+        : { input: 0.83, output: 0.17 };
+      cost = (totalTokens * r.input / 1_000_000) * 0.80 + (totalTokens * r.output / 1_000_000) * 4.00;
     } else if (model === 'sonnet') {
-      cost = (totalTokens * 0.5 / 1_000_000) * 3 + (totalTokens * 0.5 / 1_000_000) * 15;
+      // Grouping: ~55% input, ~45% output
+      cost = (totalTokens * 0.55 / 1_000_000) * 3 + (totalTokens * 0.45 / 1_000_000) * 15;
     } else {
       cost = (totalTokens / 1_000_000) * 0.02;
     }
@@ -867,7 +878,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     },
     scorePrivacy: {
       title: 'Score Privacy',
-      message: `AI will score all items 0.0-1.0 for public shareability. Items < 0.3 are considered private and will be separated during clustering. Estimated cost: ~$0.30 for 4700 items.`,
+      message: `AI will score all items 0.0-1.0 for public shareability. Items < 0.3 are considered private and will be separated during clustering.`,
       handler: async () => {
         setIsScoringPrivacy(true);
         setOperationResult(null);
@@ -899,7 +910,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     },
     reclassifyAi: {
       title: 'Reclassify (AI)',
-      message: 'Re-classify all items using AI. Very cheap (~$0.04 for 4000 items). Uses minimal Haiku prompt.',
+      message: 'Re-classify all items using AI (Haiku).',
       handler: async () => {
         setIsReclassifyingAi(true);
         setOperationResult(null);
@@ -931,7 +942,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     },
     rebuildHierarchyOnly: {
       title: 'Rebuild Hierarchy Only',
-      message: 'Keeps items + clusters, only rebuilds hierarchy grouping (Universe → categories → topics). Uses AI for grouping. ~$0.05-0.15.',
+      message: 'Keeps items + clusters, only rebuilds hierarchy grouping (Universe → categories → topics). Uses Sonnet for AI grouping.',
       handler: async () => {
         setIsRebuildingHierarchyOnly(true);
         setOperationResult(null);
@@ -1342,14 +1353,14 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                     <div className="text-xs text-gray-500">Create navigation structure + group embeddings</div>
                     {dbStats && dbStats.topicsCount > 15 && (
                       <div className="text-xs text-amber-400/80 mt-0.5">
-                        ~{Math.ceil(Math.log(dbStats.topicsCount / 10) / Math.log(10) * 3)} calls · Sonnet {estimateCost(Math.ceil(Math.log(dbStats.topicsCount / 10) / Math.log(10) * 3), 'sonnet', 5000)}
+                        ~{Math.max(3, Math.ceil(dbStats.topicsCount / 100) + 2)} calls · Sonnet {estimateCost(Math.max(3, Math.ceil(dbStats.topicsCount / 100) + 2), 'sonnet', 3000)}
                         {openaiKeyStatus && ` + OpenAI ${estimateCost(Math.ceil(dbStats.topicsCount / 8), 'openai', 500)}`}
                         <span className="text-gray-500 ml-1">({dbStats.topicsCount} topics)</span>
                       </div>
                     )}
                     {dbStats && dbStats.topicsCount <= 15 && dbStats.topicsCount > 0 && (
                       <div className="text-xs text-green-500/70 mt-0.5">
-                        1 call · Sonnet {estimateCost(1, 'sonnet', 5000)}
+                        1 call · Sonnet {estimateCost(1, 'sonnet', 3000)}
                         {openaiKeyStatus && ` + OpenAI ${estimateCost(dbStats.topicsCount, 'openai', 500)}`}
                       </div>
                     )}
@@ -1666,19 +1677,19 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   <div className="flex-1 min-w-0">
                     <div className="text-sm font-medium text-gray-200">Full Rebuild</div>
                     <div className="text-xs text-gray-500">Embedding clustering (free) + AI hierarchy. Replaces all organization.</div>
-                    {dbStats && (dbStats.unclusteredItems > 0 || dbStats.topicsCount > 0) && (
+                    {dbStats && (
                       <div className="text-xs text-amber-400/80 mt-0.5">
+                        {/* Grouping cost (Sonnet) - runs when topics > 15 */}
                         {dbStats.topicsCount > 15 && (
-                          <>~{Math.ceil(Math.log(dbStats.topicsCount / 10) / Math.log(10) * 3)} hierarchy calls · Sonnet {estimateCost(Math.ceil(Math.log(dbStats.topicsCount / 10) / Math.log(10) * 3), 'sonnet', 5000)}</>
+                          <>
+                            ~{Math.max(3, Math.ceil(dbStats.topicsCount / 100) + 2)} grouping calls · Sonnet {estimateCost(Math.max(3, Math.ceil(dbStats.topicsCount / 100) + 2), 'sonnet', 3000)}
+                          </>
                         )}
-                        {dbStats.topicsCount <= 15 && (
+                        {dbStats.topicsCount <= 15 && dbStats.topicsCount > 0 && (
                           <span className="text-cyan-400">Clustering: free (local embeddings)</span>
                         )}
-                        <span className="text-gray-500 ml-1">({dbStats.totalItems} items)</span>
+                        <span className="text-gray-500 ml-1">({dbStats.topicsCount} topics, {dbStats.totalItems} items)</span>
                       </div>
-                    )}
-                    {dbStats && dbStats.unclusteredItems === 0 && dbStats.topicsCount <= 15 && (
-                      <div className="text-xs text-green-500/70 mt-0.5">All items organized</div>
                     )}
                   </div>
                   <button
@@ -1737,7 +1748,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                     <div className="text-sm font-medium text-gray-200">Consolidate Root</div>
                     <div className="text-xs text-gray-500">Group into 4-8 uber-categories (TECH, LIFE, etc.)</div>
                     <div className="text-xs text-amber-400/80 mt-0.5">
-                      1 call · Sonnet {estimateCost(1, 'sonnet', 5000)}
+                      1 call · Sonnet {estimateCost(1, 'sonnet', 3000)}
                     </div>
                   </div>
                   <button
@@ -1781,7 +1792,12 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   <div className="flex-1 min-w-0">
                     <div className="text-sm font-medium text-gray-200">Rebuild Hierarchy Only</div>
                     <div className="text-xs text-gray-500">Keeps clusters, regroups into categories</div>
-                    <div className="text-xs text-amber-400 mt-0.5">~$0.05-0.15 · AI grouping only</div>
+                    {dbStats && dbStats.topicsCount > 0 && (
+                      <div className="text-xs text-amber-400 mt-0.5">
+                        ~{Math.max(3, Math.ceil(dbStats.topicsCount / 100) + 2)} grouping calls · Sonnet {estimateCost(Math.max(3, Math.ceil(dbStats.topicsCount / 100) + 2), 'sonnet', 3000)}
+                        <span className="text-gray-500 ml-1">({dbStats.topicsCount} topics)</span>
+                      </div>
+                    )}
                   </div>
                   <button
                     onClick={() => setConfirmAction('rebuildHierarchyOnly')}
@@ -1819,7 +1835,11 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   <div className="flex-1 min-w-0">
                     <div className="text-sm font-medium text-gray-200">Reclassify (AI)</div>
                     <div className="text-xs text-gray-500">Re-run content_type classification using AI (Haiku)</div>
-                    <div className="text-xs text-cyan-400 mt-0.5">~$0.04 for 4000 items · Better accuracy</div>
+                    {dbStats && (
+                      <div className="text-xs text-cyan-400 mt-0.5">
+                        {dbStats.totalItems} items · Haiku {estimateCost(dbStats.totalItems, 'haiku', 105, 'classify')}
+                      </div>
+                    )}
                   </div>
                   <button
                     onClick={() => setConfirmAction('reclassifyAi')}
@@ -1857,7 +1877,11 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   <div className="flex-1 min-w-0">
                     <div className="text-sm font-medium text-gray-200">Score Privacy</div>
                     <div className="text-xs text-gray-500">AI scores items 0.0 (private) to 1.0 (public) for clustering separation</div>
-                    <div className="text-xs text-amber-400 mt-0.5">~$0.30 for 4700 items · 25 items/batch</div>
+                    {dbStats && (
+                      <div className="text-xs text-amber-400 mt-0.5">
+                        {dbStats.totalItems} items · Haiku {estimateCost(dbStats.totalItems, 'haiku', 105, 'classify')}
+                      </div>
+                    )}
                   </div>
                   <button
                     onClick={() => setConfirmAction('scorePrivacy')}

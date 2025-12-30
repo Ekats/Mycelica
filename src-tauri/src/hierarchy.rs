@@ -1956,18 +1956,35 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
         estimate_secs: None,
         remaining_secs: None,
     });
-    emit_log(app, "info", "Scanning item titles for major project names...");
+    emit_log(app, "info", "Collecting capitalized words from titles...");
 
-    let major_projects = ai_client::detect_major_projects_globally(db);
+    // Step 1: Collect ALL capitalized words (very loose, 5+ occurrences)
+    let candidates = ai_client::collect_capitalized_words(db);
     let mut project_umbrellas_created = 0;
 
-    if major_projects.is_empty() {
-        emit_log(app, "info", "No major projects detected (need 2%+ of items, min 20)");
+    if candidates.is_empty() {
+        emit_log(app, "info", "No capitalized words found (need 5+ occurrences)");
     } else {
-        emit_log(app, "info", &format!("Found {} major projects:", major_projects.len()));
-        for project in &major_projects {
-            emit_log(app, "info", &format!("  • {} ({} items, {:.1}%)", project.name, project.item_count, project.percentage));
+        emit_log(app, "info", &format!("Found {} capitalized words, asking AI to detect projects...", candidates.len()));
+
+        // Show top 10 candidates
+        for candidate in candidates.iter().take(10) {
+            emit_log(app, "info", &format!("  {} ({} occurrences)", candidate.word, candidate.count));
         }
+        if candidates.len() > 10 {
+            emit_log(app, "info", &format!("  ... and {} more", candidates.len() - 10));
+        }
+
+        // Step 2: AI detects which are actual user projects
+        let major_projects = ai_client::detect_projects_with_ai(db, candidates).await;
+
+        if major_projects.is_empty() {
+            emit_log(app, "info", "AI detected no user projects");
+        } else {
+            emit_log(app, "info", &format!("AI detected {} user projects:", major_projects.len()));
+            for project in &major_projects {
+                emit_log(app, "info", &format!("  ✓ {} ({} items, {:.1}%)", project.name, project.item_count, project.percentage));
+            }
 
         // Get universe node
         let universe = db.get_universe().map_err(|e| e.to_string())?
@@ -2058,7 +2075,8 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
             emit_log(app, "info", &format!("  ✓ Created '{}' umbrella with {} topics", project.name, moved_count));
             project_umbrellas_created += 1;
         }
-    }
+        } // end inner else (AI validated projects)
+    } // end outer else (candidate_projects not empty)
 
     if project_umbrellas_created > 0 {
         emit_log(app, "info", &format!("✓ Created {} project umbrella categories", project_umbrellas_created));
@@ -2095,8 +2113,20 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
             emit_log(app, "info", &format!("  Using {} persistent tags as category anchors", tag_anchors.len()));
         }
 
-        // Call AI to group into uber-categories (batched for large sets)
-        match ai_client::group_into_uber_categories(&categories, Some(&tag_anchors)).await {
+        // Pre-fetch embeddings for similarity-sorted batching
+        let embeddings_map: std::collections::HashMap<String, Vec<f32>> = categories
+            .iter()
+            .filter_map(|c| {
+                db.get_node_embedding(&c.id)
+                    .ok()
+                    .flatten()
+                    .map(|emb| (c.id.clone(), emb))
+            })
+            .collect();
+        emit_log(app, "info", &format!("  Fetched {}/{} topic embeddings for similarity sorting", embeddings_map.len(), categories.len()));
+
+        // Call AI to group into uber-categories (similarity-sorted batching for coherent groups)
+        match ai_client::group_into_uber_categories(&categories, &embeddings_map, Some(&tag_anchors)).await {
             Ok(groupings) if !groupings.is_empty() => {
                 // Filter out garbage names from uber-categories (same pattern as cluster_hierarchy_level)
                 let groupings: Vec<_> = groupings.into_iter()
