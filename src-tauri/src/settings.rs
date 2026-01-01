@@ -51,6 +51,15 @@ pub struct Settings {
     pub use_local_embeddings: bool,
     #[serde(default = "default_cache_ttl")]
     pub similarity_cache_ttl_secs: u64,
+    /// Manual override for primary clustering threshold (None = use adaptive)
+    #[serde(default)]
+    pub clustering_primary_threshold: Option<f32>,
+    /// Manual override for secondary clustering threshold (None = use adaptive)
+    #[serde(default)]
+    pub clustering_secondary_threshold: Option<f32>,
+    /// Privacy threshold - items below this go to Personal category (default: 0.5)
+    #[serde(default = "default_privacy_threshold")]
+    pub privacy_threshold: f32,
 }
 
 fn default_cache_ttl() -> u64 {
@@ -59,6 +68,10 @@ fn default_cache_ttl() -> u64 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_privacy_threshold() -> f32 {
+    0.5 // Items below this go to Personal category
 }
 
 impl Default for Settings {
@@ -71,6 +84,9 @@ impl Default for Settings {
             protect_recent_notes: true,
             use_local_embeddings: true, // Local embeddings are optimized for clustering
             similarity_cache_ttl_secs: 300, // 5 minutes
+            clustering_primary_threshold: Some(0.75), // Tighter clusters for better accuracy
+            clustering_secondary_threshold: Some(0.60), // Secondary assignment threshold
+            privacy_threshold: 0.5, // Items below this go to Personal category
         }
     }
 }
@@ -389,14 +405,14 @@ pub const RECENT_NOTES_CONTAINER_ID: &str = "container-recent-notes";
 
 // ==================== Local Embeddings ====================
 
-/// Check if local embeddings are enabled (default: false)
+/// Check if local embeddings are enabled (default: true)
 pub fn use_local_embeddings() -> bool {
     let guard = SETTINGS.read().ok();
     guard
         .as_ref()
         .and_then(|g| g.as_ref())
         .map(|s| s.use_local_embeddings)
-        .unwrap_or(false) // Default to OpenAI
+        .unwrap_or(true) // Default to local (matches struct default)
 }
 
 /// Set local embeddings preference
@@ -429,4 +445,74 @@ pub fn similarity_cache_ttl_secs() -> u64 {
         .and_then(|g| g.as_ref())
         .map(|s| s.similarity_cache_ttl_secs)
         .unwrap_or(300)
+}
+
+// ==================== Clustering Thresholds ====================
+
+/// Get clustering thresholds (primary, secondary) - None means use adaptive
+pub fn get_clustering_thresholds() -> (Option<f32>, Option<f32>) {
+    let guard = SETTINGS.read().ok();
+    guard
+        .as_ref()
+        .and_then(|g| g.as_ref())
+        .map(|s| (s.clustering_primary_threshold, s.clustering_secondary_threshold))
+        .unwrap_or((None, None))
+}
+
+/// Set clustering thresholds (None = use adaptive defaults)
+pub fn set_clustering_thresholds(primary: Option<f32>, secondary: Option<f32>) -> Result<(), String> {
+    let mut settings_guard = SETTINGS.write()
+        .map_err(|_| "Failed to acquire settings lock")?;
+
+    let settings = settings_guard.get_or_insert_with(Settings::default);
+    settings.clustering_primary_threshold = primary;
+    settings.clustering_secondary_threshold = secondary;
+
+    // Save to disk
+    let config_path = CONFIG_PATH.read()
+        .map_err(|_| "Failed to acquire config path lock")?
+        .clone()
+        .ok_or("Settings not initialized")?;
+
+    settings.save(&config_path)?;
+
+    println!("Clustering thresholds set to: primary={:?}, secondary={:?}", primary, secondary);
+    Ok(())
+}
+
+// ==================== Privacy Threshold ====================
+
+/// Get privacy threshold (items below this go to Personal category)
+pub fn get_privacy_threshold() -> f32 {
+    let guard = SETTINGS.read().ok();
+    guard
+        .as_ref()
+        .and_then(|g| g.as_ref())
+        .map(|s| s.privacy_threshold)
+        .unwrap_or(0.5)
+}
+
+/// Set privacy threshold
+pub fn set_privacy_threshold(threshold: f32) -> Result<(), String> {
+    // Validate range
+    if threshold < 0.0 || threshold > 1.0 {
+        return Err("Privacy threshold must be between 0.0 and 1.0".to_string());
+    }
+
+    let mut settings_guard = SETTINGS.write()
+        .map_err(|_| "Failed to acquire settings lock")?;
+
+    let settings = settings_guard.get_or_insert_with(Settings::default);
+    settings.privacy_threshold = threshold;
+
+    // Save to disk
+    let config_path = CONFIG_PATH.read()
+        .map_err(|_| "Failed to acquire config path lock")?
+        .clone()
+        .ok_or("Settings not initialized")?;
+
+    settings.save(&config_path)?;
+
+    println!("Privacy threshold set to: {}", threshold);
+    Ok(())
 }

@@ -551,22 +551,52 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
     synopsisGroups.each(function(d) {
       if (!d.displayContent) return;
       const g = d3.select(this);
-      const items = d.displayContent.split(', ').filter(s => s.trim()).slice(0, 5);
-      const maxChars = 24;
+      const items = d.displayContent.split(', ').filter(s => s.trim());
+      const maxChars = 26;
       const lineHeight = 28;
+      const maxLines = Math.floor(synopsisHeight / lineHeight);
+      let lineNum = 0;
 
-      items.forEach((item, i) => {
-        const truncated = item.length > maxChars ? item.slice(0, maxChars - 3) + '...' : item;
-        g.append('text')
-          .attr('x', 0)
-          .attr('y', i * lineHeight)
-          .attr('font-family', CARD_FONT)
-          .attr('font-size', '20px')
-          .attr('font-weight', '500')
-          .attr('fill', '#ffffff')
-          .style('pointer-events', 'none')
-          .text(`• ${truncated}`);
-      });
+      for (const item of items) {
+        if (lineNum >= maxLines) break;
+
+        // Wrap item text to fit box width
+        const words = (`• ${item}`).split(' ');
+        let line = '';
+        for (const word of words) {
+          if (lineNum >= maxLines) break;
+          const test = line ? line + ' ' + word : word;
+          if (test.length <= maxChars) {
+            line = test;
+          } else {
+            if (line) {
+              g.append('text')
+                .attr('x', 0)
+                .attr('y', lineNum * lineHeight)
+                .attr('font-family', CARD_FONT)
+                .attr('font-size', '20px')
+                .attr('font-weight', '500')
+                .attr('fill', '#ffffff')
+                .style('pointer-events', 'none')
+                .text(line);
+              lineNum++;
+            }
+            line = '  ' + word; // continuation indented
+          }
+        }
+        if (line && lineNum < maxLines) {
+          g.append('text')
+            .attr('x', 0)
+            .attr('y', lineNum * lineHeight)
+            .attr('font-family', CARD_FONT)
+            .attr('font-size', '20px')
+            .attr('font-weight', '500')
+            .attr('fill', '#ffffff')
+            .style('pointer-events', 'none')
+            .text(line);
+          lineNum++;
+        }
+      }
     });
 
     // Footer background

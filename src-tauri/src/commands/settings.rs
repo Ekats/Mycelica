@@ -120,3 +120,33 @@ pub fn get_db_metadata(state: State<AppState>) -> Result<Vec<(String, String, i6
     let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
     db.get_all_metadata().map_err(|e| e.to_string())
 }
+
+// ==================== Clustering Thresholds ====================
+
+/// Get clustering thresholds (primary, secondary)
+/// Returns (None, None) for adaptive defaults
+#[tauri::command]
+pub fn get_clustering_thresholds() -> (Option<f32>, Option<f32>) {
+    settings::get_clustering_thresholds()
+}
+
+/// Set clustering thresholds
+/// Pass None for either to use adaptive defaults
+#[tauri::command]
+pub fn set_clustering_thresholds(primary: Option<f32>, secondary: Option<f32>) -> Result<(), String> {
+    settings::set_clustering_thresholds(primary, secondary)
+}
+
+// ==================== Privacy Threshold ====================
+
+/// Get privacy threshold (items below this go to Personal category)
+#[tauri::command]
+pub fn get_privacy_threshold() -> f32 {
+    settings::get_privacy_threshold()
+}
+
+/// Set privacy threshold (0.0 to 1.0)
+#[tauri::command]
+pub fn set_privacy_threshold(threshold: f32) -> Result<(), String> {
+    settings::set_privacy_threshold(threshold)
+}

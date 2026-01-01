@@ -15,7 +15,7 @@ use crate::ai_client::{self, TopicInfo};
 use crate::settings;
 use crate::commands::is_rebuild_cancelled;
 use crate::classification;
-use crate::similarity::cosine_similarity;
+use crate::similarity::{cosine_similarity, compute_centroid};
 use rand::Rng;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -31,6 +31,28 @@ fn safe_truncate(s: &str, max_bytes: usize) -> &str {
     }
     &s[..end]
 }
+
+/// Compute and store centroid embedding for a parent node from its children's embeddings
+/// This enables similarity-based grouping of intermediate nodes (topics/categories)
+fn compute_and_store_centroid(db: &Database, parent_id: &str) {
+    let children = match db.get_children(parent_id) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let child_embeddings: Vec<Vec<f32>> = children
+        .iter()
+        .filter_map(|c| db.get_node_embedding(&c.id).ok().flatten())
+        .collect();
+
+    if !child_embeddings.is_empty() {
+        let refs: Vec<&[f32]> = child_embeddings.iter().map(|e| e.as_slice()).collect();
+        if let Some(centroid) = compute_centroid(&refs) {
+            let _ = db.update_node_embedding(parent_id, &centroid);
+        }
+    }
+}
+
 use tauri::{AppHandle, Emitter};
 use tokio::time::{timeout, Duration};
 
@@ -304,13 +326,14 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
         println!("[Hierarchy] Excluding {} protected items (Recent Notes)", protected_ids.len());
     }
 
-    // Step 2.5: Separate private items (privacy < 0.3) - they go to Personal category
+    // Step 2.5: Separate private items (privacy < threshold) - they go to Personal category
+    let privacy_threshold = crate::settings::get_privacy_threshold() as f64;
     let (private_items, items): (Vec<Node>, Vec<Node>) = after_protected
         .into_iter()
-        .partition(|item| item.privacy.map(|p| p < 0.3).unwrap_or(false));
+        .partition(|item| item.privacy.map(|p| p < privacy_threshold).unwrap_or(false));
 
     if !private_items.is_empty() {
-        println!("[Hierarchy] Found {} private items (privacy < 0.3) - will go to Personal category", private_items.len());
+        println!("[Hierarchy] Found {} private items (privacy < {}) - will go to Personal category", private_items.len(), privacy_threshold);
     }
 
     let item_count = items.len();
@@ -440,6 +463,12 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
 
     println!("Created {} topic nodes", topics_created);
 
+    // Compute centroid embeddings for topic nodes (enables similarity-based uber-category grouping)
+    for topic_id in &topic_ids {
+        compute_and_store_centroid(db, topic_id);
+    }
+    println!("Computed centroid embeddings for {} topics", topic_ids.len());
+
     // Step 6: Create Universe (depth 0) and attach topics to it
     let universe_id = create_universe(db, &topic_ids)?;
 
@@ -477,7 +506,7 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
             cluster_id: None,
             cluster_label: Some("Personal".to_string()),
             ai_title: Some("Personal".to_string()),
-            summary: Some("Private items (privacy score < 0.3)".to_string()),
+            summary: Some(format!("Private items (privacy score < {})", privacy_threshold)),
             tags: None,
             emoji: Some("🔒".to_string()),
             is_processed: true,
@@ -1295,6 +1324,14 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
         db.update_child_count(category_id, actual_count).map_err(|e| e.to_string())?;
     }
 
+    // Compute centroid embeddings for new categories (enables similarity-based grouping)
+    for category_id in &created_category_ids {
+        compute_and_store_centroid(db, category_id);
+    }
+    if !created_category_ids.is_empty() {
+        emit_log(app, "info", &format!("Computed centroid embeddings for {} categories", created_category_ids.len()));
+    }
+
     // SET depths for reparented children to correct value (not increment!)
     // Children are now under categories at new_intermediate_depth, so they should be at new_intermediate_depth + 1
     // This prevents depth explosion from accumulated increments across multiple grouping iterations.
@@ -1766,6 +1803,14 @@ async fn cluster_items_by_embedding(
     for category_id in &created_category_ids {
         let actual = db.get_children(category_id).map_err(|e| e.to_string())?.len() as i32;
         db.update_child_count(category_id, actual).map_err(|e| e.to_string())?;
+    }
+
+    // 7. Compute centroid embeddings for new categories (enables similarity-based grouping)
+    for category_id in &created_category_ids {
+        compute_and_store_centroid(db, category_id);
+    }
+    if !created_category_ids.is_empty() {
+        emit_log(app, "info", &format!("Computed centroid embeddings for {} categories", created_category_ids.len()));
     }
 
     // Update parent's child count

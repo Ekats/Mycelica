@@ -1153,223 +1153,6 @@ pub fn delete_empty_nodes(state: State<AppState>) -> Result<usize, String> {
     state.db.read().map_err(|e| format!("DB lock error: {}", e))?.delete_empty_items().map_err(|e| e.to_string())
 }
 
-/// Result of quick_add_to_hierarchy
-#[derive(Debug, serde::Serialize)]
-pub struct QuickAddResult {
-    pub items_added: usize,
-    pub topics_created: usize,
-    pub items_skipped: usize,
-    pub inbox_count: usize,  // Items in Inbox - prompt rebuild when > 20
-}
-
-/// Quickly add orphaned items to existing hierarchy without full rebuild
-/// For small additions (1-10 items) - takes ~2 seconds instead of 30 minutes
-/// New clusters go into "📥 Inbox" category to avoid cluttering top-level
-#[tauri::command]
-pub async fn quick_add_to_hierarchy(
-    state: State<'_, AppState>,
-) -> Result<QuickAddResult, String> {
-    use crate::db::{Node, NodeType, Position};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    const INBOX_ID: &str = "inbox-category";
-    const INBOX_TITLE: &str = "📥 Inbox";
-
-    // Get orphaned items that have been clustered but not added to hierarchy
-    let orphans = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_orphaned_clustered_items().map_err(|e| e.to_string())?;
-
-    if orphans.is_empty() {
-        // Still return inbox count for UI
-        let inbox_count = match state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_node(INBOX_ID) {
-            Ok(Some(inbox)) => inbox.child_count as usize,
-            _ => 0,
-        };
-        return Ok(QuickAddResult {
-            items_added: 0,
-            topics_created: 0,
-            items_skipped: 0,
-            inbox_count,
-        });
-    }
-
-    println!("[QuickAdd] Found {} orphaned items to add", orphans.len());
-
-    let mut items_added = 0;
-    let mut topics_created = 0;
-    let mut items_skipped = 0;
-
-    // Get Universe for fallback parent
-    let universe = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_universe()
-        .map_err(|e| e.to_string())?
-        .ok_or("No Universe node found - run full hierarchy build first")?;
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-
-    // Get or create Inbox category for new topics
-    let inbox_depth = universe.depth + 1;
-    let inbox = match state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_node(INBOX_ID).map_err(|e| e.to_string())? {
-        Some(existing) => existing,
-        None => {
-            // Create Inbox category
-            let inbox_node = Node {
-                id: INBOX_ID.to_string(),
-                title: INBOX_TITLE.to_string(),
-                node_type: NodeType::Cluster,
-                url: None,
-                content: None,
-                position: Position { x: 0.0, y: 0.0 },
-                created_at: now,
-                updated_at: now,
-                cluster_id: None,
-                cluster_label: Some("Inbox".to_string()),
-                depth: inbox_depth,
-                is_item: false,
-                is_universe: false,
-                parent_id: Some(universe.id.clone()),
-                child_count: 0,
-                ai_title: None,
-                summary: Some("New items awaiting organization".to_string()),
-                tags: None,
-                emoji: Some("📥".to_string()),
-                is_processed: true,
-                conversation_id: None,
-                sequence_index: None,
-                is_pinned: false,
-                last_accessed_at: None,
-                latest_child_date: None,
-                is_private: None,
-                privacy_reason: None,
-                source: None,
-                content_type: None,
-                associated_idea_id: None,
-                privacy: None,
-            };
-            state.db.read().map_err(|e| format!("DB lock error: {}", e))?.insert_node(&inbox_node).map_err(|e| e.to_string())?;
-            state.db.read().map_err(|e| format!("DB lock error: {}", e))?.increment_child_count(&universe.id).map_err(|e| e.to_string())?;
-            println!("[QuickAdd] Created 📥 Inbox category");
-            inbox_node
-        }
-    };
-
-    for item in orphans {
-        // Skip items without cluster_label
-        let cluster_label = match &item.cluster_label {
-            Some(label) => label.clone(),
-            None => {
-                println!("[QuickAdd] Skipping {} - no cluster_label", item.id);
-                items_skipped += 1;
-                continue;
-            }
-        };
-
-        // Try to find existing topic with matching cluster_label
-        let topic = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.find_topic_by_cluster_label(&cluster_label)
-            .map_err(|e| e.to_string())?;
-
-        match topic {
-            Some(existing_topic) => {
-                // Add item to existing topic
-                let item_depth = existing_topic.depth + 1;
-                state.db.read().map_err(|e| format!("DB lock error: {}", e))?.set_node_parent(&item.id, &existing_topic.id, item_depth)
-                    .map_err(|e| e.to_string())?;
-                state.db.read().map_err(|e| format!("DB lock error: {}", e))?.increment_child_count(&existing_topic.id)
-                    .map_err(|e| e.to_string())?;
-
-                println!("[QuickAdd] Added '{}' to existing topic '{}'",
-                    item.ai_title.as_ref().unwrap_or(&item.title),
-                    existing_topic.title);
-                items_added += 1;
-            }
-            None => {
-                // Create new topic under Inbox (not Universe)
-                let topic_id = format!("topic-quick-{}", item.cluster_id.unwrap_or(0));
-
-                // Check if this topic already exists (might have been created in this batch)
-                if let Ok(Some(_)) = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_node(&topic_id) {
-                    // Topic was just created, add item to it
-                    let topic_depth = inbox_depth + 1;
-                    let item_depth = topic_depth + 1;
-                    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.set_node_parent(&item.id, &topic_id, item_depth)
-                        .map_err(|e| e.to_string())?;
-                    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.increment_child_count(&topic_id)
-                        .map_err(|e| e.to_string())?;
-                    items_added += 1;
-                    continue;
-                }
-
-                // Create new topic node under Inbox
-                let topic_depth = inbox_depth + 1;
-                let topic_node = Node {
-                    id: topic_id.clone(),
-                    title: cluster_label.clone(),
-                    node_type: NodeType::Cluster,
-                    url: None,
-                    content: None,
-                    position: Position { x: 0.0, y: 0.0 },
-                    created_at: now,
-                    updated_at: now,
-                    cluster_id: item.cluster_id,
-                    cluster_label: Some(cluster_label.clone()),
-                    depth: topic_depth,
-                    is_item: false,
-                    is_universe: false,
-                    parent_id: Some(inbox.id.clone()),  // Under Inbox, not Universe
-                    child_count: 1, // The item we're adding
-                    ai_title: None,
-                    summary: Some(format!("New topic: {}", cluster_label)),
-                    tags: None,
-                    emoji: None,
-                    is_processed: false,
-                    conversation_id: None,
-                    sequence_index: None,
-                    is_pinned: false,
-                    last_accessed_at: None,
-                    latest_child_date: Some(item.created_at),
-                    is_private: None,
-                    privacy_reason: None,
-                    source: None,
-                    content_type: None,
-                    associated_idea_id: None,
-                    privacy: None,
-                };
-
-                state.db.read().map_err(|e| format!("DB lock error: {}", e))?.insert_node(&topic_node).map_err(|e| e.to_string())?;
-                state.db.read().map_err(|e| format!("DB lock error: {}", e))?.increment_child_count(&inbox.id).map_err(|e| e.to_string())?;
-                topics_created += 1;
-
-                // Add item to new topic
-                let item_depth = topic_depth + 1;
-                state.db.read().map_err(|e| format!("DB lock error: {}", e))?.set_node_parent(&item.id, &topic_id, item_depth)
-                    .map_err(|e| e.to_string())?;
-
-                println!("[QuickAdd] Created new topic '{}' under Inbox for '{}'",
-                    cluster_label,
-                    item.ai_title.as_ref().unwrap_or(&item.title));
-                items_added += 1;
-            }
-        }
-    }
-
-    // Get final inbox count
-    let inbox_count = match state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_node(INBOX_ID) {
-        Ok(Some(inbox)) => inbox.child_count as usize,
-        _ => 0,
-    };
-
-    println!("[QuickAdd] Done: {} items added, {} topics created, {} skipped, {} in Inbox",
-        items_added, topics_created, items_skipped, inbox_count);
-
-    Ok(QuickAddResult {
-        items_added,
-        topics_created,
-        items_skipped,
-        inbox_count,
-    })
-}
-
 /// Flatten empty passthrough levels in hierarchy
 /// Removes single-child chains and "Uncategorized" passthrough nodes
 #[tauri::command]
@@ -2137,5 +1920,440 @@ pub async fn rebuild_hierarchy_only(
         clusters_created: 0,
         hierarchy_levels: result.levels_created,
         method: "hierarchy-only".to_string(),
+    })
+}
+
+// ==================== Smart Add (10-50 items) ====================
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmartAddResult {
+    pub orphans_found: usize,
+    pub matched_to_existing: usize,
+    pub new_topics_created: usize,
+    pub sent_to_inbox: usize,
+    pub processing_time_ms: u64,
+}
+
+/// Smart add orphaned items to hierarchy using embedding similarity
+/// For medium batches (10-50 items) - faster than full rebuild, smarter than quick add
+/// Uses embedding similarity to match items to existing topics
+#[tauri::command]
+pub async fn smart_add_to_hierarchy(
+    state: State<'_, AppState>,
+) -> Result<SmartAddResult, String> {
+    use crate::db::{Node, NodeType, Position};
+    use crate::similarity::cosine_similarity;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::collections::HashMap;
+
+    let start = Instant::now();
+    const INBOX_ID: &str = "inbox-category";
+    const INBOX_TITLE: &str = "📥 Inbox";
+
+    // Content types to exclude (SUPPORTING and HIDDEN tiers)
+    const EXCLUDED_TYPES: &[&str] = &[
+        "investigation", "discussion", "reference", "creative",  // SUPPORTING
+        "debug", "code", "paste", "trivial",                     // HIDDEN
+    ];
+
+    // Get clustering thresholds
+    let (_, secondary_threshold) = crate::settings::get_clustering_thresholds();
+    let similarity_threshold = secondary_threshold.unwrap_or(0.60);
+
+    // Get orphaned items (processed, with cluster_id)
+    let all_orphans = state.db.read()
+        .map_err(|e| format!("DB lock error: {}", e))?
+        .get_orphaned_clustered_items()
+        .map_err(|e| e.to_string())?;
+
+    // Filter out SUPPORTING/HIDDEN content types
+    let orphans: Vec<Node> = all_orphans
+        .into_iter()
+        .filter(|item| {
+            match &item.content_type {
+                Some(ct) => !EXCLUDED_TYPES.contains(&ct.as_str()),
+                None => true, // Include items without content_type
+            }
+        })
+        .collect();
+
+    if orphans.is_empty() {
+        return Ok(SmartAddResult {
+            orphans_found: 0,
+            matched_to_existing: 0,
+            new_topics_created: 0,
+            sent_to_inbox: 0,
+            processing_time_ms: start.elapsed().as_millis() as u64,
+        });
+    }
+
+    println!("[SmartAdd] Found {} orphaned items to process", orphans.len());
+
+    // Get Universe
+    let universe = state.db.read()
+        .map_err(|e| format!("DB lock error: {}", e))?
+        .get_universe()
+        .map_err(|e| e.to_string())?
+        .ok_or("No Universe node found - run full hierarchy build first")?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    // Get or create Inbox category
+    let inbox_depth = universe.depth + 1;
+    let inbox = match state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_node(INBOX_ID).map_err(|e| e.to_string())? {
+        Some(existing) => existing,
+        None => {
+            let inbox_node = Node {
+                id: INBOX_ID.to_string(),
+                title: INBOX_TITLE.to_string(),
+                node_type: NodeType::Cluster,
+                url: None,
+                content: None,
+                position: Position { x: 0.0, y: 0.0 },
+                created_at: now,
+                updated_at: now,
+                cluster_id: None,
+                cluster_label: Some("Inbox".to_string()),
+                depth: inbox_depth,
+                is_item: false,
+                is_universe: false,
+                parent_id: Some(universe.id.clone()),
+                child_count: 0,
+                ai_title: None,
+                summary: Some("New items awaiting organization".to_string()),
+                tags: None,
+                emoji: Some("📥".to_string()),
+                is_processed: true,
+                conversation_id: None,
+                sequence_index: None,
+                is_pinned: false,
+                last_accessed_at: None,
+                latest_child_date: None,
+                is_private: None,
+                privacy_reason: None,
+                source: None,
+                content_type: None,
+                associated_idea_id: None,
+                privacy: None,
+            };
+            state.db.read().map_err(|e| format!("DB lock error: {}", e))?.insert_node(&inbox_node).map_err(|e| e.to_string())?;
+            state.db.read().map_err(|e| format!("DB lock error: {}", e))?.increment_child_count(&universe.id).map_err(|e| e.to_string())?;
+            println!("[SmartAdd] Created 📥 Inbox category");
+            inbox_node
+        }
+    };
+
+    // Get all topic nodes (non-items with embeddings) and their centroids
+    // A topic is any non-item, non-universe node that has children
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+
+    // Build a map of topic_id -> stored centroid embedding
+    // Topics already have centroids computed during hierarchy build
+    let mut topic_centroids: HashMap<String, Vec<f32>> = HashMap::new();
+
+    // Get all non-item nodes as potential topics
+    let all_nodes = db.get_all_nodes().map_err(|e| e.to_string())?;
+    let topic_nodes: Vec<&Node> = all_nodes.iter()
+        .filter(|n| !n.is_item && !n.is_universe && n.id != INBOX_ID)
+        .collect();
+
+    println!("[SmartAdd] Found {} potential topic nodes", topic_nodes.len());
+
+    // Fetch stored embeddings directly (topics have centroids from hierarchy build)
+    for topic in &topic_nodes {
+        if let Some(emb) = db.get_node_embedding(&topic.id).ok().flatten() {
+            topic_centroids.insert(topic.id.clone(), emb);
+        }
+    }
+
+    // Pre-fetch orphan embeddings and build topic lookup map
+    let mut orphan_embeddings: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut topic_nodes_map: HashMap<String, Node> = HashMap::new();
+
+    for orphan in &orphans {
+        if let Some(emb) = db.get_node_embedding(&orphan.id).ok().flatten() {
+            orphan_embeddings.insert(orphan.id.clone(), emb);
+        }
+    }
+
+    for topic in topic_nodes {
+        topic_nodes_map.insert(topic.id.clone(), topic.clone());
+    }
+
+    drop(db); // Release lock before processing
+
+    println!("[SmartAdd] Loaded centroids for {} topics, {} orphan embeddings",
+        topic_centroids.len(), orphan_embeddings.len());
+
+    let mut matched_to_existing = 0;
+    let mut sent_to_inbox = 0;
+    let mut new_topics_created = 0;
+    let mut unmatched_items: Vec<Node> = Vec::new();
+
+    // Process each orphan using pre-fetched data
+    for item in orphans.iter() {
+        // Get pre-fetched embedding
+        let item_emb = match orphan_embeddings.get(&item.id) {
+            Some(emb) => emb,
+            None => {
+                // No embedding - fall back to cluster_label matching
+                if let Some(ref label) = item.cluster_label {
+                    if let Ok(Some(topic)) = state.db.read()
+                        .map_err(|e| format!("DB lock error: {}", e))?
+                        .find_topic_by_cluster_label(label)
+                    {
+                        let item_depth = topic.depth + 1;
+                        let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+                        db.set_node_parent(&item.id, &topic.id, item_depth)
+                            .map_err(|e| e.to_string())?;
+                        db.increment_child_count(&topic.id)
+                            .map_err(|e| e.to_string())?;
+                        matched_to_existing += 1;
+                        println!("[SmartAdd] Matched '{}' to '{}' by cluster_label",
+                            item.ai_title.as_ref().unwrap_or(&item.title), topic.title);
+                        continue;
+                    }
+                }
+                // No embedding and no cluster_label match - add to unmatched
+                unmatched_items.push(item.clone());
+                continue;
+            }
+        };
+
+        // Find best matching topic by embedding similarity
+        let mut best_topic: Option<(String, f32)> = None;
+        for (topic_id, centroid) in &topic_centroids {
+            let similarity = cosine_similarity(item_emb, centroid);
+            if similarity > similarity_threshold {
+                if best_topic.is_none() || similarity > best_topic.as_ref().unwrap().1 {
+                    best_topic = Some((topic_id.clone(), similarity));
+                }
+            }
+        }
+
+        if let Some((topic_id, similarity)) = best_topic {
+            // Found a good match - use pre-fetched topic data
+            let topic = topic_nodes_map.get(&topic_id)
+                .ok_or_else(|| format!("Topic {} not found", topic_id))?;
+
+            let item_depth = topic.depth + 1;
+            let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+            db.set_node_parent(&item.id, &topic_id, item_depth)
+                .map_err(|e| e.to_string())?;
+            db.increment_child_count(&topic_id)
+                .map_err(|e| e.to_string())?;
+
+            println!("[SmartAdd] Matched '{}' to '{}' (similarity: {:.3})",
+                item.ai_title.as_ref().unwrap_or(&item.title),
+                topic.title,
+                similarity);
+            matched_to_existing += 1;
+        } else {
+            // No good match - add to unmatched list
+            unmatched_items.push(item.clone());
+        }
+    }
+
+    println!("[SmartAdd] {} items matched, {} unmatched", matched_to_existing, unmatched_items.len());
+
+    // Handle unmatched items
+    if !unmatched_items.is_empty() {
+        if unmatched_items.len() < 5 {
+            // Few items - just put in Inbox
+            let topic_depth = inbox_depth + 1;
+            let item_depth = topic_depth + 1;
+
+            for item in &unmatched_items {
+                // Create a topic under Inbox if item has cluster_label
+                if let Some(ref label) = item.cluster_label {
+                    let topic_id = format!("topic-smart-{}", item.cluster_id.unwrap_or(0));
+
+                    // Check if topic exists
+                    let topic_exists = state.db.read()
+                        .map_err(|e| format!("DB lock error: {}", e))?
+                        .get_node(&topic_id)
+                        .map_err(|e| e.to_string())?
+                        .is_some();
+
+                    if !topic_exists {
+                        // Create new topic under Inbox
+                        let topic_node = Node {
+                            id: topic_id.clone(),
+                            title: label.clone(),
+                            node_type: NodeType::Cluster,
+                            url: None,
+                            content: None,
+                            position: Position { x: 0.0, y: 0.0 },
+                            created_at: now,
+                            updated_at: now,
+                            cluster_id: item.cluster_id,
+                            cluster_label: Some(label.clone()),
+                            depth: topic_depth,
+                            is_item: false,
+                            is_universe: false,
+                            parent_id: Some(inbox.id.clone()),
+                            child_count: 0,
+                            ai_title: None,
+                            summary: Some(format!("New topic: {}", label)),
+                            tags: None,
+                            emoji: None,
+                            is_processed: false,
+                            conversation_id: None,
+                            sequence_index: None,
+                            is_pinned: false,
+                            last_accessed_at: None,
+                            latest_child_date: Some(item.created_at),
+                            is_private: None,
+                            privacy_reason: None,
+                            source: None,
+                            content_type: None,
+                            associated_idea_id: None,
+                            privacy: None,
+                        };
+
+                        state.db.read().map_err(|e| format!("DB lock error: {}", e))?
+                            .insert_node(&topic_node)
+                            .map_err(|e| e.to_string())?;
+                        state.db.read().map_err(|e| format!("DB lock error: {}", e))?
+                            .increment_child_count(&inbox.id)
+                            .map_err(|e| e.to_string())?;
+                        new_topics_created += 1;
+                    }
+
+                    // Add item to the topic
+                    state.db.read().map_err(|e| format!("DB lock error: {}", e))?
+                        .set_node_parent(&item.id, &topic_id, item_depth)
+                        .map_err(|e| e.to_string())?;
+                    state.db.read().map_err(|e| format!("DB lock error: {}", e))?
+                        .increment_child_count(&topic_id)
+                        .map_err(|e| e.to_string())?;
+                } else {
+                    // No cluster_label - add directly to Inbox (one level below inbox)
+                    state.db.read().map_err(|e| format!("DB lock error: {}", e))?
+                        .set_node_parent(&item.id, &inbox.id, inbox_depth + 1)
+                        .map_err(|e| e.to_string())?;
+                    state.db.read().map_err(|e| format!("DB lock error: {}", e))?
+                        .increment_child_count(&inbox.id)
+                        .map_err(|e| e.to_string())?;
+                }
+                sent_to_inbox += 1;
+            }
+            println!("[SmartAdd] Sent {} items to Inbox", sent_to_inbox);
+        } else {
+            // 5+ unmatched items - cluster them into new topics
+            // Group by cluster_label first
+            let mut label_groups: HashMap<String, Vec<&Node>> = HashMap::new();
+            let mut no_label: Vec<&Node> = Vec::new();
+
+            for item in &unmatched_items {
+                match &item.cluster_label {
+                    Some(label) => {
+                        label_groups.entry(label.clone()).or_default().push(item);
+                    }
+                    None => no_label.push(item),
+                }
+            }
+
+            let topic_depth = inbox_depth + 1;
+            let item_depth = topic_depth + 1;
+
+            // Create topics for each label group
+            for (label, items) in label_groups {
+                let cluster_id = items[0].cluster_id.unwrap_or(0);
+                let topic_id = format!("topic-smart-{}", cluster_id);
+
+                // Check if topic exists
+                let existing = state.db.read()
+                    .map_err(|e| format!("DB lock error: {}", e))?
+                    .get_node(&topic_id)
+                    .map_err(|e| e.to_string())?;
+
+                if existing.is_none() {
+                    // Create new topic
+                    let topic_node = Node {
+                        id: topic_id.clone(),
+                        title: label.clone(),
+                        node_type: NodeType::Cluster,
+                        url: None,
+                        content: None,
+                        position: Position { x: 0.0, y: 0.0 },
+                        created_at: now,
+                        updated_at: now,
+                        cluster_id: Some(cluster_id),
+                        cluster_label: Some(label.clone()),
+                        depth: topic_depth,
+                        is_item: false,
+                        is_universe: false,
+                        parent_id: Some(inbox.id.clone()),
+                        child_count: 0,
+                        ai_title: None,
+                        summary: Some(format!("New topic: {}", label)),
+                        tags: None,
+                        emoji: None,
+                        is_processed: false,
+                        conversation_id: None,
+                        sequence_index: None,
+                        is_pinned: false,
+                        last_accessed_at: None,
+                        latest_child_date: None,
+                        is_private: None,
+                        privacy_reason: None,
+                        source: None,
+                        content_type: None,
+                        associated_idea_id: None,
+                        privacy: None,
+                    };
+
+                    state.db.read().map_err(|e| format!("DB lock error: {}", e))?
+                        .insert_node(&topic_node)
+                        .map_err(|e| e.to_string())?;
+                    state.db.read().map_err(|e| format!("DB lock error: {}", e))?
+                        .increment_child_count(&inbox.id)
+                        .map_err(|e| e.to_string())?;
+                    new_topics_created += 1;
+                }
+
+                // Add all items to this topic
+                for item in items {
+                    state.db.read().map_err(|e| format!("DB lock error: {}", e))?
+                        .set_node_parent(&item.id, &topic_id, item_depth)
+                        .map_err(|e| e.to_string())?;
+                    state.db.read().map_err(|e| format!("DB lock error: {}", e))?
+                        .increment_child_count(&topic_id)
+                        .map_err(|e| e.to_string())?;
+                    sent_to_inbox += 1;
+                }
+            }
+
+            // Items without labels go directly to Inbox (one level below inbox)
+            for item in no_label {
+                state.db.read().map_err(|e| format!("DB lock error: {}", e))?
+                    .set_node_parent(&item.id, &inbox.id, inbox_depth + 1)
+                    .map_err(|e| e.to_string())?;
+                state.db.read().map_err(|e| format!("DB lock error: {}", e))?
+                    .increment_child_count(&inbox.id)
+                    .map_err(|e| e.to_string())?;
+                sent_to_inbox += 1;
+            }
+
+            println!("[SmartAdd] Created {} new topics, sent {} items to Inbox",
+                new_topics_created, sent_to_inbox);
+        }
+    }
+
+    let elapsed = start.elapsed().as_millis() as u64;
+    println!("[SmartAdd] Complete in {}ms: {} matched, {} new topics, {} to inbox",
+        elapsed, matched_to_existing, new_topics_created, sent_to_inbox);
+
+    Ok(SmartAddResult {
+        orphans_found: orphans.len(),
+        matched_to_existing,
+        new_topics_created,
+        sent_to_inbox,
+        processing_time_ms: elapsed,
     })
 }

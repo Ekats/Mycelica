@@ -863,10 +863,11 @@ pub fn collect_capitalized_words(db: &crate::db::Database) -> Vec<CandidateWord>
         }
     }
 
-    // Return words with 5+ occurrences, sorted by count descending
+    // Return words with 3+ occurrences, sorted by count descending
+    // Lowered from 5 to catch smaller projects like crDroid customizations
     let mut candidates: Vec<CandidateWord> = word_stats
         .into_iter()
-        .filter(|(_, ids)| ids.len() >= 5)
+        .filter(|(_, ids)| ids.len() >= 3)
         .map(|(word, item_ids)| CandidateWord {
             word,
             count: item_ids.len(),
@@ -876,7 +877,7 @@ pub fn collect_capitalized_words(db: &crate::db::Database) -> Vec<CandidateWord>
 
     candidates.sort_by(|a, b| b.count.cmp(&a.count));
 
-    eprintln!("[ProjectDetection] Collected {} capitalized words with 5+ occurrences", candidates.len());
+    eprintln!("[ProjectDetection] Collected {} capitalized words with 3+ occurrences", candidates.len());
     candidates
 }
 
@@ -910,25 +911,29 @@ pub async fn detect_projects_with_ai(
         word_list.push_str(&format!("{}: {} occurrences\n", candidate.word, candidate.count));
     }
 
-    let prompt = format!(r#"Here are capitalized words found in a developer's knowledge base:
+    let prompt = format!(r#"Capitalized words from a developer's knowledge base:
 
 {}
-Which of these are names of SOFTWARE PROJECTS the user BUILT or WORKS ON (not libraries/frameworks they used, not generic English words)?
+Which are SOFTWARE PROJECTS the user BUILT or CUSTOMIZED (not libraries, not generic words)?
 
-Look for:
-- Unique/invented names (Mycelica, Tartubus, Breax)
-- Names that appear frequently and consistently
-- Proper nouns that aren't common tech terms
+Include:
+- Apps, tools, or systems the user created
+- Custom ROMs or Android forks (crDroid, LineageOS builds)
+- Firmware customizations (Klipper configs, custom firmware)
+- Game mods or projects they actively develop
 
 Exclude:
-- Libraries/frameworks (React, Node, Python, Rust)
-- Generic words (Progress, Status, Update, Debug, Error)
-- Technical terms (Implementation, Architecture, Configuration)
-- Common nouns that happen to be capitalized
+- Generic platform names (Android, Linux, Windows)
+- Libraries they just USE (React, Rust, Python)
+- Single generic words (Code, App, System)
 
-Return ONLY a JSON array of project names the user likely built.
-Example: ["Mycelica", "Tartubus"]
-If no user projects found: []"#, word_list);
+Return ONLY a raw JSON array. No markdown. No code fences. No explanation.
+Correct: ["Mycelica", "crDroid", "Klipper"]
+If none: []
+
+WRONG (will break parsing):
+- ```json ["..."] ```
+- Any text before or after the array"#, word_list);
 
     let request = AnthropicRequest {
         model: "claude-haiku-4-5-20251001".to_string(),
@@ -977,22 +982,41 @@ If no user projects found: []"#, word_list);
     }
 
     // Parse the JSON array response
-    let text = api_response
+    let raw_text = api_response
         .content
         .first()
         .map(|c| c.text.trim())
         .unwrap_or("[]");
 
-    // Extract project names from JSON array
-    let project_names: Vec<String> = match serde_json::from_str::<Vec<String>>(text) {
+    // Strip markdown fences if present (AI sometimes wraps in ```json ... ```)
+    let text = if raw_text.starts_with("```") {
+        raw_text.lines()
+            .skip(1)
+            .take_while(|l| !l.starts_with("```"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        raw_text.to_string()
+    };
+
+    // Find the JSON array brackets - extract only the [...] part
+    let text = text.trim();
+    let json_array = match (text.find('['), text.rfind(']')) {
+        (Some(start), Some(end)) if start < end => &text[start..=end],
+        _ => {
+            eprintln!("[ProjectDetection] No valid JSON array found in response: {}",
+                      &raw_text[..raw_text.len().min(100)]);
+            return vec![];
+        }
+    };
+
+    // Parse JSON - NO FALLBACK (the comma-split fallback caused garbage)
+    let project_names: Vec<String> = match serde_json::from_str::<Vec<String>>(json_array) {
         Ok(names) => names,
-        Err(_) => {
-            // Try to extract names manually if JSON parsing fails
-            text.trim_matches(|c| c == '[' || c == ']')
-                .split(',')
-                .map(|s| s.trim().trim_matches('"').to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
+        Err(e) => {
+            eprintln!("[ProjectDetection] JSON parse failed: {} - response: {}",
+                      e, &raw_text[..raw_text.len().min(200)]);
+            return vec![]; // Return empty, don't try to salvage garbage
         }
     };
 

@@ -26,7 +26,7 @@ use commands::{
     // Hierarchy commands
     get_nodes_at_depth, get_children, get_universe, get_items, get_max_depth,
     build_hierarchy, build_full_hierarchy, cluster_hierarchy_level, unsplit_node, get_children_flat,
-    propagate_latest_dates, quick_add_to_hierarchy,
+    propagate_latest_dates, smart_add_to_hierarchy,
     // Multi-path association commands
     get_item_associations, get_related_items, get_category_items,
     // Mini-clustering commands
@@ -57,6 +57,10 @@ use commands::{
     get_protect_recent_notes, set_protect_recent_notes,
     // Local embeddings commands
     get_use_local_embeddings, set_use_local_embeddings, regenerate_all_embeddings,
+    // Clustering thresholds commands
+    get_clustering_thresholds, set_clustering_thresholds,
+    // Privacy threshold commands
+    get_privacy_threshold, set_privacy_threshold,
 };
 use db::Database;
 use std::sync::Arc;
@@ -200,7 +204,7 @@ pub fn run() {
             cluster_hierarchy_level,
             unsplit_node,
             propagate_latest_dates,
-            quick_add_to_hierarchy,
+            smart_add_to_hierarchy,
             // Multi-path associations
             get_item_associations,
             get_related_items,
@@ -274,6 +278,11 @@ pub fn run() {
             get_use_local_embeddings,
             set_use_local_embeddings,
             regenerate_all_embeddings,
+            // Clustering thresholds
+            get_clustering_thresholds,
+            set_clustering_thresholds,
+            get_privacy_threshold,
+            set_privacy_threshold,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

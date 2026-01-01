@@ -18,7 +18,6 @@ import {
   Shield,
   Download,
   Cpu,
-  Network,
 } from 'lucide-react';
 import { ConfirmDialog } from './ConfirmDialog';
 
@@ -58,7 +57,7 @@ interface SettingsPanelProps {
   onDataChanged?: () => void;
 }
 
-type ConfirmAction = 'deleteAll' | 'resetAi' | 'resetClustering' | 'clearEmbeddings' | 'clearHierarchy' | 'clearTags' | 'resetPrivacy' | 'fullRebuild' | 'rebuildStructure' | 'flattenHierarchy' | 'consolidateRoot' | 'tidyDatabase' | 'scorePrivacy' | 'reclassifyPattern' | 'reclassifyAi' | 'rebuildLite' | 'rebuildHierarchyOnly' | null;
+type ConfirmAction = 'deleteAll' | 'resetAi' | 'resetClustering' | 'clearEmbeddings' | 'clearHierarchy' | 'clearTags' | 'resetPrivacy' | 'fullRebuild' | 'flattenHierarchy' | 'consolidateRoot' | 'tidyDatabase' | 'scorePrivacy' | 'reclassifyPattern' | 'reclassifyAi' | 'rebuildLite' | null;
 
 interface TidyReport {
   sameNameMerged: number;
@@ -143,7 +142,6 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
 
   // Operations
   const [isFullRebuilding, setIsFullRebuilding] = useState(false);
-  const [isRebuildingStructure, setIsRebuildingStructure] = useState(false);
   const [isFlattening, setIsFlattening] = useState(false);
   const [isConsolidating, setIsConsolidating] = useState(false);
   const [isTidying, setIsTidying] = useState(false);
@@ -151,7 +149,6 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const [isReclassifyingPattern, setIsReclassifyingPattern] = useState(false);
   const [isReclassifyingAi, setIsReclassifyingAi] = useState(false);
   const [isRebuildingLite, setIsRebuildingLite] = useState(false);
-  const [isRebuildingHierarchyOnly, setIsRebuildingHierarchyOnly] = useState(false);
   const [operationResult, setOperationResult] = useState<string | null>(null);
 
   // Setup flow operations
@@ -182,6 +179,17 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const [isRegeneratingEmbeddings, setIsRegeneratingEmbeddings] = useState(false);
   const [regenerateProgress, setRegenerateProgress] = useState<{ current: number; total: number; status: string } | null>(null);
 
+  // Clustering thresholds
+  const [clusteringPrimary, setClusteringPrimary] = useState<string>('');
+  const [clusteringSecondary, setClusteringSecondary] = useState<string>('');
+  const [savingThresholds, setSavingThresholds] = useState(false);
+  const [thresholdResult, setThresholdResult] = useState<string | null>(null);
+
+  // Privacy threshold (for Personal category separation)
+  const [privacyThresholdInput, setPrivacyThresholdInput] = useState<string>('0.5');
+  const [savingPrivacyThreshold, setSavingPrivacyThreshold] = useState(false);
+  const [privacyThresholdResult, setPrivacyThresholdResult] = useState<string | null>(null);
+
   // Load data on mount
   useEffect(() => {
     if (open) {
@@ -193,6 +201,8 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
       loadPrivacyStats();
       loadProtectionSettings();
       loadLocalEmbeddingsStatus();
+      loadClusteringThresholds();
+      loadPrivacyThresholdSetting();
       setImportResult(null);
       setActionResult(null);
       setPrivacyResult(null);
@@ -310,6 +320,75 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     } catch (err) {
       setActionResult(`Error: ${err}`);
     }
+  };
+
+  const loadClusteringThresholds = async () => {
+    try {
+      const [primary, secondary] = await invoke<[number | null, number | null]>('get_clustering_thresholds');
+      setClusteringPrimary(primary !== null ? primary.toString() : '');
+      setClusteringSecondary(secondary !== null ? secondary.toString() : '');
+    } catch (err) {
+      console.error('Failed to load clustering thresholds:', err);
+    }
+  };
+
+  const handleSaveClusteringThresholds = async () => {
+    setSavingThresholds(true);
+    setThresholdResult(null);
+    try {
+      const primary = clusteringPrimary ? parseFloat(clusteringPrimary) : null;
+      const secondary = clusteringSecondary ? parseFloat(clusteringSecondary) : null;
+
+      // Validate ranges
+      if (primary !== null && (primary < 0.3 || primary > 0.95)) {
+        setThresholdResult('Primary threshold must be between 0.3 and 0.95');
+        setSavingThresholds(false);
+        return;
+      }
+      if (secondary !== null && (secondary < 0.2 || secondary > 0.85)) {
+        setThresholdResult('Secondary threshold must be between 0.2 and 0.85');
+        setSavingThresholds(false);
+        return;
+      }
+
+      await invoke('set_clustering_thresholds', { primary, secondary });
+      setThresholdResult(primary && secondary
+        ? `Saved: ${primary}/${secondary}. Run Full Rebuild to apply.`
+        : 'Using adaptive thresholds. Run Full Rebuild to apply.');
+    } catch (err) {
+      setThresholdResult(`Error: ${err}`);
+    }
+    setSavingThresholds(false);
+  };
+
+  const loadPrivacyThresholdSetting = async () => {
+    try {
+      const threshold = await invoke<number>('get_privacy_threshold');
+      setPrivacyThresholdInput(threshold.toString());
+    } catch (err) {
+      console.error('Failed to load privacy threshold:', err);
+    }
+  };
+
+  const handleSavePrivacyThreshold = async () => {
+    setSavingPrivacyThreshold(true);
+    setPrivacyThresholdResult(null);
+    try {
+      const threshold = parseFloat(privacyThresholdInput);
+
+      // Validate range
+      if (isNaN(threshold) || threshold < 0.0 || threshold > 1.0) {
+        setPrivacyThresholdResult('Privacy threshold must be between 0.0 and 1.0');
+        setSavingPrivacyThreshold(false);
+        return;
+      }
+
+      await invoke('set_privacy_threshold', { threshold });
+      setPrivacyThresholdResult(`Saved: ${threshold}. Run Full Rebuild to apply.`);
+    } catch (err) {
+      setPrivacyThresholdResult(`Error: ${err}`);
+    }
+    setSavingPrivacyThreshold(false);
   };
 
   const handleRegenerateEmbeddings = async () => {
@@ -579,17 +658,19 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
       setQuickProcessStep('Clustering into topics...');
       await invoke('run_clustering');
 
-      // Step 3: Quick Add to hierarchy
+      // Step 3: Smart Add to hierarchy (uses embedding similarity)
       setQuickProcessStep('Adding to hierarchy...');
       const result = await invoke<{
-        items_added: number;
-        topics_created: number;
-        inbox_count: number;
-      }>('quick_add_to_hierarchy');
+        orphansFound: number;
+        matchedToExisting: number;
+        newTopicsCreated: number;
+        sentToInbox: number;
+        processingTimeMs: number;
+      }>('smart_add_to_hierarchy');
 
       setShowQuickProcessPrompt(false);
-      setInboxCount(result.inbox_count);
-      setImportResult(`Processed ${newItemCount} items → ${result.items_added} added, ${result.topics_created} new topics`);
+      setInboxCount(result.sentToInbox);
+      setImportResult(`Processed ${newItemCount} items → ${result.matchedToExisting} matched, ${result.newTopicsCreated} new topics (${result.processingTimeMs}ms)`);
       await loadDbStats();
       onDataChanged?.();
       window.location.reload();
@@ -679,21 +760,22 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     }
   };
 
-  const handleQuickAdd = async () => {
+  const handleSmartAdd = async () => {
     setIsQuickAdding(true);
     setSetupResult(null);
     try {
       const result = await invoke<{
-        items_added: number;
-        topics_created: number;
-        items_skipped: number;
-        inbox_count: number;
-      }>('quick_add_to_hierarchy');
-      setInboxCount(result.inbox_count);
-      if (result.items_added === 0 && result.topics_created === 0) {
+        orphansFound: number;
+        matchedToExisting: number;
+        newTopicsCreated: number;
+        sentToInbox: number;
+        processingTimeMs: number;
+      }>('smart_add_to_hierarchy');
+      setInboxCount(result.sentToInbox);
+      if (result.matchedToExisting === 0 && result.newTopicsCreated === 0) {
         setSetupResult('No orphan items to add');
       } else {
-        setSetupResult(`Added ${result.items_added} items, created ${result.topics_created} topics`);
+        setSetupResult(`Added ${result.matchedToExisting} to existing topics, ${result.newTopicsCreated} new topics, ${result.sentToInbox} to Inbox (${result.processingTimeMs}ms)`);
       }
       await loadDbStats();
       onDataChanged?.();
@@ -787,31 +869,6 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
           return msg;
         } finally {
           setIsFullRebuilding(false);
-        }
-      },
-    },
-    rebuildStructure: {
-      title: 'Rebuild Structure',
-      message: 'This rebuilds the hierarchy without re-clustering. Uses existing cluster assignments. Faster than Full Rebuild.',
-      handler: async () => {
-        setIsRebuildingStructure(true);
-        setOperationResult(null);
-        try {
-          const result = await invoke<{
-            clusteringResult: null;
-            hierarchyResult: { levelsCreated: number; intermediateNodesCreated: number; itemsOrganized: number; maxDepth: number };
-            levelsCreated: number;
-            groupingIterations: number;
-          }>('build_full_hierarchy', { runClustering: false });
-
-          // Flatten empty passthrough levels
-          const flattenCount = await invoke<number>('flatten_hierarchy');
-
-          const msg = `Created ${result.hierarchyResult.intermediateNodesCreated} nodes, ${result.groupingIterations} grouping iterations, flattened ${flattenCount}`;
-          setOperationResult(msg);
-          return msg;
-        } finally {
-          setIsRebuildingStructure(false);
         }
       },
     },
@@ -937,22 +994,6 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
           return msg;
         } finally {
           setIsRebuildingLite(false);
-        }
-      },
-    },
-    rebuildHierarchyOnly: {
-      title: 'Rebuild Hierarchy Only',
-      message: 'Keeps items + clusters, only rebuilds hierarchy grouping (Universe → categories → topics). Uses Sonnet for AI grouping.',
-      handler: async () => {
-        setIsRebuildingHierarchyOnly(true);
-        setOperationResult(null);
-        try {
-          const result = await invoke<{ itemsClassified: number; clustersCreated: number; hierarchyLevels: number; method: string }>('rebuild_hierarchy_only');
-          const msg = `Hierarchy rebuilt: ${result.hierarchyLevels} levels created`;
-          setOperationResult(msg);
-          return msg;
-        } finally {
-          setIsRebuildingHierarchyOnly(false);
         }
       },
     },
@@ -1394,12 +1435,12 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   </button>
                 </div>
 
-                {/* Step 6: Quick Add (for incremental imports) */}
+                {/* Step 6: Smart Add (for incremental imports) */}
                 <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
                   <span className="flex-shrink-0 w-7 h-7 rounded-full bg-indigo-600 flex items-center justify-center text-white text-sm font-bold">6</span>
                   <div className="flex-1 min-w-0">
-                    <div className="text-sm font-medium text-gray-200">Quick Add <span className="text-gray-500">(incremental)</span></div>
-                    <div className="text-xs text-gray-500">Fast add new items to hierarchy (~2s)</div>
+                    <div className="text-sm font-medium text-gray-200">Smart Add <span className="text-gray-500">(incremental)</span></div>
+                    <div className="text-xs text-gray-500">Add new items using embedding similarity (~5-15s)</div>
                     <div className="text-xs text-gray-600 mt-0.5">
                       No API calls
                       {dbStats && dbStats.orphanItems > 0 && (
@@ -1408,11 +1449,11 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                     </div>
                   </div>
                   <button
-                    onClick={handleQuickAdd}
+                    onClick={handleSmartAdd}
                     disabled={isQuickAdding}
                     className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-indigo-600 hover:bg-indigo-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
-                    {isQuickAdding ? <Loader2 className="w-5 h-5 animate-spin" /> : '⚡'}
+                    {isQuickAdding ? <Loader2 className="w-5 h-5 animate-spin" /> : '🧠'}
                   </button>
                 </div>
 
@@ -1694,29 +1735,10 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   </div>
                   <button
                     onClick={() => setConfirmAction('fullRebuild')}
-                    disabled={isFullRebuilding || isRebuildingStructure || isFlattening || isConsolidating || isTidying}
+                    disabled={isFullRebuilding || isFlattening || isConsolidating || isTidying}
                     className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-green-600 hover:bg-green-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isFullRebuilding ? <Loader2 className="w-5 h-5 animate-spin" /> : '🔄'}
-                  </button>
-                </div>
-
-                {/* Rebuild Structure (no clustering) */}
-                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
-                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-blue-600 flex items-center justify-center text-white text-sm">
-                    <RefreshCw className="w-3.5 h-3.5" />
-                  </span>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm font-medium text-gray-200">Rebuild Structure</div>
-                    <div className="text-xs text-gray-500">Rebuild hierarchy without re-clustering. Uses existing clusters.</div>
-                    <div className="text-xs text-cyan-400/80 mt-0.5">Faster · No embedding cost</div>
-                  </div>
-                  <button
-                    onClick={() => setConfirmAction('rebuildStructure')}
-                    disabled={isRebuildingStructure || isFullRebuilding || isFlattening || isConsolidating || isTidying}
-                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-blue-600 hover:bg-blue-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
-                  >
-                    {isRebuildingStructure ? <Loader2 className="w-5 h-5 animate-spin" /> : '🏗️'}
                   </button>
                 </div>
 
@@ -1777,34 +1799,10 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   </div>
                   <button
                     onClick={() => setConfirmAction('rebuildLite')}
-                    disabled={isRebuildingLite || isFullRebuilding || isRebuildingStructure || isFlattening || isConsolidating || isTidying}
+                    disabled={isRebuildingLite || isFullRebuilding || isFlattening || isConsolidating || isTidying}
                     className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-green-700 hover:bg-green-800 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isRebuildingLite ? <Loader2 className="w-5 h-5 animate-spin" /> : '🔄'}
-                  </button>
-                </div>
-
-                {/* Rebuild Hierarchy Only */}
-                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3 border border-amber-500/30">
-                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-amber-600 flex items-center justify-center text-white text-sm">
-                    <Network className="w-3.5 h-3.5" />
-                  </span>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm font-medium text-gray-200">Rebuild Hierarchy Only</div>
-                    <div className="text-xs text-gray-500">Keeps clusters, regroups into categories</div>
-                    {dbStats && dbStats.topicsCount > 0 && (
-                      <div className="text-xs text-amber-400 mt-0.5">
-                        ~{Math.max(3, Math.ceil(dbStats.topicsCount / 100) + 2)} grouping calls · Sonnet {estimateCost(Math.max(3, Math.ceil(dbStats.topicsCount / 100) + 2), 'sonnet', 3000)}
-                        <span className="text-gray-500 ml-1">({dbStats.topicsCount} topics)</span>
-                      </div>
-                    )}
-                  </div>
-                  <button
-                    onClick={() => setConfirmAction('rebuildHierarchyOnly')}
-                    disabled={isRebuildingHierarchyOnly || isFullRebuilding || isRebuildingStructure || isFlattening || isConsolidating || isTidying}
-                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-amber-600 hover:bg-amber-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
-                  >
-                    {isRebuildingHierarchyOnly ? <Loader2 className="w-5 h-5 animate-spin" /> : '🏗️'}
                   </button>
                 </div>
 
@@ -1895,6 +1893,119 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                 {operationResult && (
                   <p className="text-xs text-green-400">{operationResult}</p>
                 )}
+              </div>
+            </section>
+
+            {/* Clustering Thresholds Section */}
+            <section>
+              <div className="flex items-center gap-2 mb-4">
+                <Zap className="w-5 h-5 text-amber-400" />
+                <h3 className="text-lg font-medium text-white">Clustering Thresholds</h3>
+              </div>
+
+              <div className="bg-gray-900/50 rounded-lg p-4 space-y-4">
+                <p className="text-xs text-gray-400">
+                  Higher = tighter clusters, more categories. Lower = looser clusters, fewer categories.
+                  Default: <span className="text-amber-400">0.75 / 0.60</span> for accurate clustering.
+                </p>
+
+                <div className="flex gap-4">
+                  <div className="flex-1">
+                    <label className="text-sm text-gray-400">Primary (0.3-0.95)</label>
+                    <input
+                      type="number"
+                      step="0.05"
+                      min="0.3"
+                      max="0.95"
+                      placeholder="0.75"
+                      value={clusteringPrimary}
+                      onChange={(e) => setClusteringPrimary(e.target.value)}
+                      className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm text-white placeholder-gray-500 focus:border-amber-500 focus:ring-1 focus:ring-amber-500 outline-none"
+                    />
+                  </div>
+                  <div className="flex-1">
+                    <label className="text-sm text-gray-400">Secondary (0.2-0.85)</label>
+                    <input
+                      type="number"
+                      step="0.05"
+                      min="0.2"
+                      max="0.85"
+                      placeholder="0.60"
+                      value={clusteringSecondary}
+                      onChange={(e) => setClusteringSecondary(e.target.value)}
+                      className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm text-white placeholder-gray-500 focus:border-amber-500 focus:ring-1 focus:ring-amber-500 outline-none"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <button
+                    onClick={handleSaveClusteringThresholds}
+                    disabled={savingThresholds}
+                    className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
+                  >
+                    {savingThresholds ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                    Save Thresholds
+                  </button>
+                  {thresholdResult && (
+                    <p className={`text-xs ${thresholdResult.startsWith('Error') ? 'text-red-400' : 'text-green-400'}`}>
+                      {thresholdResult}
+                    </p>
+                  )}
+                </div>
+
+                <p className="text-xs text-gray-500">
+                  Lower values (0.50-0.65) create fewer, broader clusters. Adjust and rebuild to experiment.
+                </p>
+              </div>
+            </section>
+
+            {/* Privacy Threshold Section */}
+            <section>
+              <div className="flex items-center gap-2 mb-4">
+                <Shield className="w-5 h-5 text-rose-400" />
+                <h3 className="text-lg font-medium text-white">Privacy Threshold</h3>
+              </div>
+
+              <div className="bg-gray-900/50 rounded-lg p-4 space-y-4">
+                <p className="text-xs text-gray-400">
+                  Items with privacy score below this threshold go to the Personal category.
+                  Default: <span className="text-rose-400">0.5</span> (captures Highly Private + Personal tiers).
+                </p>
+
+                <div className="flex gap-4 items-end">
+                  <div className="flex-1">
+                    <label className="text-sm text-gray-400">Threshold (0.0-1.0)</label>
+                    <input
+                      type="number"
+                      step="0.1"
+                      min="0"
+                      max="1"
+                      placeholder="0.5"
+                      value={privacyThresholdInput}
+                      onChange={(e) => setPrivacyThresholdInput(e.target.value)}
+                      className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm text-white placeholder-gray-500 focus:border-rose-500 focus:ring-1 focus:ring-rose-500 outline-none"
+                    />
+                  </div>
+                  <button
+                    onClick={handleSavePrivacyThreshold}
+                    disabled={savingPrivacyThreshold}
+                    className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
+                  >
+                    {savingPrivacyThreshold ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                    Save
+                  </button>
+                </div>
+
+                {privacyThresholdResult && (
+                  <p className={`text-xs ${privacyThresholdResult.startsWith('Error') ? 'text-red-400' : 'text-green-400'}`}>
+                    {privacyThresholdResult}
+                  </p>
+                )}
+
+                <p className="text-xs text-gray-500">
+                  Higher = more items go to Personal. Lower = fewer items in Personal.
+                </p>
               </div>
             </section>
 

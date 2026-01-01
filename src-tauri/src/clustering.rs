@@ -177,13 +177,14 @@ pub async fn run_clustering(db: &Database, _use_ai: bool) -> Result<ClusteringRe
         println!("[Clustering] Skipping {} non-visible items (supporting/hidden)", skipped_supporting_count);
     }
 
-    // Filter out highly private items (privacy < 0.3) - they go to Personal category
+    // Filter out private items (privacy < threshold) - they go to Personal category
+    let privacy_threshold = crate::settings::get_privacy_threshold() as f64;
     let (private_items, items): (Vec<Node>, Vec<Node>) = after_content_filter
         .into_iter()
-        .partition(|item| item.privacy.map(|p| p < 0.3).unwrap_or(false));
+        .partition(|item| item.privacy.map(|p| p < privacy_threshold).unwrap_or(false));
 
     if !private_items.is_empty() {
-        println!("[Clustering] Excluding {} private items (privacy < 0.3) - will go to Personal category", private_items.len());
+        println!("[Clustering] Excluding {} private items (privacy < {}) - will go to Personal category", private_items.len(), privacy_threshold);
     }
 
     if items.is_empty() {
@@ -282,14 +283,16 @@ fn apply_multipath_assignments(
 
 use crate::similarity::{cosine_similarity, compute_centroid};
 
-/// Get adaptive thresholds based on collection size
-fn get_adaptive_thresholds(item_count: usize) -> (f32, f32) {
-    match item_count {
-        0..=50 => (0.50, 0.35),
-        51..=300 => (0.55, 0.40),
-        301..=1000 => (0.60, 0.45),
-        _ => (0.65, 0.50),
-    }
+/// Get clustering thresholds from settings, with 0.75/0.60 defaults for accurate clustering
+fn get_adaptive_thresholds(_item_count: usize) -> (f32, f32) {
+    // Get thresholds from settings (defaults to 0.75/0.60)
+    let (primary_opt, secondary_opt) = crate::settings::get_clustering_thresholds();
+
+    let primary = primary_opt.unwrap_or(0.75);
+    let secondary = secondary_opt.unwrap_or(0.60);
+
+    println!("[Clustering] Using thresholds: primary={:.2}, secondary={:.2}", primary, secondary);
+    (primary, secondary)
 }
 
 /// Ensure all items have embeddings, generating on-demand if needed
