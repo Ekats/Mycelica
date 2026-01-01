@@ -18,6 +18,8 @@ import {
   Shield,
   Download,
   Cpu,
+  ChevronDown,
+  ChevronRight,
 } from 'lucide-react';
 import { ConfirmDialog } from './ConfirmDialog';
 
@@ -57,7 +59,7 @@ interface SettingsPanelProps {
   onDataChanged?: () => void;
 }
 
-type ConfirmAction = 'deleteAll' | 'resetAi' | 'resetClustering' | 'clearEmbeddings' | 'clearHierarchy' | 'clearTags' | 'resetPrivacy' | 'fullRebuild' | 'flattenHierarchy' | 'consolidateRoot' | 'tidyDatabase' | 'scorePrivacy' | 'reclassifyPattern' | 'reclassifyAi' | 'rebuildLite' | null;
+type ConfirmAction = 'deleteAll' | 'resetAi' | 'resetClustering' | 'clearEmbeddings' | 'clearHierarchy' | 'clearTags' | 'resetPrivacy' | 'fullRebuild' | 'flattenHierarchy' | 'consolidateRoot' | 'tidyDatabase' | 'scorePrivacy' | 'reclassifyPattern' | 'reclassifyAi' | 'rebuildLite' | 'resetProcessing' | 'clearStructure' | null;
 
 interface TidyReport {
   sameNameMerged: number;
@@ -159,6 +161,8 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const [isQuickAdding, setIsQuickAdding] = useState(false);
   const [inboxCount, setInboxCount] = useState(0);
   const [setupResult, setSetupResult] = useState<string | null>(null);
+  const [isFullSetup, setIsFullSetup] = useState(false);
+  const [fullSetupStep, setFullSetupStep] = useState('');
 
   // Quick Process (post-import)
   const [showQuickProcessPrompt, setShowQuickProcessPrompt] = useState(false);
@@ -189,6 +193,10 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const [privacyThresholdInput, setPrivacyThresholdInput] = useState<string>('0.5');
   const [savingPrivacyThreshold, setSavingPrivacyThreshold] = useState(false);
   const [privacyThresholdResult, setPrivacyThresholdResult] = useState<string | null>(null);
+
+  // UI collapse states
+  const [showAdvancedSetup, setShowAdvancedSetup] = useState(false);
+  const [dangerZoneExpanded, setDangerZoneExpanded] = useState(false);
 
   // Load data on mount
   useEffect(() => {
@@ -760,6 +768,39 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     }
   };
 
+  const handleFullSetup = async () => {
+    setIsFullSetup(true);
+    setSetupResult(null);
+    try {
+      // Step 1: Process AI
+      setFullSetupStep('Processing AI (titles, summaries, embeddings)...');
+      const aiResult = await invoke<{ processed: number; skipped: number }>('process_nodes');
+
+      // Step 2: Cluster
+      setFullSetupStep('Clustering items by similarity...');
+      const clusterResult = await invoke<{ clusters_created: number; nodes_clustered: number }>('run_clustering');
+
+      // Step 3: Build Hierarchy
+      setFullSetupStep('Building hierarchy with AI grouping...');
+      const hierarchyResult = await invoke<{
+        clusteringResult: { itemsProcessed: number; clustersCreated: number; itemsAssigned: number } | null;
+        hierarchyResult: { levelsCreated: number; intermediateNodesCreated: number; itemsOrganized: number; maxDepth: number };
+        levelsCreated: number;
+        groupingIterations: number;
+      }>('build_full_hierarchy', { runClustering: false });
+
+      setFullSetupStep('');
+      setSetupResult(`Full setup complete: ${aiResult.processed} items processed, ${clusterResult.clusters_created} clusters, ${hierarchyResult.levelsCreated} hierarchy levels`);
+      await loadDbStats();
+      onDataChanged?.();
+      window.location.reload();
+    } catch (err) {
+      setSetupResult(`Error: ${err}`);
+      setFullSetupStep('');
+      setIsFullSetup(false);
+    }
+  };
+
   const handleSmartAdd = async () => {
     setIsQuickAdding(true);
     setSetupResult(null);
@@ -995,6 +1036,24 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
         } finally {
           setIsRebuildingLite(false);
         }
+      },
+    },
+    resetProcessing: {
+      title: 'Reset Processing',
+      message: 'This will reset AI processing AND clustering. Items will be marked as unprocessed and need re-clustering. Run "Full Rebuild" after.',
+      handler: async () => {
+        const aiCount = await invoke<number>('reset_ai_processing');
+        const clusterCount = await invoke<number>('reset_clustering');
+        return `Reset AI for ${aiCount} items, clustering for ${clusterCount} items`;
+      },
+    },
+    clearStructure: {
+      title: 'Clear Structure',
+      message: 'This will clear hierarchy (delete category nodes) AND embeddings. Run "Full Rebuild" to recreate.',
+      handler: async () => {
+        const hierarchyCount = await invoke<number>('clear_hierarchy');
+        const embeddingCount = await invoke<number>('clear_embeddings');
+        return `Deleted ${hierarchyCount} hierarchy nodes, cleared ${embeddingCount} embeddings`;
       },
     },
   };
@@ -1337,90 +1396,137 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   </div>
                 )}
 
-                {/* Step 2: Process AI */}
+                {/* Step 2: Full Setup (combines Process + Cluster + Build) */}
                 <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
-                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-purple-600 flex items-center justify-center text-white text-sm font-bold">2</span>
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-gradient-to-r from-purple-600 to-green-600 flex items-center justify-center text-white text-sm font-bold">2</span>
                   <div className="flex-1 min-w-0">
-                    <div className="text-sm font-medium text-gray-200">Process AI</div>
-                    <div className="text-xs text-gray-500">Generate titles, summaries & embeddings</div>
-                    {dbStats && dbStats.unprocessedItems > 0 && (
-                      <div className="text-xs text-amber-400/80 mt-0.5">
-                        {dbStats.unprocessedItems} calls · Haiku {estimateCost(dbStats.unprocessedItems, 'haiku', 1200)}
-                        {openaiKeyStatus && ` + OpenAI ${estimateCost(dbStats.unprocessedItems, 'openai', 1000)}`}
+                    <div className="text-sm font-medium text-gray-200">Full Setup</div>
+                    <div className="text-xs text-gray-500">Process AI → Cluster → Build Hierarchy</div>
+                    {isFullSetup && fullSetupStep && (
+                      <div className="text-xs text-amber-400 mt-0.5 flex items-center gap-1">
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        {fullSetupStep}
                       </div>
                     )}
-                    {dbStats && dbStats.unprocessedItems === 0 && (
-                      <div className="text-xs text-green-500/70 mt-0.5">All items processed</div>
+                    {!isFullSetup && dbStats && (dbStats.unprocessedItems > 0 || dbStats.unclusteredItems > 0) && (
+                      <div className="text-xs text-amber-400/80 mt-0.5">
+                        {dbStats.unprocessedItems > 0 && `${dbStats.unprocessedItems} to process`}
+                        {dbStats.unprocessedItems > 0 && dbStats.unclusteredItems > 0 && ' · '}
+                        {dbStats.unclusteredItems > 0 && `${dbStats.unclusteredItems} to cluster`}
+                        {' · '}Haiku {estimateCost(dbStats.unprocessedItems, 'haiku', 1200)} + Sonnet {estimateCost(Math.max(3, Math.ceil((dbStats.topicsCount || 10) / 100) + 2), 'sonnet', 3000)}
+                      </div>
+                    )}
+                    {!isFullSetup && dbStats && dbStats.unprocessedItems === 0 && dbStats.unclusteredItems === 0 && (
+                      <div className="text-xs text-green-500/70 mt-0.5">All items processed and clustered</div>
                     )}
                   </div>
                   <button
-                    onClick={handleProcessAi}
-                    disabled={isProcessingAi || !apiKeyStatus?.hasKey}
-                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-purple-600 hover:bg-purple-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                    onClick={handleFullSetup}
+                    disabled={isFullSetup || !apiKeyStatus?.hasKey}
+                    style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-gradient-to-r from-purple-600 to-green-600 hover:from-purple-700 hover:to-green-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
-                    {isProcessingAi ? <Loader2 className="w-5 h-5 animate-spin" /> : '🤖'}
+                    {isFullSetup ? <Loader2 className="w-5 h-5 animate-spin" /> : '🚀'}
                   </button>
                 </div>
 
-                {/* Step 3: Cluster */}
+                {/* Advanced Setup Steps (collapsed by default) */}
+                <button
+                  onClick={() => setShowAdvancedSetup(!showAdvancedSetup)}
+                  className="w-full flex items-center gap-2 p-2 text-sm text-gray-400 hover:text-gray-200 transition-colors"
+                >
+                  {showAdvancedSetup ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                  <span>Advanced: Individual Steps</span>
+                  <span className="text-xs text-gray-600">(for manual control)</span>
+                </button>
+
+                {showAdvancedSetup && (
+                  <div className="space-y-3 pl-2 border-l-2 border-gray-700/50 ml-2">
+                    {/* Step 2: Process AI */}
+                    <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                      <span className="flex-shrink-0 w-7 h-7 rounded-full bg-purple-600 flex items-center justify-center text-white text-sm font-bold">2</span>
+                      <div className="flex-1 min-w-0">
+                        <div className="text-sm font-medium text-gray-200">Process AI</div>
+                        <div className="text-xs text-gray-500">Generate titles, summaries & embeddings</div>
+                        {dbStats && dbStats.unprocessedItems > 0 && (
+                          <div className="text-xs text-amber-400/80 mt-0.5">
+                            {dbStats.unprocessedItems} calls · Haiku {estimateCost(dbStats.unprocessedItems, 'haiku', 1200)}
+                            {openaiKeyStatus && ` + OpenAI ${estimateCost(dbStats.unprocessedItems, 'openai', 1000)}`}
+                          </div>
+                        )}
+                        {dbStats && dbStats.unprocessedItems === 0 && (
+                          <div className="text-xs text-green-500/70 mt-0.5">All items processed</div>
+                        )}
+                      </div>
+                      <button
+                        onClick={handleProcessAi}
+                        disabled={isProcessingAi || !apiKeyStatus?.hasKey}
+                        style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-purple-600 hover:bg-purple-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                      >
+                        {isProcessingAi ? <Loader2 className="w-5 h-5 animate-spin" /> : '🤖'}
+                      </button>
+                    </div>
+
+                    {/* Step 3: Cluster */}
+                    <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                      <span className="flex-shrink-0 w-7 h-7 rounded-full bg-cyan-600 flex items-center justify-center text-white text-sm font-bold">3</span>
+                      <div className="flex-1 min-w-0">
+                        <div className="text-sm font-medium text-gray-200">Cluster</div>
+                        <div className="text-xs text-gray-500">Group items by embedding similarity (free)</div>
+                        {dbStats && dbStats.unclusteredItems > 0 && (
+                          <div className="text-xs text-cyan-400 mt-0.5">
+                            {dbStats.unclusteredItems} items to cluster · Local embeddings
+                          </div>
+                        )}
+                        {dbStats && dbStats.unclusteredItems === 0 && (
+                          <div className="text-xs text-green-500/70 mt-0.5">All items clustered</div>
+                        )}
+                      </div>
+                      <button
+                        onClick={handleClustering}
+                        disabled={isClustering}
+                        style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-cyan-600 hover:bg-cyan-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                      >
+                        {isClustering ? <Loader2 className="w-5 h-5 animate-spin" /> : '🎯'}
+                      </button>
+                    </div>
+
+                    {/* Step 4: Build Hierarchy */}
+                    <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                      <span className="flex-shrink-0 w-7 h-7 rounded-full bg-green-600 flex items-center justify-center text-white text-sm font-bold">4</span>
+                      <div className="flex-1 min-w-0">
+                        <div className="text-sm font-medium text-gray-200">Build Hierarchy</div>
+                        <div className="text-xs text-gray-500">Create navigation structure + group embeddings</div>
+                        {dbStats && dbStats.topicsCount > 15 && (
+                          <div className="text-xs text-amber-400/80 mt-0.5">
+                            ~{Math.max(3, Math.ceil(dbStats.topicsCount / 100) + 2)} calls · Sonnet {estimateCost(Math.max(3, Math.ceil(dbStats.topicsCount / 100) + 2), 'sonnet', 3000)}
+                            {openaiKeyStatus && ` + OpenAI ${estimateCost(Math.ceil(dbStats.topicsCount / 8), 'openai', 500)}`}
+                            <span className="text-gray-500 ml-1">({dbStats.topicsCount} topics)</span>
+                          </div>
+                        )}
+                        {dbStats && dbStats.topicsCount <= 15 && dbStats.topicsCount > 0 && (
+                          <div className="text-xs text-green-500/70 mt-0.5">
+                            1 call · Sonnet {estimateCost(1, 'sonnet', 3000)}
+                            {openaiKeyStatus && ` + OpenAI ${estimateCost(dbStats.topicsCount, 'openai', 500)}`}
+                          </div>
+                        )}
+                        {dbStats && dbStats.topicsCount === 0 && (
+                          <div className="text-xs text-gray-500 mt-0.5">Run Cluster first</div>
+                        )}
+                      </div>
+                      <button
+                        onClick={handleBuildHierarchy}
+                        disabled={isBuildingHierarchy || !apiKeyStatus?.hasKey}
+                        style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-green-600 hover:bg-green-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                      >
+                        {isBuildingHierarchy ? <Loader2 className="w-5 h-5 animate-spin" /> : '🏗️'}
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Step 3: Update Dates (optional) */}
                 <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
                   <span className="flex-shrink-0 w-7 h-7 rounded-full bg-cyan-600 flex items-center justify-center text-white text-sm font-bold">3</span>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm font-medium text-gray-200">Cluster</div>
-                    <div className="text-xs text-gray-500">Group items by embedding similarity (free)</div>
-                    {dbStats && dbStats.unclusteredItems > 0 && (
-                      <div className="text-xs text-cyan-400 mt-0.5">
-                        {dbStats.unclusteredItems} items to cluster · Local embeddings
-                      </div>
-                    )}
-                    {dbStats && dbStats.unclusteredItems === 0 && (
-                      <div className="text-xs text-green-500/70 mt-0.5">All items clustered</div>
-                    )}
-                  </div>
-                  <button
-                    onClick={handleClustering}
-                    disabled={isClustering}
-                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-cyan-600 hover:bg-cyan-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
-                  >
-                    {isClustering ? <Loader2 className="w-5 h-5 animate-spin" /> : '🎯'}
-                  </button>
-                </div>
-
-                {/* Step 4: Build Hierarchy */}
-                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
-                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-green-600 flex items-center justify-center text-white text-sm font-bold">4</span>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm font-medium text-gray-200">Build Hierarchy</div>
-                    <div className="text-xs text-gray-500">Create navigation structure + group embeddings</div>
-                    {dbStats && dbStats.topicsCount > 15 && (
-                      <div className="text-xs text-amber-400/80 mt-0.5">
-                        ~{Math.max(3, Math.ceil(dbStats.topicsCount / 100) + 2)} calls · Sonnet {estimateCost(Math.max(3, Math.ceil(dbStats.topicsCount / 100) + 2), 'sonnet', 3000)}
-                        {openaiKeyStatus && ` + OpenAI ${estimateCost(Math.ceil(dbStats.topicsCount / 8), 'openai', 500)}`}
-                        <span className="text-gray-500 ml-1">({dbStats.topicsCount} topics)</span>
-                      </div>
-                    )}
-                    {dbStats && dbStats.topicsCount <= 15 && dbStats.topicsCount > 0 && (
-                      <div className="text-xs text-green-500/70 mt-0.5">
-                        1 call · Sonnet {estimateCost(1, 'sonnet', 3000)}
-                        {openaiKeyStatus && ` + OpenAI ${estimateCost(dbStats.topicsCount, 'openai', 500)}`}
-                      </div>
-                    )}
-                    {dbStats && dbStats.topicsCount === 0 && (
-                      <div className="text-xs text-gray-500 mt-0.5">Run Cluster first</div>
-                    )}
-                  </div>
-                  <button
-                    onClick={handleBuildHierarchy}
-                    disabled={isBuildingHierarchy || !apiKeyStatus?.hasKey}
-                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-green-600 hover:bg-green-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
-                  >
-                    {isBuildingHierarchy ? <Loader2 className="w-5 h-5 animate-spin" /> : '🏗️'}
-                  </button>
-                </div>
-
-                {/* Step 5: Update Dates (optional) */}
-                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
-                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-cyan-600 flex items-center justify-center text-white text-sm font-bold">5</span>
                   <div className="flex-1 min-w-0">
                     <div className="text-sm font-medium text-gray-200">Update Dates <span className="text-gray-500">(optional)</span></div>
                     <div className="text-xs text-gray-500">Propagate dates to groups (fast)</div>
@@ -1429,15 +1535,15 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   <button
                     onClick={handleUpdateDates}
                     disabled={isUpdatingDates}
-                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-cyan-600 hover:bg-cyan-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                    style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-cyan-600 hover:bg-cyan-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isUpdatingDates ? <Loader2 className="w-5 h-5 animate-spin" /> : '📅'}
                   </button>
                 </div>
 
-                {/* Step 6: Smart Add (for incremental imports) */}
+                {/* Step 4: Smart Add (for incremental imports) */}
                 <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
-                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-indigo-600 flex items-center justify-center text-white text-sm font-bold">6</span>
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-indigo-600 flex items-center justify-center text-white text-sm font-bold">4</span>
                   <div className="flex-1 min-w-0">
                     <div className="text-sm font-medium text-gray-200">Smart Add <span className="text-gray-500">(incremental)</span></div>
                     <div className="text-xs text-gray-500">Add new items using embedding similarity (~5-15s)</div>
@@ -1451,7 +1557,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   <button
                     onClick={handleSmartAdd}
                     disabled={isQuickAdding}
-                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-indigo-600 hover:bg-indigo-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                    style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-indigo-600 hover:bg-indigo-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isQuickAdding ? <Loader2 className="w-5 h-5 animate-spin" /> : '🧠'}
                   </button>
@@ -1736,7 +1842,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   <button
                     onClick={() => setConfirmAction('fullRebuild')}
                     disabled={isFullRebuilding || isFlattening || isConsolidating || isTidying}
-                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-green-600 hover:bg-green-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                    style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-green-600 hover:bg-green-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isFullRebuilding ? <Loader2 className="w-5 h-5 animate-spin" /> : '🔄'}
                   </button>
@@ -1755,7 +1861,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   <button
                     onClick={() => setConfirmAction('flattenHierarchy')}
                     disabled={isFlattening || isFullRebuilding || isConsolidating || isTidying}
-                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-amber-600 hover:bg-amber-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                    style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-amber-600 hover:bg-amber-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isFlattening ? <Loader2 className="w-5 h-5 animate-spin" /> : '⚡'}
                   </button>
@@ -1776,7 +1882,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   <button
                     onClick={() => setConfirmAction('consolidateRoot')}
                     disabled={isConsolidating || isFullRebuilding || isFlattening || isTidying}
-                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-purple-600 hover:bg-purple-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                    style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-purple-600 hover:bg-purple-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isConsolidating ? <Loader2 className="w-5 h-5 animate-spin" /> : '🏛️'}
                   </button>
@@ -1800,7 +1906,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   <button
                     onClick={() => setConfirmAction('rebuildLite')}
                     disabled={isRebuildingLite || isFullRebuilding || isFlattening || isConsolidating || isTidying}
-                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-green-700 hover:bg-green-800 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                    style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-green-700 hover:bg-green-800 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isRebuildingLite ? <Loader2 className="w-5 h-5 animate-spin" /> : '🔄'}
                   </button>
@@ -1819,7 +1925,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   <button
                     onClick={() => setConfirmAction('reclassifyPattern')}
                     disabled={isReclassifyingPattern || isReclassifyingAi || isFullRebuilding || isRebuildingLite}
-                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                    style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isReclassifyingPattern ? <Loader2 className="w-5 h-5 animate-spin" /> : '🏷️'}
                   </button>
@@ -1842,7 +1948,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   <button
                     onClick={() => setConfirmAction('reclassifyAi')}
                     disabled={isReclassifyingAi || isReclassifyingPattern || isFullRebuilding || isRebuildingLite}
-                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-teal-600 hover:bg-teal-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                    style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-teal-600 hover:bg-teal-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isReclassifyingAi ? <Loader2 className="w-5 h-5 animate-spin" /> : '🤖'}
                   </button>
@@ -1861,7 +1967,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   <button
                     onClick={() => setConfirmAction('tidyDatabase')}
                     disabled={isTidying || isFullRebuilding || isFlattening || isConsolidating}
-                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-cyan-600 hover:bg-cyan-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                    style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-cyan-600 hover:bg-cyan-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isTidying ? <Loader2 className="w-5 h-5 animate-spin" /> : '🧹'}
                   </button>
@@ -1884,7 +1990,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   <button
                     onClick={() => setConfirmAction('scorePrivacy')}
                     disabled={isScoringPrivacy || isFullRebuilding || isFlattening || isConsolidating || isTidying}
-                    className="flex-shrink-0 w-12 h-12 flex items-center justify-center text-xl bg-rose-600 hover:bg-rose-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                    style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-rose-600 hover:bg-rose-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isScoringPrivacy ? <Loader2 className="w-5 h-5 animate-spin" /> : '🔒'}
                   </button>
@@ -2009,82 +2115,77 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
               </div>
             </section>
 
-            {/* Danger Zone Section */}
+            {/* Danger Zone Section (collapsed by default) */}
             <section>
-              <div className="flex items-center gap-2 mb-4">
+              <button
+                onClick={() => setDangerZoneExpanded(!dangerZoneExpanded)}
+                className="w-full flex items-center gap-2 p-2 rounded-lg hover:bg-red-900/20 transition-colors"
+              >
+                {dangerZoneExpanded ? <ChevronDown className="w-4 h-4 text-red-400" /> : <ChevronRight className="w-4 h-4 text-red-400" />}
                 <Trash2 className="w-5 h-5 text-red-400" />
                 <h3 className="text-lg font-medium text-white">Danger Zone</h3>
-              </div>
+                <span className="text-xs text-gray-500 ml-auto">Reset & clear operations</span>
+              </button>
 
-              <div className="grid grid-cols-2 gap-3">
-                <button
-                  onClick={() => setConfirmAction('resetAi')}
-                  className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
-                >
-                  <span className="text-sm font-medium text-gray-200">Reset AI Processing</span>
-                  <span className="text-xs text-gray-500">Re-run title/summary generation</span>
-                </button>
+              {dangerZoneExpanded && (
+                <div className="mt-4 space-y-4">
+                  <div className="grid grid-cols-2 gap-3">
+                    {/* Combined: Reset Processing (AI + Clustering) */}
+                    <button
+                      onClick={() => setConfirmAction('resetProcessing')}
+                      className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
+                    >
+                      <span className="text-sm font-medium text-gray-200">Reset Processing</span>
+                      <span className="text-xs text-gray-500">AI + Clustering (re-run all)</span>
+                    </button>
 
-                <button
-                  onClick={() => setConfirmAction('resetClustering')}
-                  className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
-                >
-                  <span className="text-sm font-medium text-gray-200">Reset Clustering</span>
-                  <span className="text-xs text-gray-500">Re-assign topics</span>
-                </button>
+                    {/* Combined: Clear Structure (Hierarchy + Embeddings) */}
+                    <button
+                      onClick={() => setConfirmAction('clearStructure')}
+                      className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
+                    >
+                      <span className="text-sm font-medium text-gray-200">Clear Structure</span>
+                      <span className="text-xs text-gray-500">Hierarchy + Embeddings</span>
+                    </button>
 
-                <button
-                  onClick={() => setConfirmAction('clearEmbeddings')}
-                  className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
-                >
-                  <span className="text-sm font-medium text-gray-200">Clear Embeddings</span>
-                  <span className="text-xs text-gray-500">Re-generate semantic vectors</span>
-                </button>
+                    <button
+                      onClick={() => setConfirmAction('clearTags')}
+                      className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
+                    >
+                      <span className="text-sm font-medium text-gray-200">Clear Tags</span>
+                      <span className="text-xs text-gray-500">Regenerate on rebuild</span>
+                    </button>
 
-                <button
-                  onClick={() => setConfirmAction('clearHierarchy')}
-                  className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
-                >
-                  <span className="text-sm font-medium text-gray-200">Clear Hierarchy</span>
-                  <span className="text-xs text-gray-500">Delete category nodes</span>
-                </button>
+                    <button
+                      onClick={() => setConfirmAction('resetPrivacy')}
+                      className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
+                    >
+                      <span className="text-sm font-medium text-gray-200">Reset Privacy Flags</span>
+                      <span className="text-xs text-gray-500">Re-scan with new settings</span>
+                    </button>
+                  </div>
 
-                <button
-                  onClick={() => setConfirmAction('clearTags')}
-                  className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
-                >
-                  <span className="text-sm font-medium text-gray-200">Clear Tags</span>
-                  <span className="text-xs text-gray-500">Regenerate on rebuild</span>
-                </button>
+                  {actionResult && (
+                    <p className={`mt-3 text-sm text-center ${actionResult.startsWith('Error') ? 'text-red-400' : 'text-green-400'}`}>
+                      {actionResult}
+                    </p>
+                  )}
 
-                <button
-                  onClick={() => setConfirmAction('resetPrivacy')}
-                  className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
-                >
-                  <span className="text-sm font-medium text-gray-200">Reset Privacy Flags</span>
-                  <span className="text-xs text-gray-500">Re-scan with new settings</span>
-                </button>
-              </div>
-
-              {actionResult && (
-                <p className={`mt-3 text-sm text-center ${actionResult.startsWith('Error') ? 'text-red-400' : 'text-green-400'}`}>
-                  {actionResult}
-                </p>
+                  {/* Delete All Data - at the very bottom */}
+                  <div className="mt-6 pt-4 border-t border-gray-700/50">
+                    <button
+                      onClick={() => setConfirmAction('deleteAll')}
+                      className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-red-600/20 hover:bg-red-600 text-red-400 hover:text-white rounded-lg font-medium transition-colors border border-red-600/30 hover:border-red-600"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                      Delete All Data
+                    </button>
+                    <p className="mt-2 text-xs text-gray-500 text-center">
+                      Permanently delete all nodes and edges. Cannot be undone.
+                    </p>
+                  </div>
+                </div>
               )}
-
-              {/* Delete All Data - at the very bottom */}
-              <div className="mt-6 pt-4 border-t border-gray-700/50">
-                <button
-                  onClick={() => setConfirmAction('deleteAll')}
-                  className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-red-600/20 hover:bg-red-600 text-red-400 hover:text-white rounded-lg font-medium transition-colors border border-red-600/30 hover:border-red-600"
-                >
-                  <Trash2 className="w-4 h-4" />
-                  Delete All Data
-                </button>
-                <p className="mt-2 text-xs text-gray-500 text-center">
-                  Permanently delete all nodes and edges. Cannot be undone.
-                </p>
-              </div>
             </section>
             </>
             )}
