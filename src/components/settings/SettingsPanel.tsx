@@ -164,12 +164,6 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const [isFullSetup, setIsFullSetup] = useState(false);
   const [fullSetupStep, setFullSetupStep] = useState('');
 
-  // Quick Process (post-import)
-  const [showQuickProcessPrompt, setShowQuickProcessPrompt] = useState(false);
-  const [newItemCount, setNewItemCount] = useState(0);
-  const [isQuickProcessing, setIsQuickProcessing] = useState(false);
-  const [quickProcessStep, setQuickProcessStep] = useState('');
-
   // Privacy scanning (privacyThreshold is shared via store with Graph.tsx)
   const [privacyStats, setPrivacyStats] = useState<PrivacyStats | null>(null);
   const [privacyResult, setPrivacyResult] = useState<string | null>(null);
@@ -197,6 +191,10 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   // UI collapse states
   const [showAdvancedSetup, setShowAdvancedSetup] = useState(false);
   const [dangerZoneExpanded, setDangerZoneExpanded] = useState(false);
+
+  // Smart operation suggestion after import
+  const [suggestedOperation, setSuggestedOperation] = useState<'smartAdd' | 'fullSetup' | null>(null);
+  const [suggestionReason, setSuggestionReason] = useState('');
 
   // Load data on mount
   useEffect(() => {
@@ -554,11 +552,30 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     }
   };
 
+  // Smart operation suggestion after import
+  const suggestOperationAfterImport = (newItems: number) => {
+    const existingTopics = dbStats?.topicsCount || 0;
+
+    if (existingTopics === 0) {
+      // Fresh database - must do Full Setup
+      setSuggestedOperation('fullSetup');
+      setSuggestionReason(`${newItems} items imported. Run Full Setup to create initial structure.`);
+    } else if (newItems <= 30) {
+      // Small batch - Smart Add likely sufficient
+      setSuggestedOperation('smartAdd');
+      setSuggestionReason(`${newItems} items imported. Smart Add should place most in existing topics (~${Math.max(5, Math.ceil(newItems * 0.5))}s).`);
+    } else {
+      // Large batch - Full Setup recommended
+      setSuggestedOperation('fullSetup');
+      setSuggestionReason(`${newItems} items imported. Full Setup recommended for best organization (~$0.15, 5-7min).`);
+    }
+  };
+
   // Import handler
   const handleImport = async () => {
     setImporting(true);
     setImportResult(null);
-    setShowQuickProcessPrompt(false);
+    setSuggestedOperation(null);
     try {
       const file = await openDialog({
         title: 'Select Claude conversations JSON',
@@ -573,11 +590,10 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
         await loadDbStats();
         onDataChanged?.();
 
-        // Show Quick Process prompt if items were imported
+        // Show smart operation suggestion if items were imported
         if (result.conversationsImported > 0) {
-          setNewItemCount(result.conversationsImported);
-          setShowQuickProcessPrompt(true);
-          setImportResult(null); // Clear result, prompt will show instead
+          setImportResult(`Imported ${result.conversationsImported} conversations`);
+          suggestOperationAfterImport(result.conversationsImported);
         } else {
           setImportResult(`No new conversations found`);
         }
@@ -593,6 +609,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const handleImportMarkdown = async () => {
     setImporting(true);
     setImportResult(null);
+    setSuggestedOperation(null);
     try {
       const files = await openDialog({
         title: 'Select Markdown files',
@@ -610,6 +627,11 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
           onDataChanged?.();
           const errorMsg = result.errors.length > 0 ? ` (${result.errors.length} errors)` : '';
           setImportResult(`Imported ${result.exchangesImported} markdown file${result.exchangesImported !== 1 ? 's' : ''}${errorMsg}`);
+
+          // Show smart operation suggestion if items were imported
+          if (result.exchangesImported > 0) {
+            suggestOperationAfterImport(result.exchangesImported);
+          }
         }
       }
     } catch (err) {
@@ -623,6 +645,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const handleImportGoogleKeep = async () => {
     setImporting(true);
     setImportResult(null);
+    setSuggestedOperation(null);
     try {
       const file = await openDialog({
         title: 'Select Google Takeout zip file',
@@ -640,54 +663,15 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
         const warnMsg = result.warnings.length > 0 ? ` (${result.warnings.length} warnings)` : '';
         setImportResult(`Imported ${result.notesImported} Google Keep note${result.notesImported !== 1 ? 's' : ''}${warnMsg}${errorMsg}`);
 
-        // Show Quick Process prompt if notes were imported
+        // Show smart operation suggestion if notes were imported
         if (result.notesImported > 0) {
-          setNewItemCount(result.notesImported);
-          setShowQuickProcessPrompt(true);
-          setImportResult(null);
+          suggestOperationAfterImport(result.notesImported);
         }
       }
     } catch (err) {
       setImportResult(`Error: ${err}`);
     } finally {
       setImporting(false);
-    }
-  };
-
-  const handleQuickProcess = async () => {
-    setIsQuickProcessing(true);
-    setQuickProcessStep('');
-    try {
-      // Step 1: Process AI (only unprocessed items)
-      setQuickProcessStep('Processing AI titles & summaries...');
-      await invoke('process_nodes');
-
-      // Step 2: Cluster (only unclustered items)
-      setQuickProcessStep('Clustering into topics...');
-      await invoke('run_clustering');
-
-      // Step 3: Smart Add to hierarchy (uses embedding similarity)
-      setQuickProcessStep('Adding to hierarchy...');
-      const result = await invoke<{
-        orphansFound: number;
-        matchedToExisting: number;
-        newTopicsCreated: number;
-        sentToInbox: number;
-        processingTimeMs: number;
-      }>('smart_add_to_hierarchy');
-
-      setShowQuickProcessPrompt(false);
-      setInboxCount(result.sentToInbox);
-      setImportResult(`Processed ${newItemCount} items → ${result.matchedToExisting} matched, ${result.newTopicsCreated} new topics (${result.processingTimeMs}ms)`);
-      await loadDbStats();
-      onDataChanged?.();
-      window.location.reload();
-    } catch (err) {
-      setImportResult(`Error: ${err}`);
-      setShowQuickProcessPrompt(false);
-    } finally {
-      setIsQuickProcessing(false);
-      setQuickProcessStep('');
     }
   };
 
@@ -815,6 +799,9 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
       setInboxCount(result.sentToInbox);
       if (result.matchedToExisting === 0 && result.newTopicsCreated === 0) {
         setSetupResult('No orphan items to add');
+      } else if (result.sentToInbox > 10) {
+        // Many items went to Inbox - suggest Full Rebuild
+        setSetupResult(`Added ${result.matchedToExisting} to existing, ${result.sentToInbox} to Inbox. Consider Full Rebuild to better organize Inbox items.`);
       } else {
         setSetupResult(`Added ${result.matchedToExisting} to existing topics, ${result.newTopicsCreated} new topics, ${result.sentToInbox} to Inbox (${result.processingTimeMs}ms)`);
       }
@@ -1357,39 +1344,39 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   </div>
                 </div>
 
-                {/* Quick Process prompt (after import) */}
-                {showQuickProcessPrompt && (
+                {/* Smart operation suggestion (after import) */}
+                {suggestedOperation && (
                   <div className="bg-blue-900/30 border border-blue-500/50 rounded-lg p-4">
                     <div className="flex items-start gap-3">
-                      <span className="text-2xl">📥</span>
+                      <span className="text-2xl">{suggestedOperation === 'smartAdd' ? '🧠' : '🚀'}</span>
                       <div className="flex-1">
-                        <div className="text-sm font-medium text-blue-200">
-                          Imported {newItemCount} new conversation{newItemCount !== 1 ? 's' : ''}
-                        </div>
-                        <div className="text-xs text-gray-400 mt-1">
-                          Process them now? (AI titles → Cluster → Add to hierarchy)
-                        </div>
-                        {isQuickProcessing && (
-                          <div className="text-xs text-amber-400 mt-2 flex items-center gap-2">
-                            <Loader2 className="w-5 h-5 animate-spin" />
-                            {quickProcessStep}
-                          </div>
-                        )}
+                        <div className="text-sm text-blue-200">{suggestionReason}</div>
                       </div>
                       <div className="flex gap-2">
                         <button
-                          onClick={() => setShowQuickProcessPrompt(false)}
-                          disabled={isQuickProcessing}
+                          onClick={() => setSuggestedOperation(null)}
+                          disabled={isQuickAdding || isFullSetup}
                           className="px-3 py-1.5 text-gray-400 hover:text-white text-xs disabled:opacity-50"
                         >
-                          Later
+                          Dismiss
                         </button>
                         <button
-                          onClick={handleQuickProcess}
-                          disabled={isQuickProcessing || !apiKeyStatus?.hasKey}
-                          className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-xs font-medium disabled:opacity-50"
+                          onClick={() => {
+                            if (suggestedOperation === 'smartAdd') {
+                              handleSmartAdd();
+                            } else {
+                              handleFullSetup();
+                            }
+                            setSuggestedOperation(null);
+                          }}
+                          disabled={isQuickAdding || isFullSetup || (suggestedOperation === 'fullSetup' && !apiKeyStatus?.hasKey)}
+                          className={`px-3 py-1.5 text-white rounded text-xs font-medium disabled:opacity-50 ${
+                            suggestedOperation === 'smartAdd'
+                              ? 'bg-indigo-600 hover:bg-indigo-700'
+                              : 'bg-gradient-to-r from-purple-600 to-green-600 hover:from-purple-700 hover:to-green-700'
+                          }`}
                         >
-                          {isQuickProcessing ? 'Processing...' : 'Quick Process'}
+                          {isQuickAdding || isFullSetup ? 'Running...' : `Run ${suggestedOperation === 'smartAdd' ? 'Smart Add' : 'Full Setup'}`}
                         </button>
                       </div>
                     </div>
@@ -1413,7 +1400,12 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                         {dbStats.unprocessedItems > 0 && `${dbStats.unprocessedItems} to process`}
                         {dbStats.unprocessedItems > 0 && dbStats.unclusteredItems > 0 && ' · '}
                         {dbStats.unclusteredItems > 0 && `${dbStats.unclusteredItems} to cluster`}
-                        {' · '}Haiku {estimateCost(dbStats.unprocessedItems, 'haiku', 1200)} + Sonnet {estimateCost(Math.max(3, Math.ceil((dbStats.topicsCount || 10) / 100) + 2), 'sonnet', 3000)}
+                        {' · '}Haiku {estimateCost(dbStats.unprocessedItems, 'haiku', 1200)}
+                        {useLocalEmbeddings
+                          ? <span className="text-cyan-400"> · Embeddings: FREE</span>
+                          : ` + OpenAI ${estimateCost(dbStats.unprocessedItems, 'openai', 1000)}`
+                        }
+                        {' + '}Sonnet {estimateCost(Math.max(3, Math.ceil((dbStats.topicsCount || 10) / 100) + 2), 'sonnet', 3000)}
                       </div>
                     )}
                     {!isFullSetup && dbStats && dbStats.unprocessedItems === 0 && dbStats.unclusteredItems === 0 && (
@@ -1450,7 +1442,10 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                         {dbStats && dbStats.unprocessedItems > 0 && (
                           <div className="text-xs text-amber-400/80 mt-0.5">
                             {dbStats.unprocessedItems} calls · Haiku {estimateCost(dbStats.unprocessedItems, 'haiku', 1200)}
-                            {openaiKeyStatus && ` + OpenAI ${estimateCost(dbStats.unprocessedItems, 'openai', 1000)}`}
+                            {useLocalEmbeddings
+                              ? <span className="text-cyan-400"> · Embeddings: FREE</span>
+                              : ` + OpenAI ${estimateCost(dbStats.unprocessedItems, 'openai', 1000)}`
+                            }
                           </div>
                         )}
                         {dbStats && dbStats.unprocessedItems === 0 && (
@@ -1548,7 +1543,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                     <div className="text-sm font-medium text-gray-200">Smart Add <span className="text-gray-500">(incremental)</span></div>
                     <div className="text-xs text-gray-500">Add new items using embedding similarity (~5-15s)</div>
                     <div className="text-xs text-gray-600 mt-0.5">
-                      No API calls
+                      <span className="text-cyan-400">FREE</span> · Uses stored embeddings for matching
                       {dbStats && dbStats.orphanItems > 0 && (
                         <span className="text-amber-400/80 ml-1">· {dbStats.orphanItems} items to add</span>
                       )}
@@ -1744,54 +1739,9 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   </button>
                 </div>
 
-                {/* Regenerate Button */}
-                <div className="mt-3 flex items-center gap-2">
-                  <button
-                    onClick={handleRegenerateEmbeddings}
-                    disabled={isRegeneratingEmbeddings || (!useLocalEmbeddings && !openaiKeyStatus)}
-                    className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-cyan-600 hover:bg-cyan-700 text-white rounded text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    {isRegeneratingEmbeddings ? (
-                      <>
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                        Regenerating...
-                      </>
-                    ) : (
-                      <>
-                        <RefreshCw className="w-4 h-4" />
-                        Regenerate All Embeddings
-                      </>
-                    )}
-                  </button>
-                </div>
-
-                {/* Regeneration Progress */}
-                {regenerateProgress && (
-                  <div className="mt-3">
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="text-xs text-gray-400">
-                        {regenerateProgress.status} {regenerateProgress.current}/{regenerateProgress.total}
-                      </span>
-                      <span className="text-xs text-cyan-400">
-                        {regenerateProgress.total > 0
-                          ? `${Math.round((regenerateProgress.current / regenerateProgress.total) * 100)}%`
-                          : '0%'}
-                      </span>
-                    </div>
-                    <div className="h-1.5 bg-gray-700 rounded-full overflow-hidden">
-                      <div
-                        className="h-full bg-cyan-500 transition-all duration-300"
-                        style={{
-                          width: regenerateProgress.total > 0
-                            ? `${(regenerateProgress.current / regenerateProgress.total) * 100}%`
-                            : '0%',
-                        }}
-                      />
-                    </div>
-                  </div>
-                )}
-
                 <p className="mt-3 text-xs text-gray-500">
+                  <span className="text-gray-600">Regenerate embeddings in Maintenance tab.</span>
+                  {' '}
                   {!useLocalEmbeddings && (
                     <span className="text-amber-400">OpenAI embeddings are higher-dimensional but not tuned for our clustering. </span>
                   )}
@@ -1998,6 +1948,87 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
 
                 {operationResult && (
                   <p className="text-xs text-green-400">{operationResult}</p>
+                )}
+              </div>
+            </section>
+
+            {/* Embeddings Section */}
+            <section>
+              <div className="flex items-center gap-2 mb-4">
+                <Cpu className="w-5 h-5 text-cyan-400" />
+                <h3 className="text-lg font-medium text-white">Embeddings</h3>
+              </div>
+
+              <div className="space-y-3">
+                {/* Current Source Indicator */}
+                <div className="bg-gray-900/50 rounded-lg p-3">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <div className="text-sm text-gray-300">
+                        Using: {useLocalEmbeddings ? (
+                          <span className="text-cyan-400">Local Model <span className="text-gray-500">(all-MiniLM-L6-v2)</span></span>
+                        ) : (
+                          <span className="text-amber-400">OpenAI <span className="text-gray-500">(text-embedding-3-small)</span></span>
+                        )}
+                      </div>
+                      <div className="text-xs text-gray-500 mt-0.5">
+                        Change embedding source in API Keys tab
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Regenerate All Embeddings */}
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-cyan-600 flex items-center justify-center text-white text-sm">
+                    <RefreshCw className="w-3.5 h-3.5" />
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Regenerate All Embeddings</div>
+                    <div className="text-xs text-gray-500">Re-compute all embeddings using current source</div>
+                    {dbStats && (
+                      <div className="text-xs mt-0.5">
+                        {useLocalEmbeddings ? (
+                          <span className="text-cyan-400">FREE · {dbStats.itemsWithEmbeddings} embeddings</span>
+                        ) : (
+                          <span className="text-amber-400">{dbStats.itemsWithEmbeddings} items · OpenAI {estimateCost(dbStats.itemsWithEmbeddings, 'openai', 1000)}</span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  <button
+                    onClick={handleRegenerateEmbeddings}
+                    disabled={isRegeneratingEmbeddings || (!useLocalEmbeddings && !openaiKeyStatus)}
+                    style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-cyan-600 hover:bg-cyan-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                  >
+                    {isRegeneratingEmbeddings ? <Loader2 className="w-5 h-5 animate-spin" /> : '🔄'}
+                  </button>
+                </div>
+
+                {/* Regeneration Progress */}
+                {regenerateProgress && (
+                  <div className="bg-gray-900/50 rounded-lg p-3">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-xs text-gray-400">
+                        {regenerateProgress.status} {regenerateProgress.current}/{regenerateProgress.total}
+                      </span>
+                      <span className="text-xs text-cyan-400">
+                        {regenerateProgress.total > 0
+                          ? `${Math.round((regenerateProgress.current / regenerateProgress.total) * 100)}%`
+                          : '0%'}
+                      </span>
+                    </div>
+                    <div className="h-1.5 bg-gray-700 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-cyan-500 transition-all duration-300"
+                        style={{
+                          width: regenerateProgress.total > 0
+                            ? `${(regenerateProgress.current / regenerateProgress.total) * 100}%`
+                            : '0%',
+                        }}
+                      />
+                    </div>
+                  </div>
                 )}
               </div>
             </section>
