@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
 import { readTextFile } from '@tauri-apps/plugin-fs';
+import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import { useGraphStore } from '../../stores/graphStore';
 import {
   X,
@@ -12,6 +13,8 @@ import {
   AlertCircle,
   Loader2,
   FolderOpen,
+  ExternalLink,
+  FilePlus,
   HardDrive,
   Clock,
   Zap,
@@ -480,8 +483,11 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const handleSelectDatabase = async () => {
     setSwitchingDb(true);
     try {
+      // Use current database's directory as default location
+      const defaultDir = dbPath ? dbPath.substring(0, dbPath.lastIndexOf('/') + 1) : undefined;
       const file = await openDialog({
         title: 'Select Mycelica database',
+        defaultPath: defaultDir,
         filters: [{ name: 'SQLite Database', extensions: ['db'] }],
       });
       if (file && typeof file === 'string') {
@@ -493,10 +499,43 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
         navigateToRoot();
         // Trigger graph data refresh
         onDataChanged?.();
-        // Close settings panel to show the new data
-        onClose();
+        // Reload to ensure clean state and update window title
+        window.location.reload();
       }
     } catch (err) {
+      setActionResult(`Error: ${err}`);
+    } finally {
+      setSwitchingDb(false);
+    }
+  };
+
+  // Create new database
+  const handleCreateDatabase = async () => {
+    setSwitchingDb(true);
+    try {
+      // Use current database's directory as default location
+      const defaultDir = dbPath ? dbPath.substring(0, dbPath.lastIndexOf('/') + 1) : undefined;
+      const file = await saveDialog({
+        title: 'Create new Mycelica database',
+        defaultPath: defaultDir ? `${defaultDir}mycelica-new.db` : 'mycelica-new.db',
+        filters: [{ name: 'SQLite Database', extensions: ['db'] }],
+      });
+      if (file && typeof file === 'string') {
+        console.log('Creating new database at:', file);
+        const stats = await invoke<DbStats>('switch_database', { dbPath: file });
+        console.log('Switched to new database, stats:', stats);
+        // Update local state with new db stats
+        setDbStats(stats);
+        setDbPath(file);
+        // Reset navigation to universe root
+        navigateToRoot();
+        // Trigger graph data refresh
+        onDataChanged?.();
+        // Reload to ensure clean state with new database
+        window.location.reload();
+      }
+    } catch (err) {
+      console.error('Failed to create database:', err);
       setActionResult(`Error: ${err}`);
     } finally {
       setSwitchingDb(false);
@@ -1139,18 +1178,38 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
               <div className="bg-gray-900/50 rounded-lg p-4 mb-3">
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-sm font-medium text-gray-200">Current Database</span>
-                  <button
-                    onClick={handleSelectDatabase}
-                    disabled={switchingDb}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded text-xs font-medium transition-colors disabled:opacity-50"
-                  >
-                    {switchingDb ? (
-                      <Loader2 className="w-5 h-5 animate-spin" />
-                    ) : (
-                      <FolderOpen className="w-3 h-3" />
-                    )}
-                    Select...
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => dbPath && revealItemInDir(dbPath)}
+                      disabled={!dbPath}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded text-xs font-medium transition-colors disabled:opacity-50"
+                      title="Reveal in file explorer"
+                    >
+                      <ExternalLink className="w-3 h-3" />
+                      Reveal
+                    </button>
+                    <button
+                      onClick={handleCreateDatabase}
+                      disabled={switchingDb}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-green-700 hover:bg-green-600 text-gray-200 rounded text-xs font-medium transition-colors disabled:opacity-50"
+                      title="Create a new empty database"
+                    >
+                      <FilePlus className="w-3 h-3" />
+                      New
+                    </button>
+                    <button
+                      onClick={handleSelectDatabase}
+                      disabled={switchingDb}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded text-xs font-medium transition-colors disabled:opacity-50"
+                    >
+                      {switchingDb ? (
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                      ) : (
+                        <FolderOpen className="w-3 h-3" />
+                      )}
+                      Open...
+                    </button>
+                  </div>
                 </div>
                 <div className="px-2 py-1.5 bg-gray-800 rounded text-xs text-gray-400 font-mono truncate" title={dbPath}>
                   {dbPath || 'Loading...'}

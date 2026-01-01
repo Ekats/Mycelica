@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState, Component, ErrorInfo, ReactNode } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Graph } from './components/graph/Graph';
 import { LeafView } from './components/leaf/LeafView';
 import { Sidebar } from './components/sidebar/Sidebar';
@@ -7,6 +9,25 @@ import { ComponentErrorBoundary } from './components/ErrorBoundary';
 import { useGraph } from './hooks/useGraph';
 import { useGraphStore } from './stores/graphStore';
 import './App.css';
+
+// Update window title with database path
+async function updateWindowTitle() {
+  try {
+    const dbPath = await invoke<string>('get_db_path');
+    // Replace home directory with ~ for cleaner display
+    const homePath = dbPath.replace(/^\/home\/[^/]+/, '~').replace(/^\/Users\/[^/]+/, '~');
+    const title = `Mycelica — ${homePath}`;
+
+    // Try multiple approaches for Wayland compatibility
+    // 1. Set document.title (works on some Wayland compositors)
+    document.title = title;
+
+    // 2. Use Tauri API
+    await getCurrentWindow().setTitle(title);
+  } catch (err) {
+    console.error('Failed to update window title:', err);
+  }
+}
 
 // Error boundary to catch React errors
 interface ErrorBoundaryState {
@@ -100,6 +121,11 @@ function App() {
       setLoading(false);
     }, 500);
     return () => clearTimeout(timer);
+  }, []);
+
+  // Update window title with database name on mount
+  useEffect(() => {
+    updateWindowTitle();
   }, []);
 
   // Also stop loading when nodes arrive

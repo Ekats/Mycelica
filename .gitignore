@@ -13,6 +13,7 @@ releases/
 data/
 archive/
 docs/private/
+docs/implementation/
 *.db
 !src-tauri/resources/mycelica-testing-preview.db
 *.db-journal

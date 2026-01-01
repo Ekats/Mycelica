@@ -1424,16 +1424,20 @@ pub fn get_db_path(state: State<AppState>) -> Result<String, String> {
 }
 
 /// Switch to a different database file (hot-swap without restart)
+/// Creates a new database if the file doesn't exist
 #[tauri::command]
-pub fn switch_database(_app: AppHandle, state: State<AppState>, db_path: String) -> Result<DbStats, String> {
+pub fn switch_database(app: AppHandle, state: State<AppState>, db_path: String) -> Result<DbStats, String> {
     use std::path::PathBuf;
     use crate::db::Database;
     use crate::hierarchy;
     use crate::settings;
+    use tauri::Manager;
 
     let path = PathBuf::from(&db_path);
-    if !path.exists() {
-        return Err(format!("Database file not found: {}", db_path));
+    let is_new = !path.exists();
+
+    if is_new {
+        println!("Creating new database at: {:?}", path);
     }
 
     // Save the custom db path to settings (persists across restarts)
@@ -1458,6 +1462,22 @@ pub fn switch_database(_app: AppHandle, state: State<AppState>, db_path: String)
     {
         let mut db_guard = state.db.write().map_err(|e| format!("DB lock error: {}", e))?;
         *db_guard = Arc::new(new_db);
+    }
+
+    // Update window title to show new database path
+    if let Some(window) = app.get_webview_window("main") {
+        let path_str = db_path.clone();
+        // Replace home directory with ~ for cleaner display
+        let home = std::env::var("HOME").unwrap_or_default();
+        let display_path = if !home.is_empty() && path_str.starts_with(&home) {
+            path_str.replacen(&home, "~", 1)
+        } else {
+            path_str
+        };
+        let title = format!("Mycelica — {}", display_path);
+        if let Err(e) = window.set_title(&title) {
+            eprintln!("Failed to set window title: {}", e);
+        }
     }
 
     Ok(DbStats {

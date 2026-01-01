@@ -158,6 +158,29 @@ pub fn run() {
                 similarity_cache: std::sync::RwLock::new(commands::SimilarityCache::new(cache_ttl)),
             });
 
+            // Set window title to show database path
+            // Note: On Wayland, this updates taskbar but not header bar (upstream GTK issue)
+            let db_path_clone = db_path.clone();
+            let app_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                let path_str = db_path_clone.to_string_lossy();
+                let home = std::env::var("HOME").unwrap_or_default();
+                let display_path = if !home.is_empty() && path_str.starts_with(&home) {
+                    path_str.replacen(&home, "~", 1)
+                } else {
+                    path_str.to_string()
+                };
+                let title = format!("Mycelica — {}", display_path);
+
+                // Multiple attempts for window readiness
+                for delay in [100, 500, 1000] {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let _ = window.set_title(&title);
+                    }
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
