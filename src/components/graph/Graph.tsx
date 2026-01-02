@@ -45,6 +45,11 @@ const toSuperscript = (n: number): string => {
   return String(n).split('').map(d => superscripts[parseInt(d)]).join('');
 };
 
+// Strip JATS XML tags from text (used in scientific paper abstracts)
+const stripJatsTags = (text: string): string => {
+  return text.replace(/<\/?jats:[^>]+>/g, '');
+};
+
 interface AiProgressEvent {
   current: number;
   total: number;
@@ -1216,8 +1221,8 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
           ...node,
           x, y,
           renderClusterId: colorId,
-          displayTitle: node.aiTitle || node.title || 'Untitled',
-          displayContent: node.summary || node.content || '',
+          displayTitle: stripJatsTags(node.aiTitle || node.title || 'Untitled'),
+          displayContent: stripJatsTags(node.summary || node.content || ''),
           displayEmoji: getNodeEmoji(node),
         });
         nodeIndex++;
@@ -1301,8 +1306,8 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     navigateToNode(node);
   }, [navigateToNode]);
 
-  const handleOpenLeaf = useCallback((id: string) => {
-    openLeaf(id);
+  const handleOpenLeaf = useCallback((id: string, initialView?: 'abstract' | 'pdf') => {
+    openLeaf(id, initialView);
   }, [openLeaf]);
 
   return (
@@ -1663,6 +1668,7 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
           onListNodes={listCurrentNodes}
           onListPath={listCurrentPath}
           onListHierarchy={listHierarchy}
+          onLog={(log) => setDevLogs(prev => [...prev, log])}
           isResizing={isResizing}
           onResizeStart={handleResizeStart}
           positionAtBottom={consoleAtBottom}

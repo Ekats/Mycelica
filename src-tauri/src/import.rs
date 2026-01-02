@@ -3,6 +3,8 @@
 //! Creates exchange nodes (human + assistant paired) for better clustering.
 
 use crate::db::{Database, Node, NodeType, Position};
+use crate::openaire::{OpenAireClient, OpenAireQuery, OpenAirePaper};
+use crate::format_abstract::{format_abstract, strip_html_tags};
 use serde::{Deserialize, Serialize};
 
 /// Claude conversation export format
@@ -134,6 +136,7 @@ pub fn import_claude_conversations(db: &Database, json_content: &str) -> Result<
             is_private: None,
             privacy_reason: None,
             source: Some("claude".to_string()),
+            pdf_available: None,
             content_type: None,
             associated_idea_id: None,
             privacy: None,
@@ -188,6 +191,7 @@ pub fn import_claude_conversations(db: &Database, json_content: &str) -> Result<
                 is_private: None,
                 privacy_reason: None,
                 source: Some("claude".to_string()),
+                pdf_available: None,
                 content_type: None,
                 associated_idea_id: None,
                 privacy: None,
@@ -259,6 +263,7 @@ pub fn import_markdown_files(db: &Database, file_paths: &[String]) -> Result<Imp
             is_private: None,
             privacy_reason: None,
             source: None,
+            pdf_available: None,
             content_type: None,
             associated_idea_id: None,
             privacy: None,
@@ -326,6 +331,7 @@ pub fn import_markdown_files(db: &Database, file_paths: &[String]) -> Result<Imp
             is_private: None,
             privacy_reason: None,
             source: Some("markdown".to_string()),
+            pdf_available: None,
             content_type: None,
             associated_idea_id: None,
             privacy: None,
@@ -581,6 +587,7 @@ pub fn import_google_keep(db: &Database, zip_path: &str) -> Result<GoogleKeepImp
             is_private: None,
             privacy_reason: None,
             source: Some("googlekeep".to_string()),
+            pdf_available: None,
             content_type: None,
             associated_idea_id: None,
             privacy: None,
@@ -650,6 +657,270 @@ fn pair_messages(messages: &[ClaudeMessage]) -> Vec<Exchange> {
     }
 
     exchanges
+}
+
+// ==================== OpenAIRE Paper Import ====================
+
+/// OpenAIRE import result summary
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenAireImportResult {
+    pub papers_imported: usize,
+    pub pdfs_downloaded: usize,
+    pub pdfs_skipped: usize,
+    pub duplicates_skipped: usize,
+    pub errors: Vec<String>,
+}
+
+/// Import scientific papers from OpenAIRE
+///
+/// Fetches papers matching the query, creates nodes with paper metadata,
+/// and optionally downloads PDFs.
+pub async fn import_openaire_papers(
+    db: &Database,
+    query: String,
+    country: Option<String>,
+    fos: Option<String>,
+    max_papers: u32,
+    download_pdfs: bool,
+    max_pdf_size_mb: u32,
+    on_progress: impl Fn(usize, usize),
+) -> Result<OpenAireImportResult, String> {
+    let client = OpenAireClient::new();
+
+    let mut result = OpenAireImportResult {
+        papers_imported: 0,
+        pdfs_downloaded: 0,
+        pdfs_skipped: 0,
+        duplicates_skipped: 0,
+        errors: Vec::new(),
+    };
+
+    // Pre-load all existing OpenAIRE IDs for O(1) duplicate checking
+    let existing_ids = db.get_all_openaire_ids().unwrap_or_default();
+    println!("[OpenAIRE] Pre-loaded {} existing paper IDs for duplicate check", existing_ids.len());
+
+    let page_size = 100u32.min(max_papers);
+    let mut current_page = 1u32;
+    let mut total_available: Option<u32> = None;
+
+    // Fetch papers in pages until we have enough NEW papers
+    loop {
+        if result.papers_imported >= max_papers as usize {
+            break;
+        }
+
+        let query_obj = OpenAireQuery {
+            search: query.clone(),
+            country: country.clone(),
+            fos: fos.clone(),
+            access_right: Some("OPEN".to_string()),
+            page_size,
+            page: current_page,
+            sort_by: None,
+        };
+
+        let (papers, total_count) = client.fetch_papers(&query_obj).await?;
+
+        // Store total count on first fetch
+        if total_available.is_none() {
+            total_available = Some(total_count);
+        }
+
+        println!("[OpenAIRE] Page {}: fetched {} papers (total available: {})",
+            current_page, papers.len(), total_count);
+
+        if papers.is_empty() {
+            println!("[OpenAIRE] No more papers on page {}, stopping", current_page);
+            break;
+        }
+
+        for paper in papers {
+            // Stop when we've imported enough NEW papers
+            if result.papers_imported >= max_papers as usize {
+                break;
+            }
+
+            // Check for duplicates using pre-loaded HashSet (O(1) instead of DB query)
+            if existing_ids.contains(&paper.id) {
+                result.duplicates_skipped += 1;
+                // Don't count duplicates toward progress - keep fetching until we have enough new ones
+                continue;
+            }
+
+            // Import the paper
+            match import_single_paper(db, &paper, download_pdfs, max_pdf_size_mb, &client).await {
+                Ok(pdf_downloaded) => {
+                    result.papers_imported += 1;
+                    if pdf_downloaded {
+                        result.pdfs_downloaded += 1;
+                    } else if download_pdfs && !paper.pdf_urls.is_empty() {
+                        result.pdfs_skipped += 1;
+                    }
+                    on_progress(result.papers_imported, max_papers as usize);
+                }
+                Err(e) => {
+                    result.errors.push(format!("Failed to import '{}': {}", paper.title, e));
+                }
+            }
+
+            // Rate limiting between papers
+            OpenAireClient::rate_limit_delay().await;
+        }
+
+        current_page += 1;
+
+        // Stop if we've exhausted all available papers
+        let papers_fetched_so_far = (current_page - 1) * page_size;
+        if papers_fetched_so_far >= total_available.unwrap_or(0) {
+            println!("[OpenAIRE] Reached end of results (page {} * {} >= {}). Imported: {}, Duplicates: {}",
+                current_page - 1, page_size, total_available.unwrap_or(0),
+                result.papers_imported, result.duplicates_skipped);
+            break;
+        }
+    }
+
+    println!(
+        "[OpenAIRE] Import complete: {} papers, {} PDFs, {} skipped, {} duplicates, {} errors",
+        result.papers_imported,
+        result.pdfs_downloaded,
+        result.pdfs_skipped,
+        result.duplicates_skipped,
+        result.errors.len()
+    );
+
+    Ok(result)
+}
+
+/// Import a single paper into the database
+async fn import_single_paper(
+    db: &Database,
+    paper: &OpenAirePaper,
+    download_pdfs: bool,
+    max_pdf_size_mb: u32,
+    client: &OpenAireClient,
+) -> Result<bool, String> {
+    let node_id = format!("paper-{}", uuid::Uuid::new_v4());
+
+    // Use abstract as content (for embeddings)
+    let content = paper.description.clone().unwrap_or_default();
+
+    // Serialize authors to JSON
+    let authors_json = serde_json::to_string(&paper.authors).ok();
+
+    // Serialize subjects to JSON
+    let subjects_json = serde_json::to_string(&paper.subjects).ok();
+
+    // Get first PDF URL
+    let pdf_url = paper.pdf_urls.first().cloned();
+
+    // Parse publication date to timestamp
+    let created_at = paper.publication_date
+        .as_ref()
+        .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+        .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+
+    let now = chrono::Utc::now().timestamp_millis();
+
+    // Create the node
+    let node = Node {
+        id: node_id.clone(),
+        node_type: NodeType::Paper,
+        title: paper.title.clone(),
+        url: paper.doi.as_ref().map(|doi| format!("https://doi.org/{}", doi)),
+        content: Some(content),
+        position: Position { x: 0.0, y: 0.0 },
+        created_at,
+        updated_at: now,
+        cluster_id: None,
+        cluster_label: None,
+        depth: 0,
+        is_item: true,
+        is_universe: false,
+        parent_id: None,
+        child_count: 0,
+        ai_title: Some(paper.title.clone()),
+        summary: paper.description.clone(),
+        tags: None,
+        emoji: Some("📄".to_string()),
+        is_processed: false,
+        conversation_id: None,
+        sequence_index: None,
+        is_pinned: false,
+        last_accessed_at: None,
+        latest_child_date: None,
+        is_private: None,
+        privacy_reason: None,
+        source: Some("openaire".to_string()),  // Updated to "openaire-pdf" after successful download
+        pdf_available: None,  // Updated after PDF download attempt
+        content_type: Some("paper".to_string()),
+        associated_idea_id: None,
+        privacy: None,
+    };
+
+    db.insert_node(&node).map_err(|e| e.to_string())?;
+
+    // Strip HTML from abstract and format with section detection
+    let raw_abstract = paper.description.as_deref().unwrap_or("");
+    let clean_abstract = strip_html_tags(raw_abstract);
+    let formatted = format_abstract(&clean_abstract);
+    let abstract_sections_json = if formatted.sections.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&formatted.sections).unwrap_or_default())
+    };
+    let abstract_formatted = if formatted.had_structure {
+        Some(formatted.markdown.as_str())
+    } else {
+        None
+    };
+
+    // Insert paper metadata (store clean abstract without HTML tags)
+    db.insert_paper(
+        &node_id,
+        Some(&paper.id),
+        paper.doi.as_deref(),
+        authors_json.as_deref(),
+        paper.publication_date.as_deref(),
+        paper.journal.as_deref(),
+        paper.publisher.as_deref(),
+        Some(&clean_abstract),
+        abstract_formatted,
+        abstract_sections_json.as_deref(),
+        pdf_url.as_deref(),
+        subjects_json.as_deref(),
+        Some(&paper.access_right),
+    ).map_err(|e| e.to_string())?;
+
+    // Download document (PDF/DOCX/DOC) if requested
+    let mut pdf_downloaded = false;
+    if download_pdfs {
+        if let Some(url) = &pdf_url {
+            match client.download_document(url, max_pdf_size_mb).await {
+                Ok(Some((doc_bytes, format))) => {
+                    if let Err(e) = db.update_paper_document(&node_id, &doc_bytes, &format) {
+                        eprintln!("[OpenAIRE] Failed to store document: {}", e);
+                    } else {
+                        pdf_downloaded = true;
+                        // Mark node as having document for graph badge display
+                        let source = format!("openaire-{}", format);
+                        if let Err(e) = db.update_node_source(&node_id, &source) {
+                            eprintln!("[OpenAIRE] Failed to update node source: {}", e);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // Document download failed or was too large - that's OK, we have the URL
+                }
+                Err(e) => {
+                    eprintln!("[OpenAIRE] Document download error: {}", e);
+                }
+            }
+        }
+    }
+
+    Ok(pdf_downloaded)
 }
 
 #[cfg(test)]

@@ -36,6 +36,7 @@ pub enum ContentType {
     Synthesis,     // Summarizing, connecting threads
     Question,      // Inquiry that frames investigation
     Planning,      // Roadmap, TODO, intentions
+    Paper,         // Scientific paper (fixed type, never reclassified)
 
     // SUPPORTING - lazy-loaded in leaf view
     Investigation, // Problem-solving focused on fixing
@@ -66,6 +67,7 @@ impl ContentType {
             ContentType::Synthesis => "synthesis",
             ContentType::Question => "question",
             ContentType::Planning => "planning",
+            ContentType::Paper => "paper",
             ContentType::Investigation => "investigation",
             ContentType::Discussion => "discussion",
             ContentType::Reference => "reference",
@@ -85,6 +87,7 @@ impl ContentType {
             "synthesis" => Some(ContentType::Synthesis),
             "question" => Some(ContentType::Question),
             "planning" => Some(ContentType::Planning),
+            "paper" => Some(ContentType::Paper),
             // Supporting
             "investigation" => Some(ContentType::Investigation),
             "discussion" => Some(ContentType::Discussion),
@@ -102,7 +105,7 @@ impl ContentType {
     pub fn visibility(&self) -> VisibilityTier {
         match self {
             ContentType::Insight | ContentType::Exploration | ContentType::Synthesis |
-            ContentType::Question | ContentType::Planning => VisibilityTier::Visible,
+            ContentType::Question | ContentType::Planning | ContentType::Paper => VisibilityTier::Visible,
 
             ContentType::Investigation | ContentType::Discussion |
             ContentType::Reference | ContentType::Creative => VisibilityTier::Supporting,
@@ -738,6 +741,12 @@ pub fn classify_all_items(db: &Database) -> Result<usize, String> {
         // Progress logging every 500 items
         if idx > 0 && idx % 500 == 0 {
             println!("[Classification] Processed {}/{} items...", idx, total_items);
+        }
+
+        // Skip papers (fixed content_type, never reclassify)
+        if item.content_type.as_deref() == Some("paper") {
+            already_classified += 1;
+            continue;
         }
 
         // Skip already classified items (likely from AI processing)

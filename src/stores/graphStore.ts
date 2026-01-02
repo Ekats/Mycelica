@@ -25,6 +25,7 @@ interface GraphState {
   // View mode state
   viewMode: ViewMode;              // 'graph' or 'leaf'
   leafNodeId: string | null;       // Node ID being viewed in leaf mode
+  leafInitialView: 'abstract' | 'pdf' | null;  // For papers: which view to open initially
 
   // Navigation state for drill-down
   currentDepth: number;             // Current hierarchy depth being viewed
@@ -51,7 +52,7 @@ interface GraphState {
   setActiveNode: (id: string | null) => void;
 
   // View mode actions
-  openLeaf: (nodeId: string) => void;  // Open item in leaf mode
+  openLeaf: (nodeId: string, initialView?: 'abstract' | 'pdf') => void;  // Open item in leaf mode
   closeLeaf: () => void;               // Return to graph mode
 
   // Navigation actions
@@ -78,6 +79,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   // View mode state - start in graph mode
   viewMode: 'graph',
   leafNodeId: null,
+  leafInitialView: null,
 
   // Navigation state - start at Universe (depth 0)
   currentDepth: 0,
@@ -138,15 +140,17 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   setActiveNode: (activeNodeId) => set({ activeNodeId }),
 
   // View mode actions
-  openLeaf: (nodeId) => set({
+  openLeaf: (nodeId, initialView) => set({
     viewMode: 'leaf',
     leafNodeId: nodeId,
+    leafInitialView: initialView || null,
     activeNodeId: nodeId,
   }),
 
   closeLeaf: () => set({
     viewMode: 'graph',
     leafNodeId: null,
+    leafInitialView: null,
   }),
 
   // Navigation actions

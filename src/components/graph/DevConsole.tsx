@@ -1,4 +1,5 @@
-import React, { RefObject } from 'react';
+import React, { RefObject, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 
 export interface DevConsoleLog {
   type: 'info' | 'warn' | 'error';
@@ -25,6 +26,7 @@ interface DevConsoleProps {
   onListNodes: () => void;
   onListPath: () => void;
   onListHierarchy: () => void;
+  onLog: (log: DevConsoleLog) => void;
   isResizing: boolean;
   onResizeStart: (e: React.MouseEvent) => void;
   positionAtBottom: boolean;
@@ -43,10 +45,33 @@ export const DevConsole = React.memo(function DevConsole({
   onListNodes,
   onListPath,
   onListHierarchy,
+  onLog,
   isResizing,
   onResizeStart,
   positionAtBottom,
 }: DevConsoleProps) {
+  const [cmdInput, setCmdInput] = useState('');
+  const [isRunning, setIsRunning] = useState(false);
+
+  const runCommand = async () => {
+    const cmd = cmdInput.trim();
+    if (!cmd || isRunning) return;
+
+    const time = new Date().toLocaleTimeString('en-US', { hour12: false });
+    onLog({ type: 'info', message: `> ${cmd}`, time });
+
+    setIsRunning(true);
+    try {
+      const result = await invoke(cmd);
+      onLog({ type: 'info', message: `${JSON.stringify(result)}`, time: new Date().toLocaleTimeString('en-US', { hour12: false }) });
+    } catch (err) {
+      onLog({ type: 'error', message: `${err}`, time: new Date().toLocaleTimeString('en-US', { hour12: false }) });
+    } finally {
+      setIsRunning(false);
+      setCmdInput('');
+    }
+  };
+
   return (
     <div
       className={`absolute bg-gray-900/95 backdrop-blur-sm rounded-lg border border-gray-700 overflow-hidden flex flex-col ${
@@ -79,6 +104,23 @@ export const DevConsole = React.memo(function DevConsole({
             </div>
           ))
         )}
+      </div>
+
+      {/* Command input */}
+      <div className="px-2 py-1 border-t border-gray-700 flex-shrink-0">
+        <div className="flex items-center gap-2">
+          <span className="text-green-400 text-xs">{'>'}</span>
+          <input
+            type="text"
+            value={cmdInput}
+            onChange={(e) => setCmdInput(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && runCommand()}
+            placeholder="invoke command (e.g. reformat_paper_abstracts)"
+            className="flex-1 bg-transparent text-xs text-gray-200 outline-none placeholder-gray-600 font-mono"
+            disabled={isRunning}
+          />
+          {isRunning && <span className="text-amber-400 text-xs animate-pulse">...</span>}
+        </div>
       </div>
 
       {/* Footer controls */}

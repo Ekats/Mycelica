@@ -9,6 +9,8 @@ mod similarity;
 mod local_embeddings;
 pub mod classification;
 mod tags;
+mod openaire;
+mod format_abstract;
 
 use commands::{
     AppState,
@@ -37,7 +39,9 @@ use commands::{
     // Conversation context commands
     get_conversation_context,
     // Import commands
-    import_claude_conversations, import_markdown_files, import_google_keep,
+    import_claude_conversations, import_markdown_files, import_google_keep, import_openaire, count_openaire_papers, get_imported_paper_count,
+    // Paper retrieval commands
+    get_paper_metadata, get_paper_pdf, get_paper_document, has_paper_pdf, open_paper_external, reformat_paper_abstracts, sync_paper_pdf_status,
     // Quick access commands (Sidebar)
     set_node_pinned, touch_node, get_pinned_nodes, get_recent_nodes, clear_recent,
     // Semantic similarity commands
@@ -158,8 +162,8 @@ pub fn run() {
                 similarity_cache: std::sync::RwLock::new(commands::SimilarityCache::new(cache_ttl)),
             });
 
-            // Set window title to show database path
-            // Note: On Wayland, this updates taskbar but not header bar (upstream GTK issue)
+            // Set window title and handle HiDPI scaling
+            // Note: On Wayland, title updates taskbar but not header bar (upstream GTK issue)
             let db_path_clone = db_path.clone();
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
@@ -177,6 +181,25 @@ pub fn run() {
                     std::thread::sleep(std::time::Duration::from_millis(delay));
                     if let Some(window) = app_handle.get_webview_window("main") {
                         let _ = window.set_title(&title);
+
+                        // HiDPI fix: WebKitGTK on Wayland doesn't report scale correctly
+                        // Check MYCELICA_SCALE env var, or GDK_SCALE, or fallback to detected
+                        let detected_scale = window.scale_factor().unwrap_or(1.0);
+                        let forced_scale = std::env::var("MYCELICA_SCALE")
+                            .or_else(|_| std::env::var("GDK_SCALE"))
+                            .ok()
+                            .and_then(|s| s.parse::<f64>().ok());
+
+                        let scale = forced_scale.unwrap_or(detected_scale);
+                        println!("[HiDPI] Detected: {}, Forced: {:?}, Using: {}", detected_scale, forced_scale, scale);
+
+                        if scale > 1.0 {
+                            if let Err(e) = window.set_zoom(scale) {
+                                eprintln!("[HiDPI] Failed to set zoom: {}", e);
+                            } else {
+                                println!("[HiDPI] Set webview zoom to {}", scale);
+                            }
+                        }
                     }
                 }
             });
@@ -250,6 +273,17 @@ pub fn run() {
             import_claude_conversations,
             import_markdown_files,
             import_google_keep,
+            import_openaire,
+            count_openaire_papers,
+            get_imported_paper_count,
+            // Paper retrieval
+            get_paper_metadata,
+            get_paper_pdf,
+            get_paper_document,
+            has_paper_pdf,
+            open_paper_external,
+            reformat_paper_abstracts,
+            sync_paper_pdf_status,
             // Quick access (Sidebar)
             set_node_pinned,
             touch_node,

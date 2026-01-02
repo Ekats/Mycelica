@@ -86,12 +86,16 @@ export interface Node {
   privacy?: number;         // 0.0 = private, 1.0 = public, undefined = unscored
   privacyReason?: string;   // Why it was marked private (for review)
 
+  // --- Import source ---
+  source?: string;          // "claude", "openaire", "openaire-pdf", etc.
+  pdfAvailable?: boolean;   // For papers: whether PDF is stored in database
+
   // --- Content classification (3 visibility tiers) ---
-  // VISIBLE (shown in graph): insight, idea, exploration, synthesis, question, planning
+  // VISIBLE (shown in graph): insight, idea, exploration, synthesis, question, planning, paper
   // SUPPORTING (lazy-loaded): investigation, discussion, reference, creative
   // HIDDEN (excluded): debug, code, paste, trivial
   contentType?:
-    | 'insight' | 'idea' | 'exploration' | 'synthesis' | 'question' | 'planning'  // VISIBLE
+    | 'insight' | 'idea' | 'exploration' | 'synthesis' | 'question' | 'planning' | 'paper'  // VISIBLE
     | 'investigation' | 'discussion' | 'reference' | 'creative'  // SUPPORTING
     | 'debug' | 'code' | 'paste' | 'trivial';  // HIDDEN
   associatedIdeaId?: string;  // Links supporting item to specific idea node

@@ -172,6 +172,7 @@ pub fn add_note(state: State<AppState>, title: String, content: String) -> Resul
             is_private: None,
             privacy_reason: None,
             source: None,
+            pdf_available: None,
             content_type: None,
             associated_idea_id: None,
             privacy: None,
@@ -220,6 +221,7 @@ pub fn add_note(state: State<AppState>, title: String, content: String) -> Resul
         is_private: None,
         privacy_reason: None,
         source: None,
+        pdf_available: None,
         content_type: None,
         associated_idea_id: None,
         privacy: None,
@@ -434,6 +436,11 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
 
         // Skip nodes with no content
         if content.is_empty() {
+            continue;
+        }
+
+        // Skip papers (already have title/summary/content_type from import)
+        if node.content_type.as_deref() == Some("paper") {
             continue;
         }
 
@@ -917,6 +924,230 @@ pub fn import_google_keep(state: State<AppState>, zip_path: String) -> Result<im
     import::import_google_keep(&db, &zip_path)
 }
 
+/// Import scientific papers from OpenAIRE (EU open science graph).
+///
+/// Fetches papers matching the search query, creates paper nodes,
+/// and optionally downloads PDFs.
+#[tauri::command]
+pub async fn import_openaire(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    query: String,
+    country: Option<String>,
+    fos: Option<String>,
+    max_papers: u32,
+    download_pdfs: bool,
+    max_pdf_size_mb: Option<u32>,
+) -> Result<import::OpenAireImportResult, String> {
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clone();
+    let max_size = max_pdf_size_mb.unwrap_or(20);
+
+    // Progress callback that emits events to frontend
+    let app_handle = app.clone();
+    let on_progress = move |current: usize, total: usize| {
+        let _ = app_handle.emit("openaire-progress", serde_json::json!({
+            "current": current,
+            "total": total,
+        }));
+    };
+
+    import::import_openaire_papers(
+        &db,
+        query,
+        country,
+        fos,
+        max_papers,
+        download_pdfs,
+        max_size,
+        on_progress,
+    ).await
+}
+
+/// Count papers matching OpenAIRE query without importing
+/// Returns (total_count, already_imported_count)
+/// Fetches a sample of 100 papers to check against local DB
+#[tauri::command]
+pub async fn count_openaire_papers(
+    state: State<'_, AppState>,
+    query: String,
+    country: Option<String>,
+    fos: Option<String>,
+) -> Result<(u32, u32), String> {
+    use crate::openaire::{OpenAireClient, OpenAireQuery};
+
+    let client = OpenAireClient::new();
+
+    // First get total count
+    let count_query = OpenAireQuery {
+        search: query.clone(),
+        country: country.clone(),
+        fos: fos.clone(),
+        access_right: Some("OPEN".to_string()),
+        page_size: 1,
+        page: 1,
+        sort_by: None,
+    };
+    let total_count = client.count_papers(&count_query).await?;
+
+    // Then fetch first 100 papers to check which are already imported
+    let sample_query = OpenAireQuery {
+        search: query,
+        country,
+        fos,
+        access_right: Some("OPEN".to_string()),
+        page_size: 100,
+        page: 1,
+        sort_by: None,
+    };
+    let (papers, _) = client.fetch_papers(&sample_query).await?;
+
+    // Get existing IDs from local DB
+    let existing_ids = state.db.read()
+        .map_err(|e| format!("DB lock error: {}", e))?
+        .get_all_openaire_ids()
+        .map_err(|e| e.to_string())?;
+
+    // Count how many of the sample are already imported
+    let imported_count = papers.iter()
+        .filter(|p| existing_ids.contains(&p.id))
+        .count() as u32;
+
+    Ok((total_count, imported_count))
+}
+
+/// Get count of already-imported papers from local database
+#[tauri::command]
+pub fn get_imported_paper_count(state: State<AppState>) -> Result<i32, String> {
+    state.db.read()
+        .map_err(|e| format!("DB lock error: {}", e))?
+        .get_paper_count()
+        .map_err(|e| e.to_string())
+}
+
+// ==================== Paper Retrieval Commands ====================
+
+/// Get paper metadata by node ID
+#[tauri::command]
+pub fn get_paper_metadata(state: State<AppState>, node_id: String) -> Result<Option<crate::db::Paper>, String> {
+    let result = state.db.read()
+        .map_err(|e| format!("DB lock error: {}", e))?
+        .get_paper_by_node_id(&node_id)
+        .map_err(|e| e.to_string())?;
+    if let Some(ref paper) = result {
+        eprintln!("[PDF] get_paper_metadata: node_id={}, pdfAvailable={}, pdfUrl={:?}",
+            node_id, paper.pdf_available, paper.pdf_url);
+    }
+    Ok(result)
+}
+
+/// Get PDF binary for a paper
+#[tauri::command]
+pub fn get_paper_pdf(state: State<AppState>, node_id: String) -> Result<Option<Vec<u8>>, String> {
+    eprintln!("[PDF] get_paper_pdf called for node_id: {}", node_id);
+    let result = state.db.read()
+        .map_err(|e| format!("DB lock error: {}", e))?
+        .get_paper_pdf(&node_id)
+        .map_err(|e| e.to_string())?;
+    eprintln!("[PDF] get_paper_pdf result: {} bytes", result.as_ref().map(|v| v.len()).unwrap_or(0));
+    Ok(result)
+}
+
+/// Check if a paper has a PDF available
+#[tauri::command]
+pub fn has_paper_pdf(state: State<AppState>, node_id: String) -> Result<bool, String> {
+    state.db.read()
+        .map_err(|e| format!("DB lock error: {}", e))?
+        .has_paper_pdf(&node_id)
+        .map_err(|e| e.to_string())
+}
+
+/// Get document binary and format for a paper (supports PDF, DOCX, DOC)
+#[tauri::command]
+pub fn get_paper_document(state: State<AppState>, node_id: String) -> Result<Option<(Vec<u8>, String)>, String> {
+    eprintln!("[Document] get_paper_document called for node_id: {}", node_id);
+    let result = state.db.read()
+        .map_err(|e| format!("DB lock error: {}", e))?
+        .get_paper_document(&node_id)
+        .map_err(|e| e.to_string())?;
+    if let Some((ref bytes, ref format)) = result {
+        eprintln!("[Document] get_paper_document result: {} bytes, format: {}", bytes.len(), format);
+    }
+    Ok(result)
+}
+
+/// Open a paper's document in the system's default viewer
+#[tauri::command]
+pub fn open_paper_external(state: State<AppState>, node_id: String, title: String) -> Result<(), String> {
+    use std::io::Write;
+
+    let (doc_data, format) = state.db.read()
+        .map_err(|e| format!("DB lock error: {}", e))?
+        .get_paper_document(&node_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Document not available".to_string())?;
+
+    // Create safe filename
+    let safe_name: String = title.chars()
+        .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
+        .take(50)
+        .collect();
+    let safe_name = safe_name.trim().replace(' ', "_");
+
+    // Write to temp file with correct extension
+    let temp_dir = std::env::temp_dir();
+    let file_path = temp_dir.join(format!("{}.{}", safe_name, format));
+
+    let mut file = std::fs::File::create(&file_path)
+        .map_err(|e| format!("Failed to create temp file: {}", e))?;
+    file.write_all(&doc_data)
+        .map_err(|e| format!("Failed to write document: {}", e))?;
+
+    eprintln!("[Document] Opening external: {:?}", file_path);
+
+    // Open with system default viewer
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&file_path)
+            .spawn()
+            .map_err(|e| format!("Failed to open document: {}", e))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&file_path)
+            .spawn()
+            .map_err(|e| format!("Failed to open document: {}", e))?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &file_path.to_string_lossy()])
+            .spawn()
+            .map_err(|e| format!("Failed to open document: {}", e))?;
+    }
+
+    Ok(())
+}
+
+/// Reformat all paper abstracts (for papers imported before the formatter)
+#[tauri::command]
+pub fn reformat_paper_abstracts(state: State<AppState>) -> Result<usize, String> {
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+    let count = db.reformat_all_paper_abstracts().map_err(|e| e.to_string())?;
+    eprintln!("[Papers] Reformatted {} abstracts with detected structure", count);
+    Ok(count)
+}
+
+/// Sync pdf_available from papers table to nodes table
+#[tauri::command]
+pub fn sync_paper_pdf_status(state: State<AppState>) -> Result<usize, String> {
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+    let count = db.sync_paper_pdf_status().map_err(|e| e.to_string())?;
+    eprintln!("[Papers] Synced pdf_available for {} paper nodes", count);
+    Ok(count)
+}
+
 // ==================== Quick Access Commands (Sidebar) ====================
 
 /// Pin or unpin a node for quick access
@@ -1304,6 +1535,7 @@ pub async fn consolidate_root(state: State<'_, AppState>) -> Result<ConsolidateR
             is_private: None,
             privacy_reason: None,
             source: None,
+            pdf_available: None,
             content_type: None,
             associated_idea_id: None,
             privacy: None,
@@ -1771,6 +2003,11 @@ pub async fn reclassify_ai(
             break;
         }
 
+        // Skip papers (fixed content_type, never reclassify)
+        if item.content_type.as_deref() == Some("paper") {
+            continue;
+        }
+
         let content = item.content.as_deref().unwrap_or("");
         if content.is_empty() {
             skipped_empty += 1;
@@ -2056,6 +2293,7 @@ pub async fn smart_add_to_hierarchy(
                 is_private: None,
                 privacy_reason: None,
                 source: None,
+                pdf_available: None,
                 content_type: None,
                 associated_idea_id: None,
                 privacy: None,
@@ -2230,6 +2468,7 @@ pub async fn smart_add_to_hierarchy(
                             is_private: None,
                             privacy_reason: None,
                             source: None,
+                            pdf_available: None,
                             content_type: None,
                             associated_idea_id: None,
                             privacy: None,
@@ -2323,6 +2562,7 @@ pub async fn smart_add_to_hierarchy(
                         is_private: None,
                         privacy_reason: None,
                         source: None,
+                        pdf_available: None,
                         content_type: None,
                         associated_idea_id: None,
                         privacy: None,

@@ -1,11 +1,29 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import ReactMarkdown from 'react-markdown';
 import { ChevronLeft, ChevronRight, Pencil, Save, X, Code, Bug, FileText } from 'lucide-react';
 import { useGraphStore } from '../../stores/graphStore';
 import { getEmojiForNode } from '../../utils/emojiMatcher';
 import { ConversationRenderer, isConversationContent } from './ConversationRenderer';
+import { PaperViewer } from './PaperViewer';
 import type { Node } from '../../types/graph';
+
+interface PaperMetadata {
+  id: number;
+  nodeId: string;
+  openAireId?: string;
+  doi?: string;
+  authors?: string;
+  publicationDate?: string;
+  journal?: string;
+  publisher?: string;
+  abstract?: string;
+  pdfUrl?: string;
+  pdfAvailable: boolean;
+  subjects?: string;
+  accessRight?: string;
+  createdAt: number;
+}
 
 interface LeafViewProps {
   nodeId: string;
@@ -21,6 +39,7 @@ export function LeafView({ nodeId, onBack }: LeafViewProps) {
   const [editContent, setEditContent] = useState<string>('');
   const [saving, setSaving] = useState(false);
   const [associatedItems, setAssociatedItems] = useState<Node[]>([]);
+  const [paperMetadata, setPaperMetadata] = useState<PaperMetadata | null>(null);
 
   const node = nodes.get(nodeId);
 
@@ -47,6 +66,20 @@ export function LeafView({ nodeId, onBack }: LeafViewProps) {
     fetchContent();
   }, [nodeId, node?.content]);
 
+  // Check if this is a paper node
+  useEffect(() => {
+    const fetchPaperMetadata = async () => {
+      try {
+        const metadata = await invoke<PaperMetadata | null>('get_paper_metadata', { nodeId });
+        setPaperMetadata(metadata);
+      } catch (err) {
+        console.error('Failed to fetch paper metadata:', err);
+        setPaperMetadata(null);
+      }
+    };
+    fetchPaperMetadata();
+  }, [nodeId]);
+
   // Fetch associated items (code/debug/paste linked to this idea)
   useEffect(() => {
     const fetchAssociated = async () => {
@@ -60,6 +93,18 @@ export function LeafView({ nodeId, onBack }: LeafViewProps) {
     };
     fetchAssociated();
   }, [nodeId]);
+
+  // Escape key: go back to graph (only for non-paper views, papers handle their own)
+  const handleEscape = useCallback((e: KeyboardEvent) => {
+    if (e.key === 'Escape' && !paperMetadata) {
+      onBack();
+    }
+  }, [onBack, paperMetadata]);
+
+  useEffect(() => {
+    document.addEventListener('keydown', handleEscape);
+    return () => document.removeEventListener('keydown', handleEscape);
+  }, [handleEscape]);
 
   // Build hierarchy path for breadcrumbs
   const getHierarchyPath = (): Node[] => {
@@ -125,6 +170,18 @@ export function LeafView({ nodeId, onBack }: LeafViewProps) {
           </button>
         </div>
       </div>
+    );
+  }
+
+  // Render PaperViewer for scientific papers
+  if (paperMetadata) {
+    return (
+      <PaperViewer
+        nodeId={nodeId}
+        metadata={paperMetadata}
+        title={node.aiTitle || node.title}
+        onBack={onBack}
+      />
     );
   }
 

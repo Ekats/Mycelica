@@ -1,7 +1,7 @@
 use rusqlite::{Connection, Result, params, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
-use super::models::{Node, Edge, NodeType, EdgeType, Position, Tag};
+use super::models::{Node, Edge, NodeType, EdgeType, Position, Tag, Paper};
 
 pub struct Database {
     conn: Mutex<Connection>,
@@ -120,6 +120,32 @@ impl Database {
                 value TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+
+            -- Scientific papers from OpenAIRE
+            CREATE TABLE IF NOT EXISTS papers (
+                id INTEGER PRIMARY KEY,
+                node_id TEXT NOT NULL,
+                openaire_id TEXT UNIQUE,
+                doi TEXT,
+                authors TEXT,              -- JSON array of {fullName, orcid}
+                publication_date TEXT,
+                journal TEXT,
+                publisher TEXT,
+                abstract TEXT,
+                abstract_formatted TEXT,   -- Markdown with **Section** headers
+                abstract_sections TEXT,    -- JSON array of detected sections
+                pdf_blob BLOB,             -- Stored PDF binary (up to 20MB)
+                pdf_url TEXT,              -- Fallback external URL
+                pdf_available INTEGER NOT NULL DEFAULT 0,
+                subjects TEXT,             -- JSON array of {scheme, value}
+                access_right TEXT,         -- OPEN, CLOSED, etc.
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_papers_node_id ON papers(node_id);
+            CREATE INDEX IF NOT EXISTS idx_papers_doi ON papers(doi);
+            CREATE INDEX IF NOT EXISTS idx_papers_openaire_id ON papers(openaire_id);
 
             CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
@@ -406,6 +432,55 @@ impl Database {
             eprintln!("Migration: Added privacy score column (0.0=private, 1.0=public)");
         }
 
+        // Migration: Add pdf_available column to nodes (denormalized from papers table)
+        let has_pdf_available: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('nodes') WHERE name = 'pdf_available'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_pdf_available {
+            conn.execute("ALTER TABLE nodes ADD COLUMN pdf_available INTEGER DEFAULT 0", [])?;
+            eprintln!("Migration: Added pdf_available column to nodes");
+        }
+
+        // Sync pdf_available from papers table to nodes (only set to 1 where papers have PDFs)
+        let synced = conn.execute(
+            "UPDATE nodes SET pdf_available = 1
+             WHERE content_type = 'paper'
+               AND id IN (SELECT node_id FROM papers WHERE pdf_available = 1)",
+            [],
+        )?;
+        if synced > 0 {
+            eprintln!("Migration: Synced pdf_available=1 for {} paper nodes with PDFs", synced);
+        }
+
+        // Migration: Add abstract_formatted and abstract_sections columns to papers
+        let has_abstract_formatted: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('papers') WHERE name = 'abstract_formatted'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !has_abstract_formatted {
+            conn.execute("ALTER TABLE papers ADD COLUMN abstract_formatted TEXT", [])?;
+            conn.execute("ALTER TABLE papers ADD COLUMN abstract_sections TEXT", [])?;
+            eprintln!("Migration: Added abstract_formatted and abstract_sections columns to papers");
+        }
+
+        // Migration: Add doc_format column to papers for DOCX/DOC support
+        let has_doc_format: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('papers') WHERE name = 'doc_format'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !has_doc_format {
+            conn.execute("ALTER TABLE papers ADD COLUMN doc_format TEXT", [])?;
+            // Set existing PDFs to have doc_format = 'pdf'
+            conn.execute("UPDATE papers SET doc_format = 'pdf' WHERE pdf_available = 1", [])?;
+            eprintln!("Migration: Added doc_format column to papers");
+        }
+
         // Create indexes for dynamic hierarchy columns (after migrations ensure columns exist)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_depth ON nodes(depth)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_is_item ON nodes(is_item)", [])?;
@@ -432,8 +507,8 @@ impl Database {
     pub fn insert_node(&self, node: &Node) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO nodes (id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, source, content_type, associated_idea_id, privacy)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
+            "INSERT INTO nodes (id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, source, pdf_available, content_type, associated_idea_id, privacy)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
             params![
                 node.id,
                 node.node_type.as_str(),
@@ -461,6 +536,7 @@ impl Database {
                 node.is_pinned,
                 node.last_accessed_at,
                 node.source,
+                node.pdf_available,
                 node.content_type,
                 node.associated_idea_id,
                 node.privacy,
@@ -607,14 +683,15 @@ impl Database {
             is_private: row.get::<_, Option<i32>>(26)?.map(|v| v != 0),
             privacy_reason: row.get(27)?,
             source: row.get(28)?,
-            content_type: row.get(29)?,
-            associated_idea_id: row.get(30)?,
-            privacy: row.get(31)?,
+            pdf_available: row.get::<_, Option<i32>>(29)?.map(|v| v != 0),
+            content_type: row.get(30)?,
+            associated_idea_id: row.get(31)?,
+            privacy: row.get(32)?,
         })
     }
 
     /// Standard SELECT columns for nodes (excludes embedding - use dedicated functions)
-    const NODE_COLUMNS: &'static str = "id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date, is_private, privacy_reason, source, content_type, associated_idea_id, privacy";
+    const NODE_COLUMNS: &'static str = "id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date, is_private, privacy_reason, source, pdf_available, content_type, associated_idea_id, privacy";
 
     /// Get nodes for graph view (only VISIBLE tier + unclassified)
     /// SUPPORTING (investigation, discussion, reference, creative) and
@@ -624,7 +701,7 @@ impl Database {
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes
              WHERE content_type IS NULL
-                OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning')
+                OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper')
              ORDER BY created_at DESC",
             Self::NODE_COLUMNS
         ))?;
@@ -681,6 +758,16 @@ impl Database {
         conn.execute(
             "UPDATE nodes SET content = ?2, updated_at = ?3 WHERE id = ?1",
             params![node_id, content, chrono::Utc::now().timestamp_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// Update just the source field of a node
+    pub fn update_node_source(&self, node_id: &str, source: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE nodes SET source = ?2 WHERE id = ?1",
+            params![node_id, source],
         )?;
         Ok(())
     }
@@ -1172,13 +1259,13 @@ impl Database {
 
     // ==================== Content Visibility Query Methods ====================
     //
-    // VISIBLE tier: insight, idea, exploration, synthesis, question, planning
+    // VISIBLE tier: insight, idea, exploration, synthesis, question, planning, paper
     // SUPPORTING tier: investigation, discussion, reference, creative
     // HIDDEN tier: debug, code, paste, trivial
 
     /// SQL fragment for VISIBLE content types (for graph rendering)
     const VISIBLE_CONTENT_TYPES: &'static str =
-        "content_type IS NULL OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning')";
+        "content_type IS NULL OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper')";
 
     /// Get only VISIBLE tier nodes for graph rendering
     /// Categories (is_item = 0) are always included
@@ -1269,14 +1356,14 @@ impl Database {
     }
 
     /// Get only VISIBLE tier items for hierarchy building
-    /// VISIBLE: insight, exploration, synthesis, question, planning
+    /// VISIBLE: insight, exploration, synthesis, question, planning, paper
     /// Excludes SUPPORTING (investigation, discussion, reference, creative)
     /// Excludes HIDDEN (debug, code, paste, trivial)
     pub fn get_visible_items(&self) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE is_item = 1
-             AND content_type IN ('insight', 'exploration', 'synthesis', 'question', 'planning')
+             AND content_type IN ('insight', 'exploration', 'synthesis', 'question', 'planning', 'paper')
              ORDER BY created_at DESC",
             Self::NODE_COLUMNS
         ))?;
@@ -1817,6 +1904,7 @@ impl Database {
             is_private: None,
             privacy_reason: None,
             source: None,
+            pdf_available: None,
             content_type: None,
             associated_idea_id: None,
             privacy: None,
@@ -2094,7 +2182,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT id, embedding FROM nodes
              WHERE embedding IS NOT NULL
-               AND (content_type IS NULL OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning'))"
+               AND (content_type IS NULL OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper'))"
         )?;
 
         let results = stmt.query_map([], |row| {
@@ -2643,17 +2731,17 @@ impl Database {
         let conn = self.conn.lock().unwrap();
 
         // Find all mismatches
-        // Count only VISIBLE tier children (insight, idea, exploration, synthesis, question, planning)
+        // Count only VISIBLE tier children (insight, idea, exploration, synthesis, question, planning, paper)
         let mismatches: Vec<(String, i32, i32)> = {
             let mut stmt = conn.prepare(
                 "SELECT n.id, n.child_count,
                         (SELECT COUNT(*) FROM nodes c
                          WHERE c.parent_id = n.id
-                           AND (c.content_type IS NULL OR c.content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning'))) as actual
+                           AND (c.content_type IS NULL OR c.content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper'))) as actual
                  FROM nodes n
                  WHERE n.child_count != (SELECT COUNT(*) FROM nodes c
                                          WHERE c.parent_id = n.id
-                                           AND (c.content_type IS NULL OR c.content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning')))"
+                                           AND (c.content_type IS NULL OR c.content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper')))"
             )?;
             let results: Vec<_> = stmt.query_map([], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -3381,6 +3469,247 @@ impl Database {
             ))
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    // ==================== Paper Methods ====================
+
+    /// Insert a new paper record
+    pub fn insert_paper(
+        &self,
+        node_id: &str,
+        openaire_id: Option<&str>,
+        doi: Option<&str>,
+        authors: Option<&str>,
+        publication_date: Option<&str>,
+        journal: Option<&str>,
+        publisher: Option<&str>,
+        abstract_text: Option<&str>,
+        abstract_formatted: Option<&str>,
+        abstract_sections: Option<&str>,
+        pdf_url: Option<&str>,
+        subjects: Option<&str>,
+        access_right: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        conn.execute(
+            "INSERT INTO papers (node_id, openaire_id, doi, authors, publication_date, journal, publisher, abstract, abstract_formatted, abstract_sections, pdf_url, subjects, access_right, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![node_id, openaire_id, doi, authors, publication_date, journal, publisher, abstract_text, abstract_formatted, abstract_sections, pdf_url, subjects, access_right, now],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get paper metadata by node ID
+    pub fn get_paper_by_node_id(&self, node_id: &str) -> Result<Option<Paper>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, node_id, openaire_id, doi, authors, publication_date, journal, publisher, abstract, abstract_formatted, abstract_sections, pdf_url, pdf_available, doc_format, subjects, access_right, created_at
+             FROM papers WHERE node_id = ?1",
+            params![node_id],
+            |row| {
+                Ok(Paper {
+                    id: row.get(0)?,
+                    node_id: row.get(1)?,
+                    openaire_id: row.get(2)?,
+                    doi: row.get(3)?,
+                    authors: row.get(4)?,
+                    publication_date: row.get(5)?,
+                    journal: row.get(6)?,
+                    publisher: row.get(7)?,
+                    abstract_text: row.get(8)?,
+                    abstract_formatted: row.get(9)?,
+                    abstract_sections: row.get(10)?,
+                    pdf_url: row.get(11)?,
+                    pdf_available: row.get::<_, i32>(12)? != 0,
+                    doc_format: row.get(13)?,
+                    subjects: row.get(14)?,
+                    access_right: row.get(15)?,
+                    created_at: row.get(16)?,
+                })
+            },
+        ).optional()
+    }
+
+    /// Check if a paper with this OpenAIRE ID already exists
+    pub fn paper_exists_by_openaire_id(&self, openaire_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM papers WHERE openaire_id = ?1",
+            params![openaire_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Get all OpenAIRE IDs for batch duplicate checking (O(1) lookup)
+    pub fn get_all_openaire_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT openaire_id FROM papers WHERE openaire_id IS NOT NULL")?;
+        let ids = stmt.query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(ids)
+    }
+
+    /// Count papers matching OpenAIRE IDs (for showing "X already imported")
+    pub fn count_papers_by_openaire_ids(&self, openaire_ids: &[String]) -> Result<i32> {
+        if openaire_ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().unwrap();
+        // Use IN clause with placeholders
+        let placeholders: Vec<_> = (0..openaire_ids.len()).map(|i| format!("?{}", i + 1)).collect();
+        let sql = format!(
+            "SELECT COUNT(*) FROM papers WHERE openaire_id IN ({})",
+            placeholders.join(", ")
+        );
+        let params: Vec<&dyn rusqlite::ToSql> = openaire_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let count: i32 = conn.query_row(&sql, params.as_slice(), |row| row.get(0))?;
+        Ok(count)
+    }
+
+    /// Get PDF blob for a paper
+    pub fn get_paper_pdf(&self, node_id: &str) -> Result<Option<Vec<u8>>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT pdf_blob FROM papers WHERE node_id = ?1 AND pdf_available = 1",
+            params![node_id],
+            |row| row.get(0),
+        ).optional()
+    }
+
+    /// Store PDF blob for a paper
+    pub fn update_paper_pdf(&self, node_id: &str, pdf_blob: &[u8]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        // Update papers table with doc_format = 'pdf'
+        conn.execute(
+            "UPDATE papers SET pdf_blob = ?1, pdf_available = 1, doc_format = 'pdf' WHERE node_id = ?2",
+            params![pdf_blob, node_id],
+        )?;
+        // Also sync to nodes table (denormalized for graph display)
+        conn.execute(
+            "UPDATE nodes SET pdf_available = 1 WHERE id = ?1",
+            params![node_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get document blob and format for a paper (supports PDF, DOCX, DOC)
+    pub fn get_paper_document(&self, node_id: &str) -> Result<Option<(Vec<u8>, String)>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT pdf_blob, doc_format FROM papers WHERE node_id = ?1 AND pdf_available = 1",
+            params![node_id],
+            |row| {
+                let blob: Vec<u8> = row.get(0)?;
+                let format: String = row.get::<_, Option<String>>(1)?.unwrap_or_else(|| "pdf".to_string());
+                Ok((blob, format))
+            },
+        ).optional()
+    }
+
+    /// Store document blob with format for a paper
+    pub fn update_paper_document(&self, node_id: &str, doc_blob: &[u8], format: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        // Update papers table
+        conn.execute(
+            "UPDATE papers SET pdf_blob = ?1, pdf_available = 1, doc_format = ?2 WHERE node_id = ?3",
+            params![doc_blob, format, node_id],
+        )?;
+        // Also sync to nodes table (denormalized for graph display)
+        conn.execute(
+            "UPDATE nodes SET pdf_available = 1 WHERE id = ?1",
+            params![node_id],
+        )?;
+        Ok(())
+    }
+
+    /// Check if a paper has a PDF available
+    pub fn has_paper_pdf(&self, node_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let available: Option<i32> = conn.query_row(
+            "SELECT pdf_available FROM papers WHERE node_id = ?1",
+            params![node_id],
+            |row| row.get(0),
+        ).optional()?;
+        Ok(available == Some(1))
+    }
+
+    /// Sync pdf_available from papers table to nodes table
+    pub fn sync_paper_pdf_status(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+
+        let count = conn.execute(
+            "UPDATE nodes SET pdf_available = 1
+             WHERE content_type = 'paper'
+               AND id IN (SELECT node_id FROM papers WHERE pdf_available = 1)",
+            [],
+        )?;
+
+        Ok(count)
+    }
+
+    /// Get count of papers
+    pub fn get_paper_count(&self) -> Result<i32> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM papers", [], |row| row.get(0))
+    }
+
+    /// Get count of papers with PDFs
+    pub fn get_paper_pdf_count(&self) -> Result<i32> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM papers WHERE pdf_available = 1", [], |row| row.get(0))
+    }
+
+    /// Reformat all paper abstracts with section detection
+    pub fn reformat_all_paper_abstracts(&self) -> Result<usize> {
+        use crate::format_abstract::{format_abstract, strip_html_tags};
+
+        let conn = self.conn.lock().unwrap();
+
+        let mut stmt = conn.prepare(
+            "SELECT node_id, abstract FROM papers WHERE abstract IS NOT NULL"
+        )?;
+
+        let papers: Vec<(String, String)> = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+        drop(stmt);
+
+        let mut count = 0;
+        for (node_id, abstract_text) in papers {
+            // Strip HTML from raw abstract
+            let clean_abstract = strip_html_tags(&abstract_text);
+            let formatted = format_abstract(&clean_abstract);
+
+            // Always update - clean raw abstract and add formatted version if structured
+            let abstract_formatted = if formatted.had_structure {
+                Some(formatted.markdown.as_str())
+            } else {
+                None
+            };
+            let sections_json = if formatted.sections.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&formatted.sections).ok()
+            };
+
+            conn.execute(
+                "UPDATE papers SET abstract = ?1, abstract_formatted = ?2, abstract_sections = ?3 WHERE node_id = ?4",
+                params![clean_abstract, abstract_formatted, sections_json, node_id],
+            )?;
+            count += 1;
+        }
+
+        Ok(count)
     }
 }
 

@@ -7,6 +7,7 @@ pub enum NodeType {
     Thought,
     Context,
     Cluster,
+    Paper,  // Scientific paper from OpenAIRE
 }
 
 impl NodeType {
@@ -16,6 +17,7 @@ impl NodeType {
             NodeType::Thought => "thought",
             NodeType::Context => "context",
             NodeType::Cluster => "cluster",
+            NodeType::Paper => "paper",
         }
     }
 
@@ -25,6 +27,7 @@ impl NodeType {
             "thought" => Some(NodeType::Thought),
             "context" => Some(NodeType::Context),
             "cluster" => Some(NodeType::Cluster),
+            "paper" => Some(NodeType::Paper),
             _ => None,
         }
     }
@@ -133,6 +136,8 @@ pub struct Node {
 
     // Import source tracking
     pub source: Option<String>,           // "claude", "googlekeep", "markdown", etc.
+    #[serde(rename = "pdfAvailable")]
+    pub pdf_available: Option<bool>,      // For papers: whether PDF is stored in database
 
     // Content classification (for mini-clustering)
     #[serde(rename = "contentType")]
@@ -195,4 +200,52 @@ pub struct ItemTag {
     pub tag_id: String,
     pub confidence: f64,
     pub source: String,  // "ai" or "user"
+}
+
+/// Scientific paper metadata from OpenAIRE
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Paper {
+    pub id: i64,
+    #[serde(rename = "nodeId")]
+    pub node_id: String,
+    #[serde(rename = "openAireId")]
+    pub openaire_id: Option<String>,
+    pub doi: Option<String>,
+    pub authors: Option<String>,        // JSON array
+    #[serde(rename = "publicationDate")]
+    pub publication_date: Option<String>,
+    pub journal: Option<String>,
+    pub publisher: Option<String>,
+    #[serde(rename = "abstract")]
+    pub abstract_text: Option<String>,
+    #[serde(rename = "abstractFormatted")]
+    pub abstract_formatted: Option<String>,  // Markdown with **Section** headers
+    #[serde(rename = "abstractSections")]
+    pub abstract_sections: Option<String>,   // JSON array of detected sections
+    #[serde(rename = "pdfUrl")]
+    pub pdf_url: Option<String>,
+    #[serde(rename = "pdfAvailable")]
+    pub pdf_available: bool,
+    #[serde(rename = "docFormat")]
+    pub doc_format: Option<String>,     // "pdf", "docx", "doc", or NULL
+    pub subjects: Option<String>,       // JSON array (FOS, keywords)
+    #[serde(rename = "accessRight")]
+    pub access_right: Option<String>,
+    #[serde(rename = "createdAt")]
+    pub created_at: i64,
+}
+
+/// Author information for papers
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaperAuthor {
+    #[serde(rename = "fullName")]
+    pub full_name: String,
+    pub orcid: Option<String>,
+}
+
+/// Subject/keyword for papers
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaperSubject {
+    pub scheme: String,  // "FOS", "keyword", etc.
+    pub value: String,
 }

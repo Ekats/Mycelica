@@ -127,6 +127,18 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const [showImportSources, setShowImportSources] = useState(false);
   const importDropdownRef = useRef<HTMLDivElement>(null);
 
+  // OpenAIRE import
+  const [showOpenAireDialog, setShowOpenAireDialog] = useState(false);
+  const [openAireQuery, setOpenAireQuery] = useState('');
+  const [openAireCountry, setOpenAireCountry] = useState<string>('EE');
+  const [openAireFos, setOpenAireFos] = useState<string>('');
+  const [openAireMaxPapers, setOpenAireMaxPapers] = useState(100);
+  const [openAirePaperCount, setOpenAirePaperCount] = useState<number | null>(null);
+  const [openAireImportedCount, setOpenAireImportedCount] = useState<number | null>(null);
+  const [openAireCountLoading, setOpenAireCountLoading] = useState(false);
+  const [openAireDownloadPdfs, setOpenAireDownloadPdfs] = useState(true);
+  const [openAireMaxPdfSize, setOpenAireMaxPdfSize] = useState(20);
+
   // Click outside to close import sources dropdown
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -706,6 +718,87 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
         if (result.notesImported > 0) {
           suggestOperationAfterImport(result.notesImported);
         }
+      }
+    } catch (err) {
+      setImportResult(`Error: ${err}`);
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  // OpenAIRE paper count preview (debounced)
+  // Returns [total_count, already_imported_from_query]
+  useEffect(() => {
+    if (!showOpenAireDialog || !openAireQuery.trim()) {
+      setOpenAirePaperCount(null);
+      setOpenAireImportedCount(null);
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      setOpenAireCountLoading(true);
+      try {
+        const [total, imported] = await invoke<[number, number]>('count_openaire_papers', {
+          query: openAireQuery,
+          country: openAireCountry || null,
+          fos: openAireFos || null,
+        });
+        setOpenAirePaperCount(total);
+        setOpenAireImportedCount(imported);
+      } catch (err) {
+        console.error('Failed to count papers:', err);
+        setOpenAirePaperCount(null);
+        setOpenAireImportedCount(null);
+      } finally {
+        setOpenAireCountLoading(false);
+      }
+    }, 500);  // 500ms debounce
+
+    return () => clearTimeout(timer);
+  }, [showOpenAireDialog, openAireQuery, openAireCountry, openAireFos]);
+
+  // OpenAIRE import handler
+  const handleImportOpenAire = async () => {
+    if (!openAireQuery.trim()) {
+      setImportResult('Please enter a search query');
+      return;
+    }
+    setImporting(true);
+    setImportResult(null);
+    setSuggestedOperation(null);
+    setShowOpenAireDialog(false);
+    try {
+      const result = await invoke<{
+        papersImported: number;
+        pdfsDownloaded: number;
+        pdfsSkipped: number;
+        duplicatesSkipped: number;
+        errors: string[];
+      }>('import_openaire', {
+        query: openAireQuery,
+        country: openAireCountry || null,
+        fos: openAireFos || null,
+        maxPapers: openAireMaxPapers,
+        downloadPdfs: openAireDownloadPdfs,
+        maxPdfSizeMb: openAireMaxPdfSize,
+      });
+      await loadDbStats();
+      onDataChanged?.();
+
+      const parts = [`Imported ${result.papersImported} paper${result.papersImported !== 1 ? 's' : ''}`];
+      if (result.pdfsDownloaded > 0) {
+        parts.push(`${result.pdfsDownloaded} PDF${result.pdfsDownloaded !== 1 ? 's' : ''} downloaded`);
+      }
+      if (result.duplicatesSkipped > 0) {
+        parts.push(`${result.duplicatesSkipped} duplicate${result.duplicatesSkipped !== 1 ? 's' : ''} skipped`);
+      }
+      if (result.errors.length > 0) {
+        parts.push(`${result.errors.length} error${result.errors.length !== 1 ? 's' : ''}`);
+      }
+      setImportResult(parts.join(', '));
+
+      if (result.papersImported > 0) {
+        suggestOperationAfterImport(result.papersImported);
       }
     } catch (err) {
       setImportResult(`Error: ${err}`);
@@ -1399,6 +1492,15 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                       <span className="text-2xl">{importing ? <Loader2 className="w-6 h-6 animate-spin" /> : '📝'}</span>
                       <span className="text-xs text-gray-300">Google Keep</span>
                       <span className="text-xs text-gray-500">.zip</span>
+                    </button>
+                    <button
+                      onClick={() => setShowOpenAireDialog(true)}
+                      disabled={importing}
+                      className="flex-1 flex flex-col items-center gap-2 p-3 bg-gray-800/50 hover:bg-gray-800 rounded-lg transition-colors disabled:opacity-50"
+                    >
+                      <span className="text-2xl">{importing ? <Loader2 className="w-6 h-6 animate-spin" /> : '📚'}</span>
+                      <span className="text-xs text-gray-300">Papers</span>
+                      <span className="text-xs text-gray-500">OpenAIRE</span>
                     </button>
                   </div>
                 </div>
@@ -2407,6 +2509,155 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
           </div>
         </div>
       </div>
+
+      {/* OpenAIRE Import Dialog */}
+      {showOpenAireDialog && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-xl shadow-2xl max-w-md w-full p-6 space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-lg font-semibold text-white flex items-center gap-2">
+                <span>📚</span>
+                Import from OpenAIRE
+              </h3>
+              <button
+                onClick={() => setShowOpenAireDialog(false)}
+                className="p-1 hover:bg-gray-700 rounded-lg transition-colors text-gray-400 hover:text-white"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <p className="text-sm text-gray-400">
+              Search the EU Open Research Graph for scientific papers.
+            </p>
+
+            <div className="space-y-3">
+              <div>
+                <label className="block text-sm text-gray-300 mb-1">Search Query *</label>
+                <input
+                  type="text"
+                  value={openAireQuery}
+                  onChange={(e) => setOpenAireQuery(e.target.value)}
+                  placeholder="e.g., semiotics, machine learning, climate"
+                  className="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-white text-sm focus:border-amber-500 focus:outline-none"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-sm text-gray-300 mb-1">Country</label>
+                  <select
+                    value={openAireCountry}
+                    onChange={(e) => setOpenAireCountry(e.target.value)}
+                    style={{ colorScheme: 'dark' }}
+                    className="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-white text-sm focus:border-amber-500 focus:outline-none"
+                  >
+                    <option value="">All countries</option>
+                    <option value="EE">Estonia</option>
+                    <option value="FI">Finland</option>
+                    <option value="DE">Germany</option>
+                    <option value="FR">France</option>
+                    <option value="GB">United Kingdom</option>
+                    <option value="US">United States</option>
+                    <option value="NL">Netherlands</option>
+                    <option value="SE">Sweden</option>
+                    <option value="IT">Italy</option>
+                    <option value="ES">Spain</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-sm text-gray-300 mb-1">Field of Science</label>
+                  <select
+                    value={openAireFos}
+                    onChange={(e) => setOpenAireFos(e.target.value)}
+                    style={{ colorScheme: 'dark' }}
+                    className="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-white text-sm focus:border-amber-500 focus:outline-none"
+                  >
+                    <option value="">All fields</option>
+                    <option value="01 natural sciences">Natural Sciences</option>
+                    <option value="02 engineering and technology">Engineering</option>
+                    <option value="03 medical and health sciences">Medical & Health</option>
+                    <option value="05 social sciences">Social Sciences</option>
+                    <option value="06 humanities">Humanities</option>
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm text-gray-300 mb-1">Max Papers</label>
+                <input
+                  type="number"
+                  value={openAireMaxPapers}
+                  onChange={(e) => setOpenAireMaxPapers(Math.max(1, Math.min(500, parseInt(e.target.value) || 100)))}
+                  min={1}
+                  max={500}
+                  className="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-white text-sm focus:border-amber-500 focus:outline-none"
+                />
+                {/* Paper count preview */}
+                <div className="mt-1 text-xs h-5">
+                  {openAireCountLoading ? (
+                    <span className="text-gray-500">Counting...</span>
+                  ) : openAirePaperCount !== null ? (
+                    <span className="text-amber-400">
+                      Found {openAirePaperCount.toLocaleString()} papers
+                      {openAireImportedCount !== null && openAireImportedCount > 0 && (
+                        <span className="text-gray-400">
+                          {' '}({openAireImportedCount} of first 100 already imported)
+                        </span>
+                      )}
+                    </span>
+                  ) : openAireQuery.trim() ? (
+                    <span className="text-gray-500">Enter query to see count</span>
+                  ) : null}
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={openAireDownloadPdfs}
+                    onChange={(e) => setOpenAireDownloadPdfs(e.target.checked)}
+                    className="w-4 h-4 rounded border-gray-600 bg-gray-900 text-amber-500 focus:ring-amber-500"
+                  />
+                  <span className="text-sm text-gray-300">Download PDFs (when available)</span>
+                </label>
+
+                {openAireDownloadPdfs && (
+                  <div className="ml-6">
+                    <label className="block text-xs text-gray-400 mb-1">Max PDF size (MB)</label>
+                    <input
+                      type="number"
+                      value={openAireMaxPdfSize}
+                      onChange={(e) => setOpenAireMaxPdfSize(Math.max(1, Math.min(100, parseInt(e.target.value) || 20)))}
+                      min={1}
+                      max={100}
+                      className="w-24 px-2 py-1 bg-gray-900 border border-gray-700 rounded text-white text-sm focus:border-amber-500 focus:outline-none"
+                    />
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="flex gap-3 pt-2">
+              <button
+                onClick={() => setShowOpenAireDialog(false)}
+                className="flex-1 px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleImportOpenAire}
+                disabled={!openAireQuery.trim()}
+                className="flex-1 px-4 py-2 bg-amber-600 hover:bg-amber-500 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-lg text-sm font-medium transition-colors"
+              >
+                Import Papers
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Confirmation Dialog */}
       {confirmAction && (

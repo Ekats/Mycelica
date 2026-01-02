@@ -39,7 +39,7 @@ export interface GraphCanvasProps {
   // Callbacks to parent
   onSelectNode: (id: string | null) => void;
   onNavigateToNode: (node: Node) => void;
-  onOpenLeaf: (id: string) => void;
+  onOpenLeaf: (id: string, initialView?: 'abstract' | 'pdf') => void;
   onFetchSimilarNodes: (id: string) => void;
   onShowContextMenu: (id: string, pos: { x: number; y: number }) => void;
   onZoomChange: (zoom: number) => void;
@@ -626,14 +626,21 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       .attr('fill', d => (d.childCount > 0 && d.latestChildDate) ? getDateColor(d.latestChildDate, minDate, maxDate) : 'transparent')
       .text(d => (d.childCount > 0 && d.latestChildDate) ? `Latest: ${new Date(d.latestChildDate).toLocaleDateString()}` : '');
 
-    // "NOTE" badge for items
-    const noteBadges = cardGroups.filter(d => d.isItem && d.childCount === 0);
-    noteBadges.append('rect')
-      .attr('x', NOTE_WIDTH / 2 - 36).attr('y', NOTE_HEIGHT - 34)
-      .attr('width', 72).attr('height', 26)
+    // Item type badge (NOTE or PAPER)
+    const itemBadges = cardGroups.filter(d => d.isItem && d.childCount === 0);
+
+    const getBadgeText = (d: GraphNode) => d.contentType === 'paper' ? 'PAPER' : 'NOTE';
+    const BADGE_WIDTH = 72;
+    const PDF_BADGE_WIDTH = 46;
+    const BADGE_GAP = 6;
+
+    // Main badge (NOTE or PAPER) - always centered
+    itemBadges.append('rect')
+      .attr('x', NOTE_WIDTH / 2 - BADGE_WIDTH / 2).attr('y', NOTE_HEIGHT - 34)
+      .attr('width', BADGE_WIDTH).attr('height', 26)
       .attr('rx', 4)
-      .attr('fill', '#5b21b6');
-    noteBadges.append('text')
+      .attr('fill', d => d.contentType === 'paper' ? '#b45309' : '#5b21b6');
+    itemBadges.append('text')
       .attr('x', NOTE_WIDTH / 2).attr('y', NOTE_HEIGHT - 15)
       .attr('text-anchor', 'middle')
       .attr('font-family', CARD_FONT)
@@ -641,7 +648,40 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       .attr('font-weight', '700')
       .attr('letter-spacing', '1.5px')
       .attr('fill', '#ffffff')
-      .text('NOTE');
+      .text(d => getBadgeText(d));
+
+    // PDF badge (lighter blue, to the right, clickable) - only for papers with PDF
+    const pdfBadgeGroups = itemBadges.filter(d => d.contentType === 'paper' && d.pdfAvailable)
+      .append('g')
+      .attr('class', 'pdf-badge')
+      .attr('cursor', 'pointer')
+      .on('click', (event, d) => {
+        event.stopPropagation();  // Don't trigger card click
+        onOpenLeaf(d.id, 'pdf');
+      })
+      .on('mouseenter', function(event) {
+        event.stopPropagation();  // Don't trigger card hover tooltip
+        setHoveredNode(null);     // Clear any existing tooltip
+        d3.select(this).select('rect').attr('fill', '#1e6fd9');  // Lighter on hover
+      })
+      .on('mouseleave', function(event) {
+        event.stopPropagation();
+        d3.select(this).select('rect').attr('fill', '#0a51a9');  // Back to normal
+      });
+    pdfBadgeGroups.append('rect')
+      .attr('x', NOTE_WIDTH / 2 + BADGE_WIDTH / 2 + BADGE_GAP).attr('y', NOTE_HEIGHT - 34)
+      .attr('width', PDF_BADGE_WIDTH).attr('height', 26)
+      .attr('rx', 4)
+      .attr('fill', '#0a51a9');  // Dark blue
+    pdfBadgeGroups.append('text')
+      .attr('x', NOTE_WIDTH / 2 + BADGE_WIDTH / 2 + BADGE_GAP + PDF_BADGE_WIDTH / 2).attr('y', NOTE_HEIGHT - 15)
+      .attr('text-anchor', 'middle')
+      .attr('font-family', CARD_FONT)
+      .attr('font-size', '14px')
+      .attr('font-weight', '700')
+      .attr('fill', '#ffffff')
+      .attr('pointer-events', 'none')  // Let clicks pass through to parent group
+      .text('PDF');
 
     // Menu button for items
     const menuBtnGroups = cardGroups.filter(d => d.childCount === 0)

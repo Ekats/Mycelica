@@ -53,6 +53,9 @@ interface BackendNode {
   // Content classification (mini-clustering)
   contentType: string | null;  // Rust uses #[serde(rename = "contentType")]: "idea" | "code" | "debug" | "paste"
   associatedIdeaId: string | null;  // Rust uses #[serde(rename = "associatedIdeaId")]
+  // Paper fields
+  source: string | null;  // e.g., "openaire", "openaire-pdf"
+  pdfAvailable: boolean | null;  // Rust uses #[serde(rename = "pdfAvailable")]
 }
 
 interface BackendEdge {
@@ -111,6 +114,9 @@ function mapBackendNode(n: BackendNode): Node {
     // Content classification (mini-clustering)
     contentType: n.contentType as Node['contentType'] ?? undefined,
     associatedIdeaId: n.associatedIdeaId ?? undefined,
+    // Paper fields
+    source: n.source ?? undefined,
+    pdfAvailable: n.pdfAvailable ?? undefined,
   };
 }
 
