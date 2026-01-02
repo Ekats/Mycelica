@@ -135,13 +135,21 @@ function App() {
     }
   }, [nodes]);
 
-  // Auto-open Settings if database is empty (only check once after data loaded)
+  // Auto-open Settings if no hierarchy exists (only check once after data loaded)
   useEffect(() => {
     if (loaded && !settingsChecked) {
       setSettingsChecked(true);
-      if (nodes.size === 0) {
-        setShowSettings(true);
-      }
+      // Check if hierarchy exists (universe node present)
+      invoke<unknown>('get_universe').then((universe) => {
+        if (!universe) {
+          setShowSettings(true);
+        }
+      }).catch(() => {
+        // On error, check if we have any nodes at all
+        if (nodes.size === 0) {
+          setShowSettings(true);
+        }
+      });
     }
   }, [loaded, settingsChecked, nodes.size]);
 

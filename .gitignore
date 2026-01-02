@@ -15,6 +15,7 @@ archive/
 docs/private/
 docs/implementation/
 *.db
+!mycelica-openAIRE-preview.db
 !src-tauri/resources/mycelica-testing-preview.db
 *.db-journal
 *.db-wal

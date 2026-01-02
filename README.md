@@ -23,9 +23,11 @@ Currently handles 3700+ nodes with 14,000+ semantic connections.
 
 ## Demo
 
-A sample database is included for testing: `mycelica-testing-preview.db`
+A sample database is included for testing: `mycelica-openAIRE-preview.db`
 
-Switch to it via Settings → Select Database to explore ~80 nodes covering AI, philosophy, and technical topics.
+Switch to it via Settings → Select Database to explore ~2300 medical research papers from OpenAIRE.
+
+NB! DEMO DATABASES ARE ALREADY FULLY PREPROCESSED, NO NEED TO RUN ANY SETUP/PROCESSING IN SETTINGS!
 
 ---
 
