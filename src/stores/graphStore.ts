@@ -38,6 +38,9 @@ interface GraphState {
   privacyThreshold: number;         // 0.0-1.0, nodes with privacy < threshold are hidden
   hidePrivate: boolean;             // Toggle for privacy filtering
 
+  // UI preferences
+  showTips: boolean;                // Show popup hints on selected nodes
+
   // Actions
   setNodes: (nodes: Map<string, Node>) => void;
   addNode: (node: Node) => void;
@@ -68,6 +71,9 @@ interface GraphState {
   // Privacy actions
   setPrivacyThreshold: (threshold: number) => void;
   setHidePrivate: (hide: boolean) => void;
+
+  // UI preference actions
+  setShowTips: (show: boolean) => void;
 }
 
 export const useGraphStore = create<GraphState>((set, get) => ({
@@ -91,6 +97,9 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   // Privacy filter state - default threshold 0.3 (keeps most content)
   privacyThreshold: 0.3,
   hidePrivate: false,
+
+  // UI preferences
+  showTips: true,
 
   setNodes: (nodes) => set({ nodes }),
 
@@ -282,4 +291,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   // Privacy actions
   setPrivacyThreshold: (threshold) => set({ privacyThreshold: threshold }),
   setHidePrivate: (hide) => set({ hidePrivate: hide }),
+
+  // UI preference actions
+  setShowTips: (show) => set({ showTips: show }),
 }));

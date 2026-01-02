@@ -48,6 +48,7 @@ export interface GraphCanvasProps {
   // Helpers
   getNodeEmoji: (node: Node) => string;
   hidePrivate: boolean;
+  showTips: boolean;
 }
 
 // =============================================================================
@@ -92,7 +93,7 @@ const NOTE_HEIGHT = 320;
 const DOT_SIZE = 24;
 
 // Zoom limits
-const MIN_ZOOM = 0.02;
+const MIN_ZOOM = 0.05;
 const MAX_ZOOM = 2;
 
 // Get muted cluster color (gray with hint of cluster hue)
@@ -124,10 +125,13 @@ const getNodeColor = (
 const getNodeOpacity = (
   d: GraphNode,
   activeNodeId: string | null,
-  connectionMap: Map<string, { weight: number; distance: number }>
+  connectionMap: Map<string, { weight: number; distance: number }>,
+  edgeConnectedIds?: Set<string>
 ): number => {
   if (!activeNodeId) return 1;
   if (d.id === activeNodeId) return 1;
+  // Keep edge-connected nodes at full opacity
+  if (edgeConnectedIds?.has(d.id)) return 1;
   const conn = connectionMap.get(d.id);
   if (conn) {
     if (conn.distance === 1) return 1;
@@ -219,6 +223,7 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
     devLog,
     getNodeEmoji,
     hidePrivate,
+    showTips,
   } = props;
 
   // ==========================================================================
@@ -274,13 +279,46 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
     const nodeMap = new Map(graphNodes.map(n => [n.id, n]));
 
     // Calculate graph bounds for pan limiting
-    const boundsPadding = NOTE_WIDTH * 40;
+    const boundsPadding = NOTE_WIDTH * 80;
     const graphBounds = {
       minX: graphNodes.length > 0 ? Math.min(...graphNodes.map(n => n.x)) - boundsPadding : -1000,
       maxX: graphNodes.length > 0 ? Math.max(...graphNodes.map(n => n.x)) + boundsPadding : 1000,
       minY: graphNodes.length > 0 ? Math.min(...graphNodes.map(n => n.y)) - boundsPadding : -1000,
       maxY: graphNodes.length > 0 ? Math.max(...graphNodes.map(n => n.y)) + boundsPadding : 1000,
     };
+
+    // Calculate initial fit scale for proper card sizing on load
+    const xs = graphNodes.map(n => n.x);
+    const ys = graphNodes.map(n => n.y);
+    const fitPadding = NOTE_WIDTH;
+    const fitMinX = Math.min(...xs) - fitPadding;
+    const fitMaxX = Math.max(...xs) + fitPadding;
+    const fitMinY = Math.min(...ys) - fitPadding;
+    const fitMaxY = Math.max(...ys) + fitPadding;
+    const graphWidth = fitMaxX - fitMinX;
+    const graphHeight = fitMaxY - fitMinY;
+    const fitScale = Math.min(width / graphWidth, height / graphHeight) * 0.85;
+    const initialK = Math.max(0.1, Math.min(fitScale, 1));
+
+    // Pre-calculate initial card scale (same logic as zoom handler)
+    const curveEnd = 0.35;
+    const minApparentSize = 0.75;
+    const sparseMinApparentSize = 0.52;
+    const curveStart = 0.10;
+    const MIN_CARD_SCALE = 0.15;
+
+    const smoothstep = (edge0: number, edge1: number, val: number) => {
+      const t = Math.max(0, Math.min(1, (val - edge0) / (edge1 - edge0)));
+      return t * t * (3 - 2 * t);
+    };
+    const blendFactor = smoothstep(curveStart, curveEnd, initialK);
+    const effectiveMinSize = sparseMinApparentSize + blendFactor * (minApparentSize - sparseMinApparentSize);
+    const initialPositionScale = initialK < curveEnd ? Math.sqrt(curveEnd / initialK) : 1;
+    let initialCardScale = 1;
+    if (initialK < 1) {
+      const targetApparent = Math.max(effectiveMinSize, Math.sqrt(initialK));
+      initialCardScale = Math.max(MIN_CARD_SCALE, targetApparent / initialK);
+    }
 
     // ==========================================================================
     // EDGE RENDERING
@@ -292,6 +330,15 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
     const minWeight = relatedWeights.length > 0 ? Math.min(...relatedWeights) : 0;
     const maxWeight = relatedWeights.length > 0 ? Math.max(...relatedWeights) : 1;
     const weightRange = maxWeight - minWeight || 0.1;
+
+    // Build set of nodes connected to active node via edges
+    const edgeConnectedIds = new Set<string>();
+    if (activeNodeId) {
+      edgeData.forEach(e => {
+        if (e.source.id === activeNodeId) edgeConnectedIds.add(e.target.id);
+        if (e.target.id === activeNodeId) edgeConnectedIds.add(e.source.id);
+      });
+    }
 
     // Define arrow markers
     const defs = svg.append('defs');
@@ -324,21 +371,22 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
         return getEdgeColor(normalized);
       })
       .attr('stroke-opacity', d => d.type === 'contains' ? 0.5 : 0.7)
-      .attr('stroke-width', d => {
-        if (d.type === 'contains') return 6;
-        const normalized = (d.weight - minWeight) / weightRange;
-        return 6 + normalized * 18;
+      .attr('stroke-width', (e: EdgeData) => {
+        const isConnected = activeNodeId && (e.source.id === activeNodeId || e.target.id === activeNodeId);
+        const baseWidth = e.type === 'contains' ? 6 : 6 + ((e.weight - minWeight) / weightRange) * 18;
+        return isConnected ? baseWidth * 1.8 : baseWidth;
       })
       .attr('opacity', (e: EdgeData) => {
         if (!activeNodeId) return 1;
-        if (e.source.id === activeNodeId || e.target.id === activeNodeId) return 0.9;
-        const srcConn = connectionMap.has(e.source.id);
-        const tgtConn = connectionMap.has(e.target.id);
-        if (srcConn && tgtConn) return 0.7;
-        return 0.15;
+        if (e.source.id === activeNodeId || e.target.id === activeNodeId) return 1;
+        return 0.5;
       })
       .attr('d', d => {
-        const points = getEdgePoints(d.source, d.target, NOTE_WIDTH, NOTE_HEIGHT);
+        const scaledWidth = NOTE_WIDTH * initialCardScale;
+        const scaledHeight = NOTE_HEIGHT * initialCardScale;
+        const scaledSource = { x: d.source.x * initialPositionScale, y: d.source.y * initialPositionScale };
+        const scaledTarget = { x: d.target.x * initialPositionScale, y: d.target.y * initialPositionScale };
+        const points = getEdgePoints(scaledSource, scaledTarget, scaledWidth, scaledHeight);
         const dx = points.target.x - points.source.x;
         const dy = points.target.y - points.source.y;
         const dr = Math.sqrt(dx * dx + dy * dy) * 1.5;
@@ -348,7 +396,11 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
     // Connection point dots at endpoints
     linksGroup.selectAll('circle.connection-dot')
       .data(edgeData.flatMap(d => {
-        const points = getEdgePoints(d.source, d.target, NOTE_WIDTH, NOTE_HEIGHT);
+        const scaledWidth = NOTE_WIDTH * initialCardScale;
+        const scaledHeight = NOTE_HEIGHT * initialCardScale;
+        const scaledSource = { x: d.source.x * initialPositionScale, y: d.source.y * initialPositionScale };
+        const scaledTarget = { x: d.target.x * initialPositionScale, y: d.target.y * initialPositionScale };
+        const points = getEdgePoints(scaledSource, scaledTarget, scaledWidth, scaledHeight);
         const normalized = (d.weight - minWeight) / weightRange;
         const color = d.type === 'contains' ? '#6b7280' : getEdgeColor(normalized);
         return [
@@ -360,7 +412,7 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       .attr('class', 'connection-dot')
       .attr('cx', d => d.x)
       .attr('cy', d => d.y)
-      .attr('r', 4)
+      .attr('r', 4 * initialCardScale)
       .attr('fill', d => d.color);
 
     // ==========================================================================
@@ -376,13 +428,15 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
     const cardsGroup = container.append('g').attr('class', 'cards');
     const dotsGroup = container.append('g').attr('class', 'dots');
 
-    // Unified card rendering for ALL nodes
+    // Unified card rendering for ALL nodes - apply initial scale to prevent flash
     const cardGroups = cardsGroup.selectAll('g.node-card')
       .data(graphNodes)
       .join('g')
       .attr('class', 'card')
       .attr('cursor', 'pointer')
-      .attr('transform', d => `translate(${d.x - NOTE_WIDTH/2}, ${d.y - NOTE_HEIGHT/2})`);
+      .attr('transform', d =>
+        `translate(${d.x * initialPositionScale}, ${d.y * initialPositionScale}) scale(${initialCardScale}) translate(${-NOTE_WIDTH/2}, ${-NOTE_HEIGHT/2})`
+      );
 
     // === TOPIC SHADOWS (render order = z-order, first = bottom) ===
 
@@ -459,7 +513,7 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       .attr('stroke-width', d => d.id === activeNodeId ? 2 : 1);
 
     // Apply opacity to entire card group
-    cardGroups.style('opacity', d => getNodeOpacity(d, activeNodeId, connectionMap));
+    cardGroups.style('opacity', d => getNodeOpacity(d, activeNodeId, connectionMap, edgeConnectedIds));
 
     // Titlebar - darker area at top
     cardGroups.append('rect')
@@ -626,6 +680,41 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       .attr('fill', d => (d.childCount > 0 && d.latestChildDate) ? getDateColor(d.latestChildDate, minDate, maxDate) : 'transparent')
       .text(d => (d.childCount > 0 && d.latestChildDate) ? `Latest: ${new Date(d.latestChildDate).toLocaleDateString()}` : '');
 
+    // Open/Enter button (shown when selected, if showTips enabled)
+    const OPEN_BTN_WIDTH = 80;
+    const OPEN_BTN_HEIGHT = 28;
+    const openBtnGroups = cardGroups.append('g')
+      .attr('class', 'open-btn')
+      .attr('transform', `translate(${NOTE_WIDTH / 2 - OPEN_BTN_WIDTH / 2}, ${NOTE_HEIGHT - 68})`)
+      .style('opacity', 0) // Hidden by default
+      .style('cursor', 'pointer');
+
+    openBtnGroups.append('rect')
+      .attr('width', OPEN_BTN_WIDTH)
+      .attr('height', OPEN_BTN_HEIGHT)
+      .attr('rx', 6)
+      .attr('fill', '#d97706');
+
+    openBtnGroups.append('text')
+      .attr('x', OPEN_BTN_WIDTH / 2)
+      .attr('y', OPEN_BTN_HEIGHT / 2 + 5)
+      .attr('text-anchor', 'middle')
+      .attr('font-family', CARD_FONT)
+      .attr('font-size', '14px')
+      .attr('font-weight', '600')
+      .attr('fill', 'white')
+      .text(d => d.isItem ? 'Open' : (d.childCount > 0 ? 'Enter' : ''));
+
+    openBtnGroups.on('click', function(event, d) {
+      event.stopPropagation();
+      if (d.isItem) {
+        onOpenLeaf(d.id);
+      } else if (d.childCount > 0) {
+        onSelectNode(null);
+        onNavigateToNode(d);
+      }
+    });
+
     // Item type badge (NOTE or PAPER)
     const itemBadges = cardGroups.filter(d => d.isItem && d.childCount === 0);
 
@@ -709,17 +798,6 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       .attr('cursor', 'pointer')
       .attr('transform', d => `translate(${d.x}, ${d.y})`);
 
-    // Violet ring for topics
-    dotGroups.filter(d => getStructuralDepth(d.childCount, d.isItem) >= 1)
-      .append('circle')
-      .attr('class', 'dot-violet')
-      .attr('cx', d => 2 * getStructuralDepth(d.childCount, d.isItem))
-      .attr('cy', d => 2 * getStructuralDepth(d.childCount, d.isItem))
-      .attr('r', DOT_SIZE + 2)
-      .attr('fill', 'none')
-      .attr('stroke', '#5b21b6')
-      .attr('stroke-width', 4);
-
     // Stack circles for deep topics
     dotGroups.filter(d => getStructuralDepth(d.childCount, d.isItem) >= 3)
       .append('circle')
@@ -761,14 +839,69 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       .attr('stroke', d => d.id === activeNodeId ? '#fbbf24' : 'rgba(255,255,255,0.6)')
       .attr('stroke-width', d => d.id === activeNodeId ? 3 : 1.5);
 
-    dotGroups.style('opacity', d => getNodeOpacity(d, activeNodeId, connectionMap));
+    dotGroups.style('opacity', d => getNodeOpacity(d, activeNodeId, connectionMap, edgeConnectedIds));
 
+    // Emoji near top of bubble
     dotGroups.append('text')
+      .attr('class', 'dot-emoji')
       .attr('text-anchor', 'middle')
-      .attr('dy', '0.35em')
+      .attr('y', -DOT_SIZE * 0.35)
       .attr('font-size', '18px')
       .attr('fill', '#fff')
       .text(d => d.displayEmoji);
+
+    // Title text below emoji (max 3 lines, wrapped)
+    const wrapText = (text: string, maxCharsPerLine: number, maxLines: number): string[] => {
+      const words = text.split(/\s+/);
+      const lines: string[] = [];
+      let currentLine = '';
+
+      for (const word of words) {
+        if (lines.length >= maxLines) break;
+        const testLine = currentLine ? `${currentLine} ${word}` : word;
+        if (testLine.length <= maxCharsPerLine) {
+          currentLine = testLine;
+        } else {
+          if (currentLine) {
+            lines.push(currentLine);
+            if (lines.length >= maxLines) break;
+          }
+          currentLine = word.length > maxCharsPerLine ? word.slice(0, maxCharsPerLine - 1) + '…' : word;
+        }
+      }
+      if (currentLine && lines.length < maxLines) {
+        lines.push(currentLine);
+      }
+      // Add ellipsis to last line if there are more words
+      if (lines.length === maxLines && words.join(' ').length > lines.join(' ').length) {
+        const lastLine = lines[maxLines - 1];
+        if (lastLine.length > maxCharsPerLine - 1) {
+          lines[maxLines - 1] = lastLine.slice(0, maxCharsPerLine - 2) + '…';
+        } else if (!lastLine.endsWith('…')) {
+          lines[maxLines - 1] = lastLine + '…';
+        }
+      }
+      return lines;
+    };
+
+    dotGroups.each(function(d) {
+      const group = d3.select(this);
+      const title = d.aiTitle || d.title;
+      const lines = wrapText(title, 12, 3);
+      const lineHeight = 7;
+      const startY = DOT_SIZE * 0.05;
+
+      lines.forEach((line, i) => {
+        group.append('text')
+          .attr('class', 'dot-title')
+          .attr('text-anchor', 'middle')
+          .attr('y', startY + i * lineHeight)
+          .attr('font-size', '5px')
+          .attr('fill', '#fff')
+          .attr('opacity', 0.9)
+          .text(line);
+      });
+    });
 
     // Start with cards shown, dots hidden
     dotsGroup.style('display', 'none');
@@ -785,6 +918,9 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
     // Card click - select node
     cardGroups.on('click', function(event, d) {
       event.stopPropagation();
+
+      // Bring clicked node to front
+      d3.select(this).raise();
 
       // If clicking already-selected node, defer deselection to allow double-click
       if (activeNodeIdRef.current === d.id) {
@@ -840,6 +976,9 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
     dotGroups.on('click', function(event, d) {
       event.stopPropagation();
 
+      // Bring clicked node to front
+      d3.select(this).raise();
+
       // If clicking already-selected node, defer deselection to allow double-click
       if (activeNodeIdRef.current === d.id) {
         if (pendingDeselectRef.current) clearTimeout(pendingDeselectRef.current);
@@ -852,7 +991,9 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
         return;
       }
 
+      // Select node
       onSelectNode(d.id);
+
       if (pendingFetchRef.current) clearTimeout(pendingFetchRef.current);
       pendingFetchRef.current = setTimeout(() => onFetchSimilarNodes(d.id), 50);
     });
@@ -958,12 +1099,8 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
     // ZOOM AND PAN
     // ==========================================================================
 
-    // Level-of-detail thresholds
-    const bubbleThreshold = 0.12;
-    const curveStart = 0.14;
-    const curveEnd = 0.35;
-    const minApparentSize = 0.75;
-    const sparseMinApparentSize = 0.52;
+    // Level-of-detail thresholds (reuse constants from initial scale calculation above)
+    const bubbleThreshold = 0.08;  // Switch to bubbles at 8% zoom
 
     const zoom = d3.zoom<SVGSVGElement, unknown>()
       .scaleExtent([MIN_ZOOM, MAX_ZOOM])
@@ -990,10 +1127,14 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
           // Apply container transform (now batched with other updates)
           container.attr('transform', `translate(${x},${y}) scale(${k})`);
 
-          // === OPTIMIZATION 1: Skip ALL work if zoom delta < 2% ===
+          // === OPTIMIZATION 1: Skip work if zoom delta < 2% AND not crossing mode threshold ===
           const zoomDelta = Math.abs(k - lastProcessedZoomRef.current) / lastProcessedZoomRef.current;
-          if (zoomDelta < 0.02) {
-            return; // Skip everything for tiny zoom changes - no React re-renders
+          const wasCardMode = lastProcessedZoomRef.current >= bubbleThreshold;
+          const isCardMode = k >= bubbleThreshold;
+          const crossingModeThreshold = wasCardMode !== isCardMode;
+
+          if (zoomDelta < 0.02 && !crossingModeThreshold) {
+            return; // Skip for tiny zoom changes unless crossing mode threshold
           }
           lastProcessedZoomRef.current = k;
 
@@ -1008,9 +1149,6 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
               visibleIds.add(node.id);
             }
           });
-
-          // Determine mode once, then only update the active mode's elements
-          const isCardMode = k >= bubbleThreshold;
 
           if (isCardMode) {
             // Card mode - only update cards, not dots
@@ -1031,7 +1169,7 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
             let cardScale = 1;
             if (k < 1) {
               const targetApparent = Math.max(effectiveMinSize, Math.sqrt(k));
-              cardScale = targetApparent / k;
+              cardScale = Math.max(MIN_CARD_SCALE, targetApparent / k);
             }
 
             cardGroups.attr('transform', d =>
@@ -1097,19 +1235,50 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
             // Bubble mode - only update dots, not cards
             cardsGroup.style('display', 'none');
             dotsGroup.style('display', null);
-            linksGroup.style('display', 'none');
-            connectionDots.style('display', 'none');
+            linksGroup.style('display', null);
+            connectionDots.style('display', null);
 
             // Viewport culling for dots only
             dotGroups.style('display', d => visibleIds.has(d.id) ? null : 'none');
 
             const positionScale = Math.sqrt(curveEnd / k);
-            const targetScreenSize = 40;
+            const targetScreenSize = 120;  // 3x larger bubbles
             const bubbleScale = targetScreenSize / (DOT_SIZE * 2 * k);
 
             dotGroups.attr('transform', d =>
               `translate(${d.x * positionScale}, ${d.y * positionScale}) scale(${bubbleScale})`
             );
+
+            // Update edges to match bubble positions and sizes
+            const scaledBubbleSize = DOT_SIZE * 2 * bubbleScale;
+            edgePaths.attr('d', (d: EdgeData) => {
+              const scaledSource = { x: d.source.x * positionScale, y: d.source.y * positionScale };
+              const scaledTarget = { x: d.target.x * positionScale, y: d.target.y * positionScale };
+              const points = getEdgePoints(scaledSource, scaledTarget, scaledBubbleSize, scaledBubbleSize);
+              const dx = points.target.x - points.source.x;
+              const dy = points.target.y - points.source.y;
+              const dr = Math.sqrt(dx * dx + dy * dy) * 1.5;
+              return `M${points.source.x},${points.source.y} A${dr},${dr} 0 0,1 ${points.target.x},${points.target.y}`;
+            });
+
+            // Update connection dots for bubble mode
+            const bubbleEdgePoints = edgeData.map(d => {
+              const scaledSource = { x: d.source.x * positionScale, y: d.source.y * positionScale };
+              const scaledTarget = { x: d.target.x * positionScale, y: d.target.y * positionScale };
+              return getEdgePoints(scaledSource, scaledTarget, scaledBubbleSize, scaledBubbleSize);
+            });
+            connectionDots
+              .attr('r', 4 * bubbleScale)
+              .attr('cx', (_d: unknown, i: number) => {
+                const edgeIdx = Math.floor(i / 2);
+                const isSource = i % 2 === 0;
+                return isSource ? bubbleEdgePoints[edgeIdx]?.source.x ?? 0 : bubbleEdgePoints[edgeIdx]?.target.x ?? 0;
+              })
+              .attr('cy', (_d: unknown, i: number) => {
+                const edgeIdx = Math.floor(i / 2);
+                const isSource = i % 2 === 0;
+                return isSource ? bubbleEdgePoints[edgeIdx]?.source.y ?? 0 : bubbleEdgePoints[edgeIdx]?.target.y ?? 0;
+              });
           }
 
           onZoomChange(k);
@@ -1172,6 +1341,15 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
 
     const svg = d3.select(svgRef.current);
 
+    // Build set of nodes connected to active node via edges
+    const edgeConnectedIds = new Set<string>();
+    if (activeNodeId) {
+      edgeData.forEach(e => {
+        if (e.source.id === activeNodeId) edgeConnectedIds.add(e.target.id);
+        if (e.target.id === activeNodeId) edgeConnectedIds.add(e.source.id);
+      });
+    }
+
     // Helper to get color from node data
     const getColorFromData = (data: GraphNode | null): string => {
       if (!data) return '#374151';
@@ -1181,7 +1359,7 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
     // Helper to get opacity from node data
     const getOpacityFromData = (data: GraphNode | null): number => {
       if (!data) return 1;
-      return getNodeOpacity(data, activeNodeId, connectionMap);
+      return getNodeOpacity(data, activeNodeId, connectionMap, edgeConnectedIds);
     };
 
     // Update card background colors with transition
@@ -1267,7 +1445,35 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       .transition().duration(150)
       .style('opacity', (d: GraphNode) => getOpacityFromData(d));
 
-  }, [activeNodeId, connectionMap, graphNodes]);
+    // Update edge opacity and thickness based on selection
+    svg.selectAll<SVGPathElement, EdgeData>('.links path')
+      .transition().duration(150)
+      .attr('opacity', (e: EdgeData) => {
+        if (!activeNodeId) return 1;
+        if (e.source.id === activeNodeId || e.target.id === activeNodeId) return 1;
+        return 0.5;
+      })
+      .attr('stroke-width', (e: EdgeData) => {
+        const isConnected = activeNodeId && (e.source.id === activeNodeId || e.target.id === activeNodeId);
+        const baseWidth = e.type === 'contains' ? 6 : 6 + (e.weight * 18);
+        return isConnected ? baseWidth * 1.8 : baseWidth;
+      });
+
+    // Update Open/Enter button visibility based on selection
+    svg.selectAll<SVGGElement, GraphNode>('.open-btn')
+      .transition().duration(150)
+      .style('opacity', function(this: SVGGElement) {
+        const parentEl = this.parentNode as Element;
+        if (!parentEl) return 0;
+        const data = d3.select<Element, GraphNode>(parentEl).datum();
+        // Show if: tips enabled, node selected, and node has action (is item or has children)
+        if (showTips && data.id === activeNodeId && (data.isItem || data.childCount > 0)) {
+          return 1;
+        }
+        return 0;
+      });
+
+  }, [activeNodeId, connectionMap, graphNodes, edgeData, showTips]);
 
   // ==========================================================================
   // RENDER
@@ -1306,6 +1512,7 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
           </div>
         </div>
       )}
+
     </>
   );
 });

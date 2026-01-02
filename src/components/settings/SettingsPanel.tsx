@@ -113,6 +113,11 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const [savingOpenaiKey, setSavingOpenaiKey] = useState(false);
   const [openaiKeyError, setOpenaiKeyError] = useState<string | null>(null);
 
+  const [openaireKeyStatus, setOpenaireKeyStatus] = useState<string | null>(null);
+  const [openaireKeyInput, setOpenaireKeyInput] = useState('');
+  const [savingOpenaireKey, setSavingOpenaireKey] = useState(false);
+  const [openaireKeyError, setOpenaireKeyError] = useState<string | null>(null);
+
   // Database stats and path
   const [dbStats, setDbStats] = useState<DbStats | null>(null);
   const [dbPath, setDbPath] = useState<string>('');
@@ -163,6 +168,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const [isConsolidating, setIsConsolidating] = useState(false);
   const [isTidying, setIsTidying] = useState(false);
   const [isScoringPrivacy, setIsScoringPrivacy] = useState(false);
+  const [isExportingTrimmed, setIsExportingTrimmed] = useState(false);
   const [isReclassifyingPattern, setIsReclassifyingPattern] = useState(false);
   const [isReclassifyingAi, setIsReclassifyingAi] = useState(false);
   const [isRebuildingLite, setIsRebuildingLite] = useState(false);
@@ -186,6 +192,9 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
 
   // Protection settings
   const [protectRecentNotes, setProtectRecentNotes] = useState(true);
+
+  // Tips setting from store (shared with Graph)
+  const { showTips, setShowTips } = useGraphStore();
 
   // Local embeddings
   const [useLocalEmbeddings, setUseLocalEmbeddings] = useState(false);
@@ -216,11 +225,13 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     if (open) {
       loadApiKeyStatus();
       loadOpenaiKeyStatus();
+      loadOpenaireKeyStatus();
       loadDbStats();
       loadDbPath();
       loadProcessingStats();
       loadPrivacyStats();
       loadProtectionSettings();
+      loadShowTips();
       loadLocalEmbeddingsStatus();
       loadClusteringThresholds();
       loadPrivacyThresholdSetting();
@@ -245,6 +256,15 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
       setOpenaiKeyStatus(maskedKey);
     } catch (err) {
       console.error('Failed to load OpenAI API key status:', err);
+    }
+  };
+
+  const loadOpenaireKeyStatus = async () => {
+    try {
+      const maskedKey = await invoke<string | null>('get_openaire_api_key_status');
+      setOpenaireKeyStatus(maskedKey);
+    } catch (err) {
+      console.error('Failed to load OpenAIRE API key status:', err);
     }
   };
 
@@ -315,6 +335,24 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
       setProtectRecentNotes(enabled);
     } catch (err) {
       console.error('Failed to toggle protection:', err);
+    }
+  };
+
+  const loadShowTips = async () => {
+    try {
+      const enabled = await invoke<boolean>('get_show_tips');
+      setShowTips(enabled);
+    } catch (err) {
+      console.error('Failed to load tips setting:', err);
+    }
+  };
+
+  const handleToggleShowTips = async (enabled: boolean) => {
+    try {
+      await invoke('set_show_tips', { enabled });
+      setShowTips(enabled); // Updates store, which updates Graph
+    } catch (err) {
+      console.error('Failed to toggle tips:', err);
     }
   };
 
@@ -554,6 +592,32 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     }
   };
 
+  // Export trimmed database (no PDF blobs)
+  const handleExportTrimmed = async () => {
+    setIsExportingTrimmed(true);
+    setOperationResult(null);
+    try {
+      const defaultDir = dbPath ? dbPath.substring(0, dbPath.lastIndexOf('/') + 1) : undefined;
+      const defaultName = dbPath
+        ? dbPath.substring(dbPath.lastIndexOf('/') + 1).replace('.db', '-trimmed.db')
+        : 'mycelica-trimmed.db';
+      const file = await saveDialog({
+        title: 'Export trimmed database (no PDFs)',
+        defaultPath: defaultDir ? `${defaultDir}${defaultName}` : defaultName,
+        filters: [{ name: 'SQLite Database', extensions: ['db'] }],
+      });
+      if (file && typeof file === 'string') {
+        const result = await invoke<string>('export_trimmed_database', { outputPath: file });
+        setOperationResult(result);
+      }
+    } catch (err) {
+      console.error('Failed to export trimmed database:', err);
+      setOperationResult(`Error: ${err}`);
+    } finally {
+      setIsExportingTrimmed(false);
+    }
+  };
+
   // API Key handlers
   const handleSaveApiKey = async () => {
     if (!apiKeyInput.trim()) return;
@@ -600,6 +664,30 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
       await loadOpenaiKeyStatus();
     } catch (err) {
       console.error('Failed to clear OpenAI API key:', err);
+    }
+  };
+
+  const handleSaveOpenaireKey = async () => {
+    if (!openaireKeyInput.trim()) return;
+    setSavingOpenaireKey(true);
+    setOpenaireKeyError(null);
+    try {
+      await invoke('save_openaire_api_key', { key: openaireKeyInput.trim() });
+      await loadOpenaireKeyStatus();
+      setOpenaireKeyInput('');
+    } catch (err) {
+      setOpenaireKeyError(err as string);
+    } finally {
+      setSavingOpenaireKey(false);
+    }
+  };
+
+  const handleClearOpenaireKey = async () => {
+    try {
+      await invoke('clear_openaire_api_key');
+      await loadOpenaireKeyStatus();
+    } catch (err) {
+      console.error('Failed to clear OpenAIRE API key:', err);
     }
   };
 
@@ -1159,20 +1247,20 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     },
     resetProcessing: {
       title: 'Reset Processing',
-      message: 'This will reset AI processing AND clustering. Items will be marked as unprocessed and need re-clustering. Run "Full Rebuild" after.',
+      message: 'This will reset AI processing AND embeddings. Items will be re-analyzed and get new embeddings. Run "Full Rebuild" after.',
       handler: async () => {
         const aiCount = await invoke<number>('reset_ai_processing');
-        const clusterCount = await invoke<number>('reset_clustering');
-        return `Reset AI for ${aiCount} items, clustering for ${clusterCount} items`;
+        const embeddingCount = await invoke<number>('clear_embeddings');
+        return `Reset AI for ${aiCount} items, cleared ${embeddingCount} embeddings`;
       },
     },
     clearStructure: {
       title: 'Clear Structure',
-      message: 'This will clear hierarchy (delete category nodes) AND embeddings. Run "Full Rebuild" to recreate.',
+      message: 'This will clear clustering AND hierarchy. Items keep their embeddings. Run "Full Rebuild" to re-cluster.',
       handler: async () => {
+        const clusterCount = await invoke<number>('reset_clustering');
         const hierarchyCount = await invoke<number>('clear_hierarchy');
-        const embeddingCount = await invoke<number>('clear_embeddings');
-        return `Deleted ${hierarchyCount} hierarchy nodes, cleared ${embeddingCount} embeddings`;
+        return `Reset clustering for ${clusterCount} items, deleted ${hierarchyCount} hierarchy nodes`;
       },
     },
   };
@@ -1418,6 +1506,26 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                     <span
                       className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
                         protectRecentNotes ? 'translate-x-6' : 'translate-x-1'
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                {/* Tips toggle */}
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-sm font-medium text-gray-200">Show Tips</div>
+                    <div className="text-xs text-gray-500 mt-0.5">Show popup buttons on selected nodes</div>
+                  </div>
+                  <button
+                    onClick={() => handleToggleShowTips(!showTips)}
+                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                      showTips ? 'bg-amber-500' : 'bg-gray-600'
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                        showTips ? 'translate-x-6' : 'translate-x-1'
                       }`}
                     />
                   </button>
@@ -1857,6 +1965,57 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                 </p>
               </div>
 
+              {/* OpenAIRE API Key */}
+              <div className="bg-gray-900/50 rounded-lg p-4">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-sm font-medium text-gray-200">OpenAIRE API Key <span className="text-gray-500">(optional)</span></span>
+                  {openaireKeyStatus ? (
+                    <span className="flex items-center gap-1 text-xs text-green-400">
+                      <Check className="w-3 h-3" />
+                      Authenticated
+                    </span>
+                  ) : (
+                    <span className="text-xs text-gray-500">Public API</span>
+                  )}
+                </div>
+                {openaireKeyStatus && (
+                  <div className="mb-2 px-2 py-1 bg-gray-800 rounded text-xs text-gray-400 font-mono">
+                    {openaireKeyStatus}
+                  </div>
+                )}
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    placeholder="Bearer token..."
+                    value={openaireKeyInput}
+                    onChange={(e) => setOpenaireKeyInput(e.target.value)}
+                    className="flex-1 px-3 py-1.5 bg-gray-800 border border-gray-700 rounded text-sm text-white placeholder-gray-500 focus:border-amber-500/50 focus:ring-1 focus:ring-amber-500/20 focus:outline-none"
+                  />
+                  <button
+                    onClick={handleSaveOpenaireKey}
+                    disabled={savingOpenaireKey || !openaireKeyInput.trim()}
+                    className="px-3 py-1.5 bg-amber-500/20 text-amber-200 rounded text-sm font-medium hover:bg-amber-500/30 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {savingOpenaireKey ? 'Saving...' : 'Save'}
+                  </button>
+                  {openaireKeyStatus && (
+                    <button
+                      onClick={handleClearOpenaireKey}
+                      className="px-3 py-1.5 bg-red-500/20 text-red-300 rounded text-sm font-medium hover:bg-red-500/30 transition-colors"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+                {openaireKeyError && <p className="mt-2 text-xs text-red-400">{openaireKeyError}</p>}
+                <p className="mt-2 text-xs text-gray-500">
+                  Optional. Public API works fine, auth gives higher rate limits.{' '}
+                  <a href="https://develop.openaire.eu/" target="_blank" rel="noopener noreferrer" className="text-amber-400 hover:underline">
+                    Get token
+                  </a>
+                </p>
+              </div>
+
               {/* Local Embeddings Toggle */}
               <div className="bg-gray-900/50 rounded-lg p-4 mt-3">
                 <div className="flex items-center gap-2 mb-3">
@@ -2081,6 +2240,27 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                     style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-cyan-600 hover:bg-cyan-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isTidying ? <Loader2 className="w-5 h-5 animate-spin" /> : '🧹'}
+                  </button>
+                </div>
+
+                {/* Export Trimmed Database */}
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-indigo-600 flex items-center justify-center text-white text-sm">
+                    <Download className="w-3.5 h-3.5" />
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Export Trimmed</div>
+                    <div className="text-xs text-gray-500">Export database without PDF blobs for sharing</div>
+                    <div className="text-xs text-indigo-400 mt-0.5">
+                      Removes PDF blobs · PDFs download on-demand when viewing
+                    </div>
+                  </div>
+                  <button
+                    onClick={handleExportTrimmed}
+                    disabled={isExportingTrimmed || isFullRebuilding}
+                    style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-indigo-600 hover:bg-indigo-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                  >
+                    {isExportingTrimmed ? <Loader2 className="w-5 h-5 animate-spin" /> : '📦'}
                   </button>
                 </div>
 
@@ -2322,22 +2502,22 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
               {dangerZoneExpanded && (
                 <div className="mt-4 space-y-4">
                   <div className="grid grid-cols-2 gap-3">
-                    {/* Combined: Reset Processing (AI + Clustering) */}
+                    {/* Combined: Reset Processing (AI + Embeddings) */}
                     <button
                       onClick={() => setConfirmAction('resetProcessing')}
                       className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
                     >
                       <span className="text-sm font-medium text-gray-200">Reset Processing</span>
-                      <span className="text-xs text-gray-500">AI + Clustering (re-run all)</span>
+                      <span className="text-xs text-gray-500">AI + Embeddings</span>
                     </button>
 
-                    {/* Combined: Clear Structure (Hierarchy + Embeddings) */}
+                    {/* Combined: Clear Structure (Clustering + Hierarchy) */}
                     <button
                       onClick={() => setConfirmAction('clearStructure')}
                       className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
                     >
                       <span className="text-sm font-medium text-gray-200">Clear Structure</span>
-                      <span className="text-xs text-gray-500">Hierarchy + Embeddings</span>
+                      <span className="text-xs text-gray-500">Clustering + Hierarchy</span>
                     </button>
 
                     <button
@@ -2603,7 +2783,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                       Found {openAirePaperCount.toLocaleString()} papers
                       {openAireImportedCount !== null && openAireImportedCount > 0 && (
                         <span className="text-gray-400">
-                          {' '}({openAireImportedCount} of first 100 already imported)
+                          {' '}({openAireImportedCount} already imported)
                         </span>
                       )}
                     </span>

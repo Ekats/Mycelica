@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useDeferredValue, useMemo } from 'react';
-import { Search, X, ChevronRight, ChevronDown, Settings, Pin, Clock, PinOff } from 'lucide-react';
+import { Search, X, ChevronRight, ChevronDown, Settings, Pin, Clock, PinOff, GripVertical } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useGraphStore } from '../../stores/graphStore';
@@ -7,6 +7,9 @@ import { getEmojiForNode, initLearnedMappings } from '../../utils/emojiMatcher';
 import type { Node } from '../../types/graph';
 
 type SidebarTab = 'pinned' | 'search';
+
+const MIN_SIDEBAR_WIDTH = 200;
+const MAX_SIDEBAR_WIDTH = 400;
 
 interface SidebarProps {
   onOpenSettings?: () => void;
@@ -16,6 +19,10 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
   const { nodes, activeNodeId, setActiveNode, navigateToRoot, jumpToNode } = useGraphStore();
   const [activeTab, setActiveTab] = useState<SidebarTab>('pinned');
   const [searchQuery, setSearchQuery] = useState('');
+
+  // Resize state
+  const [sidebarWidth, setSidebarWidth] = useState(MIN_SIDEBAR_WIDTH);
+  const [isResizing, setIsResizing] = useState(false);
 
   // Quick access state
   const [recentNodes, setRecentNodes] = useState<Node[]>([]);
@@ -50,6 +57,28 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
         .catch(console.error);
     }
   }, [activeNodeId]);
+
+  // Sidebar resize handling
+  useEffect(() => {
+    if (!isResizing) return;
+
+    const handleMouseMove = (e: MouseEvent) => {
+      const newWidth = Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, e.clientX));
+      setSidebarWidth(newWidth);
+    };
+
+    const handleMouseUp = () => {
+      setIsResizing(false);
+    };
+
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [isResizing]);
 
   const loadLearnedEmojis = async () => {
     try {
@@ -180,7 +209,26 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
   };
 
   return (
-    <aside className="w-72 h-full bg-gray-800/95 backdrop-blur-sm border-r border-gray-700/50 flex flex-col">
+    <aside
+      className="h-full bg-gray-800/95 backdrop-blur-sm border-r border-gray-700/50 flex flex-col relative"
+      style={{ width: sidebarWidth }}
+    >
+      {/* Resize handle */}
+      <div
+        className={`absolute top-0 right-0 w-1 h-full cursor-col-resize group z-10 ${
+          isResizing ? 'bg-amber-500/50' : 'hover:bg-amber-500/30'
+        }`}
+        onMouseDown={(e) => {
+          e.preventDefault();
+          setIsResizing(true);
+        }}
+      >
+        <div className={`absolute top-1/2 -translate-y-1/2 -left-1 w-3 h-8 flex items-center justify-center rounded ${
+          isResizing ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+        } transition-opacity`}>
+          <GripVertical className="w-3 h-3 text-gray-400" />
+        </div>
+      </div>
       {/* Header */}
       <div className="p-4 border-b border-gray-700/50">
         <div className="flex items-center justify-between mb-3">

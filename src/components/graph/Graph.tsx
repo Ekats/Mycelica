@@ -169,6 +169,9 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     hidePrivate,
     setHidePrivate,
     privacyThreshold,
+    // UI preferences from store
+    showTips,
+    setShowTips,
   } = useGraphStore();
   const [zoomLevel, setZoomLevel] = useState(1);
   const [devLogs, setDevLogs] = useState<DevConsoleLog[]>([]);
@@ -205,7 +208,7 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     stackNodesRef.current = value;
     setStackNodesState(value);
   };
-  const [detailsPanelSize, setDetailsPanelSize] = useState({ width: 400, height: 800 });
+  const [detailsPanelSize, setDetailsPanelSize] = useState({ width: 300, height: 800 });
   const [isResizingDetails, setIsResizingDetails] = useState(false);
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(new Set());
   // Zen mode removed - hover/selection now handles connection highlighting
@@ -381,6 +384,19 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     };
     loadPinnedIds();
   }, []);
+
+  // Load showTips setting on mount
+  useEffect(() => {
+    const loadShowTipsSetting = async () => {
+      try {
+        const tips = await invoke<boolean>('get_show_tips');
+        setShowTips(tips);
+      } catch (err) {
+        console.error('Failed to load showTips setting:', err);
+      }
+    };
+    loadShowTipsSetting();
+  }, [setShowTips]);
 
   // Handle toggling pin status
   const handleTogglePin = useCallback(async (nodeId: string, currentlyPinned: boolean) => {
@@ -1166,18 +1182,20 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     if (nodeArray.length === 0) return { graphNodesComputed: [], edgeDataComputed: [] };
 
     // Constants
-    const noteWidth = 320, noteHeight = 320, nodeSpacing = 300;
-    const ellipseAspect = Math.min((width / height) * 0.9, 2.0);
-    const goldenAngle = Math.PI * (3 - Math.sqrt(5));
-    const horizontalBandHalfAngle = Math.PI / 4.5;
-    const restrictionStartRing = 2;
+    const noteWidth = 320, noteHeight = 320, nodeSpacing = 400;
+    const ellipseAspect = Math.min((width / height) * 1.2, 2.5);
+    const goldenAngle = Math.PI * (3 - Math.sqrt(5));  // ~137.5° for even visual spacing
 
-    // Ring layout helpers
-    const getNodesPerRing = (ring: number): number => ring === 0 ? 1 : 4;
+    // Ring layout helpers - more nodes per ring for orderly layout
+    const getNodesPerRing = (ring: number): number => {
+      if (ring === 0) return 1;
+      if (ring === 1) return 6;
+      return Math.min(12, 6 + (ring - 1) * 2);  // 6, 8, 10, 12, 12...
+    };
     const getRingRadius = (ring: number): number => {
       if (ring === 0) return 0;
-      if (ring === 1) return (noteHeight + nodeSpacing * 1.5) * 1.1;
-      return (noteHeight + nodeSpacing * 1.5) * (1.1 + (ring - 1) * 0.9);
+      if (ring === 1) return (noteHeight + nodeSpacing) * 1.6;
+      return (noteHeight + nodeSpacing) * (1.6 + (ring - 1) * 1.4);
     };
 
     // Sort by importance
@@ -1199,22 +1217,10 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
 
       for (let i = 0; i < nodesInThisRing; i++) {
         const node = sortedNodes[nodeIndex];
-        let angle: number;
-        if (ringIndex < restrictionStartRing) {
-          angle = ringStartAngle + (i / nodesInThisRing) * 2 * Math.PI;
-        } else {
-          const progress = i / nodesInThisRing;
-          if (progress < 0.5) {
-            angle = -horizontalBandHalfAngle + (progress * 2) * (2 * horizontalBandHalfAngle);
-          } else {
-            angle = Math.PI - horizontalBandHalfAngle + ((progress - 0.5) * 2) * (2 * horizontalBandHalfAngle);
-          }
-          angle += (ringIndex % 4) * 0.1;
-        }
-
-        const verticalStretch = ringIndex === 1 ? 1.3 : 1.0;
+        // Simple even distribution around the ring, offset by ring index for visual variety
+        const angle = ringStartAngle + (i / nodesInThisRing) * 2 * Math.PI;
         const x = ringRadius * ellipseAspect * Math.cos(angle);
-        const y = ringRadius * verticalStretch * Math.sin(angle);
+        const y = ringRadius * Math.sin(angle);
         const colorId = node.clusterId ?? hashString(node.id);
 
         graphNodes.push({
@@ -1228,49 +1234,6 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
         nodeIndex++;
       }
       ringIndex++;
-    }
-
-    // Force simulation for connected nodes
-    const semanticEdges: Array<{source: string, target: string, weight: number}> = [];
-    edges.forEach(edge => {
-      if (edge.type === 'related' && edge.weight !== undefined) {
-        const sourceInView = graphNodes.some(n => n.id === edge.source);
-        const targetInView = graphNodes.some(n => n.id === edge.target);
-        if (sourceInView && targetInView) {
-          semanticEdges.push({ source: edge.source, target: edge.target, weight: edge.weight });
-        }
-      }
-    });
-
-    const connectedNodeIds = new Set<string>();
-    semanticEdges.forEach(e => { connectedNodeIds.add(e.source); connectedNodeIds.add(e.target); });
-
-    if (graphNodes.length >= 2 && semanticEdges.length > 0) {
-      const simNodes = graphNodes.map(n => ({
-        id: n.id, x: n.x, y: n.y,
-        isConnected: connectedNodeIds.has(n.id), origX: n.x, origY: n.y,
-      }));
-      const simLinks = semanticEdges.map(e => ({
-        source: e.source, target: e.target, strength: e.weight * 0.5
-      }));
-
-      const simulation = d3.forceSimulation(simNodes)
-        .force('link', d3.forceLink(simLinks)
-          .id((d: any) => d.id).distance(noteWidth * 2.5).strength((d: any) => d.strength * 0.4))
-        .force('charge', d3.forceManyBody().strength(-noteWidth * 6).distanceMax(noteWidth * 15))
-        .force('anchorX', d3.forceX((d: any) => d.origX).strength((d: any) => d.isConnected ? 0.01 : 0.3))
-        .force('anchorY', d3.forceY((d: any) => d.origY).strength((d: any) => d.isConnected ? 0.01 : 0.3))
-        .force('collide', d3.forceCollide().radius(Math.max(noteWidth, noteHeight) * 1.5).strength(1.0).iterations(3))
-        .stop();
-
-      const numTicks = Math.min(300, 50 + graphNodes.length * 2);
-      for (let i = 0; i < numTicks; i++) simulation.tick();
-
-      const posMap = new Map(simNodes.map(n => [n.id, { x: n.x, y: n.y }]));
-      graphNodes.forEach(node => {
-        const newPos = posMap.get(node.id);
-        if (newPos) { node.x = newPos.x; node.y = newPos.y; }
-      });
     }
 
     // Build edge data
@@ -1329,6 +1292,7 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
         devLog={devLog}
         getNodeEmoji={getNodeEmoji}
         hidePrivate={hidePrivate}
+        showTips={showTips}
       />
 
       {/* Hierarchy Breadcrumbs - Shows actual navigation path with node titles */}

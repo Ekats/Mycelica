@@ -60,6 +60,7 @@ export function PaperViewer({ nodeId, metadata, title, onBack }: PaperViewerProp
   const [docxHtml, setDocxHtml] = useState<string | null>(null);  // Rendered DOCX HTML
   const [docLoading, setDocLoading] = useState(false);
   const [docError, setDocError] = useState<string | null>(null);
+  const [downloadingFromSource, setDownloadingFromSource] = useState(false);
   const [numPages, setNumPages] = useState<number>(0);
   const [pageNumber, setPageNumber] = useState(1);
   const [pageWidth, setPageWidth] = useState<number | null>(null);  // Track actual rendered width
@@ -71,11 +72,13 @@ export function PaperViewer({ nodeId, metadata, title, onBack }: PaperViewerProp
     : [];
 
   // Load document when switching to document view
+  // Works for both cached (pdfAvailable) and on-demand (pdfUrl) cases
   useEffect(() => {
-    if (viewMode === 'document' && metadata.pdfAvailable && !pdfBlobUrl && !docxHtml) {
+    const canLoad = metadata.pdfAvailable || metadata.pdfUrl;
+    if (viewMode === 'document' && canLoad && !pdfBlobUrl && !docxHtml) {
       loadDocument();
     }
-  }, [viewMode, metadata.pdfAvailable]);
+  }, [viewMode, metadata.pdfAvailable, metadata.pdfUrl]);
 
   // Cleanup blob URL on unmount
   useEffect(() => {
@@ -89,8 +92,23 @@ export function PaperViewer({ nodeId, metadata, title, onBack }: PaperViewerProp
   const loadDocument = async () => {
     setDocLoading(true);
     setDocError(null);
+    setDownloadingFromSource(false);
+
     try {
-      const result = await invoke<[number[], string] | null>('get_paper_document', { nodeId });
+      // First try to get document from local cache
+      let result = await invoke<[number[], string] | null>('get_paper_document', { nodeId });
+
+      // If not cached locally but we have a PDF URL, download on demand
+      if (!result && metadata.pdfUrl) {
+        console.log('[PaperViewer] Not cached locally, downloading on demand...');
+        setDownloadingFromSource(true);
+        result = await invoke<[number[], string] | null>('download_paper_on_demand', {
+          nodeId,
+          cacheLocally: true  // Cache after download for faster next view
+        });
+        setDownloadingFromSource(false);
+      }
+
       if (result) {
         const [data, format] = result;
         setDocFormat(format);
@@ -108,11 +126,14 @@ export function PaperViewer({ nodeId, metadata, title, onBack }: PaperViewerProp
           setDocError('DOC format requires external viewer. Click "Open External" to view.');
         }
       } else {
-        setDocError('Document not available');
+        setDocError('Document not available. No cached copy and download failed.');
       }
     } catch (err) {
       console.error('Failed to load document:', err);
-      setDocError(err instanceof Error ? err.message : 'Failed to load document');
+      // Tauri returns Err(String) as a plain string, not Error object
+      const errorMsg = typeof err === 'string' ? err : (err instanceof Error ? err.message : 'Failed to load document');
+      setDocError(errorMsg);
+      setDownloadingFromSource(false);
     } finally {
       setDocLoading(false);
     }
@@ -238,7 +259,7 @@ export function PaperViewer({ nodeId, metadata, title, onBack }: PaperViewerProp
             <FileText size={16} className="inline mr-2" />
             Abstract
           </button>
-          {metadata.pdfAvailable ? (
+          {(metadata.pdfAvailable || metadata.pdfUrl) ? (
             <>
               <button
                 onClick={() => setViewMode('document')}
@@ -249,26 +270,31 @@ export function PaperViewer({ nodeId, metadata, title, onBack }: PaperViewerProp
                 }`}
               >
                 {docFormat === 'docx' || docFormat === 'doc' ? 'Document' : 'PDF Viewer'}
+                {!metadata.pdfAvailable && metadata.pdfUrl && (
+                  <span className="ml-1 text-xs opacity-70">(stream)</span>
+                )}
               </button>
-              <button
-                onClick={openInExternalViewer}
-                className="px-4 py-2 rounded-lg text-sm font-medium bg-gray-700 text-gray-300 hover:bg-gray-600 flex items-center gap-2"
-                title="Open in system viewer"
-              >
-                <ExternalLink size={16} />
-                Open External
-              </button>
+              {metadata.pdfAvailable ? (
+                <button
+                  onClick={openInExternalViewer}
+                  className="px-4 py-2 rounded-lg text-sm font-medium bg-gray-700 text-gray-300 hover:bg-gray-600 flex items-center gap-2"
+                  title="Open in system viewer"
+                >
+                  <ExternalLink size={16} />
+                  Open External
+                </button>
+              ) : metadata.pdfUrl ? (
+                <a
+                  href={metadata.pdfUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-4 py-2 rounded-lg text-sm font-medium bg-gray-700 text-gray-300 hover:bg-gray-600 flex items-center gap-2"
+                >
+                  <ExternalLink size={16} />
+                  Open in Browser
+                </a>
+              ) : null}
             </>
-          ) : metadata.pdfUrl ? (
-            <a
-              href={metadata.pdfUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="px-4 py-2 rounded-lg text-sm font-medium bg-gray-700 text-gray-300 hover:bg-gray-600 flex items-center gap-2"
-            >
-              <ExternalLink size={16} />
-              Open Paper
-            </a>
           ) : null}
         </div>
       </div>
@@ -325,7 +351,17 @@ export function PaperViewer({ nodeId, metadata, title, onBack }: PaperViewerProp
         ) : (
           <div className="flex flex-col items-center">
             {docLoading ? (
-              <div className="text-gray-400">Loading document...</div>
+              <div className="flex flex-col items-center gap-3 text-gray-400">
+                <div className="animate-spin w-8 h-8 border-2 border-amber-500 border-t-transparent rounded-full" />
+                {downloadingFromSource ? (
+                  <div className="text-center">
+                    <div className="text-amber-400">Downloading from source...</div>
+                    <div className="text-sm text-gray-500 mt-1">This will be cached for next time</div>
+                  </div>
+                ) : (
+                  <div>Loading document...</div>
+                )}
+              </div>
             ) : docError ? (
               <div className="text-red-400">{docError}</div>
             ) : docxHtml ? (
