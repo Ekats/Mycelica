@@ -1,10 +1,10 @@
-mod db;
+pub mod db;
 mod commands;
 mod clustering;
 mod ai_client;
-mod settings;
+pub mod settings;
 mod hierarchy;
-mod import;
+pub mod import;
 mod similarity;
 mod local_embeddings;
 pub mod classification;
@@ -41,18 +41,20 @@ use commands::{
     // Import commands
     import_claude_conversations, import_markdown_files, import_google_keep, import_openaire, count_openaire_papers, get_imported_paper_count,
     // Paper retrieval commands
-    get_paper_metadata, get_paper_pdf, get_paper_document, has_paper_pdf, open_paper_external, reformat_paper_abstracts, sync_paper_pdf_status,
+    get_paper_metadata, get_paper_pdf, get_paper_document, has_paper_pdf, open_paper_external, reformat_paper_abstracts, sync_paper_pdf_status, download_paper_on_demand,
     // Quick access commands (Sidebar)
     set_node_pinned, touch_node, get_pinned_nodes, get_recent_nodes, clear_recent,
     // Semantic similarity commands
     get_similar_nodes, get_embedding_status,
     // OpenAI API key commands
     get_openai_api_key_status, save_openai_api_key, clear_openai_api_key,
+    // OpenAIRE API key commands
+    get_openaire_api_key_status, save_openaire_api_key, clear_openaire_api_key,
     // Leaf view commands
     get_leaf_content,
     // Settings panel commands
     delete_all_data, reset_ai_processing, reset_clustering, clear_embeddings, clear_hierarchy, clear_tags, delete_empty_nodes, flatten_hierarchy, consolidate_root, get_db_stats,
-    get_db_path, switch_database, tidy_database,
+    get_db_path, switch_database, tidy_database, export_trimmed_database,
     // Processing stats commands
     get_processing_stats, add_ai_processing_time, add_rebuild_time,
     // Privacy filtering commands
@@ -65,6 +67,8 @@ use commands::{
     get_clustering_thresholds, set_clustering_thresholds,
     // Privacy threshold commands
     get_privacy_threshold, set_privacy_threshold,
+    // Tips commands
+    get_show_tips, set_show_tips,
 };
 use db::Database;
 use std::sync::Arc;
@@ -113,8 +117,8 @@ pub fn run() {
                             Ok(resource_dir) => {
                                 println!("Resource dir: {:?}", resource_dir);
                                 // Try both possible paths (with and without resources/ prefix)
-                                let bundled_db = resource_dir.join("resources/mycelica-testing-preview.db");
-                                let bundled_db_alt = resource_dir.join("mycelica-testing-preview.db");
+                                let bundled_db = resource_dir.join("resources/mycelica-openAIRE-med-trimmed.db");
+                                let bundled_db_alt = resource_dir.join("mycelica-openAIRE-med-trimmed.db");
 
                                 let source = if bundled_db.exists() {
                                     Some(bundled_db)
@@ -284,6 +288,7 @@ pub fn run() {
             open_paper_external,
             reformat_paper_abstracts,
             sync_paper_pdf_status,
+            download_paper_on_demand,
             // Quick access (Sidebar)
             set_node_pinned,
             touch_node,
@@ -297,6 +302,10 @@ pub fn run() {
             get_openai_api_key_status,
             save_openai_api_key,
             clear_openai_api_key,
+            // OpenAIRE API key
+            get_openaire_api_key_status,
+            save_openaire_api_key,
+            clear_openaire_api_key,
             // Leaf view
             get_leaf_content,
             // Settings panel
@@ -313,6 +322,7 @@ pub fn run() {
             get_db_stats,
             get_db_path,
             switch_database,
+            export_trimmed_database,
             // Processing stats
             get_processing_stats,
             add_ai_processing_time,
@@ -340,6 +350,8 @@ pub fn run() {
             set_clustering_thresholds,
             get_privacy_threshold,
             set_privacy_threshold,
+            get_show_tips,
+            set_show_tips,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

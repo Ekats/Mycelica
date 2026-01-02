@@ -150,3 +150,15 @@ pub fn get_privacy_threshold() -> f32 {
 pub fn set_privacy_threshold(threshold: f32) -> Result<(), String> {
     settings::set_privacy_threshold(threshold)
 }
+
+// ==================== Show Tips ====================
+
+#[tauri::command]
+pub fn get_show_tips() -> bool {
+    settings::show_tips()
+}
+
+#[tauri::command]
+pub fn set_show_tips(enabled: bool) -> Result<(), String> {
+    settings::set_show_tips(enabled)
+}

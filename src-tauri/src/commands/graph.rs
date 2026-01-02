@@ -942,6 +942,9 @@ pub async fn import_openaire(
     let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clone();
     let max_size = max_pdf_size_mb.unwrap_or(20);
 
+    // Get OpenAIRE API key from settings (optional - public API also works)
+    let api_key = settings::get_openaire_api_key();
+
     // Progress callback that emits events to frontend
     let app_handle = app.clone();
     let on_progress = move |current: usize, total: usize| {
@@ -959,13 +962,14 @@ pub async fn import_openaire(
         max_papers,
         download_pdfs,
         max_size,
+        api_key,
         on_progress,
     ).await
 }
 
 /// Count papers matching OpenAIRE query without importing
 /// Returns (total_count, already_imported_count)
-/// Fetches a sample of 100 papers to check against local DB
+/// Fetches ALL papers from query and checks against local DB
 #[tauri::command]
 pub async fn count_openaire_papers(
     state: State<'_, AppState>,
@@ -975,42 +979,59 @@ pub async fn count_openaire_papers(
 ) -> Result<(u32, u32), String> {
     use crate::openaire::{OpenAireClient, OpenAireQuery};
 
-    let client = OpenAireClient::new();
+    // Get OpenAIRE API key from settings (optional)
+    let api_key = settings::get_openaire_api_key();
+    let client = OpenAireClient::new_with_key(api_key);
 
-    // First get total count
-    let count_query = OpenAireQuery {
-        search: query.clone(),
-        country: country.clone(),
-        fos: fos.clone(),
-        access_right: Some("OPEN".to_string()),
-        page_size: 1,
-        page: 1,
-        sort_by: None,
-    };
-    let total_count = client.count_papers(&count_query).await?;
-
-    // Then fetch first 100 papers to check which are already imported
-    let sample_query = OpenAireQuery {
-        search: query,
-        country,
-        fos,
-        access_right: Some("OPEN".to_string()),
-        page_size: 100,
-        page: 1,
-        sort_by: None,
-    };
-    let (papers, _) = client.fetch_papers(&sample_query).await?;
-
-    // Get existing IDs from local DB
+    // Get existing IDs from local DB upfront
     let existing_ids = state.db.read()
         .map_err(|e| format!("DB lock error: {}", e))?
         .get_all_openaire_ids()
         .map_err(|e| e.to_string())?;
 
-    // Count how many of the sample are already imported
-    let imported_count = papers.iter()
-        .filter(|p| existing_ids.contains(&p.id))
-        .count() as u32;
+    let mut total_count = 0u32;
+    let mut imported_count = 0u32;
+    let mut current_page = 1u32;
+    let page_size = 100u32;
+
+    // Paginate through all results
+    loop {
+        let query_obj = OpenAireQuery {
+            search: query.clone(),
+            country: country.clone(),
+            fos: fos.clone(),
+            access_right: Some("OPEN".to_string()),
+            page_size,
+            page: current_page,
+            sort_by: None,
+        };
+
+        let (papers, count) = client.fetch_papers(&query_obj).await?;
+
+        // Store total from first response
+        if current_page == 1 {
+            total_count = count;
+        }
+
+        if papers.is_empty() {
+            break;
+        }
+
+        // Count how many are already imported
+        imported_count += papers.iter()
+            .filter(|p| existing_ids.contains(&p.id))
+            .count() as u32;
+
+        current_page += 1;
+
+        // Stop if we've fetched all pages
+        if (current_page - 1) * page_size >= total_count {
+            break;
+        }
+
+        // Rate limit between pages
+        client.rate_limit_delay().await;
+    }
 
     Ok((total_count, imported_count))
 }
@@ -1072,6 +1093,61 @@ pub fn get_paper_document(state: State<AppState>, node_id: String) -> Result<Opt
     if let Some((ref bytes, ref format)) = result {
         eprintln!("[Document] get_paper_document result: {} bytes, format: {}", bytes.len(), format);
     }
+    Ok(result)
+}
+
+/// Download paper document on demand from source URL
+/// Falls back to cached version if available, otherwise downloads from pdf_url
+#[tauri::command]
+pub async fn download_paper_on_demand(
+    state: State<'_, AppState>,
+    node_id: String,
+    cache_locally: bool,
+) -> Result<Option<(Vec<u8>, String)>, String> {
+    use crate::openaire::OpenAireClient;
+
+    // First check if we have it cached locally
+    if let Ok(Some(doc)) = state.db.read()
+        .map_err(|e| format!("DB lock: {}", e))?
+        .get_paper_document(&node_id)
+    {
+        eprintln!("[OnDemand] Found cached document for {}", node_id);
+        return Ok(Some(doc));
+    }
+
+    // Get the PDF URL from paper metadata
+    let pdf_url = state.db.read()
+        .map_err(|e| format!("DB lock: {}", e))?
+        .get_paper_by_node_id(&node_id)
+        .map_err(|e| e.to_string())?
+        .and_then(|p| p.pdf_url);
+
+    let url = match pdf_url {
+        Some(u) => u,
+        None => return Err("No PDF URL available for this paper".to_string()),
+    };
+
+    eprintln!("[OnDemand] Downloading from: {}", url);
+
+    // Download on demand
+    let client = OpenAireClient::new();
+    let result = client.download_document(&url, 20).await?;
+
+    if let Some((ref bytes, ref format)) = result {
+        eprintln!("[OnDemand] Downloaded {} KB, format: {}", bytes.len() / 1024, format);
+
+        // Optionally cache to DB for faster access next time
+        if cache_locally {
+            if let Ok(db) = state.db.read() {
+                if let Err(e) = db.update_paper_document(&node_id, bytes, format) {
+                    eprintln!("[OnDemand] Failed to cache: {}", e);
+                } else {
+                    eprintln!("[OnDemand] Cached to local DB");
+                }
+            }
+        }
+    }
+
     Ok(result)
 }
 
@@ -1298,6 +1374,24 @@ pub fn save_openai_api_key(key: String) -> Result<(), String> {
 #[tauri::command]
 pub fn clear_openai_api_key() -> Result<(), String> {
     settings::set_openai_api_key(String::new())
+}
+
+// ==================== OpenAIRE API Key Commands ====================
+
+#[tauri::command]
+pub fn get_openaire_api_key_status() -> Result<Option<String>, String> {
+    // Return masked key for display, or None if not set
+    Ok(settings::get_masked_openaire_api_key())
+}
+
+#[tauri::command]
+pub fn save_openaire_api_key(key: String) -> Result<(), String> {
+    settings::set_openaire_api_key(key)
+}
+
+#[tauri::command]
+pub fn clear_openaire_api_key() -> Result<(), String> {
+    settings::set_openaire_api_key(String::new())
 }
 
 // ==================== Leaf View Commands ====================
@@ -1722,6 +1816,63 @@ pub fn switch_database(app: AppHandle, state: State<AppState>, db_path: String) 
         orphan_items,
         topics_count,
     })
+}
+
+/// Export a trimmed copy of the database without PDF blobs
+/// Reduces database size from ~1.8GB to ~50MB for sharing
+#[tauri::command]
+pub fn export_trimmed_database(state: State<AppState>, output_path: String) -> Result<String, String> {
+    use std::path::PathBuf;
+
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+    let source_path = db.get_path();
+    let output = PathBuf::from(&output_path);
+
+    // Ensure output directory exists
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create output directory: {}", e))?;
+    }
+
+    // Copy database file
+    std::fs::copy(&source_path, &output).map_err(|e| format!("Failed to copy database: {}", e))?;
+    eprintln!("[Export] Copied database to {:?}", output);
+
+    // Open copy and clear PDF blobs
+    let conn = rusqlite::Connection::open(&output).map_err(|e| format!("Failed to open copy: {}", e))?;
+
+    // Get original size
+    let original_size: i64 = conn.query_row(
+        "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+        [],
+        |row| row.get(0)
+    ).unwrap_or(0);
+
+    // Clear PDF blobs and mark as not available (they'll be downloaded on-demand)
+    let cleared = conn.execute("UPDATE papers SET pdf_blob = NULL, pdf_available = 0 WHERE pdf_blob IS NOT NULL", [])
+        .map_err(|e| format!("Failed to clear blobs: {}", e))?;
+    // Also update the denormalized pdf_available flag in nodes table
+    conn.execute("UPDATE nodes SET pdf_available = 0 WHERE pdf_available = 1", [])
+        .map_err(|e| format!("Failed to sync nodes: {}", e))?;
+    eprintln!("[Export] Cleared {} PDF blobs, marked for on-demand download", cleared);
+
+    // Vacuum to reclaim space
+    conn.execute("VACUUM", []).map_err(|e| format!("Failed to vacuum: {}", e))?;
+
+    // Get final size
+    let final_size = std::fs::metadata(&output)
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
+
+    let saved_mb = (original_size - final_size) as f64 / 1024.0 / 1024.0;
+    let final_mb = final_size as f64 / 1024.0 / 1024.0;
+
+    let result = format!(
+        "Exported to {:?}: {:.1} MB (saved {:.1} MB by removing {} PDF blobs)",
+        output, final_mb, saved_mb, cleared
+    );
+    eprintln!("[Export] {}", result);
+
+    Ok(result)
 }
 
 // ==================== Recent Notes Protection ====================

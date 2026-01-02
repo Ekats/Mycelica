@@ -684,9 +684,10 @@ pub async fn import_openaire_papers(
     max_papers: u32,
     download_pdfs: bool,
     max_pdf_size_mb: u32,
+    api_key: Option<String>,
     on_progress: impl Fn(usize, usize),
 ) -> Result<OpenAireImportResult, String> {
-    let client = OpenAireClient::new();
+    let client = OpenAireClient::new_with_key(api_key);
 
     let mut result = OpenAireImportResult {
         papers_imported: 0,
@@ -765,7 +766,7 @@ pub async fn import_openaire_papers(
             }
 
             // Rate limiting between papers
-            OpenAireClient::rate_limit_delay().await;
+            client.rate_limit_delay().await;
         }
 
         current_page += 1;

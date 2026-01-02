@@ -684,7 +684,7 @@ async fn cluster_with_embeddings_impl(
 }
 
 /// Maximum clusters per AI naming batch to prevent response truncation
-const NAMING_BATCH_SIZE: usize = 50;
+const NAMING_BATCH_SIZE: usize = 30;
 
 /// Name clusters using AI with batching to prevent response truncation
 async fn name_clusters_with_ai(

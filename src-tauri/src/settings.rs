@@ -42,6 +42,8 @@ pub struct Settings {
     #[serde(default)]
     pub openai_api_key: Option<String>,
     #[serde(default)]
+    pub openaire_api_key: Option<String>,
+    #[serde(default)]
     pub processing_stats: ProcessingStats,
     #[serde(default)]
     pub custom_db_path: Option<String>,
@@ -60,6 +62,9 @@ pub struct Settings {
     /// Privacy threshold - items below this go to Personal category (default: 0.5)
     #[serde(default = "default_privacy_threshold")]
     pub privacy_threshold: f32,
+    /// Show tips/hints in the UI (default: true)
+    #[serde(default = "default_true")]
+    pub show_tips: bool,
 }
 
 fn default_cache_ttl() -> u64 {
@@ -79,6 +84,7 @@ impl Default for Settings {
         Self {
             anthropic_api_key: None,
             openai_api_key: None,
+            openaire_api_key: None,
             processing_stats: ProcessingStats::default(),
             custom_db_path: None,
             protect_recent_notes: true,
@@ -87,6 +93,7 @@ impl Default for Settings {
             clustering_primary_threshold: Some(0.75), // Tighter clusters for better accuracy
             clustering_secondary_threshold: Some(0.60), // Secondary assignment threshold
             privacy_threshold: 0.5, // Items below this go to Personal category
+            show_tips: true, // Show tips by default
         }
     }
 }
@@ -231,6 +238,59 @@ pub fn set_openai_api_key(key: String) -> Result<(), String> {
 /// Get masked OpenAI API key for display (shows first/last 4 chars)
 pub fn get_masked_openai_api_key() -> Option<String> {
     get_openai_api_key().map(|key| {
+        if key.len() > 12 {
+            format!("{}...{}", &key[..8], &key[key.len()-4..])
+        } else {
+            "*".repeat(key.len())
+        }
+    })
+}
+
+// ==================== OpenAIRE API Key ====================
+
+/// Get the OpenAIRE API key (checks env var first, then stored setting)
+pub fn get_openaire_api_key() -> Option<String> {
+    // Environment variable takes precedence
+    if let Ok(key) = std::env::var("OPENAIRE_API_KEY") {
+        if !key.is_empty() {
+            return Some(key);
+        }
+    }
+
+    // Fall back to stored setting
+    let guard = SETTINGS.read().ok()?;
+    let settings = guard.as_ref()?;
+    settings.openaire_api_key.clone()
+}
+
+/// Check if OpenAIRE API key is available
+pub fn has_openaire_api_key() -> bool {
+    get_openaire_api_key().map(|k| !k.is_empty()).unwrap_or(false)
+}
+
+/// Set and save the OpenAIRE API key
+pub fn set_openaire_api_key(key: String) -> Result<(), String> {
+    let mut settings_guard = SETTINGS.write()
+        .map_err(|_| "Failed to acquire settings lock")?;
+
+    let settings = settings_guard.get_or_insert_with(Settings::default);
+    settings.openaire_api_key = if key.is_empty() { None } else { Some(key) };
+
+    // Save to disk
+    let config_path = CONFIG_PATH.read()
+        .map_err(|_| "Failed to acquire config path lock")?
+        .clone()
+        .ok_or("Settings not initialized")?;
+
+    settings.save(&config_path)?;
+
+    println!("OpenAIRE API key saved to settings");
+    Ok(())
+}
+
+/// Get masked OpenAIRE API key for display (shows first/last 4 chars)
+pub fn get_masked_openaire_api_key() -> Option<String> {
+    get_openaire_api_key().map(|key| {
         if key.len() > 12 {
             format!("{}...{}", &key[..8], &key[key.len()-4..])
         } else {
@@ -514,5 +574,37 @@ pub fn set_privacy_threshold(threshold: f32) -> Result<(), String> {
     settings.save(&config_path)?;
 
     println!("Privacy threshold set to: {}", threshold);
+    Ok(())
+}
+
+// ==================== Show Tips ====================
+
+/// Check if tips are enabled (default: true)
+pub fn show_tips() -> bool {
+    let guard = SETTINGS.read().ok();
+    guard
+        .as_ref()
+        .and_then(|g| g.as_ref())
+        .map(|s| s.show_tips)
+        .unwrap_or(true)
+}
+
+/// Set show tips preference
+pub fn set_show_tips(enabled: bool) -> Result<(), String> {
+    let mut settings_guard = SETTINGS.write()
+        .map_err(|_| "Failed to acquire settings lock")?;
+
+    let settings = settings_guard.get_or_insert_with(Settings::default);
+    settings.show_tips = enabled;
+
+    // Save to disk
+    let config_path = CONFIG_PATH.read()
+        .map_err(|_| "Failed to acquire config path lock")?
+        .clone()
+        .ok_or("Settings not initialized")?;
+
+    settings.save(&config_path)?;
+
+    println!("Show tips set to: {}", enabled);
     Ok(())
 }

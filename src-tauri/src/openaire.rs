@@ -64,6 +64,7 @@ fn detect_document_format(bytes: &[u8]) -> Option<&'static str> {
 pub struct OpenAireClient {
     client: Client,
     base_url: String,
+    api_key: Option<String>,
 }
 
 /// Query parameters for paper search
@@ -200,8 +201,14 @@ struct RawInstance {
 }
 
 impl OpenAireClient {
-    /// Create a new OpenAIRE client
+    /// Create a new OpenAIRE client (public API, lower rate limits)
     pub fn new() -> Self {
+        Self::new_with_key(None)
+    }
+
+    /// Create a new OpenAIRE client with optional API key
+    /// With key: higher rate limits, authenticated access
+    pub fn new_with_key(api_key: Option<String>) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -210,6 +217,7 @@ impl OpenAireClient {
         Self {
             client,
             base_url: "https://api.openaire.eu/graph/v2/researchProducts".to_string(),
+            api_key,
         }
     }
 
@@ -248,11 +256,18 @@ impl OpenAireClient {
             url.push_str(&format!("&sortBy={}", urlencoding::encode(sort)));
         }
 
-        println!("[OpenAIRE] Fetching: {}", url);
+        println!("[OpenAIRE] Fetching: {} (auth: {})", url, self.api_key.is_some());
 
-        let response = self.client
+        let mut request = self.client
             .get(&url)
-            .header("Accept", "application/json")
+            .header("Accept", "application/json");
+
+        // Add auth header if API key is present
+        if let Some(key) = &self.api_key {
+            request = request.header("Authorization", format!("Bearer {}", key));
+        }
+
+        let response = request
             .send()
             .await
             .map_err(|e| format!("HTTP request failed: {}", e))?;
@@ -425,11 +440,17 @@ impl OpenAireClient {
             url.push_str(&format!("&bestOpenAccessRightLabel={}", access));
         }
 
-        println!("[OpenAIRE] Counting papers: {}", url);
+        println!("[OpenAIRE] Counting papers: {} (auth: {})", url, self.api_key.is_some());
 
-        let response = self.client
+        let mut request = self.client
             .get(&url)
-            .header("Accept", "application/json")
+            .header("Accept", "application/json");
+
+        if let Some(key) = &self.api_key {
+            request = request.header("Authorization", format!("Bearer {}", key));
+        }
+
+        let response = request
             .send()
             .await
             .map_err(|e| format!("HTTP request failed: {}", e))?;
@@ -712,8 +733,11 @@ impl OpenAireClient {
     }
 
     /// Sleep for rate limiting (call between requests)
-    pub async fn rate_limit_delay() {
-        tokio::time::sleep(Duration::from_millis(70)).await;
+    /// Authenticated requests can use shorter delays (~15 req/s)
+    /// Public API should use longer delays (~7 req/s)
+    pub async fn rate_limit_delay(&self) {
+        let delay_ms = if self.api_key.is_some() { 70 } else { 150 };
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
 }
 

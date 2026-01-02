@@ -3600,10 +3600,11 @@ impl Database {
     }
 
     /// Get document blob and format for a paper (supports PDF, DOCX, DOC)
+    /// Returns None if blob is not available (including NULL blob with pdf_available=1)
     pub fn get_paper_document(&self, node_id: &str) -> Result<Option<(Vec<u8>, String)>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT pdf_blob, doc_format FROM papers WHERE node_id = ?1 AND pdf_available = 1",
+            "SELECT pdf_blob, doc_format FROM papers WHERE node_id = ?1 AND pdf_available = 1 AND pdf_blob IS NOT NULL",
             params![node_id],
             |row| {
                 let blob: Vec<u8> = row.get(0)?;

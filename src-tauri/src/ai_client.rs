@@ -501,7 +501,7 @@ Return ONLY valid JSON, no markdown:
 
     let request = AnthropicRequest {
         model: "claude-haiku-4-5-20251001".to_string(),
-        max_tokens: 1000,
+        max_tokens: 2000,  // 30 clusters * ~50 chars each = 1500+ chars needed
         messages: vec![Message {
             role: "user".to_string(),
             content: prompt,
