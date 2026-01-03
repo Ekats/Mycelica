@@ -186,24 +186,23 @@ pub fn run() {
                     if let Some(window) = app_handle.get_webview_window("main") {
                         let _ = window.set_title(&title);
 
-                        // HiDPI fix: WebKitGTK on Wayland doesn't report scale correctly
-                        // Check MYCELICA_SCALE env var, or GDK_SCALE, or fallback to detected
-                        let detected_scale = window.scale_factor().unwrap_or(1.0);
-                        let forced_scale = std::env::var("MYCELICA_SCALE")
-                            .or_else(|_| std::env::var("GDK_SCALE"))
-                            .ok()
-                            .and_then(|s| s.parse::<f64>().ok());
-
-                        let scale = forced_scale.unwrap_or(detected_scale);
-                        println!("[HiDPI] Detected: {}, Forced: {:?}, Using: {}", detected_scale, forced_scale, scale);
-
-                        if scale > 1.0 {
-                            if let Err(e) = window.set_zoom(scale) {
-                                eprintln!("[HiDPI] Failed to set zoom: {}", e);
-                            } else {
-                                println!("[HiDPI] Set webview zoom to {}", scale);
-                            }
-                        }
+                        // HiDPI fix: DISABLED - was causing double-scaling
+                        // let detected_scale = window.scale_factor().unwrap_or(1.0);
+                        // let forced_scale = std::env::var("MYCELICA_SCALE")
+                        //     .or_else(|_| std::env::var("GDK_SCALE"))
+                        //     .ok()
+                        //     .and_then(|s| s.parse::<f64>().ok());
+                        //
+                        // let scale = forced_scale.unwrap_or(detected_scale);
+                        // println!("[HiDPI] Detected: {}, Forced: {:?}, Using: {}", detected_scale, forced_scale, scale);
+                        //
+                        // if scale > 1.0 {
+                        //     if let Err(e) = window.set_zoom(scale) {
+                        //         eprintln!("[HiDPI] Failed to set zoom: {}", e);
+                        //     } else {
+                        //         println!("[HiDPI] Set webview zoom to {}", scale);
+                        //     }
+                        // }
                     }
                 }
             });
