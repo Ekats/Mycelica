@@ -71,6 +71,13 @@ Thumbs.db
 CLAUDE.md
 
 # ===================
+# AUR packaging (aur-mycelica/ is separate repo)
+# ===================
+aur-mycelica/
+pkg/
+*.pkg.tar.zst
+
+# ===================
 # Misc
 # ===================
 *.local

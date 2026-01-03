@@ -59,6 +59,7 @@ impl SimilarityCache {
 pub struct AppState {
     pub db: RwLock<Arc<Database>>,
     pub similarity_cache: RwLock<SimilarityCache>,
+    pub openaire_cancel: std::sync::atomic::AtomicBool,
 }
 
 #[tauri::command]
@@ -935,6 +936,8 @@ pub async fn import_openaire(
     query: String,
     country: Option<String>,
     fos: Option<String>,
+    from_year: Option<String>,
+    to_year: Option<String>,
     max_papers: u32,
     download_pdfs: bool,
     max_pdf_size_mb: Option<u32>,
@@ -959,6 +962,8 @@ pub async fn import_openaire(
         query,
         country,
         fos,
+        from_year,
+        to_year,
         max_papers,
         download_pdfs,
         max_size,
@@ -969,71 +974,55 @@ pub async fn import_openaire(
 
 /// Count papers matching OpenAIRE query without importing
 /// Returns (total_count, already_imported_count)
-/// Fetches ALL papers from query and checks against local DB
+/// Just gets the count from the API header, doesn't paginate
 #[tauri::command]
 pub async fn count_openaire_papers(
     state: State<'_, AppState>,
     query: String,
     country: Option<String>,
     fos: Option<String>,
+    from_year: Option<String>,
+    to_year: Option<String>,
 ) -> Result<(u32, u32), String> {
     use crate::openaire::{OpenAireClient, OpenAireQuery};
+    use std::sync::atomic::Ordering;
+
+    // Reset cancel flag at start
+    state.openaire_cancel.store(false, Ordering::SeqCst);
 
     // Get OpenAIRE API key from settings (optional)
     let api_key = settings::get_openaire_api_key();
     let client = OpenAireClient::new_with_key(api_key);
 
-    // Get existing IDs from local DB upfront
-    let existing_ids = state.db.read()
-        .map_err(|e| format!("DB lock error: {}", e))?
-        .get_all_openaire_ids()
-        .map_err(|e| e.to_string())?;
+    let query_obj = OpenAireQuery {
+        search: query,
+        country,
+        fos,
+        from_year,
+        to_year,
+        access_right: Some("OPEN".to_string()),
+        page_size: 1,  // Just need the count, not the papers
+        page: 1,
+        sort_by: None,
+    };
 
-    let mut total_count = 0u32;
-    let mut imported_count = 0u32;
-    let mut current_page = 1u32;
-    let page_size = 100u32;
-
-    // Paginate through all results
-    loop {
-        let query_obj = OpenAireQuery {
-            search: query.clone(),
-            country: country.clone(),
-            fos: fos.clone(),
-            access_right: Some("OPEN".to_string()),
-            page_size,
-            page: current_page,
-            sort_by: None,
-        };
-
-        let (papers, count) = client.fetch_papers(&query_obj).await?;
-
-        // Store total from first response
-        if current_page == 1 {
-            total_count = count;
-        }
-
-        if papers.is_empty() {
-            break;
-        }
-
-        // Count how many are already imported
-        imported_count += papers.iter()
-            .filter(|p| existing_ids.contains(&p.id))
-            .count() as u32;
-
-        current_page += 1;
-
-        // Stop if we've fetched all pages
-        if (current_page - 1) * page_size >= total_count {
-            break;
-        }
-
-        // Rate limit between pages
-        client.rate_limit_delay().await;
+    // Check cancel before API call
+    if state.openaire_cancel.load(Ordering::SeqCst) {
+        return Err("Cancelled".to_string());
     }
 
-    Ok((total_count, imported_count))
+    let total_count = client.count_papers(&query_obj).await?;
+
+    // We don't count already-imported anymore (too expensive)
+    Ok((total_count, 0))
+}
+
+/// Cancel any ongoing OpenAIRE operations
+#[tauri::command]
+pub fn cancel_openaire(state: State<'_, AppState>) {
+    use std::sync::atomic::Ordering;
+    state.openaire_cancel.store(true, Ordering::SeqCst);
+    println!("[OpenAIRE] Cancel requested");
 }
 
 /// Get count of already-imported papers from local database

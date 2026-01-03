@@ -74,6 +74,8 @@ pub struct OpenAireQuery {
     pub country: Option<String>,       // e.g., "EE" for Estonia
     pub fos: Option<String>,           // Field of science
     pub access_right: Option<String>,  // e.g., "OPEN"
+    pub from_year: Option<String>,     // e.g., "2020" - filters from Jan 1
+    pub to_year: Option<String>,       // e.g., "2025" - filters to Dec 31
     pub page_size: u32,                // Max 100
     pub page: u32,                     // Page number (1-indexed)
     pub sort_by: Option<String>,       // e.g., "publicationDate", "popularity", "influence"
@@ -246,6 +248,14 @@ impl OpenAireClient {
             url.push_str(&format!("&fos={}", urlencoding::encode(fos)));
         }
 
+        // Add date range filters
+        if let Some(from) = &query.from_year {
+            url.push_str(&format!("&fromPublicationDate={}-01-01", from));
+        }
+        if let Some(to) = &query.to_year {
+            url.push_str(&format!("&toPublicationDate={}-12-31", to));
+        }
+
         // Add access rights filter
         if let Some(access) = &query.access_right {
             url.push_str(&format!("&bestOpenAccessRightLabel={}", access));
@@ -256,7 +266,16 @@ impl OpenAireClient {
             url.push_str(&format!("&sortBy={}", urlencoding::encode(sort)));
         }
 
-        println!("[OpenAIRE] Fetching: {} (auth: {})", url, self.api_key.is_some());
+        // Log query details
+        println!("[OpenAIRE] Searching: \"{}\"", query.search);
+        if query.country.is_some() || query.fos.is_some() || query.from_year.is_some() || query.to_year.is_some() {
+            let mut filters = Vec::new();
+            if let Some(c) = &query.country { filters.push(format!("country: {}", c)); }
+            if let Some(f) = &query.fos { filters.push(format!("field: {}", f)); }
+            if let Some(from) = &query.from_year { filters.push(format!("from: {}", from)); }
+            if let Some(to) = &query.to_year { filters.push(format!("to: {}", to)); }
+            println!("[OpenAIRE]   Filters: {}", filters.join(", "));
+        }
 
         let mut request = self.client
             .get(&url)
@@ -283,14 +302,6 @@ impl OpenAireClient {
             .await
             .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-        // Debug: log first raw paper from API
-        if let Some(results) = &api_response.results {
-            if let Some(first_raw) = results.first() {
-                eprintln!("[OpenAIRE] First raw paper title: {:?}", first_raw.main_title);
-                eprintln!("[OpenAIRE] descriptions field: {:?}", first_raw.descriptions);
-            }
-        }
-
         let papers: Vec<OpenAirePaper> = api_response
             .results
             .unwrap_or_default()
@@ -298,27 +309,12 @@ impl OpenAireClient {
             .filter_map(|raw| self.parse_paper(raw))
             .collect();
 
-        // Debug: log first parsed paper
-        if let Some(first) = papers.first() {
-            eprintln!("[OpenAIRE] First parsed paper description: {:?}", first.description);
-        }
-
-        // Debug: log PDF URL extraction
-        for paper in &papers {
-            if !paper.pdf_urls.is_empty() {
-                eprintln!("[OpenAIRE] Paper '{}' has PDF URLs: {:?}",
-                    paper.title.chars().take(50).collect::<String>(),
-                    paper.pdf_urls);
-            }
-        }
-        eprintln!("[OpenAIRE] Papers with PDF URLs: {}/{}",
-            papers.iter().filter(|p| !p.pdf_urls.is_empty()).count(),
-            papers.len());
-
         // Extract total count from header
         let total_count = api_response.header
             .and_then(|h| h.num_found)
             .unwrap_or(0);
+
+        println!("[OpenAIRE]   Fetched {}/{} papers", papers.len(), total_count);
 
         Ok((papers, total_count))
     }
@@ -418,62 +414,18 @@ impl OpenAireClient {
     /// Count papers matching query without fetching all data
     /// Useful for showing preview count before import
     pub async fn count_papers(&self, query: &OpenAireQuery) -> Result<u32, String> {
-        let mut url = format!("{}?pageSize=1", self.base_url);
+        // Use fetch_papers with page_size=1 to get the count from header
+        let count_query = OpenAireQuery {
+            page_size: 1,
+            ..query.clone()
+        };
 
-        // Add search query
-        if !query.search.is_empty() {
-            url.push_str(&format!("&search={}", urlencoding::encode(&query.search)));
-        }
+        println!("[OpenAIRE] Counting: \"{}\"", query.search);
 
-        // Add country filter
-        if let Some(country) = &query.country {
-            url.push_str(&format!("&countryCode={}", country));
-        }
+        let (_, total_count) = self.fetch_papers(&count_query).await?;
 
-        // Add field of science filter
-        if let Some(fos) = &query.fos {
-            url.push_str(&format!("&fos={}", urlencoding::encode(fos)));
-        }
-
-        // Add access rights filter
-        if let Some(access) = &query.access_right {
-            url.push_str(&format!("&bestOpenAccessRightLabel={}", access));
-        }
-
-        println!("[OpenAIRE] Counting papers: {} (auth: {})", url, self.api_key.is_some());
-
-        let mut request = self.client
-            .get(&url)
-            .header("Accept", "application/json");
-
-        if let Some(key) = &self.api_key {
-            request = request.header("Authorization", format!("Bearer {}", key));
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| format!("HTTP request failed: {}", e))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(format!("API error {}: {}", status, body));
-        }
-
-        let json: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-        // Try common field names in header
-        let total = json.get("header")
-            .and_then(|h| h.get("total").or(h.get("numFound")))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-
-        println!("[OpenAIRE] Found {} papers matching query", total);
-        Ok(total)
+        println!("[OpenAIRE]   Found {} papers", total_count);
+        Ok(total_count)
     }
 
     /// Download PDF from URL with size limit

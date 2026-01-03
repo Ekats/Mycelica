@@ -39,7 +39,7 @@ use commands::{
     // Conversation context commands
     get_conversation_context,
     // Import commands
-    import_claude_conversations, import_markdown_files, import_google_keep, import_openaire, count_openaire_papers, get_imported_paper_count,
+    import_claude_conversations, import_markdown_files, import_google_keep, import_openaire, count_openaire_papers, cancel_openaire, get_imported_paper_count,
     // Paper retrieval commands
     get_paper_metadata, get_paper_pdf, get_paper_document, has_paper_pdf, open_paper_external, reformat_paper_abstracts, sync_paper_pdf_status, download_paper_on_demand,
     // Quick access commands (Sidebar)
@@ -164,6 +164,7 @@ pub fn run() {
             app.manage(AppState {
                 db: std::sync::RwLock::new(Arc::new(db)),
                 similarity_cache: std::sync::RwLock::new(commands::SimilarityCache::new(cache_ttl)),
+                openaire_cancel: std::sync::atomic::AtomicBool::new(false),
             });
 
             // Set window title and handle HiDPI scaling
@@ -278,6 +279,7 @@ pub fn run() {
             import_google_keep,
             import_openaire,
             count_openaire_papers,
+            cancel_openaire,
             get_imported_paper_count,
             // Paper retrieval
             get_paper_metadata,

@@ -94,6 +94,8 @@ async fn main() {
             query.search.to_string(),
             Some(COUNTRY.to_string()),
             None, // fos
+            None, // from_year
+            None, // to_year
             query.max_papers,
             DOWNLOAD_PDFS,
             MAX_PDF_SIZE_MB,

@@ -23,6 +23,7 @@ import {
   Cpu,
   ChevronDown,
   ChevronRight,
+  Plus,
 } from 'lucide-react';
 import { ConfirmDialog } from './ConfirmDialog';
 
@@ -134,15 +135,21 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
 
   // OpenAIRE import
   const [showOpenAireDialog, setShowOpenAireDialog] = useState(false);
-  const [openAireQuery, setOpenAireQuery] = useState('');
+  const [openAireQueryTags, setOpenAireQueryTags] = useState<string[]>([]);
+  const [openAireQueryInput, setOpenAireQueryInput] = useState('');
+  const [openAireMatchAll, setOpenAireMatchAll] = useState(false); // false = OR, true = AND
+  const [openAireFromYear, setOpenAireFromYear] = useState<string>('');
+  const [openAireToYear, setOpenAireToYear] = useState<string>('');
   const [openAireCountry, setOpenAireCountry] = useState<string>('EE');
   const [openAireFos, setOpenAireFos] = useState<string>('');
   const [openAireMaxPapers, setOpenAireMaxPapers] = useState(100);
   const [openAirePaperCount, setOpenAirePaperCount] = useState<number | null>(null);
-  const [openAireImportedCount, setOpenAireImportedCount] = useState<number | null>(null);
+  const [openAirePrevCount, setOpenAirePrevCount] = useState<number | null>(null);
   const [openAireCountLoading, setOpenAireCountLoading] = useState(false);
+  const [openAireShowMore, setOpenAireShowMore] = useState(false);
   const [openAireDownloadPdfs, setOpenAireDownloadPdfs] = useState(true);
   const [openAireMaxPdfSize, setOpenAireMaxPdfSize] = useState(20);
+  const openAireCountAbortRef = useRef<AbortController | null>(null);
 
   // Click outside to close import sources dropdown
   useEffect(() => {
@@ -814,41 +821,90 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     }
   };
 
+  // OpenAIRE tag handlers
+  const handleAddOpenAireTag = () => {
+    const trimmed = openAireQueryInput.trim();
+    if (trimmed && !openAireQueryTags.includes(trimmed)) {
+      setOpenAireQueryTags([...openAireQueryTags, trimmed]);
+      setOpenAireQueryInput('');
+    }
+  };
+
+  const handleRemoveOpenAireTag = (tagToRemove: string) => {
+    setOpenAireQueryTags(openAireQueryTags.filter(t => t !== tagToRemove));
+  };
+
+  // Build query string based on match mode
+  const buildOpenAireQueryString = () => {
+    // No quotes - OpenAIRE treats quoted phrases as exact match only
+    // Parentheses group the OR expression
+    if (openAireMatchAll) {
+      return openAireQueryTags.join(' AND ');
+    }
+    if (openAireQueryTags.length === 1) {
+      return openAireQueryTags[0];
+    }
+    return `(${openAireQueryTags.join(') OR (')})`;
+  };
+
   // OpenAIRE paper count preview (debounced)
-  // Returns [total_count, already_imported_from_query]
   useEffect(() => {
-    if (!showOpenAireDialog || !openAireQuery.trim()) {
-      setOpenAirePaperCount(null);
-      setOpenAireImportedCount(null);
+    // Cancel any pending count
+    if (openAireCountAbortRef.current) {
+      openAireCountAbortRef.current.abort();
+      openAireCountAbortRef.current = null;
+    }
+
+    if (!showOpenAireDialog || openAireQueryTags.length === 0) {
+      // Cancel backend operation too
+      invoke('cancel_openaire').catch(() => {});
+      setOpenAirePaperCount(0);
+      setOpenAirePrevCount(null);
+      setOpenAireCountLoading(false);
       return;
     }
 
+    const abortController = new AbortController();
+    openAireCountAbortRef.current = abortController;
+
     const timer = setTimeout(async () => {
+      if (abortController.signal.aborted) return;
+
       setOpenAireCountLoading(true);
       try {
-        const [total, imported] = await invoke<[number, number]>('count_openaire_papers', {
-          query: openAireQuery,
+        if (abortController.signal.aborted) return;
+        const queryString = buildOpenAireQueryString();
+        const [total] = await invoke<[number, number]>('count_openaire_papers', {
+          query: queryString,
           country: openAireCountry || null,
           fos: openAireFos || null,
+          fromYear: openAireFromYear || null,
+          toYear: openAireToYear || null,
         });
+        if (abortController.signal.aborted) return;
+        setOpenAirePrevCount(openAirePaperCount);
         setOpenAirePaperCount(total);
-        setOpenAireImportedCount(imported);
       } catch (err) {
+        if (abortController.signal.aborted) return;
         console.error('Failed to count papers:', err);
         setOpenAirePaperCount(null);
-        setOpenAireImportedCount(null);
       } finally {
-        setOpenAireCountLoading(false);
+        if (!abortController.signal.aborted) {
+          setOpenAireCountLoading(false);
+        }
       }
     }, 500);  // 500ms debounce
 
-    return () => clearTimeout(timer);
-  }, [showOpenAireDialog, openAireQuery, openAireCountry, openAireFos]);
+    return () => {
+      clearTimeout(timer);
+      abortController.abort();
+    };
+  }, [showOpenAireDialog, openAireQueryTags, openAireMatchAll, openAireCountry, openAireFos, openAireFromYear, openAireToYear]);
 
   // OpenAIRE import handler
   const handleImportOpenAire = async () => {
-    if (!openAireQuery.trim()) {
-      setImportResult('Please enter a search query');
+    if (openAireQueryTags.length === 0) {
+      setImportResult('Please add at least one search term');
       return;
     }
     setImporting(true);
@@ -863,9 +919,11 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
         duplicatesSkipped: number;
         errors: string[];
       }>('import_openaire', {
-        query: openAireQuery,
+        query: buildOpenAireQueryString(),
         country: openAireCountry || null,
         fos: openAireFos || null,
+        fromYear: openAireFromYear || null,
+        toYear: openAireToYear || null,
         maxPapers: openAireMaxPapers,
         downloadPdfs: openAireDownloadPdfs,
         maxPdfSizeMb: openAireMaxPdfSize,
@@ -1669,7 +1727,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                         {dbStats.unprocessedItems > 0 && `${dbStats.unprocessedItems} to process`}
                         {dbStats.unprocessedItems > 0 && dbStats.unclusteredItems > 0 && ' · '}
                         {dbStats.unclusteredItems > 0 && `${dbStats.unclusteredItems} to cluster`}
-                        {' · '}Haiku {estimateCost(dbStats.unprocessedItems, 'haiku', 1200)}
+                        {' · '}Haiku ≤{estimateCost(dbStats.unprocessedItems, 'haiku', 1200)} <span className="text-gray-500">(papers skipped)</span>
                         {useLocalEmbeddings
                           ? <span className="text-cyan-400"> · Embeddings: FREE</span>
                           : ` + OpenAI ${estimateCost(dbStats.unprocessedItems, 'openai', 1000)}`
@@ -1710,7 +1768,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                         <div className="text-xs text-gray-500">Generate titles, summaries & embeddings</div>
                         {dbStats && dbStats.unprocessedItems > 0 && (
                           <div className="text-xs text-amber-400/80 mt-0.5">
-                            {dbStats.unprocessedItems} calls · Haiku {estimateCost(dbStats.unprocessedItems, 'haiku', 1200)}
+                            {dbStats.unprocessedItems} items · Haiku ≤{estimateCost(dbStats.unprocessedItems, 'haiku', 1200)} <span className="text-gray-500">(papers skipped)</span>
                             {useLocalEmbeddings
                               ? <span className="text-cyan-400"> · Embeddings: FREE</span>
                               : ` + OpenAI ${estimateCost(dbStats.unprocessedItems, 'openai', 1000)}`
@@ -2721,17 +2779,70 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
             </p>
 
             <div className="space-y-3">
+              {/* Search Query with Tags */}
               <div>
-                <label className="block text-sm text-gray-300 mb-1">Search Query *</label>
-                <input
-                  type="text"
-                  value={openAireQuery}
-                  onChange={(e) => setOpenAireQuery(e.target.value)}
-                  placeholder="e.g., semiotics, machine learning, climate"
-                  className="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-white text-sm focus:border-amber-500 focus:outline-none"
-                />
+                <label className="block text-sm text-gray-300 mb-1">Search Terms *</label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={openAireQueryInput}
+                    onChange={(e) => setOpenAireQueryInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        handleAddOpenAireTag();
+                      }
+                    }}
+                    placeholder="Type term and press Enter"
+                    className="flex-1 px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-white text-sm focus:border-amber-500 focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleAddOpenAireTag}
+                    disabled={!openAireQueryInput.trim()}
+                    className="px-3 py-2 bg-amber-600 hover:bg-amber-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm transition-colors"
+                  >
+                    <Plus className="w-4 h-4" />
+                  </button>
+                </div>
+                {openAireQueryTags.length > 0 && (
+                  <div className="flex flex-wrap gap-2 mt-2">
+                    {openAireQueryTags.map((tag) => (
+                      <span key={tag} className="inline-flex items-center gap-1 px-2 py-1 bg-amber-600/20 text-amber-400 rounded text-sm">
+                        {tag}
+                        <button type="button" onClick={() => handleRemoveOpenAireTag(tag)} className="hover:text-amber-200">
+                          <X className="w-3 h-3" />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
 
+              {/* Match Mode Toggle */}
+              <div className="flex items-center gap-4">
+                <span className="text-sm text-gray-400">Match:</span>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="radio"
+                    checked={!openAireMatchAll}
+                    onChange={() => setOpenAireMatchAll(false)}
+                    className="w-4 h-4 text-amber-500"
+                  />
+                  <span className="text-sm text-gray-300">Any term</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="radio"
+                    checked={openAireMatchAll}
+                    onChange={() => setOpenAireMatchAll(true)}
+                    className="w-4 h-4 text-amber-500"
+                  />
+                  <span className="text-sm text-gray-300">All terms</span>
+                </label>
+              </div>
+
+              {/* Country + Field of Science */}
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block text-sm text-gray-300 mb-1">Country</label>
@@ -2775,55 +2886,103 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
 
               <div>
                 <label className="block text-sm text-gray-300 mb-1">Max Papers</label>
-                <input
-                  type="number"
-                  value={openAireMaxPapers}
-                  onChange={(e) => setOpenAireMaxPapers(Math.max(1, Math.min(500, parseInt(e.target.value) || 100)))}
-                  min={1}
-                  max={500}
-                  className="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-white text-sm focus:border-amber-500 focus:outline-none"
-                />
+                <div className="flex gap-2">
+                  <input
+                    type="number"
+                    value={openAireMaxPapers}
+                    onChange={(e) => setOpenAireMaxPapers(Math.max(1, parseInt(e.target.value) || 100))}
+                    min={1}
+                    className="flex-1 px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-white text-sm focus:border-amber-500 focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setOpenAireMaxPapers(openAirePaperCount ?? 100)}
+                    disabled={!openAirePaperCount}
+                    className="px-3 py-2 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:text-gray-500 text-white rounded-lg text-sm transition-colors"
+                  >
+                    All
+                  </button>
+                </div>
                 {/* Paper count preview */}
                 <div className="mt-1 text-xs h-5">
                   {openAireCountLoading ? (
                     <span className="text-gray-500">Counting...</span>
-                  ) : openAirePaperCount !== null ? (
+                  ) : (
                     <span className="text-amber-400">
-                      Found {openAirePaperCount.toLocaleString()} papers
-                      {openAireImportedCount !== null && openAireImportedCount > 0 && (
-                        <span className="text-gray-400">
-                          {' '}({openAireImportedCount} already imported)
+                      {(openAirePaperCount ?? 0).toLocaleString()} total found
+                      {openAirePrevCount !== null && openAirePaperCount !== null && openAirePrevCount !== openAirePaperCount && (
+                        <span className={openAirePaperCount > openAirePrevCount ? "text-green-400" : "text-red-400"}>
+                          {' '}({openAirePaperCount > openAirePrevCount ? '+' : ''}{(openAirePaperCount - openAirePrevCount).toLocaleString()})
                         </span>
                       )}
                     </span>
-                  ) : openAireQuery.trim() ? (
-                    <span className="text-gray-500">Enter query to see count</span>
-                  ) : null}
+                  )}
                 </div>
               </div>
 
-              <div className="space-y-2">
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={openAireDownloadPdfs}
-                    onChange={(e) => setOpenAireDownloadPdfs(e.target.checked)}
-                    className="w-4 h-4 rounded border-gray-600 bg-gray-900 text-amber-500 focus:ring-amber-500"
-                  />
-                  <span className="text-sm text-gray-300">Download PDFs (when available)</span>
-                </label>
+              {/* More options (collapsible) */}
+              <div>
+                <button
+                  type="button"
+                  onClick={() => setOpenAireShowMore(!openAireShowMore)}
+                  className="flex items-center gap-1 text-sm text-gray-400 hover:text-gray-300"
+                >
+                  {openAireShowMore ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                  More options
+                </button>
+                {openAireShowMore && (
+                  <div className="mt-2 ml-5 space-y-3">
+                    {/* Year Range */}
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-xs text-gray-400 mb-1">From Year</label>
+                        <input
+                          type="number"
+                          value={openAireFromYear}
+                          onChange={(e) => setOpenAireFromYear(e.target.value)}
+                          placeholder="e.g., 2020"
+                          min="1900"
+                          max="2030"
+                          className="w-full px-2 py-1 bg-gray-900 border border-gray-700 rounded text-white text-sm focus:border-amber-500 focus:outline-none"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs text-gray-400 mb-1">To Year</label>
+                        <input
+                          type="number"
+                          value={openAireToYear}
+                          onChange={(e) => setOpenAireToYear(e.target.value)}
+                          placeholder="e.g., 2025"
+                          min="1900"
+                          max="2030"
+                          className="w-full px-2 py-1 bg-gray-900 border border-gray-700 rounded text-white text-sm focus:border-amber-500 focus:outline-none"
+                        />
+                      </div>
+                    </div>
 
-                {openAireDownloadPdfs && (
-                  <div className="ml-6">
-                    <label className="block text-xs text-gray-400 mb-1">Max PDF size (MB)</label>
-                    <input
-                      type="number"
-                      value={openAireMaxPdfSize}
-                      onChange={(e) => setOpenAireMaxPdfSize(Math.max(1, Math.min(100, parseInt(e.target.value) || 20)))}
-                      min={1}
-                      max={100}
-                      className="w-24 px-2 py-1 bg-gray-900 border border-gray-700 rounded text-white text-sm focus:border-amber-500 focus:outline-none"
-                    />
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={openAireDownloadPdfs}
+                        onChange={(e) => setOpenAireDownloadPdfs(e.target.checked)}
+                        className="w-4 h-4 rounded border-gray-600 bg-gray-900 text-amber-500 focus:ring-amber-500"
+                      />
+                      <span className="text-sm text-gray-300">Download PDFs (when available)</span>
+                    </label>
+
+                    {openAireDownloadPdfs && (
+                      <div className="ml-6">
+                        <label className="block text-xs text-gray-400 mb-1">Max PDF size (MB)</label>
+                        <input
+                          type="number"
+                          value={openAireMaxPdfSize}
+                          onChange={(e) => setOpenAireMaxPdfSize(Math.max(1, Math.min(100, parseInt(e.target.value) || 20)))}
+                          min={1}
+                          max={100}
+                          className="w-24 px-2 py-1 bg-gray-900 border border-gray-700 rounded text-white text-sm focus:border-amber-500 focus:outline-none"
+                        />
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -2838,7 +2997,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
               </button>
               <button
                 onClick={handleImportOpenAire}
-                disabled={!openAireQuery.trim()}
+                disabled={openAireQueryTags.length === 0}
                 className="flex-1 px-4 py-2 bg-amber-600 hover:bg-amber-500 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-lg text-sm font-medium transition-colors"
               >
                 Import Papers

@@ -49,14 +49,29 @@ NB! DEMO DATABASES ARE ALREADY FULLY PREPROCESSED, NO NEED TO RUN ANY SETUP/PROC
 
 ---
 
-## Quick Start
+## Installation
+
+### Pre-built Binaries
+
+Download from [Releases](https://github.com/Ekats/Mycelica/releases):
+
+| Format | Install |
+|--------|---------|
+| `.deb` | `sudo dpkg -i Mycelica_*.deb` |
+| `.rpm` | `sudo rpm -i Mycelica-*.rpm` |
+| `.AppImage` | `chmod +x Mycelica_*.AppImage && ./Mycelica_*.AppImage` |
+| `.tar.gz` | `tar -xzf Mycelica_*.tar.gz && ./mycelica` |
+
+### Build from Source
 
 ```bash
-# Install dependencies
-npm install
+# Prerequisites: Rust toolchain, Node.js 18+, platform build tools
 
-# Run development server
-npm run tauri dev
+git clone https://github.com/Ekats/Mycelica.git
+cd Mycelica
+npm install
+npm run tauri dev    # Development
+npm run tauri build  # Production
 ```
 
 ### API Keys
@@ -117,19 +132,6 @@ Universe (root)
 ---
 
 ## Development
-
-### Prerequisites
-
-- [Rust toolchain](https://rustup.rs/) (stable)
-- Node.js 16+
-- Platform build tools (Xcode on macOS, build-essential on Linux)
-
-### Commands
-
-```bash
-npm run tauri dev    # Development with hot reload
-npm run tauri build  # Production build
-```
 
 ### Project Structure
 
