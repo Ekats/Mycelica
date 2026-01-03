@@ -16,7 +16,8 @@ docs/private/
 docs/implementation/
 *.db
 !mycelica-openAIRE-preview.db
-!src-tauri/resources/mycelica-testing-preview.db
+!src-tauri/resources/mycelica-testing-preview.
+!mycelica-somatic-neuroscience-trimmed.db
 *.db-journal
 *.db-wal
 *.db-shm
