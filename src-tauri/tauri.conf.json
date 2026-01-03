@@ -34,7 +34,7 @@
       "icons/icon.ico"
     ],
     "resources": [
-      "resources/mycelica-openAIRE-med-trimmed.db"
+      "../mycelica-openAIRE-preview.db"
     ]
   }
 }
