@@ -16,7 +16,7 @@ interface SimilarGroup {
   id: string;           // Parent node id (or 'root' for top level)
   name: string;         // Display name
   emoji: string;        // Display emoji
-  avgSimilarity: number; // Weighted average of top 10 items
+  avgSimilarity: number; // Highest similarity in this group
   items: SimilarNode[]; // Direct items in this group
   children: SimilarGroup[]; // Nested groups
   depth: number;        // Hierarchy depth
@@ -45,20 +45,10 @@ interface SimilarNodesPanelProps {
 }
 
 
-// Calculate weighted average of top N similarities
-const calcWeightedAvg = (items: SimilarNode[], topN: number = 10): number => {
+// Get highest similarity in the group
+const getMaxSimilarity = (items: SimilarNode[]): number => {
   if (items.length === 0) return 0;
-  const sorted = [...items].sort((a, b) => b.similarity - a.similarity);
-  const top = sorted.slice(0, topN);
-  // Weight by position: first item has weight N, second N-1, etc.
-  let weightedSum = 0;
-  let totalWeight = 0;
-  top.forEach((item, idx) => {
-    const weight = topN - idx;
-    weightedSum += item.similarity * weight;
-    totalWeight += weight;
-  });
-  return totalWeight > 0 ? weightedSum / totalWeight : 0;
+  return Math.max(...items.map(item => item.similarity));
 };
 
 export const SimilarNodesPanel = memo(function SimilarNodesPanel({
@@ -273,14 +263,14 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
         id: parentId,
         name: parentNode?.aiTitle || parentNode?.title || 'Other',
         emoji: parentNode?.emoji || (parentNode ? getNodeEmoji(parentNode) : '📁'),
-        avgSimilarity: calcWeightedAvg(items), // Will be recalculated with all descendants
+        avgSimilarity: getMaxSimilarity(items), // Will be recalculated with all descendants
         items: items.sort((a, b) => b.similarity - a.similarity),
         children: [],
         depth: parentNode?.depth ?? 0,
       });
     });
 
-    // Sort groups by weighted average (descending)
+    // Sort groups by max similarity (descending)
     groups.sort((a, b) => b.avgSimilarity - a.avgSimilarity);
 
     // Now group the groups by THEIR parents (for nested hierarchy)
@@ -342,7 +332,7 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
           id: grandparentId,
           name: grandparentNode?.aiTitle || grandparentNode?.title || 'Group',
           emoji: grandparentNode?.emoji || (grandparentNode ? getNodeEmoji(grandparentNode) : '📁'),
-          avgSimilarity: calcWeightedAvg(allDescendantItems), // Use ALL descendants
+          avgSimilarity: getMaxSimilarity(allDescendantItems), // Use ALL descendants
           items: [], // No direct items at this level
           children: childGroups.sort((a, b) => b.avgSimilarity - a.avgSimilarity),
           depth: grandparentNode?.depth ?? 0,
@@ -381,7 +371,7 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
     const recalcAvg = (group: SimilarGroup): SimilarGroup => {
       group.children = group.children.map(recalcAvg);
       const allItems = getAllDescendantItems(group);
-      group.avgSimilarity = calcWeightedAvg(allItems);
+      group.avgSimilarity = getMaxSimilarity(allItems);
       return group;
     };
     result = result.map(recalcAvg);

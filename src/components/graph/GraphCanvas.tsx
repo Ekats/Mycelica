@@ -403,9 +403,10 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
         const points = getEdgePoints(scaledSource, scaledTarget, scaledWidth, scaledHeight);
         const normalized = (d.weight - minWeight) / weightRange;
         const color = d.type === 'contains' ? '#6b7280' : getEdgeColor(normalized);
+        // Include source/target IDs for dynamic visibility check
         return [
-          { x: points.source.x, y: points.source.y, color },
-          { x: points.target.x, y: points.target.y, color }
+          { x: points.source.x, y: points.source.y, color, sourceId: d.source.id, targetId: d.target.id },
+          { x: points.target.x, y: points.target.y, color, sourceId: d.source.id, targetId: d.target.id }
         ];
       }))
       .join('circle')
@@ -413,7 +414,11 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       .attr('cx', d => d.x)
       .attr('cy', d => d.y)
       .attr('r', 4 * initialCardScale)
-      .attr('fill', d => d.color);
+      .attr('fill', d => d.color)
+      .style('display', d => {
+        if (!activeNodeId) return null;
+        return (d.sourceId === activeNodeId || d.targetId === activeNodeId) ? null : 'none';
+      });
 
     // ==========================================================================
     // NODE RENDERING
@@ -687,6 +692,7 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       .attr('class', 'open-btn')
       .attr('transform', `translate(${NOTE_WIDTH / 2 - OPEN_BTN_WIDTH / 2}, ${NOTE_HEIGHT - 68})`)
       .style('opacity', 0) // Hidden by default
+      .style('pointer-events', 'none') // Disabled when hidden
       .style('cursor', 'pointer');
 
     openBtnGroups.append('rect')
@@ -1225,7 +1231,11 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
 
               // Fade edges back in
               linksGroup.transition().duration(100).style('opacity', 1);
-              connectionDots.transition().duration(100).style('opacity', 1);
+              connectionDots.transition().duration(100)
+                .style('opacity', (d: { sourceId: string; targetId: string }) => {
+                  if (!activeNodeIdRef.current) return 1;
+                  return (d.sourceId === activeNodeIdRef.current || d.targetId === activeNodeIdRef.current) ? 1 : 0;
+                });
             }, 120); // Recalculate edges after 120ms of no zoom
 
             // Show links group but faded
@@ -1236,7 +1246,10 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
             cardsGroup.style('display', 'none');
             dotsGroup.style('display', null);
             linksGroup.style('display', null);
-            connectionDots.style('display', null);
+            connectionDots.style('display', (d: { sourceId: string; targetId: string }) => {
+              if (!activeNodeIdRef.current) return null;
+              return (d.sourceId === activeNodeIdRef.current || d.targetId === activeNodeIdRef.current) ? null : 'none';
+            });
 
             // Viewport culling for dots only
             dotGroups.style('display', d => visibleIds.has(d.id) ? null : 'none');
@@ -1459,14 +1472,30 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
         return isConnected ? baseWidth * 1.8 : baseWidth;
       });
 
+    // Update connection dots visibility - only show dots for edges connected to selected node
+    svg.selectAll<SVGCircleElement, { sourceId: string; targetId: string }>('circle.connection-dot')
+      .transition().duration(150)
+      .style('display', (d) => {
+        if (!activeNodeId) return null;
+        return (d.sourceId === activeNodeId || d.targetId === activeNodeId) ? null : 'none';
+      });
+
     // Update Open/Enter button visibility based on selection
     svg.selectAll<SVGGElement, GraphNode>('.open-btn')
+      .each(function(this: SVGGElement) {
+        const parentEl = this.parentNode as Element;
+        if (!parentEl) return;
+        const data = d3.select<Element, GraphNode>(parentEl).datum();
+        // Show if: tips enabled, node selected, and node has action (is item or has children)
+        const isVisible = showTips && data.id === activeNodeId && (data.isItem || data.childCount > 0);
+        // Set pointer-events immediately (not animated)
+        d3.select(this).style('pointer-events', isVisible ? 'auto' : 'none');
+      })
       .transition().duration(150)
       .style('opacity', function(this: SVGGElement) {
         const parentEl = this.parentNode as Element;
         if (!parentEl) return 0;
         const data = d3.select<Element, GraphNode>(parentEl).datum();
-        // Show if: tips enabled, node selected, and node has action (is item or has children)
         if (showTips && data.id === activeNodeId && (data.isItem || data.childCount > 0)) {
           return 1;
         }

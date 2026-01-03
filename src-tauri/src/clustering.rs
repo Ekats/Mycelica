@@ -311,18 +311,15 @@ async fn ensure_embeddings(
         let embedding = match db.get_node_embedding(&item.id).map_err(|e| e.to_string())? {
             Some(emb) => emb,
             None => {
-                // Generate embedding from CONTENT (truncated to ~1000 bytes for efficiency)
-                // Content is much more semantically meaningful than short titles
+                // Generate embedding from TITLE + CONTENT for better semantic differentiation
+                // Title helps distinguish items with similar/identical content (e.g., book chapters)
+                let title = item.ai_title.as_ref().unwrap_or(&item.title);
                 let text = if let Some(content) = &item.content {
-                    // Use actual conversation content, truncated safely
-                    safe_truncate(content, 1000).to_string()
+                    // Prepend title to content (reserve ~100 chars for title, rest for content)
+                    format!("{}\n\n{}", title, safe_truncate(content, 900))
                 } else {
                     // Fallback for items without content (shouldn't happen for items)
-                    format!(
-                        "{} {}",
-                        item.ai_title.as_ref().unwrap_or(&item.title),
-                        item.summary.as_deref().unwrap_or("")
-                    )
+                    format!("{} {}", title, item.summary.as_deref().unwrap_or(""))
                 };
 
                 println!("[Clustering] Generating embedding for item: {} ({}chars)", item.id, text.len());

@@ -2413,9 +2413,10 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
             for (i, node) in nodes_needing_embeddings.iter().enumerate() {
                 let current = i + 1;
                 let title = node.ai_title.as_deref().unwrap_or(&node.title);
-                // Use content for embeddings (more semantically meaningful)
+                // Use TITLE + CONTENT for embeddings (title helps distinguish similar content)
                 let embed_text = if let Some(content) = &node.content {
-                    safe_truncate(content, 1000).to_string()
+                    // Prepend title to content (reserve ~100 chars for title, rest for content)
+                    format!("{}\n\n{}", title, safe_truncate(content, 900))
                 } else {
                     // Fallback for nodes without content
                     let summary = node.summary.as_deref().unwrap_or("");

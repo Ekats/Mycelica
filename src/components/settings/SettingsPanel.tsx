@@ -2502,13 +2502,22 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
               {dangerZoneExpanded && (
                 <div className="mt-4 space-y-4">
                   <div className="grid grid-cols-2 gap-3">
-                    {/* Combined: Reset Processing (AI + Embeddings) */}
+                    {/* Reset AI Processing (titles, summaries, tags) */}
                     <button
-                      onClick={() => setConfirmAction('resetProcessing')}
+                      onClick={() => setConfirmAction('resetAi')}
                       className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
                     >
-                      <span className="text-sm font-medium text-gray-200">Reset Processing</span>
-                      <span className="text-xs text-gray-500">AI + Embeddings</span>
+                      <span className="text-sm font-medium text-gray-200">Reset AI</span>
+                      <span className="text-xs text-gray-500">Titles, summaries, tags</span>
+                    </button>
+
+                    {/* Clear Embeddings (for similarity) */}
+                    <button
+                      onClick={() => setConfirmAction('clearEmbeddings')}
+                      className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
+                    >
+                      <span className="text-sm font-medium text-gray-200">Clear Embeddings</span>
+                      <span className="text-xs text-gray-500">Similarity vectors</span>
                     </button>
 
                     {/* Combined: Clear Structure (Clustering + Hierarchy) */}
