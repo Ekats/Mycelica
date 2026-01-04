@@ -710,6 +710,8 @@ mod tests {
             country: Some("EE".to_string()),
             fos: Some("humanities".to_string()),
             access_right: Some("OPEN".to_string()),
+            from_year: None,
+            to_year: None,
             page_size: 50,
             page: 1,
             sort_by: None,

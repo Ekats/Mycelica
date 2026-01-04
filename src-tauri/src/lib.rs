@@ -1,15 +1,15 @@
 pub mod db;
 mod commands;
-mod clustering;
-mod ai_client;
+pub mod clustering;
+pub mod ai_client;
 pub mod settings;
-mod hierarchy;
+pub mod hierarchy;
 pub mod import;
-mod similarity;
+pub mod similarity;
 mod local_embeddings;
 pub mod classification;
 mod tags;
-mod openaire;
+pub mod openaire;
 mod format_abstract;
 
 use commands::{

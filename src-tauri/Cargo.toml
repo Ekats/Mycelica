@@ -36,6 +36,15 @@ flate2 = "1"
 url = "2"
 dirs = "5"
 
+# CLI dependencies
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+ratatui = "0.26"
+crossterm = "0.27"
+tui-tree-widget = "0.19"
+nucleo = "0.5"
+arboard = "3"
+
 # Local embeddings via candle
 candle-core = "0.8"
 candle-nn = "0.8"
@@ -64,3 +73,7 @@ opt-level = 3
 [[bin]]
 name = "batch_import"
 path = "src/bin/batch_import.rs"
+
+[[bin]]
+name = "mycelica-cli"
+path = "src/bin/cli.rs"

@@ -136,8 +136,6 @@ pub fn init(app_data_dir: PathBuf) {
     let config_path = app_data_dir.join("settings.json");
     let settings = Settings::load(&config_path);
 
-    println!("Settings loaded from: {:?}", config_path);
-
     *CONFIG_PATH.write().unwrap() = Some(config_path);
     *SETTINGS.write().unwrap() = Some(settings);
 }

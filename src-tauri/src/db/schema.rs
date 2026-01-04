@@ -1152,7 +1152,7 @@ impl Database {
     pub fn search_nodes(&self, query: &str) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT n.id, n.type, n.title, n.url, n.content, n.position_x, n.position_y, n.created_at, n.updated_at, n.cluster_id, n.cluster_label, n.ai_title, n.summary, n.tags, n.emoji, n.is_processed, n.depth, n.is_item, n.is_universe, n.parent_id, n.child_count, n.conversation_id, n.sequence_index, n.is_pinned, n.last_accessed_at, n.latest_child_date, n.is_private, n.privacy_reason
+            "SELECT n.id, n.type, n.title, n.url, n.content, n.position_x, n.position_y, n.created_at, n.updated_at, n.cluster_id, n.cluster_label, n.ai_title, n.summary, n.tags, n.emoji, n.is_processed, n.depth, n.is_item, n.is_universe, n.parent_id, n.child_count, n.conversation_id, n.sequence_index, n.is_pinned, n.last_accessed_at, n.latest_child_date, n.is_private, n.privacy_reason, n.source, n.pdf_available, n.content_type, n.associated_idea_id, n.privacy
              FROM nodes n
              JOIN nodes_fts fts ON n.rowid = fts.rowid
              WHERE nodes_fts MATCH ?1
