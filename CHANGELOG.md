@@ -2,6 +2,40 @@
 
 All notable changes to Mycelica will be documented in this file.
 
+## [0.6.0] - 2026-01-04
+
+### Added
+- **Full CLI interface**: Headless command-line tool (`mycelica-cli`) for scripting, automation, and server use
+  - 50+ commands across 14 categories: db, import, node, hierarchy, process, cluster, embeddings, privacy, paper, config, recent, pinned, nav, completions
+  - `--json` flag for machine-readable output
+  - `--db <path>` to specify database
+  - `-q/--quiet` and `-v/--verbose` flags
+- **Interactive TUI mode**: Terminal UI for browsing the knowledge graph (`mycelica-cli tui`)
+  - Tree view with expand/collapse navigation
+  - Detail pane showing node info, summary, content
+  - Vim-style keybindings (j/k/h/l, g/G)
+  - Full-text search with `/`
+- **Database selector**: `mycelica-cli db select` scans common locations and lets you pick interactively
+  - Saves selection to settings for persistence
+  - Checks repo directory, app data, Downloads for .db files
+- **Shell completions**: `mycelica-cli completions bash|zsh|fish` generates shell completions
+- **OpenAIRE import via CLI**: `mycelica-cli import openaire --query "..." --country EE --fos "medical"` with year filters
+- **Navigation commands**: `nav ls`, `nav tree`, `nav path`, `nav edges`, `nav similar` for non-interactive exploration
+- **Paper commands**: `paper list`, `paper get`, `paper download`, `paper open`, `paper sync-pdfs`, `paper reformat-abstracts`
+
+### Changed
+- Settings initialization moved earlier in CLI startup to support custom database path loading
+- README updated with CLI & TUI documentation and Quick Start section
+
+### Technical
+- Added dependencies: clap 4, clap_complete 4, ratatui 0.26, crossterm 0.27, tui-tree-widget 0.19, nucleo 0.5, arboard 3
+- New binary target `mycelica-cli` in Cargo.toml
+- Made modules public for CLI access: clustering, ai_client, settings, hierarchy, import, similarity, openaire
+- TUI uses parent_id tracking for proper tree expansion
+- Fixed `search_nodes` SQL query missing 5 columns (source, pdf_available, content_type, associated_idea_id, privacy)
+
+---
+
 ## [Unreleased]
 
 ### Added
