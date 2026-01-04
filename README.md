@@ -85,6 +85,95 @@ Set via **Settings panel** or environment variables:
 
 ---
 
+## CLI & TUI
+
+Mycelica includes a headless CLI for scripting, automation, and server use.
+
+### Build the CLI
+
+```bash
+cd src-tauri
+cargo build --release --bin mycelica-cli
+# Binary at: target/release/mycelica-cli
+```
+
+### CLI Usage
+
+```bash
+mycelica-cli [OPTIONS] <COMMAND>
+
+# Global options
+--db <PATH>     # Use specific database
+--json          # Output JSON for scripting
+-q, --quiet     # Suppress progress output
+-v, --verbose   # Detailed logging
+```
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `db stats` | Show database statistics |
+| `db select` | Interactive database picker |
+| `db export <path>` | Export trimmed database |
+| `import openaire --query "..." --country EE` | Import papers from OpenAIRE |
+| `import markdown <path>` | Import markdown files |
+| `import claude <path>` | Import Claude conversation JSON |
+| `node search <query>` | Full-text search |
+| `node similar <id>` | Find semantically similar nodes |
+| `hierarchy build` | Build/rebuild hierarchy |
+| `cluster run` | Run clustering on new items |
+| `embeddings status` | Show embedding stats |
+| `privacy stats` | Show privacy scan status |
+| `paper list` | List imported papers |
+| `config list` | Show all settings |
+| `nav tree root --depth 3` | Show hierarchy tree |
+| `tui` | Launch interactive TUI |
+| `completions bash` | Generate shell completions |
+
+### Examples
+
+```bash
+# Select database interactively
+mycelica-cli db select
+
+# Import papers and run full setup
+mycelica-cli import openaire --query "machine learning" --max 100
+mycelica-cli hierarchy build
+mycelica-cli cluster run
+
+# Search and export results as JSON
+mycelica-cli --json node search "neural networks" > results.json
+
+# Generate shell completions
+mycelica-cli completions bash >> ~/.bashrc
+mycelica-cli completions zsh >> ~/.zshrc
+mycelica-cli completions fish > ~/.config/fish/completions/mycelica-cli.fish
+```
+
+### TUI Mode
+
+Interactive terminal UI for browsing the knowledge graph:
+
+```bash
+mycelica-cli tui
+```
+
+**Controls:**
+| Key | Action |
+|-----|--------|
+| `j/k` or `↑/↓` | Navigate up/down |
+| `Enter` or `l/→` | Expand node |
+| `h/←` | Collapse node |
+| `/` | Search mode |
+| `g` | Jump to top |
+| `G` | Jump to bottom |
+| `r` | Reload tree |
+| `?` | Show help |
+| `q` | Quit |
+
+---
+
 ## Architecture
 
 ```
@@ -153,13 +242,10 @@ mycelica/
 │       ├── ai_client.rs    # Anthropic integration
 │       ├── hierarchy.rs    # Hierarchy algorithms
 │       └── clustering.rs   # Topic clustering
-│
-└── CLAUDE.md               # Detailed developer docs
+
+
 ```
 
-See [CLAUDE.md](./CLAUDE.md) for comprehensive architecture documentation.
-
----
 
 ## Database Locations
 
