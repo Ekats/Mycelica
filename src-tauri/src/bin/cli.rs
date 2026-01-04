@@ -12,6 +12,21 @@ use std::sync::Arc;
 use std::io::Write;
 use chrono::Utc;
 
+// TUI imports
+use crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    Frame, Terminal,
+};
+
 // ============================================================================
 // Main CLI Structure
 // ============================================================================
@@ -1811,15 +1826,471 @@ async fn handle_nav(cmd: NavCommands, db: &Database, json: bool) -> Result<(), S
 }
 
 // ============================================================================
-// TUI Mode (placeholder)
+// TUI Mode
 // ============================================================================
 
-async fn run_tui(_db: &Database) -> Result<(), String> {
-    eprintln!("TUI mode coming soon!");
-    eprintln!("For now, use the nav commands for non-interactive navigation:");
-    eprintln!("  mycelica-cli nav ls root");
-    eprintln!("  mycelica-cli nav tree root --depth 3");
-    Ok(())
+/// Tree node for TUI display
+#[derive(Clone)]
+struct TreeNode {
+    id: String,
+    parent_id: Option<String>,
+    title: String,
+    depth: i32,
+    child_count: i32,
+    is_item: bool,
+    is_expanded: bool,
+    is_universe: bool,
+    children_loaded: bool,
+}
+
+/// TUI Application state
+struct TuiApp {
+    nodes: Vec<TreeNode>,
+    visible_nodes: Vec<usize>,  // Indices into nodes that are currently visible
+    list_state: ListState,
+    selected_node: Option<Node>,
+    search_mode: bool,
+    search_query: String,
+    search_results: Vec<usize>,
+    status_message: String,
+}
+
+impl TuiApp {
+    fn new() -> Self {
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        Self {
+            nodes: Vec::new(),
+            visible_nodes: Vec::new(),
+            list_state,
+            selected_node: None,
+            search_mode: false,
+            search_query: String::new(),
+            search_results: Vec::new(),
+            status_message: String::new(),
+        }
+    }
+
+    fn load_tree(&mut self, db: &Database) -> Result<(), String> {
+        self.nodes.clear();
+        self.visible_nodes.clear();
+
+        // Get universe as root
+        if let Some(universe) = db.get_universe().map_err(|e| e.to_string())? {
+            self.nodes.push(TreeNode {
+                id: universe.id.clone(),
+                parent_id: None,
+                title: universe.title.clone(),
+                depth: 0,
+                child_count: universe.child_count,
+                is_item: false,
+                is_expanded: true,  // Start with root expanded
+                is_universe: true,
+                children_loaded: false,
+            });
+
+            // Load first level children
+            self.load_children_for_node(db, 0)?;
+        }
+
+        self.update_visible_nodes();
+        Ok(())
+    }
+
+    fn load_children_for_node(&mut self, db: &Database, node_idx: usize) -> Result<(), String> {
+        if self.nodes[node_idx].children_loaded {
+            return Ok(());
+        }
+
+        let parent_id = self.nodes[node_idx].id.clone();
+        let children = db.get_children(&parent_id).map_err(|e| e.to_string())?;
+
+        // Insert children right after the parent node
+        let insert_pos = node_idx + 1;
+
+        for (i, child) in children.into_iter().enumerate() {
+            self.nodes.insert(insert_pos + i, TreeNode {
+                id: child.id.clone(),
+                parent_id: Some(parent_id.clone()),
+                title: child.ai_title.clone().unwrap_or(child.title.clone()),
+                depth: child.depth,
+                child_count: child.child_count,
+                is_item: child.is_item,
+                is_expanded: false,
+                is_universe: false,
+                children_loaded: false,
+            });
+        }
+
+        self.nodes[node_idx].children_loaded = true;
+        Ok(())
+    }
+
+    fn update_visible_nodes(&mut self) {
+        self.visible_nodes.clear();
+
+        // Build set of expanded node IDs for quick lookup
+        let expanded_ids: std::collections::HashSet<String> = self.nodes.iter()
+            .filter(|n| n.is_expanded)
+            .map(|n| n.id.clone())
+            .collect();
+
+        for (idx, node) in self.nodes.iter().enumerate() {
+            // Always show root (universe)
+            if node.parent_id.is_none() {
+                self.visible_nodes.push(idx);
+                continue;
+            }
+
+            // Check if all ancestors are expanded
+            if self.is_ancestor_chain_expanded(idx, &expanded_ids) {
+                self.visible_nodes.push(idx);
+            }
+        }
+    }
+
+    fn is_ancestor_chain_expanded(&self, idx: usize, expanded_ids: &std::collections::HashSet<String>) -> bool {
+        let node = &self.nodes[idx];
+
+        // Check if parent is expanded
+        if let Some(ref parent_id) = node.parent_id {
+            if !expanded_ids.contains(parent_id) {
+                return false;
+            }
+            // Recursively check parent's ancestors
+            for (i, n) in self.nodes.iter().enumerate() {
+                if n.id == *parent_id {
+                    if n.parent_id.is_none() {
+                        return true; // Reached root, which is always visible
+                    }
+                    return self.is_ancestor_chain_expanded(i, expanded_ids);
+                }
+            }
+        }
+        true
+    }
+
+    fn toggle_expand(&mut self, db: &Database) {
+        if let Some(selected) = self.list_state.selected() {
+            if selected < self.visible_nodes.len() {
+                let node_idx = self.visible_nodes[selected];
+                let node = &self.nodes[node_idx];
+
+                if !node.is_item && node.child_count > 0 {
+                    // Toggle expansion
+                    let was_expanded = self.nodes[node_idx].is_expanded;
+                    self.nodes[node_idx].is_expanded = !was_expanded;
+
+                    if !was_expanded {
+                        // Load children if not already loaded
+                        let _ = self.load_children_for_node(db, node_idx);
+                    }
+
+                    self.update_visible_nodes();
+
+                    // Adjust selection if needed (visible_nodes may have changed)
+                    if selected >= self.visible_nodes.len() {
+                        self.list_state.select(Some(self.visible_nodes.len().saturating_sub(1)));
+                    }
+                }
+            }
+        }
+    }
+
+    fn select_next(&mut self) {
+        if let Some(selected) = self.list_state.selected() {
+            if selected < self.visible_nodes.len().saturating_sub(1) {
+                self.list_state.select(Some(selected + 1));
+            }
+        }
+    }
+
+    fn select_prev(&mut self) {
+        if let Some(selected) = self.list_state.selected() {
+            if selected > 0 {
+                self.list_state.select(Some(selected - 1));
+            }
+        }
+    }
+
+    fn get_selected_node(&self, db: &Database) -> Option<Node> {
+        if let Some(selected) = self.list_state.selected() {
+            if selected < self.visible_nodes.len() {
+                let node_idx = self.visible_nodes[selected];
+                let tree_node = &self.nodes[node_idx];
+                return db.get_node(&tree_node.id).ok().flatten();
+            }
+        }
+        None
+    }
+}
+
+async fn run_tui(db: &Database) -> Result<(), String> {
+    // Setup terminal
+    enable_raw_mode().map_err(|e| e.to_string())?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).map_err(|e| e.to_string())?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
+
+    // Create app and load data
+    let mut app = TuiApp::new();
+    app.load_tree(db)?;
+    app.status_message = format!("Loaded {} nodes. Press ? for help, q to quit.", app.nodes.len());
+
+    // Main loop
+    let result = run_tui_loop(&mut terminal, &mut app, db);
+
+    // Restore terminal
+    disable_raw_mode().map_err(|e| e.to_string())?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    ).map_err(|e| e.to_string())?;
+    terminal.show_cursor().map_err(|e| e.to_string())?;
+
+    result
+}
+
+fn run_tui_loop(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    app: &mut TuiApp,
+    db: &Database,
+) -> Result<(), String> {
+    loop {
+        // Update selected node details
+        app.selected_node = app.get_selected_node(db);
+
+        // Draw UI
+        terminal.draw(|f| draw_ui(f, app)).map_err(|e| e.to_string())?;
+
+        // Handle input
+        if event::poll(std::time::Duration::from_millis(100)).map_err(|e| e.to_string())? {
+            if let Event::Key(key) = event::read().map_err(|e| e.to_string())? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+
+                if app.search_mode {
+                    match key.code {
+                        KeyCode::Esc => {
+                            app.search_mode = false;
+                            app.search_query.clear();
+                            app.status_message = "Search cancelled".to_string();
+                        }
+                        KeyCode::Enter => {
+                            app.search_mode = false;
+                            // Perform search
+                            if !app.search_query.is_empty() {
+                                if let Ok(results) = db.search_nodes(&app.search_query) {
+                                    app.status_message = format!("Found {} results for '{}'", results.len(), app.search_query);
+                                    // Jump to first result if found
+                                    if let Some(first) = results.first() {
+                                        for (i, &idx) in app.visible_nodes.iter().enumerate() {
+                                            if app.nodes[idx].id == first.id {
+                                                app.list_state.select(Some(i));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            app.search_query.clear();
+                        }
+                        KeyCode::Backspace => {
+                            app.search_query.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            app.search_query.push(c);
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Char('q') => return Ok(()),
+                        KeyCode::Char('j') | KeyCode::Down => app.select_next(),
+                        KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
+                        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => app.toggle_expand(db),
+                        KeyCode::Char('h') | KeyCode::Left => {
+                            // Collapse current node
+                            if let Some(selected) = app.list_state.selected() {
+                                if selected < app.visible_nodes.len() {
+                                    let node_idx = app.visible_nodes[selected];
+                                    if app.nodes[node_idx].is_expanded {
+                                        app.nodes[node_idx].is_expanded = false;
+                                        app.update_visible_nodes();
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Char('/') => {
+                            app.search_mode = true;
+                            app.search_query.clear();
+                            app.status_message = "Search: ".to_string();
+                        }
+                        KeyCode::Char('?') => {
+                            app.status_message = "j/k:up/down  Enter/l:expand  h:collapse  /:search  q:quit".to_string();
+                        }
+                        KeyCode::Char('g') => {
+                            app.list_state.select(Some(0));
+                        }
+                        KeyCode::Char('G') => {
+                            if !app.visible_nodes.is_empty() {
+                                app.list_state.select(Some(app.visible_nodes.len() - 1));
+                            }
+                        }
+                        KeyCode::Char('r') => {
+                            // Reload tree
+                            let _ = app.load_tree(db);
+                            app.status_message = format!("Reloaded {} nodes", app.nodes.len());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn draw_ui(f: &mut Frame, app: &TuiApp) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(f.size());
+
+    let main_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(40),
+            Constraint::Percentage(60),
+        ])
+        .split(chunks[0]);
+
+    // Tree view
+    draw_tree(f, app, main_chunks[0]);
+
+    // Detail pane
+    draw_detail(f, app, main_chunks[1]);
+
+    // Status bar
+    let status = if app.search_mode {
+        format!("Search: {}_", app.search_query)
+    } else {
+        app.status_message.clone()
+    };
+    let status_bar = Paragraph::new(status)
+        .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+    f.render_widget(status_bar, chunks[1]);
+}
+
+fn draw_tree(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let items: Vec<ListItem> = app.visible_nodes.iter().map(|&idx| {
+        let node = &app.nodes[idx];
+        let indent = "  ".repeat(node.depth as usize);
+
+        let prefix = if node.is_item {
+            "📄"
+        } else if node.is_expanded {
+            "▼"
+        } else if node.child_count > 0 {
+            "▶"
+        } else {
+            "○"
+        };
+
+        let count = if !node.is_item && node.child_count > 0 {
+            format!(" ({})", node.child_count)
+        } else {
+            String::new()
+        };
+
+        let content = format!("{}{} {}{}", indent, prefix, node.title, count);
+        ListItem::new(content)
+    }).collect();
+
+    let tree = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(" Hierarchy "))
+        .highlight_style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD))
+        .highlight_symbol("→ ");
+
+    f.render_stateful_widget(tree, area, &mut app.list_state.clone());
+}
+
+fn draw_detail(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let content = if let Some(ref node) = app.selected_node {
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("Title: ", Style::default().fg(Color::Yellow)),
+                Span::raw(&node.title),
+            ]),
+            Line::from(vec![
+                Span::styled("ID: ", Style::default().fg(Color::Yellow)),
+                Span::raw(&node.id[..8]),
+            ]),
+            Line::from(vec![
+                Span::styled("Type: ", Style::default().fg(Color::Yellow)),
+                Span::raw(if node.is_item { "Item" } else { "Category" }),
+            ]),
+            Line::from(vec![
+                Span::styled("Depth: ", Style::default().fg(Color::Yellow)),
+                Span::raw(node.depth.to_string()),
+            ]),
+            Line::from(vec![
+                Span::styled("Children: ", Style::default().fg(Color::Yellow)),
+                Span::raw(node.child_count.to_string()),
+            ]),
+        ];
+
+        if let Some(ref ai_title) = node.ai_title {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("AI Title: ", Style::default().fg(Color::Green)),
+                Span::raw(ai_title),
+            ]));
+        }
+
+        if let Some(ref tags) = node.tags {
+            lines.push(Line::from(vec![
+                Span::styled("Tags: ", Style::default().fg(Color::Cyan)),
+                Span::raw(tags),
+            ]));
+        }
+
+        if let Some(ref summary) = node.summary {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("Summary:", Style::default().fg(Color::Magenta))));
+            // Wrap summary
+            for chunk in summary.chars().collect::<Vec<_>>().chunks(60) {
+                lines.push(Line::from(chunk.iter().collect::<String>()));
+            }
+        }
+
+        if let Some(ref content) = node.content {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("Content:", Style::default().fg(Color::Blue))));
+            let preview = if content.len() > 500 { &content[..500] } else { content };
+            for line in preview.lines().take(15) {
+                lines.push(Line::from(line.to_string()));
+            }
+            if content.len() > 500 {
+                lines.push(Line::from("..."));
+            }
+        }
+
+        Text::from(lines)
+    } else {
+        Text::from("No node selected")
+    };
+
+    let detail = Paragraph::new(content)
+        .block(Block::default().borders(Borders::ALL).title(" Details "))
+        .wrap(Wrap { trim: false });
+
+    f.render_widget(detail, area);
 }
 
 // ============================================================================
