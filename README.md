@@ -13,7 +13,7 @@ https://github.com/user-attachments/assets/149d3241-1b93-4269-94c2-10edb9153db3
 **5,236 research papers. 25,703 semantic connections. Zero setup.**
 
 1. Download [latest release](https://github.com/Ekats/Mycelica/releases)
-2. Grab `mycelica-somatic-neuroscience-trimmed.db` (88 MB) (bundled in v0.6.0)
+2. Grab `mycelica-somatic-neuroscience-trimmed.db` (88 MB)
 3. Open Mycelica → Settings → Open database
 4. Navigate
 
