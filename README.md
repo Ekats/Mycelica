@@ -8,6 +8,17 @@ https://github.com/user-attachments/assets/149d3241-1b93-4269-94c2-10edb9153db3
 
 ---
 
+## Quick Start
+
+1. Download the [latest release](https://github.com/Ekats/Mycelica/releases)
+2. Grab the demo database: `mycelica-somatic-neuroscience-trimmed.db` (88 MB)
+3. Open Mycelica → Settings → Open database
+4. Explore 5,236 research papers, 25,703 semantic connections
+
+No API keys needed. No processing required. Just open and navigate.
+
+---
+
 ## Why
 
 Knowledge tools mimic file systems: folders, hierarchies, categories.
