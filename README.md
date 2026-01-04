@@ -8,14 +8,23 @@ https://github.com/user-attachments/assets/149d3241-1b93-4269-94c2-10edb9153db3
 
 ---
 
-## Quick Start
+## Try It Now
 
-1. Download the [latest release](https://github.com/Ekats/Mycelica/releases)
-2. Grab the demo database: `mycelica-somatic-neuroscience-trimmed.db` (88 MB)
+**5,236 research papers. 25,703 semantic connections. Zero setup.**
+
+1. Download [latest release](https://github.com/Ekats/Mycelica/releases)
+2. Grab `mycelica-somatic-neuroscience-trimmed.db` (88 MB) (bundled in v0.6.0)
 3. Open Mycelica → Settings → Open database
-4. Explore 5,236 research papers, 25,703 semantic connections
+4. Navigate
 
-No API keys needed. No processing required. Just open and navigate.
+Imported from OpenAIRE using:
+```
+(peripheral neuroplasticity) OR (somatic mutation accumulation) OR (interoception) OR (DNA repair aging)
+```
+
+From raw papers to 7-level hierarchy with 25,703 semantic edges in 33 minutes. No manual categorization. Structure emerged from embeddings.
+
+![Graph visualization](https://github.com/user-attachments/assets/695f699f-9902-4d50-a8bb-13371818c96d)
 
 ---
 
@@ -30,17 +39,6 @@ Mycelica shows structure you can navigate, plus connections that cross category 
 
 Currently handles 3700+ nodes with 14,000+ semantic connections.
 
----
-
-## Demo
-
-A sample database is included for testing: `mycelica-openAIRE-preview.db`
-
-Switch to it via Settings → Select Database to explore ~2300 medical research papers from OpenAIRE.
-
-NB! DEMO DATABASES ARE ALREADY FULLY PREPROCESSED, NO NEED TO RUN ANY SETUP/PROCESSING IN SETTINGS!
-
----
 
 ## Features
 
