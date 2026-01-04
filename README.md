@@ -37,8 +37,6 @@ Every insight links to others. Every question branches into more questions. Ever
 
 Mycelica shows structure you can navigate, plus connections that cross category boundaries. Reasoning becomes visible. Your knowledge becomes a living network you can explore, not a graveyard of files you'll never reopen.
 
-Currently handles 3700+ nodes with 14,000+ semantic connections.
-
 
 ## Features
 
