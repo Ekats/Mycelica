@@ -2,19 +2,53 @@
 
 All notable changes to Mycelica will be documented in this file.
 
-## [0.6.0] - 2026-01-04
+## [0.7.0] - 2026-01-04
 
 ### Added
 - **Full CLI interface**: Headless command-line tool (`mycelica-cli`) for scripting, automation, and server use
-  - 50+ commands across 14 categories: db, import, node, hierarchy, process, cluster, embeddings, privacy, paper, config, recent, pinned, nav, completions
+  - 70+ commands across 16 categories: db, import, export, node, hierarchy, process, cluster, embeddings, privacy, paper, config, recent, pinned, nav, maintenance, completions
   - `--json` flag for machine-readable output
   - `--db <path>` to specify database
   - `-q/--quiet` and `-v/--verbose` flags
 - **Interactive TUI mode**: Terminal UI for browsing the knowledge graph (`mycelica-cli tui`)
-  - Tree view with expand/collapse navigation
-  - Detail pane showing node info, summary, content
-  - Vim-style keybindings (j/k/h/l, g/G)
+  - **CD-style navigation**: Enter=cd into cluster, Backspace/- = go up one level
+  - **Breadcrumb bar**: Shows path from Universe to current location
+  - **3-column layout**: Tree (50%) | Pins+Recents (25%) | Preview (25%)
+  - **Pane interactivity**: Tab cycles focus between Tree → Pins → Recents (cyan border = focused)
+    - j/k navigates within focused pane, Enter jumps to selected node
+  - **Leaf View mode**: Full-screen content viewer for items
+    - Tab cycles focus: Content → Similar → Edges
+    - j/k scrolls content or navigates sidebar based on focus
+    - Enter on Similar/Edges jumps to that node
+  - **Edit mode**: Full-screen text editor with line numbers, cursor, Ctrl+S save, Esc cancel
+  - Vim-style keybindings (j/k/h/l, g/G, n/N for similar navigation)
   - Full-text search with `/`
+  - Pin/unpin nodes with `p` key
+  - Colored dates in tree (red=old → yellow → cyan=recent)
+- **Global search command**: `mycelica-cli search <query>` searches across all nodes
+  - Filter by type: `--type item|category|paper|all`
+  - Limit results: `--limit 20`
+- **Maintenance commands**: 12 dangerous operations with interactive confirmation
+  - `maintenance wipe` - Delete all nodes and edges
+  - `maintenance reset-ai` - Clear AI-generated titles/summaries
+  - `maintenance reset-clusters` - Remove clustering assignments
+  - `maintenance reset-privacy` - Clear privacy scores
+  - `maintenance clear-embeddings` - Remove all embeddings
+  - `maintenance clear-hierarchy` - Flatten hierarchy to Universe
+  - `maintenance clear-tags` - Remove tag assignments
+  - `maintenance delete-empty` - Remove nodes without content
+  - `maintenance vacuum` - Compact database
+  - `maintenance fix-counts` - Recalculate child counts
+  - `maintenance fix-depths` - Recalculate node depths
+  - `maintenance prune-edges` - Remove orphaned edges
+  - All require `--force` flag or interactive "yes" confirmation
+- **Export commands**: 5 export formats for data portability
+  - `export bibtex -o papers.bib` - BibTeX citation format for papers
+  - `export markdown -o output.md` - Markdown with hierarchy
+  - `export json -o output.json` - Full node data as JSON
+  - `export graph -o graph.dot -f dot|graphml` - Graph formats with optional similarity edges
+  - `export subgraph <node_id> -o subtree.json -d 3` - Extract subtree to depth
+  - All support `--node <id>` to limit to specific subtree
 - **Database selector**: `mycelica-cli db select` scans common locations and lets you pick interactively
   - Saves selection to settings for persistence
   - Checks repo directory, app data, Downloads for .db files
@@ -26,6 +60,7 @@ All notable changes to Mycelica will be documented in this file.
 ### Changed
 - Settings initialization moved earlier in CLI startup to support custom database path loading
 - README updated with CLI & TUI documentation and Quick Start section
+- TUI now uses modal design: Navigation mode → Leaf View → Edit mode
 
 ### Technical
 - Added dependencies: clap 4, clap_complete 4, ratatui 0.26, crossterm 0.27, tui-tree-widget 0.19, nucleo 0.5, arboard 3
@@ -33,6 +68,11 @@ All notable changes to Mycelica will be documented in this file.
 - Made modules public for CLI access: clustering, ai_client, settings, hierarchy, import, similarity, openaire
 - TUI uses parent_id tracking for proper tree expansion
 - Fixed `search_nodes` SQL query missing 5 columns (source, pdf_available, content_type, associated_idea_id, privacy)
+- TUI state machine with `TuiMode` enum: Navigation, LeafView, Edit, Search, Maintenance, Settings, Jobs
+- Pane focus tracking with `NavFocus` (Tree, Pins, Recents) and `LeafFocus` (Content, Similar, Edges) enums
+- Edit mode implements full text buffer with UTF-8 aware cursor positioning
+- Export functions: `export_dot()`, `export_graphml()`, `get_export_nodes()`, `collect_descendants()`
+- Maintenance commands use interactive confirmation pattern with `--force` override
 
 ---
 

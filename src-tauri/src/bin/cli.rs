@@ -123,6 +123,27 @@ enum Commands {
         #[command(subcommand)]
         cmd: NavCommands,
     },
+    /// Database maintenance operations (use with caution)
+    Maintenance {
+        #[command(subcommand)]
+        cmd: MaintenanceCommands,
+    },
+    /// Export data in various formats
+    Export {
+        #[command(subcommand)]
+        cmd: ExportCommands,
+    },
+    /// Global search across all nodes
+    Search {
+        /// Search query
+        query: String,
+        /// Filter by type (item, category, paper, all)
+        #[arg(long, short = 't', default_value = "all")]
+        type_filter: String,
+        /// Maximum results
+        #[arg(long, short, default_value = "20")]
+        limit: u32,
+    },
     /// Interactive TUI mode
     Tui,
     /// Generate shell completions
@@ -473,6 +494,150 @@ enum NavCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum MaintenanceCommands {
+    /// Delete ALL data (nodes, edges, everything)
+    Wipe {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+    /// Reset AI processing (titles, summaries, tags)
+    ResetAi {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+    /// Reset clustering data
+    ResetClusters {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+    /// Reset privacy scores
+    ResetPrivacy {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+    /// Clear all embeddings
+    ClearEmbeddings {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+    /// Clear hierarchy (flatten to universe)
+    ClearHierarchy {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+    /// Clear all tags
+    ClearTags {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+    /// Delete nodes with empty content
+    DeleteEmpty {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+    /// Vacuum database (reclaim space)
+    Vacuum,
+    /// Fix child counts
+    FixCounts {
+        /// Show details
+        #[arg(long, short)]
+        verbose: bool,
+    },
+    /// Fix node depths
+    FixDepths {
+        /// Show details
+        #[arg(long, short)]
+        verbose: bool,
+    },
+    /// Prune dead edges
+    PruneEdges {
+        /// Show details
+        #[arg(long, short)]
+        verbose: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExportCommands {
+    /// Export papers as BibTeX
+    Bibtex {
+        /// Output file path
+        #[arg(short, long)]
+        output: String,
+        /// Only export subtree of this node
+        #[arg(long)]
+        node: Option<String>,
+        /// Include children recursively
+        #[arg(long)]
+        subtree: bool,
+    },
+    /// Export nodes as Markdown
+    Markdown {
+        /// Output file path
+        #[arg(short, long)]
+        output: String,
+        /// Only export subtree of this node
+        #[arg(long)]
+        node: Option<String>,
+        /// Include children recursively
+        #[arg(long)]
+        subtree: bool,
+        /// Include full content (not just summaries)
+        #[arg(long)]
+        full: bool,
+    },
+    /// Export nodes as JSON
+    Json {
+        /// Output file path
+        #[arg(short, long)]
+        output: String,
+        /// Only export subtree of this node
+        #[arg(long)]
+        node: Option<String>,
+        /// Include children recursively
+        #[arg(long)]
+        subtree: bool,
+        /// Pretty-print JSON
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Export graph structure (DOT or GraphML)
+    Graph {
+        /// Output file path
+        #[arg(short, long)]
+        output: String,
+        /// Format: dot or graphml
+        #[arg(long, short, default_value = "dot")]
+        format: String,
+        /// Only export subtree of this node
+        #[arg(long)]
+        node: Option<String>,
+        /// Include similarity edges
+        #[arg(long)]
+        edges: bool,
+    },
+    /// Export a subtree as a new database
+    Subgraph {
+        /// Root node ID for subtree
+        node: String,
+        /// Output database path
+        #[arg(short, long)]
+        output: String,
+        /// Maximum depth to export
+        #[arg(long, short, default_value = "10")]
+        depth: usize,
+    },
+}
+
 // ============================================================================
 // Main Entry Point
 // ============================================================================
@@ -524,6 +689,9 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Recent { cmd } => handle_recent(cmd, &db, cli.json),
         Commands::Pinned { cmd } => handle_pinned(cmd, &db, cli.json),
         Commands::Nav { cmd } => handle_nav(cmd, &db, cli.json).await,
+        Commands::Maintenance { cmd } => handle_maintenance(cmd, &db, cli.json).await,
+        Commands::Export { cmd } => handle_export(cmd, &db, cli.quiet).await,
+        Commands::Search { query, type_filter, limit } => handle_search(&query, &type_filter, limit, &db, cli.json).await,
         Commands::Tui => run_tui(&db).await,
         Commands::Completions { .. } => unreachable!(),
     }
@@ -1826,8 +1994,540 @@ async fn handle_nav(cmd: NavCommands, db: &Database, json: bool) -> Result<(), S
 }
 
 // ============================================================================
+// Search Command
+// ============================================================================
+
+async fn handle_search(query: &str, type_filter: &str, limit: u32, db: &Database, json: bool) -> Result<(), String> {
+    let results = db.search_nodes(query).map_err(|e| e.to_string())?;
+
+    // Filter by type
+    let filtered: Vec<_> = results.into_iter()
+        .filter(|node| {
+            match type_filter {
+                "item" => node.is_item,
+                "category" => !node.is_item,
+                "paper" => node.source.as_deref() == Some("openaire"),
+                _ => true, // "all"
+            }
+        })
+        .take(limit as usize)
+        .collect();
+
+    if json {
+        let items: Vec<String> = filtered.iter().map(|node| {
+            format!(
+                r#"{{"id":"{}","title":"{}","type":"{}","depth":{}}}"#,
+                node.id,
+                escape_json(node.ai_title.as_ref().unwrap_or(&node.title)),
+                if node.is_item { "item" } else { "category" },
+                node.depth
+            )
+        }).collect();
+        println!("[{}]", items.join(","));
+    } else {
+        if filtered.is_empty() {
+            println!("No results for '{}'", query);
+        } else {
+            println!("Found {} results for '{}':\n", filtered.len(), query);
+            for node in &filtered {
+                let emoji = node.emoji.as_deref().unwrap_or(if node.is_item { "📄" } else { "📁" });
+                let title = node.ai_title.as_ref().unwrap_or(&node.title);
+                let type_str = if node.is_item { "item" } else { "cat " };
+                println!("{} {} [{}] {}", emoji, title, type_str, &node.id[..8]);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Maintenance Commands
+// ============================================================================
+
+async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool) -> Result<(), String> {
+    match cmd {
+        MaintenanceCommands::Wipe { force } => {
+            // get_stats returns (total_nodes, total_items, processed, with_embeddings, unprocessed, unclustered, orphan_items, topics)
+            let (total, _, _, _, _, _, _, _) = db.get_stats().map_err(|e| e.to_string())?;
+
+            if !force {
+                println!("\n⚠️  WARNING: This will permanently delete {} nodes!", total);
+                println!("This action CANNOT be undone.\n");
+                print!("Type 'yes' to confirm: ");
+                std::io::stdout().flush().ok();
+
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input).map_err(|e| e.to_string())?;
+
+                if input.trim() != "yes" {
+                    return Err("Operation cancelled".into());
+                }
+            }
+
+            db.delete_all_nodes().map_err(|e| e.to_string())?;
+            db.delete_all_edges().map_err(|e| e.to_string())?;
+            println!("✓ Deleted {} nodes and all edges", total);
+        }
+
+        MaintenanceCommands::ResetAi { force } => {
+            if !force && !confirm_action("reset AI processing (titles, summaries, tags)")? {
+                return Err("Operation cancelled".into());
+            }
+            let count = db.reset_ai_processing().map_err(|e| e.to_string())?;
+            println!("✓ Reset AI processing for {} nodes", count);
+        }
+
+        MaintenanceCommands::ResetClusters { force } => {
+            if !force && !confirm_action("reset clustering data")? {
+                return Err("Operation cancelled".into());
+            }
+            // Reset cluster assignments for all items
+            db.clear_item_parents().map_err(|e| e.to_string())?;
+            println!("✓ Reset clustering (cleared item parents)");
+        }
+
+        MaintenanceCommands::ResetPrivacy { force } => {
+            if !force && !confirm_action("reset privacy scores")? {
+                return Err("Operation cancelled".into());
+            }
+            let count = db.reset_all_privacy_flags().map_err(|e| e.to_string())?;
+            println!("✓ Reset privacy scores for {} nodes", count);
+        }
+
+        MaintenanceCommands::ClearEmbeddings { force } => {
+            if !force && !confirm_action("clear all embeddings")? {
+                return Err("Operation cancelled".into());
+            }
+            let count = db.clear_all_embeddings().map_err(|e| e.to_string())?;
+            println!("✓ Cleared {} embeddings", count);
+        }
+
+        MaintenanceCommands::ClearHierarchy { force } => {
+            if !force && !confirm_action("clear hierarchy (reparent all items to universe)")? {
+                return Err("Operation cancelled".into());
+            }
+            // Reparent all items to universe
+            db.clear_item_parents().map_err(|e| e.to_string())?;
+            println!("✓ Cleared item parents (run hierarchy build to rebuild structure)");
+        }
+
+        MaintenanceCommands::ClearTags { force } => {
+            if !force && !confirm_action("clear all tags")? {
+                return Err("Operation cancelled".into());
+            }
+            db.delete_all_tags().map_err(|e| e.to_string())?;
+            println!("✓ Cleared all tags");
+        }
+
+        MaintenanceCommands::DeleteEmpty { force } => {
+            // Use delete_empty_items which returns count
+            if !force && !confirm_action("delete nodes with empty content")? {
+                return Err("Operation cancelled".into());
+            }
+
+            let deleted = db.delete_empty_items().map_err(|e| e.to_string())?;
+            println!("✓ Deleted {} empty items", deleted);
+        }
+
+        MaintenanceCommands::Vacuum => {
+            // Fix counts, depths, and prune edges
+            println!("Tidying database...");
+            db.fix_all_child_counts().map_err(|e| e.to_string())?;
+            db.fix_all_depths().map_err(|e| e.to_string())?;
+            db.prune_dead_edges().map_err(|e| e.to_string())?;
+            println!("✓ Database tidied (for VACUUM, use: sqlite3 <db> 'VACUUM')");
+        }
+
+        MaintenanceCommands::FixCounts { verbose } => {
+            let fixed = db.fix_all_child_counts().map_err(|e| e.to_string())?;
+            if verbose {
+                println!("Fixed {} node child counts", fixed);
+            } else {
+                println!("✓ Fixed child counts");
+            }
+        }
+
+        MaintenanceCommands::FixDepths { verbose } => {
+            let fixed = db.fix_all_depths().map_err(|e| e.to_string())?;
+            if verbose {
+                println!("Fixed {} node depths", fixed);
+            } else {
+                println!("✓ Fixed depths");
+            }
+        }
+
+        MaintenanceCommands::PruneEdges { verbose } => {
+            let pruned = db.prune_dead_edges().map_err(|e| e.to_string())?;
+            if verbose {
+                println!("Pruned {} dead edges", pruned);
+            } else {
+                println!("✓ Pruned dead edges");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn confirm_action(action: &str) -> Result<bool, String> {
+    println!("\n⚠️  Are you sure you want to {}?", action);
+    print!("Type 'yes' to confirm: ");
+    std::io::stdout().flush().ok();
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).map_err(|e| e.to_string())?;
+
+    Ok(input.trim() == "yes")
+}
+
+// ============================================================================
+// Export Commands
+// ============================================================================
+
+async fn handle_export(cmd: ExportCommands, db: &Database, quiet: bool) -> Result<(), String> {
+    match cmd {
+        ExportCommands::Bibtex { output, node, subtree } => {
+            let nodes = get_export_nodes(db, node.as_deref(), subtree)?;
+            let papers: Vec<_> = nodes.iter()
+                .filter(|n| n.source.as_deref() == Some("openaire"))
+                .collect();
+
+            if papers.is_empty() {
+                return Err("No papers found to export".into());
+            }
+
+            let mut bibtex = String::new();
+            for paper in &papers {
+                let key = format!("paper_{}", &paper.id[..8]);
+                let title = paper.ai_title.as_ref().unwrap_or(&paper.title);
+                let year = paper.created_at / 31536000 + 1970; // Rough year from timestamp
+
+                bibtex.push_str(&format!(
+                    "@article{{{},\n  title = {{{}}},\n  year = {{{}}},\n",
+                    key, title, year
+                ));
+
+                if let Some(ref tags) = paper.tags {
+                    bibtex.push_str(&format!("  keywords = {{{}}},\n", tags));
+                }
+                if let Some(ref summary) = paper.summary {
+                    let abstract_text = summary.replace('\n', " ").replace('{', "\\{").replace('}', "\\}");
+                    bibtex.push_str(&format!("  abstract = {{{}}},\n", abstract_text));
+                }
+                bibtex.push_str("}\n\n");
+            }
+
+            std::fs::write(&output, bibtex).map_err(|e| e.to_string())?;
+            if !quiet {
+                println!("✓ Exported {} papers to {}", papers.len(), output);
+            }
+        }
+
+        ExportCommands::Markdown { output, node, subtree, full } => {
+            let nodes = get_export_nodes(db, node.as_deref(), subtree)?;
+
+            let mut markdown = String::new();
+            markdown.push_str("# Mycelica Export\n\n");
+
+            for node in &nodes {
+                let emoji = node.emoji.as_deref().unwrap_or("");
+                let title = node.ai_title.as_ref().unwrap_or(&node.title);
+                let level = "#".repeat((node.depth + 1).min(6) as usize);
+
+                markdown.push_str(&format!("{} {} {}\n\n", level, emoji, title));
+
+                if let Some(ref tags) = node.tags {
+                    markdown.push_str(&format!("**Tags:** {}\n\n", tags));
+                }
+
+                if let Some(ref summary) = node.summary {
+                    markdown.push_str(&format!("{}\n\n", summary));
+                }
+
+                if full {
+                    if let Some(ref content) = node.content {
+                        markdown.push_str("---\n\n");
+                        markdown.push_str(content);
+                        markdown.push_str("\n\n");
+                    }
+                }
+
+                markdown.push_str("---\n\n");
+            }
+
+            std::fs::write(&output, markdown).map_err(|e| e.to_string())?;
+            if !quiet {
+                println!("✓ Exported {} nodes to {}", nodes.len(), output);
+            }
+        }
+
+        ExportCommands::Json { output, node, subtree, pretty } => {
+            let nodes = get_export_nodes(db, node.as_deref(), subtree)?;
+
+            let json_nodes: Vec<serde_json::Value> = nodes.iter().map(|n| {
+                serde_json::json!({
+                    "id": n.id,
+                    "title": n.ai_title.as_ref().unwrap_or(&n.title),
+                    "emoji": n.emoji,
+                    "depth": n.depth,
+                    "is_item": n.is_item,
+                    "tags": n.tags,
+                    "summary": n.summary,
+                    "content": n.content,
+                    "created_at": n.created_at,
+                    "source": n.source,
+                })
+            }).collect();
+
+            let json_str = if pretty {
+                serde_json::to_string_pretty(&json_nodes).map_err(|e| e.to_string())?
+            } else {
+                serde_json::to_string(&json_nodes).map_err(|e| e.to_string())?
+            };
+
+            std::fs::write(&output, json_str).map_err(|e| e.to_string())?;
+            if !quiet {
+                println!("✓ Exported {} nodes to {}", nodes.len(), output);
+            }
+        }
+
+        ExportCommands::Graph { output, format, node, edges } => {
+            let nodes = get_export_nodes(db, node.as_deref(), true)?;
+
+            let graph_str = match format.as_str() {
+                "dot" => export_dot(&nodes, db, edges)?,
+                "graphml" => export_graphml(&nodes, db, edges)?,
+                _ => return Err(format!("Unknown format: {}. Use 'dot' or 'graphml'", format)),
+            };
+
+            std::fs::write(&output, graph_str).map_err(|e| e.to_string())?;
+            if !quiet {
+                println!("✓ Exported graph ({} nodes) to {}", nodes.len(), output);
+            }
+        }
+
+        ExportCommands::Subgraph { node, output, depth } => {
+            // For subgraph export, we'd need to create a new database
+            // This is a simplified version that exports to JSON
+            let root = db.get_node(&node)
+                .map_err(|e| e.to_string())?
+                .ok_or("Node not found")?;
+
+            let mut all_nodes = vec![root];
+            collect_descendants(db, &node, depth, &mut all_nodes)?;
+
+            let json_nodes: Vec<serde_json::Value> = all_nodes.iter().map(|n| {
+                serde_json::json!({
+                    "id": n.id,
+                    "parent_id": n.parent_id,
+                    "title": n.title,
+                    "ai_title": n.ai_title,
+                    "emoji": n.emoji,
+                    "depth": n.depth,
+                    "is_item": n.is_item,
+                    "tags": n.tags,
+                    "summary": n.summary,
+                    "content": n.content,
+                })
+            }).collect();
+
+            let json_str = serde_json::to_string_pretty(&json_nodes).map_err(|e| e.to_string())?;
+            std::fs::write(&output, json_str).map_err(|e| e.to_string())?;
+            if !quiet {
+                println!("✓ Exported subgraph ({} nodes, depth {}) to {}", all_nodes.len(), depth, output);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn get_export_nodes(db: &Database, node_id: Option<&str>, subtree: bool) -> Result<Vec<Node>, String> {
+    match node_id {
+        Some(id) => {
+            let root = db.get_node(id)
+                .map_err(|e| e.to_string())?
+                .ok_or("Node not found")?;
+
+            if subtree {
+                let mut nodes = vec![root];
+                collect_descendants(db, id, 100, &mut nodes)?;
+                Ok(nodes)
+            } else {
+                Ok(vec![root])
+            }
+        }
+        None => {
+            // Export all items
+            db.get_items().map_err(|e| e.to_string())
+        }
+    }
+}
+
+fn collect_descendants(db: &Database, parent_id: &str, max_depth: usize, nodes: &mut Vec<Node>) -> Result<(), String> {
+    if max_depth == 0 {
+        return Ok(());
+    }
+
+    let children = db.get_children(parent_id).map_err(|e| e.to_string())?;
+    for child in children {
+        let child_id = child.id.clone();
+        nodes.push(child);
+        collect_descendants(db, &child_id, max_depth - 1, nodes)?;
+    }
+
+    Ok(())
+}
+
+fn export_dot(nodes: &[Node], db: &Database, include_edges: bool) -> Result<String, String> {
+    let mut dot = String::from("digraph Mycelica {\n");
+    dot.push_str("  rankdir=TB;\n");
+    dot.push_str("  node [shape=box, style=rounded];\n\n");
+
+    // Add nodes
+    for node in nodes {
+        let label = node.ai_title.as_ref().unwrap_or(&node.title);
+        let label_escaped = label.replace('"', "\\\"");
+        let color = if node.is_item { "lightblue" } else { "lightyellow" };
+        dot.push_str(&format!(
+            "  \"{}\" [label=\"{}\", fillcolor={}, style=filled];\n",
+            &node.id[..8], label_escaped, color
+        ));
+    }
+
+    dot.push_str("\n");
+
+    // Add hierarchy edges
+    for node in nodes {
+        if let Some(ref parent_id) = node.parent_id {
+            // Check if parent is in our export set
+            if nodes.iter().any(|n| n.id == *parent_id) {
+                dot.push_str(&format!(
+                    "  \"{}\" -> \"{}\" [color=gray];\n",
+                    &parent_id[..8.min(parent_id.len())], &node.id[..8]
+                ));
+            }
+        }
+    }
+
+    // Add similarity edges if requested
+    if include_edges {
+        let node_ids: std::collections::HashSet<_> = nodes.iter().map(|n| n.id.as_str()).collect();
+
+        for node in nodes {
+            if let Ok(edges) = db.get_edges_for_node(&node.id) {
+                for edge in edges {
+                    let other_id = if edge.source == node.id { &edge.target } else { &edge.source };
+                    if node_ids.contains(other_id.as_str()) && edge.source == node.id {
+                        let weight = edge.weight.unwrap_or(0.0);
+                        if weight > 0.7 {
+                            dot.push_str(&format!(
+                                "  \"{}\" -> \"{}\" [color=red, style=dashed, label=\"{:.0}%\"];\n",
+                                &node.id[..8], &other_id[..8.min(other_id.len())], weight * 100.0
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    dot.push_str("}\n");
+    Ok(dot)
+}
+
+fn export_graphml(nodes: &[Node], db: &Database, include_edges: bool) -> Result<String, String> {
+    let mut xml = String::from(r#"<?xml version="1.0" encoding="UTF-8"?>
+<graphml xmlns="http://graphml.graphdrawing.org/xmlns">
+  <key id="label" for="node" attr.name="label" attr.type="string"/>
+  <key id="type" for="node" attr.name="type" attr.type="string"/>
+  <key id="weight" for="edge" attr.name="weight" attr.type="double"/>
+  <graph id="G" edgedefault="directed">
+"#);
+
+    // Add nodes
+    for node in nodes {
+        let label = node.ai_title.as_ref().unwrap_or(&node.title);
+        let label_escaped = label.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+        let node_type = if node.is_item { "item" } else { "category" };
+        xml.push_str(&format!(
+            "    <node id=\"{}\">\n      <data key=\"label\">{}</data>\n      <data key=\"type\">{}</data>\n    </node>\n",
+            &node.id[..8], label_escaped, node_type
+        ));
+    }
+
+    // Add hierarchy edges
+    let mut edge_id = 0;
+    for node in nodes {
+        if let Some(ref parent_id) = node.parent_id {
+            if nodes.iter().any(|n| n.id == *parent_id) {
+                xml.push_str(&format!(
+                    "    <edge id=\"e{}\" source=\"{}\" target=\"{}\"/>\n",
+                    edge_id, &parent_id[..8.min(parent_id.len())], &node.id[..8]
+                ));
+                edge_id += 1;
+            }
+        }
+    }
+
+    // Add similarity edges if requested
+    if include_edges {
+        let node_ids: std::collections::HashSet<_> = nodes.iter().map(|n| n.id.as_str()).collect();
+
+        for node in nodes {
+            if let Ok(edges) = db.get_edges_for_node(&node.id) {
+                for edge in edges {
+                    let other_id = if edge.source == node.id { &edge.target } else { &edge.source };
+                    if node_ids.contains(other_id.as_str()) && edge.source == node.id {
+                        let weight = edge.weight.unwrap_or(0.0);
+                        if weight > 0.7 {
+                            xml.push_str(&format!(
+                                "    <edge id=\"e{}\" source=\"{}\" target=\"{}\">\n      <data key=\"weight\">{:.3}</data>\n    </edge>\n",
+                                edge_id, &node.id[..8], &other_id[..8.min(other_id.len())], weight
+                            ));
+                            edge_id += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    xml.push_str("  </graph>\n</graphml>\n");
+    Ok(xml)
+}
+
+// ============================================================================
 // TUI Mode
 // ============================================================================
+
+/// TUI operating mode
+#[derive(Clone, Copy, PartialEq)]
+enum TuiMode {
+    Navigation,  // Browsing hierarchy (tree view)
+    LeafView,    // Viewing item content (full screen)
+    Edit,        // Editing content
+    Search,      // Search mode
+    Maintenance, // Maintenance menu
+    Settings,    // Settings screen
+    Jobs,        // Job status popup
+}
+
+/// Focus state for Navigation mode (3-column layout)
+#[derive(Clone, Copy, PartialEq)]
+enum NavFocus {
+    Tree,
+    Pins,
+    Recents,
+}
+
+/// Focus state for Leaf View mode
+#[derive(Clone, Copy, PartialEq)]
+enum LeafFocus {
+    Content,
+    Similar,
+    Edges,
+}
 
 /// Tree node for TUI display
 #[derive(Clone)]
@@ -1835,24 +2535,84 @@ struct TreeNode {
     id: String,
     parent_id: Option<String>,
     title: String,
+    emoji: Option<String>,
     depth: i32,
     child_count: i32,
     is_item: bool,
     is_expanded: bool,
     is_universe: bool,
     children_loaded: bool,
+    created_at: i64,
+}
+
+/// Similar node for leaf view sidebar
+#[derive(Clone)]
+struct SimilarNodeInfo {
+    id: String,
+    title: String,
+    emoji: Option<String>,
+    similarity: f32,
+    parent_title: Option<String>,
 }
 
 /// TUI Application state
 struct TuiApp {
+    // Mode
+    mode: TuiMode,
+
+    // Tree data
     nodes: Vec<TreeNode>,
     visible_nodes: Vec<usize>,  // Indices into nodes that are currently visible
     list_state: ListState,
+
+    // CD-style navigation
+    current_root_id: String,        // Current "directory" being viewed
+    breadcrumb_path: Vec<(String, String)>,  // (id, title) pairs from Universe to current
+
+    // Navigation mode focus (which pane is active)
+    nav_focus: NavFocus,
+    pins_selected: usize,
+    recents_selected: usize,
+
+    // Selected node in navigation
     selected_node: Option<Node>,
+
+    // Leaf view state
+    leaf_node_id: Option<String>,
+    leaf_content: Option<String>,
+    leaf_scroll_offset: u16,
+    leaf_focus: LeafFocus,  // Which section is focused: Content, Similar, or Edges
+
+    // Similar nodes (loaded on leaf view entry)
+    similar_nodes: Vec<SimilarNodeInfo>,
+    similar_selected: usize,
+
+    // Edges for current leaf
+    edges_for_node: Vec<(String, String, f64)>,  // (target_id, title, weight)
+    edges_selected: usize,
+
+    // Pins and recents
+    pinned_nodes: Vec<Node>,
+    recent_nodes: Vec<Node>,
+
+    // Search
     search_mode: bool,
     search_query: String,
-    search_results: Vec<usize>,
+    search_results: Vec<Node>,
+
+    // Edit mode
+    edit_buffer: String,
+    edit_cursor_line: usize,
+    edit_cursor_col: usize,
+    edit_scroll_offset: usize,
+    edit_dirty: bool,  // Track if content has been modified
+
+    // Status
     status_message: String,
+
+    // Date range for color gradient
+    date_min: i64,
+    date_max: i64,
 }
 
 impl TuiApp {
@@ -1860,14 +2620,37 @@ impl TuiApp {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         Self {
+            mode: TuiMode::Navigation,
             nodes: Vec::new(),
             visible_nodes: Vec::new(),
             list_state,
+            current_root_id: String::new(),
+            breadcrumb_path: Vec::new(),
+            nav_focus: NavFocus::Tree,
+            pins_selected: 0,
+            recents_selected: 0,
             selected_node: None,
+            leaf_node_id: None,
+            leaf_content: None,
+            leaf_scroll_offset: 0,
+            leaf_focus: LeafFocus::Content,
+            similar_nodes: Vec::new(),
+            similar_selected: 0,
+            edges_for_node: Vec::new(),
+            edges_selected: 0,
+            pinned_nodes: Vec::new(),
+            recent_nodes: Vec::new(),
             search_mode: false,
             search_query: String::new(),
             search_results: Vec::new(),
+            edit_buffer: String::new(),
+            edit_cursor_line: 0,
+            edit_cursor_col: 0,
+            edit_scroll_offset: 0,
+            edit_dirty: false,
             status_message: String::new(),
+            date_min: 0,
+            date_max: i64::MAX,
         }
     }
 
@@ -1877,24 +2660,426 @@ impl TuiApp {
 
         // Get universe as root
         if let Some(universe) = db.get_universe().map_err(|e| e.to_string())? {
-            self.nodes.push(TreeNode {
-                id: universe.id.clone(),
-                parent_id: None,
-                title: universe.title.clone(),
-                depth: 0,
-                child_count: universe.child_count,
-                is_item: false,
-                is_expanded: true,  // Start with root expanded
-                is_universe: true,
-                children_loaded: false,
-            });
+            // If no current root, start at Universe
+            if self.current_root_id.is_empty() {
+                self.current_root_id = universe.id.clone();
+                self.breadcrumb_path = vec![(universe.id.clone(), "Universe".to_string())];
+            }
 
-            // Load first level children
-            self.load_children_for_node(db, 0)?;
+            // Load children of current root directly (flat list, not tree)
+            let children = db.get_children(&self.current_root_id).map_err(|e| e.to_string())?;
+
+            // Calculate date range for color gradient
+            if !children.is_empty() {
+                self.date_min = children.iter()
+                    .map(|n| n.created_at)
+                    .min()
+                    .unwrap_or(0);
+                self.date_max = children.iter()
+                    .map(|n| n.latest_child_date.unwrap_or(n.created_at))
+                    .max()
+                    .unwrap_or(i64::MAX);
+            }
+
+            for child in children {
+                self.nodes.push(TreeNode {
+                    id: child.id.clone(),
+                    parent_id: Some(self.current_root_id.clone()),
+                    title: child.ai_title.clone().unwrap_or(child.title.clone()),
+                    emoji: child.emoji.clone(),
+                    depth: 0,  // Relative depth from current root
+                    child_count: child.child_count,
+                    is_item: child.is_item,
+                    is_expanded: false,
+                    is_universe: false,
+                    children_loaded: false,
+                    created_at: child.created_at,
+                });
+            }
         }
 
         self.update_visible_nodes();
+
+        // Load pins and recents
+        self.pinned_nodes = db.get_pinned_nodes().unwrap_or_default();
+        self.recent_nodes = db.get_recent_nodes(10).unwrap_or_default();
+
         Ok(())
+    }
+
+    /// CD into a cluster (make it the new root)
+    fn cd_into(&mut self, db: &Database, node_id: &str) -> Result<(), String> {
+        let node = db.get_node(node_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("Node not found")?;
+
+        // Add to breadcrumb
+        let title = node.ai_title.clone().unwrap_or(node.title.clone());
+        self.breadcrumb_path.push((node_id.to_string(), title));
+
+        // Set as new root
+        self.current_root_id = node_id.to_string();
+
+        // Reload tree from new root
+        self.nodes.clear();
+        self.list_state.select(Some(0));
+
+        let children = db.get_children(node_id).map_err(|e| e.to_string())?;
+
+        // Update date range
+        if !children.is_empty() {
+            self.date_min = children.iter().map(|n| n.created_at).min().unwrap_or(0);
+            self.date_max = children.iter()
+                .map(|n| n.latest_child_date.unwrap_or(n.created_at))
+                .max()
+                .unwrap_or(i64::MAX);
+        }
+
+        for child in children {
+            self.nodes.push(TreeNode {
+                id: child.id.clone(),
+                parent_id: Some(node_id.to_string()),
+                title: child.ai_title.clone().unwrap_or(child.title.clone()),
+                emoji: child.emoji.clone(),
+                depth: 0,
+                child_count: child.child_count,
+                is_item: child.is_item,
+                is_expanded: false,
+                is_universe: false,
+                children_loaded: false,
+                created_at: child.created_at,
+            });
+        }
+
+        self.update_visible_nodes();
+        self.status_message = format!("Entered {} ({} items)",
+            self.breadcrumb_path.last().map(|(_, t)| t.as_str()).unwrap_or("?"),
+            self.nodes.len()
+        );
+        Ok(())
+    }
+
+    /// Go up one level (cd ..)
+    fn cd_up(&mut self, db: &Database) -> Result<(), String> {
+        if self.breadcrumb_path.len() <= 1 {
+            self.status_message = "Already at root".to_string();
+            return Ok(());
+        }
+
+        // Remove current from breadcrumb
+        self.breadcrumb_path.pop();
+
+        // Get parent ID
+        let parent_id = self.breadcrumb_path.last()
+            .map(|(id, _)| id.clone())
+            .unwrap_or_default();
+
+        self.current_root_id = parent_id.clone();
+
+        // Reload tree from parent
+        self.nodes.clear();
+        self.list_state.select(Some(0));
+
+        let children = db.get_children(&parent_id).map_err(|e| e.to_string())?;
+
+        for child in children {
+            self.nodes.push(TreeNode {
+                id: child.id.clone(),
+                parent_id: Some(parent_id.clone()),
+                title: child.ai_title.clone().unwrap_or(child.title.clone()),
+                emoji: child.emoji.clone(),
+                depth: 0,
+                child_count: child.child_count,
+                is_item: child.is_item,
+                is_expanded: false,
+                is_universe: false,
+                children_loaded: false,
+                created_at: child.created_at,
+            });
+        }
+
+        self.update_visible_nodes();
+        self.status_message = format!("Back to {} ({} items)",
+            self.breadcrumb_path.last().map(|(_, t)| t.as_str()).unwrap_or("Universe"),
+            self.nodes.len()
+        );
+        Ok(())
+    }
+
+    /// Enter leaf view mode for an item
+    fn enter_leaf_view(&mut self, db: &Database, node_id: &str) -> Result<(), String> {
+        let node = db.get_node(node_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("Node not found")?;
+
+        self.mode = TuiMode::LeafView;
+        self.leaf_node_id = Some(node_id.to_string());
+        self.leaf_content = node.content.clone();
+        self.leaf_scroll_offset = 0;
+        self.leaf_focus = LeafFocus::Content;
+        self.edges_selected = 0;
+        self.similar_nodes.clear();
+        self.similar_selected = 0;
+
+        // Store selected node for header display
+        self.selected_node = Some(node.clone());
+
+        // Load similar nodes using embeddings
+        if let Some(target_emb) = db.get_node_embedding(node_id).ok().flatten() {
+            if let Ok(all_embeddings) = db.get_nodes_with_embeddings() {
+                let similar = similarity::find_similar(&target_emb, &all_embeddings, node_id, 15, 0.5);
+
+                for (sim_id, score) in similar {
+                    if let Ok(Some(sim_node)) = db.get_node(&sim_id) {
+                        // Get parent title for grouping display
+                        let parent_title = if let Some(ref pid) = sim_node.parent_id {
+                            db.get_node(pid).ok().flatten().map(|p| p.ai_title.unwrap_or(p.title))
+                        } else {
+                            None
+                        };
+
+                        self.similar_nodes.push(SimilarNodeInfo {
+                            id: sim_id,
+                            title: sim_node.ai_title.unwrap_or(sim_node.title),
+                            emoji: sim_node.emoji,
+                            similarity: score,
+                            parent_title,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Load edges for this node
+        self.edges_for_node.clear();
+        if let Ok(edges) = db.get_edges_for_node(node_id) {
+            for edge in edges {
+                let target_id = if edge.source == node_id { &edge.target } else { &edge.source };
+                if let Ok(Some(target)) = db.get_node(target_id) {
+                    let title = target.ai_title.unwrap_or(target.title);
+                    let weight = edge.weight.unwrap_or(0.0);
+                    self.edges_for_node.push((target_id.to_string(), title, weight));
+                }
+            }
+        }
+
+        // Touch node to update recent
+        let _ = db.touch_node(node_id);
+
+        // Reload recents
+        self.recent_nodes = db.get_recent_nodes(10).unwrap_or_default();
+
+        self.status_message = format!("Viewing: {} ({} similar) [q/Esc to go back]",
+            node.ai_title.unwrap_or(node.title),
+            self.similar_nodes.len());
+        Ok(())
+    }
+
+    /// Exit leaf view, return to navigation
+    fn exit_leaf_view(&mut self) {
+        self.mode = TuiMode::Navigation;
+        self.leaf_node_id = None;
+        self.leaf_content = None;
+        self.similar_nodes.clear();
+        self.edges_for_node.clear();
+        self.status_message = "Back to navigation".to_string();
+    }
+
+    /// Enter edit mode from leaf view
+    fn enter_edit_mode(&mut self) {
+        if let Some(ref content) = self.leaf_content {
+            self.edit_buffer = content.clone();
+        } else {
+            self.edit_buffer = String::new();
+        }
+        self.edit_cursor_line = 0;
+        self.edit_cursor_col = 0;
+        self.edit_scroll_offset = 0;
+        self.edit_dirty = false;
+        self.mode = TuiMode::Edit;
+        self.status_message = "Edit mode: Ctrl+S save, Esc cancel".to_string();
+    }
+
+    /// Save edited content and return to leaf view
+    fn save_edit(&mut self, db: &Database) -> Result<(), String> {
+        if let Some(ref node_id) = self.leaf_node_id {
+            db.update_node_content(node_id, &self.edit_buffer)
+                .map_err(|e| e.to_string())?;
+
+            // Update the leaf content with saved buffer
+            self.leaf_content = Some(self.edit_buffer.clone());
+            self.leaf_scroll_offset = 0;
+            self.mode = TuiMode::LeafView;
+            self.edit_dirty = false;
+            self.status_message = "Content saved".to_string();
+            Ok(())
+        } else {
+            Err("No node to save".to_string())
+        }
+    }
+
+    /// Cancel edit and return to leaf view
+    fn cancel_edit(&mut self) {
+        let was_dirty = self.edit_dirty;
+        self.mode = TuiMode::LeafView;
+        self.edit_buffer.clear();
+        self.edit_dirty = false;
+        self.status_message = if was_dirty {
+            "Edit cancelled (changes discarded)".to_string()
+        } else {
+            "Edit cancelled".to_string()
+        };
+    }
+
+    /// Get the lines of the edit buffer
+    fn edit_lines(&self) -> Vec<&str> {
+        self.edit_buffer.lines().collect()
+    }
+
+    /// Get total line count in edit buffer
+    fn edit_line_count(&self) -> usize {
+        self.edit_buffer.lines().count().max(1)
+    }
+
+    /// Get the current line content
+    fn current_edit_line(&self) -> &str {
+        self.edit_buffer.lines().nth(self.edit_cursor_line).unwrap_or("")
+    }
+
+    /// Insert a character at cursor position
+    fn edit_insert_char(&mut self, c: char) {
+        let byte_pos = self.cursor_byte_position();
+        self.edit_buffer.insert(byte_pos, c);
+        if c == '\n' {
+            self.edit_cursor_line += 1;
+            self.edit_cursor_col = 0;
+        } else {
+            self.edit_cursor_col += 1;
+        }
+        self.edit_dirty = true;
+    }
+
+    /// Delete character before cursor (backspace)
+    fn edit_backspace(&mut self) {
+        if self.edit_cursor_col > 0 {
+            // Delete character before cursor on current line
+            let byte_pos = self.cursor_byte_position();
+            if byte_pos > 0 {
+                // Find the byte position of the previous character
+                let prev_char_start = self.edit_buffer[..byte_pos]
+                    .char_indices()
+                    .last()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                self.edit_buffer.remove(prev_char_start);
+                self.edit_cursor_col = self.edit_cursor_col.saturating_sub(1);
+                self.edit_dirty = true;
+            }
+        } else if self.edit_cursor_line > 0 {
+            // At start of line, merge with previous line
+            let byte_pos = self.cursor_byte_position();
+            if byte_pos > 0 {
+                // Remove the newline before current position
+                self.edit_buffer.remove(byte_pos - 1);
+                self.edit_cursor_line -= 1;
+                // Set cursor to end of the now-merged line
+                self.edit_cursor_col = self.edit_buffer
+                    .lines()
+                    .nth(self.edit_cursor_line)
+                    .map(|l| l.chars().count())
+                    .unwrap_or(0);
+                self.edit_dirty = true;
+            }
+        }
+    }
+
+    /// Delete character at cursor (delete key)
+    fn edit_delete(&mut self) {
+        let byte_pos = self.cursor_byte_position();
+        if byte_pos < self.edit_buffer.len() {
+            self.edit_buffer.remove(byte_pos);
+            self.edit_dirty = true;
+        }
+    }
+
+    /// Move cursor left
+    fn edit_cursor_left(&mut self) {
+        if self.edit_cursor_col > 0 {
+            self.edit_cursor_col -= 1;
+        } else if self.edit_cursor_line > 0 {
+            self.edit_cursor_line -= 1;
+            self.edit_cursor_col = self.current_edit_line().chars().count();
+        }
+    }
+
+    /// Move cursor right
+    fn edit_cursor_right(&mut self) {
+        let line_len = self.current_edit_line().chars().count();
+        if self.edit_cursor_col < line_len {
+            self.edit_cursor_col += 1;
+        } else if self.edit_cursor_line < self.edit_line_count().saturating_sub(1) {
+            self.edit_cursor_line += 1;
+            self.edit_cursor_col = 0;
+        }
+    }
+
+    /// Move cursor up
+    fn edit_cursor_up(&mut self) {
+        if self.edit_cursor_line > 0 {
+            self.edit_cursor_line -= 1;
+            // Clamp column to line length
+            let line_len = self.current_edit_line().chars().count();
+            self.edit_cursor_col = self.edit_cursor_col.min(line_len);
+        }
+    }
+
+    /// Move cursor down
+    fn edit_cursor_down(&mut self) {
+        let line_count = self.edit_line_count();
+        if self.edit_cursor_line < line_count.saturating_sub(1) {
+            self.edit_cursor_line += 1;
+            // Clamp column to line length
+            let line_len = self.current_edit_line().chars().count();
+            self.edit_cursor_col = self.edit_cursor_col.min(line_len);
+        }
+    }
+
+    /// Move cursor to start of line
+    fn edit_cursor_home(&mut self) {
+        self.edit_cursor_col = 0;
+    }
+
+    /// Move cursor to end of line
+    fn edit_cursor_end(&mut self) {
+        self.edit_cursor_col = self.current_edit_line().chars().count();
+    }
+
+    /// Calculate byte position from line/col
+    fn cursor_byte_position(&self) -> usize {
+        let mut byte_pos = 0;
+        for (line_idx, line) in self.edit_buffer.lines().enumerate() {
+            if line_idx == self.edit_cursor_line {
+                // Add bytes up to cursor column
+                for (col, c) in line.chars().enumerate() {
+                    if col >= self.edit_cursor_col {
+                        break;
+                    }
+                    byte_pos += c.len_utf8();
+                }
+                return byte_pos;
+            }
+            byte_pos += line.len() + 1; // +1 for newline
+        }
+        self.edit_buffer.len()
+    }
+
+    /// Update scroll offset to keep cursor visible
+    fn edit_ensure_cursor_visible(&mut self, visible_lines: usize) {
+        if self.edit_cursor_line < self.edit_scroll_offset {
+            self.edit_scroll_offset = self.edit_cursor_line;
+        } else if self.edit_cursor_line >= self.edit_scroll_offset + visible_lines {
+            self.edit_scroll_offset = self.edit_cursor_line.saturating_sub(visible_lines) + 1;
+        }
     }
 
     fn load_children_for_node(&mut self, db: &Database, node_idx: usize) -> Result<(), String> {
@@ -1913,12 +3098,14 @@ impl TuiApp {
                 id: child.id.clone(),
                 parent_id: Some(parent_id.clone()),
                 title: child.ai_title.clone().unwrap_or(child.title.clone()),
+                emoji: child.emoji.clone(),
                 depth: child.depth,
                 child_count: child.child_count,
                 is_item: child.is_item,
                 is_expanded: false,
                 is_universe: false,
                 children_loaded: false,
+                created_at: child.created_at,
             });
         }
 
@@ -1929,6 +3116,9 @@ impl TuiApp {
     fn update_visible_nodes(&mut self) {
         self.visible_nodes.clear();
 
+        // With CD-style navigation, all direct children of current_root are at depth 0
+        // They are always visible. Only their expanded children need ancestor checking.
+
         // Build set of expanded node IDs for quick lookup
         let expanded_ids: std::collections::HashSet<String> = self.nodes.iter()
             .filter(|n| n.is_expanded)
@@ -1936,13 +3126,13 @@ impl TuiApp {
             .collect();
 
         for (idx, node) in self.nodes.iter().enumerate() {
-            // Always show root (universe)
-            if node.parent_id.is_none() {
+            // Depth 0 nodes are direct children of current root - always visible
+            if node.depth == 0 {
                 self.visible_nodes.push(idx);
                 continue;
             }
 
-            // Check if all ancestors are expanded
+            // For deeper nodes, check if all ancestors are expanded
             if self.is_ancestor_chain_expanded(idx, &expanded_ids) {
                 self.visible_nodes.push(idx);
             }
@@ -1954,15 +3144,17 @@ impl TuiApp {
 
         // Check if parent is expanded
         if let Some(ref parent_id) = node.parent_id {
+            // If parent is the current root, it's implicitly expanded
+            if *parent_id == self.current_root_id {
+                return true;
+            }
+
             if !expanded_ids.contains(parent_id) {
                 return false;
             }
             // Recursively check parent's ancestors
             for (i, n) in self.nodes.iter().enumerate() {
                 if n.id == *parent_id {
-                    if n.parent_id.is_none() {
-                        return true; // Reached root, which is always visible
-                    }
                     return self.is_ancestor_chain_expanded(i, expanded_ids);
                 }
             }
@@ -2059,8 +3251,10 @@ fn run_tui_loop(
     db: &Database,
 ) -> Result<(), String> {
     loop {
-        // Update selected node details
-        app.selected_node = app.get_selected_node(db);
+        // Update selected node details (only in Navigation mode)
+        if app.mode == TuiMode::Navigation && !app.search_mode {
+            app.selected_node = app.get_selected_node(db);
+        }
 
         // Draw UI
         terminal.draw(|f| draw_ui(f, app)).map_err(|e| e.to_string())?;
@@ -2072,6 +3266,7 @@ fn run_tui_loop(
                     continue;
                 }
 
+                // Handle search mode (overlay on Navigation)
                 if app.search_mode {
                     match key.code {
                         KeyCode::Esc => {
@@ -2085,7 +3280,8 @@ fn run_tui_loop(
                             if !app.search_query.is_empty() {
                                 if let Ok(results) = db.search_nodes(&app.search_query) {
                                     app.status_message = format!("Found {} results for '{}'", results.len(), app.search_query);
-                                    // Jump to first result if found
+                                    app.search_results = results.clone();
+                                    // Jump to first result if found in current view
                                     if let Some(first) = results.first() {
                                         for (i, &idx) in app.visible_nodes.iter().enumerate() {
                                             if app.nodes[idx].id == first.id {
@@ -2106,46 +3302,527 @@ fn run_tui_loop(
                         }
                         _ => {}
                     }
-                } else {
-                    match key.code {
-                        KeyCode::Char('q') => return Ok(()),
-                        KeyCode::Char('j') | KeyCode::Down => app.select_next(),
-                        KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
-                        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => app.toggle_expand(db),
-                        KeyCode::Char('h') | KeyCode::Left => {
-                            // Collapse current node
-                            if let Some(selected) = app.list_state.selected() {
-                                if selected < app.visible_nodes.len() {
-                                    let node_idx = app.visible_nodes[selected];
-                                    if app.nodes[node_idx].is_expanded {
-                                        app.nodes[node_idx].is_expanded = false;
-                                        app.update_visible_nodes();
+                    continue;
+                }
+
+                // Handle input based on current mode
+                match app.mode {
+                    TuiMode::Navigation => {
+                        match key.code {
+                            KeyCode::Char('q') => return Ok(()),
+
+                            // Tab: Cycle focus between Tree → Pins → Recents
+                            KeyCode::Tab => {
+                                app.nav_focus = match app.nav_focus {
+                                    NavFocus::Tree => NavFocus::Pins,
+                                    NavFocus::Pins => NavFocus::Recents,
+                                    NavFocus::Recents => NavFocus::Tree,
+                                };
+                                app.status_message = match app.nav_focus {
+                                    NavFocus::Tree => "Focus: Tree".to_string(),
+                                    NavFocus::Pins => "Focus: Pins".to_string(),
+                                    NavFocus::Recents => "Focus: Recents".to_string(),
+                                };
+                            }
+                            // Shift+Tab: Cycle focus in reverse
+                            KeyCode::BackTab => {
+                                app.nav_focus = match app.nav_focus {
+                                    NavFocus::Tree => NavFocus::Recents,
+                                    NavFocus::Pins => NavFocus::Tree,
+                                    NavFocus::Recents => NavFocus::Pins,
+                                };
+                                app.status_message = match app.nav_focus {
+                                    NavFocus::Tree => "Focus: Tree".to_string(),
+                                    NavFocus::Pins => "Focus: Pins".to_string(),
+                                    NavFocus::Recents => "Focus: Recents".to_string(),
+                                };
+                            }
+
+                            // j/k: Navigate in focused pane
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                match app.nav_focus {
+                                    NavFocus::Tree => app.select_next(),
+                                    NavFocus::Pins => {
+                                        if !app.pinned_nodes.is_empty() {
+                                            app.pins_selected = (app.pins_selected + 1).min(app.pinned_nodes.len() - 1);
+                                        }
+                                    }
+                                    NavFocus::Recents => {
+                                        if !app.recent_nodes.is_empty() {
+                                            app.recents_selected = (app.recents_selected + 1).min(app.recent_nodes.len() - 1);
+                                        }
                                     }
                                 }
                             }
-                        }
-                        KeyCode::Char('/') => {
-                            app.search_mode = true;
-                            app.search_query.clear();
-                            app.status_message = "Search: ".to_string();
-                        }
-                        KeyCode::Char('?') => {
-                            app.status_message = "j/k:up/down  Enter/l:expand  h:collapse  /:search  q:quit".to_string();
-                        }
-                        KeyCode::Char('g') => {
-                            app.list_state.select(Some(0));
-                        }
-                        KeyCode::Char('G') => {
-                            if !app.visible_nodes.is_empty() {
-                                app.list_state.select(Some(app.visible_nodes.len() - 1));
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                match app.nav_focus {
+                                    NavFocus::Tree => app.select_prev(),
+                                    NavFocus::Pins => {
+                                        app.pins_selected = app.pins_selected.saturating_sub(1);
+                                    }
+                                    NavFocus::Recents => {
+                                        app.recents_selected = app.recents_selected.saturating_sub(1);
+                                    }
+                                }
                             }
+
+                            // Enter: Action depends on focused pane
+                            KeyCode::Enter => {
+                                match app.nav_focus {
+                                    NavFocus::Tree => {
+                                        if let Some(selected) = app.list_state.selected() {
+                                            if selected < app.visible_nodes.len() {
+                                                let node_idx = app.visible_nodes[selected];
+                                                let node = &app.nodes[node_idx];
+
+                                                if node.is_item {
+                                                    let node_id = node.id.clone();
+                                                    if let Err(e) = app.enter_leaf_view(db, &node_id) {
+                                                        app.status_message = format!("Error: {}", e);
+                                                    }
+                                                } else if node.child_count > 0 {
+                                                    let node_id = node.id.clone();
+                                                    if let Err(e) = app.cd_into(db, &node_id) {
+                                                        app.status_message = format!("Error: {}", e);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    NavFocus::Pins => {
+                                        if app.pins_selected < app.pinned_nodes.len() {
+                                            let node = &app.pinned_nodes[app.pins_selected];
+                                            let node_id = node.id.clone();
+                                            let is_item = node.is_item;
+                                            if is_item {
+                                                if let Err(e) = app.enter_leaf_view(db, &node_id) {
+                                                    app.status_message = format!("Error: {}", e);
+                                                }
+                                            } else {
+                                                if let Err(e) = app.cd_into(db, &node_id) {
+                                                    app.status_message = format!("Error: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    NavFocus::Recents => {
+                                        if app.recents_selected < app.recent_nodes.len() {
+                                            let node = &app.recent_nodes[app.recents_selected];
+                                            let node_id = node.id.clone();
+                                            let is_item = node.is_item;
+                                            if is_item {
+                                                if let Err(e) = app.enter_leaf_view(db, &node_id) {
+                                                    app.status_message = format!("Error: {}", e);
+                                                }
+                                            } else {
+                                                if let Err(e) = app.cd_into(db, &node_id) {
+                                                    app.status_message = format!("Error: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // l/Right: Expand children inline (toggle) - only in Tree focus
+                            KeyCode::Char('l') | KeyCode::Right => {
+                                if app.nav_focus == NavFocus::Tree {
+                                    app.toggle_expand(db);
+                                }
+                            }
+
+                            // h/Left: Collapse children - only in Tree focus
+                            KeyCode::Char('h') | KeyCode::Left => {
+                                if app.nav_focus == NavFocus::Tree {
+                                    if let Some(selected) = app.list_state.selected() {
+                                        if selected < app.visible_nodes.len() {
+                                            let node_idx = app.visible_nodes[selected];
+                                            if app.nodes[node_idx].is_expanded {
+                                                app.nodes[node_idx].is_expanded = false;
+                                                app.update_visible_nodes();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Backspace/-: Go up one level (cd ..)
+                            KeyCode::Backspace | KeyCode::Char('-') => {
+                                if let Err(e) = app.cd_up(db) {
+                                    app.status_message = format!("Error: {}", e);
+                                }
+                            }
+
+                            KeyCode::Char('/') => {
+                                app.search_mode = true;
+                                app.search_query.clear();
+                                app.status_message = "Search: ".to_string();
+                            }
+                            KeyCode::Char('?') => {
+                                app.status_message = "Tab:focus  Enter:cd/view  l:expand  h:collapse  -:up  /:search  q:quit".to_string();
+                            }
+                            KeyCode::Char('g') => {
+                                match app.nav_focus {
+                                    NavFocus::Tree => app.list_state.select(Some(0)),
+                                    NavFocus::Pins => app.pins_selected = 0,
+                                    NavFocus::Recents => app.recents_selected = 0,
+                                }
+                            }
+                            KeyCode::Char('G') => {
+                                match app.nav_focus {
+                                    NavFocus::Tree => {
+                                        if !app.visible_nodes.is_empty() {
+                                            app.list_state.select(Some(app.visible_nodes.len() - 1));
+                                        }
+                                    }
+                                    NavFocus::Pins => {
+                                        if !app.pinned_nodes.is_empty() {
+                                            app.pins_selected = app.pinned_nodes.len() - 1;
+                                        }
+                                    }
+                                    NavFocus::Recents => {
+                                        if !app.recent_nodes.is_empty() {
+                                            app.recents_selected = app.recent_nodes.len() - 1;
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char('r') => {
+                                let _ = app.load_tree(db);
+                                app.status_message = format!("Reloaded {} nodes", app.nodes.len());
+                            }
+                            KeyCode::Char('p') => {
+                                // Toggle pin for selected node (works in any focus)
+                                if let Some(ref node) = app.selected_node {
+                                    let new_pinned = !node.is_pinned;
+                                    if db.set_node_pinned(&node.id, new_pinned).is_ok() {
+                                        app.pinned_nodes = db.get_pinned_nodes().unwrap_or_default();
+                                        app.status_message = if new_pinned {
+                                            format!("Pinned: {}", node.ai_title.as_ref().unwrap_or(&node.title))
+                                        } else {
+                                            format!("Unpinned: {}", node.ai_title.as_ref().unwrap_or(&node.title))
+                                        };
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        KeyCode::Char('r') => {
-                            // Reload tree
-                            let _ = app.load_tree(db);
-                            app.status_message = format!("Reloaded {} nodes", app.nodes.len());
+                    }
+
+                    TuiMode::LeafView => {
+                        match key.code {
+                            // q/Esc: Back to navigation
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                app.exit_leaf_view();
+                            }
+
+                            // j/k: Scroll content OR navigate in sidebar based on focus
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                match app.leaf_focus {
+                                    LeafFocus::Content => {
+                                        // Calculate visual line count for bounds checking
+                                        if let Some(content) = &app.leaf_content {
+                                            let size = terminal.size().unwrap_or(ratatui::layout::Rect::new(0, 0, 80, 24));
+                                            let visible_lines = size.height.saturating_sub(5) as usize;
+                                            // Content width: 60% of terminal - borders(2)
+                                            let content_width = ((size.width as usize * 60) / 100).saturating_sub(2).max(1);
+
+                                            // Calculate total visual lines after wrapping
+                                            let total_visual_lines: usize = content.lines()
+                                                .map(|line| {
+                                                    let len = line.chars().count();
+                                                    if len == 0 { 1 } else { (len + content_width - 1) / content_width }
+                                                })
+                                                .sum();
+
+                                            // Only scroll if there's more content below
+                                            let max_scroll = total_visual_lines.saturating_sub(visible_lines);
+                                            if (app.leaf_scroll_offset as usize) < max_scroll {
+                                                app.leaf_scroll_offset = app.leaf_scroll_offset.saturating_add(1);
+                                            }
+                                        }
+                                    }
+                                    LeafFocus::Similar => {
+                                        if !app.similar_nodes.is_empty() {
+                                            app.similar_selected = (app.similar_selected + 1).min(app.similar_nodes.len() - 1);
+                                        }
+                                    }
+                                    LeafFocus::Edges => {
+                                        if !app.edges_for_node.is_empty() {
+                                            app.edges_selected = (app.edges_selected + 1).min(app.edges_for_node.len() - 1);
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                match app.leaf_focus {
+                                    LeafFocus::Content => {
+                                        app.leaf_scroll_offset = app.leaf_scroll_offset.saturating_sub(1);
+                                    }
+                                    LeafFocus::Similar => {
+                                        app.similar_selected = app.similar_selected.saturating_sub(1);
+                                    }
+                                    LeafFocus::Edges => {
+                                        app.edges_selected = app.edges_selected.saturating_sub(1);
+                                    }
+                                }
+                            }
+
+                            // Page down/up (only in Content focus)
+                            KeyCode::Char('d') => {
+                                if app.leaf_focus == LeafFocus::Content {
+                                    if let Some(content) = &app.leaf_content {
+                                        let size = terminal.size().unwrap_or(ratatui::layout::Rect::new(0, 0, 80, 24));
+                                        let visible_lines = size.height.saturating_sub(5) as usize;
+                                        let content_width = ((size.width as usize * 60) / 100).saturating_sub(2).max(1);
+
+                                        let total_visual_lines: usize = content.lines()
+                                            .map(|line| {
+                                                let len = line.chars().count();
+                                                if len == 0 { 1 } else { (len + content_width - 1) / content_width }
+                                            })
+                                            .sum();
+
+                                        let max_scroll = total_visual_lines.saturating_sub(visible_lines);
+                                        let new_offset = (app.leaf_scroll_offset as usize).saturating_add(visible_lines / 2).min(max_scroll);
+                                        app.leaf_scroll_offset = new_offset as u16;
+                                    }
+                                }
+                            }
+                            KeyCode::Char('u') => {
+                                if app.leaf_focus == LeafFocus::Content {
+                                    let size = terminal.size().unwrap_or(ratatui::layout::Rect::new(0, 0, 80, 24));
+                                    let visible_lines = size.height.saturating_sub(5) as usize;
+                                    app.leaf_scroll_offset = app.leaf_scroll_offset.saturating_sub(visible_lines as u16 / 2);
+                                }
+                            }
+
+                            // Tab: Cycle focus Content → Similar → Edges
+                            KeyCode::Tab => {
+                                app.leaf_focus = match app.leaf_focus {
+                                    LeafFocus::Content => LeafFocus::Similar,
+                                    LeafFocus::Similar => LeafFocus::Edges,
+                                    LeafFocus::Edges => LeafFocus::Content,
+                                };
+                                app.status_message = match app.leaf_focus {
+                                    LeafFocus::Content => "Focus: Content".to_string(),
+                                    LeafFocus::Similar => "Focus: Similar".to_string(),
+                                    LeafFocus::Edges => "Focus: Edges".to_string(),
+                                };
+                            }
+                            // Shift+Tab: Cycle focus in reverse
+                            KeyCode::BackTab => {
+                                app.leaf_focus = match app.leaf_focus {
+                                    LeafFocus::Content => LeafFocus::Edges,
+                                    LeafFocus::Similar => LeafFocus::Content,
+                                    LeafFocus::Edges => LeafFocus::Similar,
+                                };
+                                app.status_message = match app.leaf_focus {
+                                    LeafFocus::Content => "Focus: Content".to_string(),
+                                    LeafFocus::Similar => "Focus: Similar".to_string(),
+                                    LeafFocus::Edges => "Focus: Edges".to_string(),
+                                };
+                            }
+
+                            // n/N: Navigate similar nodes (quick access from any focus)
+                            KeyCode::Char('n') => {
+                                if !app.similar_nodes.is_empty() {
+                                    app.similar_selected = (app.similar_selected + 1) % app.similar_nodes.len();
+                                }
+                            }
+                            KeyCode::Char('N') => {
+                                if !app.similar_nodes.is_empty() {
+                                    app.similar_selected = if app.similar_selected == 0 {
+                                        app.similar_nodes.len() - 1
+                                    } else {
+                                        app.similar_selected - 1
+                                    };
+                                }
+                            }
+
+                            // Enter: Navigate to selected similar/edge node
+                            KeyCode::Enter => {
+                                let target_id = match app.leaf_focus {
+                                    LeafFocus::Similar if !app.similar_nodes.is_empty() => {
+                                        Some(app.similar_nodes[app.similar_selected].id.clone())
+                                    }
+                                    LeafFocus::Edges if !app.edges_for_node.is_empty() => {
+                                        Some(app.edges_for_node[app.edges_selected].0.clone())
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(id) = target_id {
+                                    app.exit_leaf_view();
+                                    if let Err(e) = app.enter_leaf_view(db, &id) {
+                                        app.status_message = format!("Error: {}", e);
+                                    }
+                                }
+                            }
+
+                            // e: Enter edit mode
+                            KeyCode::Char('e') => {
+                                app.enter_edit_mode();
+                            }
+
+                            // v: View PDF in external viewer
+                            KeyCode::Char('v') => {
+                                if let Some(ref node) = app.selected_node {
+                                    if node.pdf_available == Some(true) {
+                                        match db.get_paper_document(&node.id) {
+                                            Ok(Some((doc_data, format))) => {
+                                                let title = node.ai_title.as_ref().unwrap_or(&node.title);
+                                                let safe_name: String = title.chars()
+                                                    .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
+                                                    .take(50)
+                                                    .collect();
+                                                let safe_name = safe_name.trim().replace(' ', "_");
+
+                                                let temp_dir = std::env::temp_dir();
+                                                let file_path = temp_dir.join(format!("{}.{}", safe_name, format));
+
+                                                match std::fs::File::create(&file_path) {
+                                                    Ok(mut file) => {
+                                                        if let Err(e) = file.write_all(&doc_data) {
+                                                            app.status_message = format!("Failed to write temp file: {}", e);
+                                                        } else {
+                                                            #[cfg(target_os = "linux")]
+                                                            let result = std::process::Command::new("xdg-open")
+                                                                .arg(&file_path)
+                                                                .spawn();
+                                                            #[cfg(target_os = "macos")]
+                                                            let result = std::process::Command::new("open")
+                                                                .arg(&file_path)
+                                                                .spawn();
+                                                            #[cfg(target_os = "windows")]
+                                                            let result = std::process::Command::new("cmd")
+                                                                .args(["/C", "start", "", &file_path.to_string_lossy()])
+                                                                .spawn();
+
+                                                            match result {
+                                                                Ok(_) => app.status_message = format!("Opening {}...", format.to_uppercase()),
+                                                                Err(e) => app.status_message = format!("Failed to open viewer: {}", e),
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => app.status_message = format!("Failed to create temp file: {}", e),
+                                                }
+                                            }
+                                            Ok(None) => app.status_message = "PDF not available (not downloaded)".to_string(),
+                                            Err(e) => app.status_message = format!("Database error: {}", e),
+                                        }
+                                    } else {
+                                        app.status_message = "No PDF available for this paper".to_string();
+                                    }
+                                }
+                            }
+
+                            // o: Open URL in browser
+                            KeyCode::Char('o') => {
+                                if let Some(ref node) = app.selected_node {
+                                    if let Some(ref url) = node.url {
+                                        #[cfg(target_os = "linux")]
+                                        let result = std::process::Command::new("xdg-open")
+                                            .arg(url)
+                                            .spawn();
+                                        #[cfg(target_os = "macos")]
+                                        let result = std::process::Command::new("open")
+                                            .arg(url)
+                                            .spawn();
+                                        #[cfg(target_os = "windows")]
+                                        let result = std::process::Command::new("cmd")
+                                            .args(["/C", "start", "", url])
+                                            .spawn();
+
+                                        match result {
+                                            Ok(_) => app.status_message = format!("Opening {}...", url),
+                                            Err(e) => app.status_message = format!("Failed to open browser: {}", e),
+                                        }
+                                    } else {
+                                        app.status_message = "No URL available for this node".to_string();
+                                    }
+                                }
+                            }
+
+                            KeyCode::Char('?') => {
+                                app.status_message = "Tab:focus  j/k:nav  v:pdf  o:url  e:edit  n/N:similar  Enter:goto  q:back".to_string();
+                            }
+                            _ => {}
                         }
-                        _ => {}
+                    }
+
+                    TuiMode::Edit => {
+                        use crossterm::event::KeyModifiers;
+
+                        match key.code {
+                            // Ctrl+S: Save
+                            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                if let Err(e) = app.save_edit(db) {
+                                    app.status_message = format!("Save error: {}", e);
+                                }
+                            }
+
+                            // Esc: Cancel edit
+                            KeyCode::Esc => {
+                                app.cancel_edit();
+                            }
+
+                            // Arrow keys: Move cursor
+                            KeyCode::Left => app.edit_cursor_left(),
+                            KeyCode::Right => app.edit_cursor_right(),
+                            KeyCode::Up => app.edit_cursor_up(),
+                            KeyCode::Down => app.edit_cursor_down(),
+
+                            // Home/End: Jump to line start/end
+                            KeyCode::Home => app.edit_cursor_home(),
+                            KeyCode::End => app.edit_cursor_end(),
+
+                            // Backspace: Delete character before cursor
+                            KeyCode::Backspace => app.edit_backspace(),
+
+                            // Delete: Delete character at cursor
+                            KeyCode::Delete => app.edit_delete(),
+
+                            // Enter: Insert newline
+                            KeyCode::Enter => app.edit_insert_char('\n'),
+
+                            // Tab: Insert 4 spaces (or actual tab)
+                            KeyCode::Tab => {
+                                for _ in 0..4 {
+                                    app.edit_insert_char(' ');
+                                }
+                            }
+
+                            // Regular character input
+                            KeyCode::Char(c) => {
+                                app.edit_insert_char(c);
+                            }
+
+                            _ => {}
+                        }
+
+                        // Keep cursor visible (estimate ~20 visible lines)
+                        let visible_lines = 20;
+                        app.edit_ensure_cursor_visible(visible_lines);
+
+                        // Update status with cursor position
+                        let dirty_marker = if app.edit_dirty { " [modified]" } else { "" };
+                        app.status_message = format!(
+                            "Edit mode: Ln {}, Col {} {} | Ctrl+S save, Esc cancel",
+                            app.edit_cursor_line + 1,
+                            app.edit_cursor_col + 1,
+                            dirty_marker
+                        );
+                    }
+
+                    // Other modes (Maintenance, Settings, Jobs) - placeholder
+                    _ => {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                app.mode = TuiMode::Navigation;
+                                app.status_message = "Back to navigation".to_string();
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -2154,27 +3831,45 @@ fn run_tui_loop(
 }
 
 fn draw_ui(f: &mut Frame, app: &TuiApp) {
+    match app.mode {
+        TuiMode::Navigation => draw_navigation_mode(f, app),
+        TuiMode::LeafView => draw_leaf_view_mode(f, app),
+        TuiMode::Edit => draw_edit_mode(f, app),
+        _ => draw_navigation_mode(f, app), // Fallback for unimplemented modes
+    }
+}
+
+fn draw_navigation_mode(f: &mut Frame, app: &TuiApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),
-            Constraint::Length(1),
+            Constraint::Length(1),  // Breadcrumb bar
+            Constraint::Min(0),     // Main content
+            Constraint::Length(1),  // Status bar
         ])
         .split(f.size());
 
+    // Breadcrumb bar
+    draw_breadcrumb(f, app, chunks[0]);
+
+    // 3-column layout: Tree (50%) | Pins+Recents (25%) | Preview (25%)
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(40),
-            Constraint::Percentage(60),
+            Constraint::Percentage(50),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
         ])
-        .split(chunks[0]);
+        .split(chunks[1]);
 
     // Tree view
     draw_tree(f, app, main_chunks[0]);
 
-    // Detail pane
-    draw_detail(f, app, main_chunks[1]);
+    // Pins + Recents pane
+    draw_pins_recents(f, app, main_chunks[1]);
+
+    // Preview pane
+    draw_preview(f, app, main_chunks[2]);
 
     // Status bar
     let status = if app.search_mode {
@@ -2184,60 +3879,99 @@ fn draw_ui(f: &mut Frame, app: &TuiApp) {
     };
     let status_bar = Paragraph::new(status)
         .style(Style::default().bg(Color::DarkGray).fg(Color::White));
-    f.render_widget(status_bar, chunks[1]);
+    f.render_widget(status_bar, chunks[2]);
 }
 
-fn draw_tree(f: &mut Frame, app: &TuiApp, area: Rect) {
-    let items: Vec<ListItem> = app.visible_nodes.iter().map(|&idx| {
-        let node = &app.nodes[idx];
-        let indent = "  ".repeat(node.depth as usize);
+fn draw_pins_recents(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(50),  // Pinned
+            Constraint::Percentage(50),  // Recent
+        ])
+        .split(area);
 
-        let prefix = if node.is_item {
-            "📄"
-        } else if node.is_expanded {
-            "▼"
-        } else if node.child_count > 0 {
-            "▶"
+    // Border styles based on focus
+    let pins_border = if app.nav_focus == NavFocus::Pins {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let recents_border = if app.nav_focus == NavFocus::Recents {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    // Pinned nodes with selection highlight
+    let pinned_items: Vec<ListItem> = app.pinned_nodes.iter().enumerate().take(10).map(|(i, node)| {
+        let emoji = node.emoji.as_deref().unwrap_or("📌");
+        let title = node.ai_title.as_ref().unwrap_or(&node.title);
+        let truncated = if title.len() > 20 {
+            format!("{}...", &title[..17])
         } else {
-            "○"
+            title.clone()
         };
+        let content = format!("{} {}", emoji, truncated);
 
-        let count = if !node.is_item && node.child_count > 0 {
-            format!(" ({})", node.child_count)
+        // Highlight selected item when Pins pane is focused
+        if app.nav_focus == NavFocus::Pins && i == app.pins_selected {
+            ListItem::new(content).style(Style::default().bg(Color::Blue).fg(Color::White))
         } else {
-            String::new()
-        };
-
-        let content = format!("{}{} {}{}", indent, prefix, node.title, count);
-        ListItem::new(content)
+            ListItem::new(content)
+        }
     }).collect();
 
-    let tree = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Hierarchy "))
-        .highlight_style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD))
-        .highlight_symbol("→ ");
+    let pinned_list = List::new(pinned_items)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(pins_border)
+            .title(format!(" 📌 Pinned ({}) ", app.pinned_nodes.len())));
+    f.render_widget(pinned_list, chunks[0]);
 
-    f.render_stateful_widget(tree, area, &mut app.list_state.clone());
+    // Recent nodes with selection highlight
+    let recent_items: Vec<ListItem> = app.recent_nodes.iter().enumerate().take(10).map(|(i, node)| {
+        let emoji = node.emoji.as_deref().unwrap_or("📄");
+        let title = node.ai_title.as_ref().unwrap_or(&node.title);
+        let truncated = if title.len() > 20 {
+            format!("{}...", &title[..17])
+        } else {
+            title.clone()
+        };
+        let content = format!("{} {}", emoji, truncated);
+
+        // Highlight selected item when Recents pane is focused
+        if app.nav_focus == NavFocus::Recents && i == app.recents_selected {
+            ListItem::new(content).style(Style::default().bg(Color::Blue).fg(Color::White))
+        } else {
+            ListItem::new(content)
+        }
+    }).collect();
+
+    let recent_list = List::new(recent_items)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(recents_border)
+            .title(format!(" 🕐 Recent ({}) ", app.recent_nodes.len())));
+    f.render_widget(recent_list, chunks[1]);
 }
 
-fn draw_detail(f: &mut Frame, app: &TuiApp, area: Rect) {
+fn draw_preview(f: &mut Frame, app: &TuiApp, area: Rect) {
     let content = if let Some(ref node) = app.selected_node {
+        let emoji = node.emoji.as_deref().unwrap_or("");
+        let title = node.ai_title.as_ref().unwrap_or(&node.title);
+        let node_type = if node.is_item { "Item" } else { "Category" };
+
         let mut lines = vec![
             Line::from(vec![
-                Span::styled("Title: ", Style::default().fg(Color::Yellow)),
-                Span::raw(&node.title),
+                Span::styled(emoji, Style::default()),
+                Span::raw(" "),
+                Span::styled(title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             ]),
-            Line::from(vec![
-                Span::styled("ID: ", Style::default().fg(Color::Yellow)),
-                Span::raw(&node.id[..8]),
-            ]),
+            Line::from(""),
             Line::from(vec![
                 Span::styled("Type: ", Style::default().fg(Color::Yellow)),
-                Span::raw(if node.is_item { "Item" } else { "Category" }),
-            ]),
-            Line::from(vec![
-                Span::styled("Depth: ", Style::default().fg(Color::Yellow)),
-                Span::raw(node.depth.to_string()),
+                Span::raw(node_type),
             ]),
             Line::from(vec![
                 Span::styled("Children: ", Style::default().fg(Color::Yellow)),
@@ -2245,39 +3979,37 @@ fn draw_detail(f: &mut Frame, app: &TuiApp, area: Rect) {
             ]),
         ];
 
-        if let Some(ref ai_title) = node.ai_title {
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled("AI Title: ", Style::default().fg(Color::Green)),
-                Span::raw(ai_title),
-            ]));
-        }
+        // Add date
+        let date_str = format_date_time(node.created_at);
+        lines.push(Line::from(vec![
+            Span::styled("Date: ", Style::default().fg(Color::Yellow)),
+            Span::raw(date_str),
+        ]));
 
+        // Add tags if present
         if let Some(ref tags) = node.tags {
+            lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::styled("Tags: ", Style::default().fg(Color::Cyan)),
-                Span::raw(tags),
             ]));
-        }
-
-        if let Some(ref summary) = node.summary {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("Summary:", Style::default().fg(Color::Magenta))));
-            // Wrap summary
-            for chunk in summary.chars().collect::<Vec<_>>().chunks(60) {
+            // Wrap tags
+            for chunk in tags.chars().collect::<Vec<_>>().chunks(25) {
                 lines.push(Line::from(chunk.iter().collect::<String>()));
             }
         }
 
-        if let Some(ref content) = node.content {
+        // Add summary if present
+        if let Some(ref summary) = node.summary {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("Content:", Style::default().fg(Color::Blue))));
-            let preview = if content.len() > 500 { &content[..500] } else { content };
-            for line in preview.lines().take(15) {
-                lines.push(Line::from(line.to_string()));
-            }
-            if content.len() > 500 {
-                lines.push(Line::from("..."));
+            lines.push(Line::from(Span::styled("Summary:", Style::default().fg(Color::Magenta))));
+            // Wrap summary (short preview)
+            let preview = if summary.len() > 150 {
+                format!("{}...", &summary[..147])
+            } else {
+                summary.clone()
+            };
+            for chunk in preview.chars().collect::<Vec<_>>().chunks(25) {
+                lines.push(Line::from(chunk.iter().collect::<String>()));
             }
         }
 
@@ -2286,11 +4018,464 @@ fn draw_detail(f: &mut Frame, app: &TuiApp, area: Rect) {
         Text::from("No node selected")
     };
 
-    let detail = Paragraph::new(content)
-        .block(Block::default().borders(Borders::ALL).title(" Details "))
+    let preview = Paragraph::new(content)
+        .block(Block::default().borders(Borders::ALL).title(" Preview "))
         .wrap(Wrap { trim: false });
 
-    f.render_widget(detail, area);
+    f.render_widget(preview, area);
+}
+
+fn draw_breadcrumb(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let mut spans = vec![Span::styled(" ", Style::default().bg(Color::Rgb(40, 40, 60)))];
+
+    for (i, (_, title)) in app.breadcrumb_path.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" > ", Style::default().fg(Color::DarkGray).bg(Color::Rgb(40, 40, 60))));
+        }
+
+        let style = if i == app.breadcrumb_path.len() - 1 {
+            // Current location (highlighted)
+            Style::default().fg(Color::Cyan).bg(Color::Rgb(40, 40, 60)).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray).bg(Color::Rgb(40, 40, 60))
+        };
+
+        // Truncate long titles
+        let display_title = if title.len() > 20 {
+            format!("{}...", &title[..17])
+        } else {
+            title.clone()
+        };
+        spans.push(Span::styled(display_title, style));
+    }
+
+    // Add hint for going back
+    if app.breadcrumb_path.len() > 1 {
+        spans.push(Span::styled(
+            "   [Backspace: up]",
+            Style::default().fg(Color::DarkGray).bg(Color::Rgb(40, 40, 60))
+        ));
+    }
+
+    let breadcrumb = Paragraph::new(Line::from(spans))
+        .style(Style::default().bg(Color::Rgb(40, 40, 60)));
+    f.render_widget(breadcrumb, area);
+}
+
+fn draw_leaf_view_mode(f: &mut Frame, app: &TuiApp) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),  // Header
+            Constraint::Min(0),     // Main content
+            Constraint::Length(1),  // Status bar
+        ])
+        .split(f.size());
+
+    // Header with title and back hint
+    let title = if let Some(ref node) = app.selected_node {
+        let emoji = node.emoji.as_deref().unwrap_or("");
+        let title = node.ai_title.as_ref().unwrap_or(&node.title);
+        format!("{} {} ", emoji, title)
+    } else {
+        "Content".to_string()
+    };
+
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(" ← [q/Esc] Back", Style::default().fg(Color::Yellow)),
+            Span::raw("   "),
+            Span::styled(&title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]),
+    ])
+    .style(Style::default().bg(Color::Rgb(30, 30, 50)));
+    f.render_widget(header, chunks[0]);
+
+    // Main content area: Content (60%) | Sidebar (40%)
+    let main_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(60),
+            Constraint::Percentage(40),
+        ])
+        .split(chunks[1]);
+
+    // Content pane
+    draw_leaf_content(f, app, main_chunks[0]);
+
+    // Sidebar
+    draw_leaf_sidebar(f, app, main_chunks[1]);
+
+    // Status bar
+    let status_bar = Paragraph::new(&*app.status_message)
+        .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+    f.render_widget(status_bar, chunks[2]);
+}
+
+fn draw_leaf_content(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let content = app.leaf_content.as_deref().unwrap_or("No content");
+
+    let border_style = if app.leaf_focus == LeafFocus::Content {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let scroll_info = format!(" Content (line {}) ", app.leaf_scroll_offset + 1);
+
+    // Use Paragraph's native scroll - this handles wrapped text properly
+    // by scrolling visual lines, not raw newline-separated lines
+    let paragraph = Paragraph::new(content)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style)
+            .title(scroll_info))
+        .wrap(Wrap { trim: false })
+        .scroll((app.leaf_scroll_offset, 0));
+
+    f.render_widget(paragraph, area);
+}
+
+fn draw_leaf_sidebar(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(50),  // Similar nodes
+            Constraint::Percentage(50),  // Edges
+        ])
+        .split(area);
+
+    // Separate border styles for Similar and Edges sections
+    let similar_border = if app.leaf_focus == LeafFocus::Similar {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let edges_border = if app.leaf_focus == LeafFocus::Edges {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    // Similar nodes section with selection highlight
+    // Calculate min/max for normalization (like GraphCanvas.tsx line 346)
+    let (min_sim, max_sim) = if app.similar_nodes.is_empty() {
+        (0.5, 1.0)
+    } else {
+        let min = app.similar_nodes.iter().map(|s| s.similarity).fold(f32::MAX, f32::min);
+        let max = app.similar_nodes.iter().map(|s| s.similarity).fold(f32::MIN, f32::max);
+        (min as f64, max as f64)
+    };
+
+    let similar_items: Vec<ListItem> = app.similar_nodes.iter().enumerate().map(|(i, sim)| {
+        let emoji = sim.emoji.as_deref().unwrap_or("📄");
+        let similarity_pct = (sim.similarity * 100.0) as i32;
+        // Normalized gradient: spreads colors across visible range (red→yellow | blue→cyan)
+        let color = similarity_color_normalized(sim.similarity as f64, min_sim, max_sim);
+
+        let content = format!("{} {} {}%", emoji, &sim.title[..sim.title.len().min(25)], similarity_pct);
+
+        // Highlight selected item when Similar section is focused
+        if i == app.similar_selected && app.leaf_focus == LeafFocus::Similar {
+            ListItem::new(Span::styled(content, Style::default().bg(Color::Blue).fg(Color::White)))
+        } else {
+            ListItem::new(Span::styled(content, Style::default().fg(color)))
+        }
+    }).collect();
+
+    let similar_list = List::new(similar_items)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(similar_border)
+            .title(format!(" Similar ({}) ", app.similar_nodes.len())));
+    f.render_widget(similar_list, chunks[0]);
+
+    // Edges section with selection highlight
+    let edge_items: Vec<ListItem> = app.edges_for_node.iter().enumerate().map(|(i, (_, title, weight))| {
+        let weight_pct = (weight * 100.0) as i32;
+        let content = format!("→ {} ({}%)", &title[..title.len().min(25)], weight_pct);
+
+        // Highlight selected item when Edges section is focused
+        if i == app.edges_selected && app.leaf_focus == LeafFocus::Edges {
+            ListItem::new(Span::styled(content, Style::default().bg(Color::Blue).fg(Color::White)))
+        } else {
+            ListItem::new(content)
+        }
+    }).collect();
+
+    let edges_list = List::new(edge_items)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(edges_border)
+            .title(format!(" Edges ({}) ", app.edges_for_node.len())));
+    f.render_widget(edges_list, chunks[1]);
+}
+
+fn draw_edit_mode(f: &mut Frame, app: &TuiApp) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),  // Header
+            Constraint::Min(0),     // Editor
+            Constraint::Length(1),  // Status bar
+        ])
+        .split(f.size());
+
+    // Header with title and mode indicator
+    let title = if let Some(ref node) = app.selected_node {
+        let emoji = node.emoji.as_deref().unwrap_or("");
+        let title = node.ai_title.as_ref().unwrap_or(&node.title);
+        format!("{} {} ", emoji, title)
+    } else {
+        "Editing".to_string()
+    };
+
+    let dirty_indicator = if app.edit_dirty { " [modified]" } else { "" };
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(" ✏️  EDIT MODE", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(dirty_indicator, Style::default().fg(Color::Red)),
+            Span::raw("   "),
+            Span::styled(&title, Style::default().fg(Color::White)),
+        ]),
+    ])
+    .style(Style::default().bg(Color::Rgb(50, 30, 30)));
+    f.render_widget(header, chunks[0]);
+
+    // Calculate visible area for the editor
+    let editor_area = chunks[1];
+    let inner_height = editor_area.height.saturating_sub(2) as usize; // Account for borders
+
+    // Build editor lines with line numbers and cursor
+    let lines: Vec<&str> = app.edit_buffer.lines().collect();
+    let total_lines = lines.len().max(1);
+
+    // Calculate line number width (for alignment)
+    let line_num_width = total_lines.to_string().len();
+
+    // Build styled lines
+    let mut styled_lines: Vec<Line> = Vec::new();
+
+    // Handle empty buffer case
+    if app.edit_buffer.is_empty() {
+        let line_num = format!("{:>width$} │ ", 1, width = line_num_width);
+        styled_lines.push(Line::from(vec![
+            Span::styled(line_num, Style::default().fg(Color::DarkGray)),
+            Span::styled("█", Style::default().bg(Color::White).fg(Color::Black)), // Cursor
+        ]));
+    } else {
+        for (line_idx, line_content) in lines.iter().enumerate() {
+            // Skip lines before scroll offset
+            if line_idx < app.edit_scroll_offset {
+                continue;
+            }
+            // Stop if we've filled the visible area
+            if styled_lines.len() >= inner_height {
+                break;
+            }
+
+            let line_num = format!("{:>width$} │ ", line_idx + 1, width = line_num_width);
+            let is_cursor_line = line_idx == app.edit_cursor_line;
+
+            if is_cursor_line {
+                // Build line with cursor
+                let chars: Vec<char> = line_content.chars().collect();
+                let mut spans = vec![
+                    Span::styled(line_num, Style::default().fg(Color::Yellow)),
+                ];
+
+                // Characters before cursor
+                if app.edit_cursor_col > 0 {
+                    let before: String = chars[..app.edit_cursor_col.min(chars.len())].iter().collect();
+                    spans.push(Span::raw(before));
+                }
+
+                // Cursor character (or space if at end of line)
+                if app.edit_cursor_col < chars.len() {
+                    let cursor_char = chars[app.edit_cursor_col].to_string();
+                    spans.push(Span::styled(cursor_char, Style::default().bg(Color::White).fg(Color::Black)));
+                } else {
+                    // Cursor at end of line
+                    spans.push(Span::styled(" ", Style::default().bg(Color::White).fg(Color::Black)));
+                }
+
+                // Characters after cursor
+                if app.edit_cursor_col + 1 < chars.len() {
+                    let after: String = chars[app.edit_cursor_col + 1..].iter().collect();
+                    spans.push(Span::raw(after));
+                }
+
+                styled_lines.push(Line::from(spans));
+            } else {
+                // Regular line without cursor
+                styled_lines.push(Line::from(vec![
+                    Span::styled(line_num, Style::default().fg(Color::DarkGray)),
+                    Span::raw(*line_content),
+                ]));
+            }
+        }
+    }
+
+    // Editor pane
+    let scroll_info = format!(
+        " Editor - Ln {}/{}, Col {} ",
+        app.edit_cursor_line + 1,
+        total_lines,
+        app.edit_cursor_col + 1
+    );
+
+    let editor = Paragraph::new(styled_lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(scroll_info))
+        .wrap(Wrap { trim: false });
+    f.render_widget(editor, editor_area);
+
+    // Status bar with keybindings
+    let status_bar = Paragraph::new(&*app.status_message)
+        .style(Style::default().bg(Color::Rgb(60, 40, 40)).fg(Color::White));
+    f.render_widget(status_bar, chunks[2]);
+}
+
+fn draw_tree(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let items: Vec<ListItem> = app.visible_nodes.iter().map(|&idx| {
+        let node = &app.nodes[idx];
+        let indent = "  ".repeat(node.depth as usize);
+
+        // Use emoji if available, otherwise default icons
+        let prefix = if node.is_item {
+            node.emoji.as_deref().unwrap_or("📄").to_string()
+        } else if node.is_expanded {
+            "▼".to_string()
+        } else if node.child_count > 0 {
+            node.emoji.as_deref().unwrap_or("▶").to_string()
+        } else {
+            node.emoji.as_deref().unwrap_or("○").to_string()
+        };
+
+        let count = if !node.is_item && node.child_count > 0 {
+            format!(" ({})", node.child_count)
+        } else {
+            String::new()
+        };
+
+        // Calculate date color using graph-matching gradient (red=old → cyan=new)
+        let node_date_color = date_color(node.created_at, app.date_min, app.date_max);
+
+        // Format date
+        let date_str = format_date_time(node.created_at);
+
+        // Build as owned strings to avoid lifetime issues
+        let main_text = format!("{}{} {}{}", indent, prefix, node.title, count);
+
+        // Create styled content with colored date
+        let content = Line::from(vec![
+            Span::raw(main_text),
+            Span::raw(" "),
+            Span::styled(date_str, Style::default().fg(node_date_color)),
+        ]);
+
+        ListItem::new(content)
+    }).collect();
+
+    // Border style based on focus
+    let border_style = if app.nav_focus == NavFocus::Tree {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let tree = List::new(items)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style)
+            .title(" Hierarchy "))
+        .highlight_style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD))
+        .highlight_symbol("→ ");
+
+    f.render_stateful_widget(tree, area, &mut app.list_state.clone());
+}
+
+/// Convert HSL to RGB Color
+fn hsl_to_color(hue: f64, saturation: f64, lightness: f64) -> Color {
+    let h = (hue % 360.0) / 360.0;
+    let s = saturation.clamp(0.0, 1.0);
+    let l = lightness.clamp(0.0, 1.0);
+
+    let (r, g, b) = if s == 0.0 {
+        let v = (l * 255.0) as u8;
+        (v, v, v)
+    } else {
+        let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+        let p = 2.0 * l - q;
+
+        let hue_to_rgb = |p: f64, q: f64, mut t: f64| -> f64 {
+            if t < 0.0 { t += 1.0; }
+            if t > 1.0 { t -= 1.0; }
+            if t < 1.0 / 6.0 { return p + (q - p) * 6.0 * t; }
+            if t < 1.0 / 2.0 { return q; }
+            if t < 2.0 / 3.0 { return p + (q - p) * (2.0 / 3.0 - t) * 6.0; }
+            p
+        };
+
+        let r = (hue_to_rgb(p, q, h + 1.0 / 3.0) * 255.0) as u8;
+        let g = (hue_to_rgb(p, q, h) * 255.0) as u8;
+        let b = (hue_to_rgb(p, q, h - 1.0 / 3.0) * 255.0) as u8;
+        (r, g, b)
+    };
+
+    Color::Rgb(r, g, b)
+}
+
+/// Get similarity color with range normalization (like GraphCanvas.tsx line 346)
+/// Normalizes similarity to visible range, then applies two-segment gradient.
+/// RED (0°) → YELLOW (60°) | BLUE (210°) → CYAN (180°)
+fn similarity_color_normalized(similarity: f64, min_sim: f64, max_sim: f64) -> Color {
+    // Normalize to 0-1 based on visible range (exactly like graph edges)
+    let range = (max_sim - min_sim).max(0.01); // avoid div by zero
+    let t = ((similarity - min_sim) / range).clamp(0.0, 1.0);
+
+    // Two-segment gradient from getEdgeColor
+    let hue = if t < 0.5 {
+        t * 2.0 * 60.0              // RED (0°) → YELLOW (60°)
+    } else {
+        210.0 - (t - 0.5) * 2.0 * 30.0  // BLUE (210°) → CYAN (180°)
+    };
+
+    hsl_to_color(hue, 0.80, 0.50)
+}
+
+/// Get similarity color with default 0.5-1.0 range normalization
+fn similarity_color(similarity: f64) -> Color {
+    similarity_color_normalized(similarity, 0.5, 1.0)
+}
+
+/// Get date color using EXACT formula from GraphCanvas.tsx getDateColor
+/// RED (0°) → YELLOW (60°) at 50% | BLUE (210°) → CYAN (180°) at 100%
+/// NO GREEN anywhere. NO saturation tricks.
+fn date_color(timestamp: i64, min_date: i64, max_date: i64) -> Color {
+    if max_date <= min_date {
+        return Color::Gray;
+    }
+    let t = (timestamp - min_date) as f64 / (max_date - min_date) as f64;
+
+    // EXACT formula from GraphCanvas.tsx getEdgeColor (lines 160-168):
+    let hue = if t <= 0.5 {
+        t * 2.0 * 60.0              // 0→0°, 50%→60° (red to yellow)
+    } else {
+        210.0 - (t - 0.5) * 2.0 * 30.0  // 50%→210°, 100%→180° (blue to cyan)
+    };
+
+    // Match GraphStatusBar.tsx legend: hsl(h, 75%, 65%)
+    hsl_to_color(hue, 0.75, 0.65)
+}
+
+fn format_date_time(timestamp: i64) -> String {
+    // timestamp is in milliseconds
+    chrono::DateTime::from_timestamp_millis(timestamp)
+        .map(|dt| dt.format("%d %b %Y %H:%M").to_string())
+        .unwrap_or_else(|| "Unknown".to_string())
 }
 
 // ============================================================================
