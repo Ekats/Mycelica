@@ -108,6 +108,12 @@ enum Commands {
         #[command(subcommand)]
         cmd: ConfigCommands,
     },
+    /// Interactive setup wizard
+    Setup {
+        /// Skip the processing pipeline
+        #[arg(long)]
+        skip_pipeline: bool,
+    },
     /// Recent nodes
     Recent {
         #[command(subcommand)]
@@ -166,6 +172,14 @@ enum DbCommands {
     Path,
     /// Select database interactively
     Select,
+    /// Create a new database
+    New {
+        /// Path for the new database
+        path: String,
+        /// Don't set as default database
+        #[arg(long)]
+        no_select: bool,
+    },
     /// Export trimmed database
     Export {
         /// Output path for exported database
@@ -690,6 +704,7 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Privacy { cmd } => handle_privacy(cmd, &db, cli.json, cli.quiet).await,
         Commands::Paper { cmd } => handle_paper(cmd, &db, cli.json).await,
         Commands::Config { cmd } => handle_config(cmd, cli.json),
+        Commands::Setup { skip_pipeline } => handle_setup(&db, skip_pipeline, cli.quiet).await,
         Commands::Recent { cmd } => handle_recent(cmd, &db, cli.json),
         Commands::Pinned { cmd } => handle_pinned(cmd, &db, cli.json),
         Commands::Nav { cmd } => handle_nav(cmd, &db, cli.json).await,
@@ -764,14 +779,13 @@ async fn handle_db(cmd: DbCommands, db: &Database, json: bool) -> Result<(), Str
             // Find databases in common locations
             let mut databases: Vec<PathBuf> = Vec::new();
 
-            // Check repo directory and parent
+            // Check current directory and parent
             let cwd = std::env::current_dir().unwrap_or_default();
             for dir in [&cwd, &cwd.parent().unwrap_or(&cwd).to_path_buf()] {
                 if let Ok(entries) = std::fs::read_dir(dir) {
                     for entry in entries.flatten() {
                         let path = entry.path();
-                        if path.extension().map(|e| e == "db").unwrap_or(false)
-                           && path.file_name().map(|n| n.to_string_lossy().contains("mycelica")).unwrap_or(false) {
+                        if path.extension().map(|e| e == "db").unwrap_or(false) {
                             databases.push(path);
                         }
                     }
@@ -796,8 +810,7 @@ async fn handle_db(cmd: DbCommands, db: &Database, json: bool) -> Result<(), Str
                 if let Ok(entries) = std::fs::read_dir(&downloads) {
                     for entry in entries.flatten() {
                         let path = entry.path();
-                        if path.extension().map(|e| e == "db").unwrap_or(false)
-                           && path.file_name().map(|n| n.to_string_lossy().contains("mycelica")).unwrap_or(false) {
+                        if path.extension().map(|e| e == "db").unwrap_or(false) {
                             databases.push(path);
                         }
                     }
@@ -850,6 +863,44 @@ async fn handle_db(cmd: DbCommands, db: &Database, json: bool) -> Result<(), Str
                 println!("Selected: {}", selected.display());
             } else {
                 println!("Invalid selection.");
+            }
+        }
+        DbCommands::New { path, no_select } => {
+            let db_path = PathBuf::from(&path);
+
+            // Check if file already exists
+            if db_path.exists() {
+                return Err(format!("Database already exists at: {}", path));
+            }
+
+            // Create parent directory if needed
+            if let Some(parent) = db_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create directory: {}", e))?;
+            }
+
+            // Create new database
+            let new_db = Database::new(&db_path)
+                .map_err(|e| format!("Failed to create database: {}", e))?;
+
+            // Build hierarchy for new database
+            if let Err(e) = hierarchy::build_hierarchy(&new_db) {
+                eprintln!("Warning: Failed to build initial hierarchy: {}", e);
+            }
+
+            // Set as default unless --no-select
+            if !no_select {
+                settings::set_custom_db_path(Some(path.clone()))
+                    .map_err(|e| format!("Failed to save database path: {}", e))?;
+            }
+
+            if json {
+                println!(r#"{{"created":"{}","selected":{}}}"#, path, !no_select);
+            } else {
+                println!("Created: {}", path);
+                if !no_select {
+                    println!("Set as default database.");
+                }
             }
         }
         DbCommands::Export { path } => {
@@ -1842,6 +1893,189 @@ fn handle_config(cmd: ConfigCommands, json: bool) -> Result<(), String> {
             }
         }
     }
+    Ok(())
+}
+
+// ============================================================================
+// Setup Command
+// ============================================================================
+
+async fn handle_setup(db: &Database, skip_pipeline: bool, quiet: bool) -> Result<(), String> {
+    use std::io::{Write, BufRead};
+
+    println!("=== Mycelica Setup ===\n");
+
+    // Show current database
+    println!("Database: {}\n", db.get_path());
+
+    // Check and prompt for API keys
+    let has_openai = settings::has_openai_api_key();
+    let has_anthropic = settings::has_api_key();
+
+    println!("API Keys:");
+    println!("  OpenAI:    {}", if has_openai { "configured" } else { "not set" });
+    println!("  Anthropic: {}", if has_anthropic { "configured" } else { "not set" });
+    println!();
+
+    // Prompt for OpenAI key if not set (required for embeddings)
+    if !has_openai {
+        print!("Enter OpenAI API key (for embeddings, or press Enter to skip): ");
+        std::io::stdout().flush().ok();
+
+        let mut key = String::new();
+        std::io::stdin().lock().read_line(&mut key).ok();
+        let key = key.trim().to_string();
+        if !key.is_empty() {
+            settings::set_openai_api_key(key)?;
+            println!("  OpenAI key saved.\n");
+        } else {
+            println!("  Skipped.\n");
+        }
+    }
+
+    // Prompt for Anthropic key if not set (required for AI processing)
+    if !has_anthropic {
+        print!("Enter Anthropic API key (for AI processing, or press Enter to skip): ");
+        std::io::stdout().flush().ok();
+
+        let mut key = String::new();
+        std::io::stdin().lock().read_line(&mut key).ok();
+        let key = key.trim().to_string();
+        if !key.is_empty() {
+            settings::set_api_key(key)?;
+            println!("  Anthropic key saved.\n");
+        } else {
+            println!("  Skipped.\n");
+        }
+    }
+
+    // Show database stats
+    let items = db.get_items().map_err(|e| e.to_string())?;
+    let total = items.len();
+    let processed = items.iter().filter(|n| n.is_processed).count();
+    let with_embeddings = items.iter().filter(|n| {
+        db.get_node_embedding(&n.id).ok().flatten().is_some()
+    }).count();
+
+    println!("Database Stats:");
+    println!("  Items:      {}", total);
+    println!("  Processed:  {} / {}", processed, total);
+    println!("  Embeddings: {} / {}", with_embeddings, total);
+    println!();
+
+    if skip_pipeline {
+        println!("Setup complete. (Pipeline skipped)");
+        return Ok(());
+    }
+
+    // Ask to run pipeline if there's work to do
+    let needs_processing = processed < total;
+    let needs_embeddings = with_embeddings < total;
+
+    if !needs_processing && !needs_embeddings {
+        println!("All items are processed and have embeddings. Nothing to do!");
+        return Ok(());
+    }
+
+    print!("Run processing pipeline? [Y/n]: ");
+    std::io::stdout().flush().ok();
+
+    let mut input = String::new();
+    std::io::stdin().lock().read_line(&mut input).ok();
+    let run_pipeline = input.trim().is_empty() || input.trim().to_lowercase().starts_with('y');
+
+    if !run_pipeline {
+        println!("Setup complete. Run 'mycelica-cli process run' later to process items.");
+        return Ok(());
+    }
+
+    println!();
+
+    // Step 1: AI Processing
+    if needs_processing && settings::has_api_key() {
+        println!("[1/3] AI Processing...");
+        let unprocessed: Vec<_> = items.iter().filter(|n| !n.is_processed).collect();
+
+        for (i, node) in unprocessed.iter().enumerate() {
+            if !quiet && i % 5 == 0 {
+                eprint!("\r  Processing {}/{}...", i + 1, unprocessed.len());
+                std::io::stderr().flush().ok();
+            }
+
+            let content = node.content.as_deref().unwrap_or(&node.title);
+            match mycelica_lib::ai_client::analyze_node(&node.title, content).await {
+                Ok(result) => {
+                    db.update_node_ai(
+                        &node.id,
+                        &result.title,
+                        &result.summary,
+                        &result.tags.join(","),
+                        &result.content_type,
+                    ).ok();
+                }
+                Err(e) => {
+                    if !quiet {
+                        eprintln!("\n  Warning: Failed to process '{}': {}", node.title, e);
+                    }
+                }
+            }
+        }
+        if !quiet {
+            eprintln!("\r  Processed {} items.          ", unprocessed.len());
+        }
+    } else if needs_processing {
+        println!("[1/3] AI Processing... SKIPPED (no Anthropic API key)");
+    } else {
+        println!("[1/3] AI Processing... already complete");
+    }
+
+    // Step 2: Clustering
+    println!("[2/3] Clustering...");
+    if let Err(e) = hierarchy::build_hierarchy(db) {
+        eprintln!("  Warning: Clustering failed: {}", e);
+    } else {
+        println!("  Hierarchy built.");
+    }
+
+    // Step 3: Embeddings
+    if needs_embeddings && settings::has_openai_api_key() {
+        println!("[3/3] Generating embeddings...");
+        let items_needing = items.iter().filter(|n| {
+            db.get_node_embedding(&n.id).ok().flatten().is_none()
+        }).collect::<Vec<_>>();
+
+        for (i, node) in items_needing.iter().enumerate() {
+            if !quiet && i % 10 == 0 {
+                eprint!("\r  Embedding {}/{}...", i + 1, items_needing.len());
+                std::io::stderr().flush().ok();
+            }
+
+            let text = format!("{} {}",
+                node.ai_title.as_deref().unwrap_or(&node.title),
+                node.summary.as_deref().unwrap_or("")
+            );
+
+            match mycelica_lib::ai_client::generate_embedding(&text).await {
+                Ok(embedding) => {
+                    db.update_node_embedding(&node.id, &embedding).ok();
+                }
+                Err(e) => {
+                    if !quiet {
+                        eprintln!("\n  Warning: Failed embedding for '{}': {}", node.title, e);
+                    }
+                }
+            }
+        }
+        if !quiet {
+            eprintln!("\r  Generated {} embeddings.      ", items_needing.len());
+        }
+    } else if needs_embeddings {
+        println!("[3/3] Embeddings... SKIPPED (no OpenAI API key)");
+    } else {
+        println!("[3/3] Embeddings... already complete");
+    }
+
+    println!("\nSetup complete!");
     Ok(())
 }
 
