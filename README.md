@@ -51,7 +51,9 @@ Mycelica shows structure you can navigate, plus connections that cross category 
   ```
 - **Leaf Reader** — Full-screen reader for conversations (chat bubbles) and notes (markdown)
 - **Privacy Filtering** — Showcase/normal modes for safe database exports
-- **Import** — Claude conversations JSON, Markdown files
+- **Import** — Claude conversations, Markdown files, OpenAIRE papers, Google Keep
+- **OpenAIRE Integration** — Query EU Open Research Graph with country/field/year filters, optional PDF download
+- **CLI & TUI** — 18 command categories, interactive terminal UI, BibTeX/JSON/Markdown/DOT export
 - **Local-First** — SQLite database stays on your machine
 
 ---
@@ -118,66 +120,130 @@ mycelica-cli [OPTIONS] <COMMAND>
 
 ### Commands
 
+**Top-level:**
 | Command | Description |
 |---------|-------------|
-| `db stats` | Show database statistics |
-| `db select` | Interactive database picker |
-| `db export <path>` | Export trimmed database |
-| `import openaire --query "..." --country EE` | Import papers from OpenAIRE |
-| `import markdown <path>` | Import markdown files |
-| `import claude <path>` | Import Claude conversation JSON |
-| `node search <query>` | Full-text search |
-| `node similar <id>` | Find semantically similar nodes |
-| `hierarchy build` | Build/rebuild hierarchy |
-| `cluster run` | Run clustering on new items |
-| `embeddings status` | Show embedding stats |
-| `privacy stats` | Show privacy scan status |
-| `paper list` | List imported papers |
-| `config list` | Show all settings |
-| `nav tree root --depth 3` | Show hierarchy tree |
-| `tui` | Launch interactive TUI |
-| `completions bash` | Generate shell completions |
+| `setup` | Interactive first-time setup wizard |
+| `tui` | Interactive TUI mode |
+| `search <query>` | Global search across all nodes |
+| `db` | Database operations |
+| `import` | Import data |
+| `export` | Export data |
+| `node` | Node operations |
+| `hierarchy` | Hierarchy operations |
+| `process` | AI processing |
+| `cluster` | Clustering |
+| `embeddings` | Embedding operations |
+| `privacy` | Privacy analysis |
+| `paper` | Paper operations |
+| `config` | Configuration |
+| `recent` | Recent nodes |
+| `pinned` | Pinned nodes |
+| `nav` | Graph navigation |
+| `maintenance` | Database maintenance |
+| `completions` | Shell completions |
+
+**Import subcommands:**
+| Command | Description |
+|---------|-------------|
+| `import openaire -q "..."` | Import from OpenAIRE |
+| `import claude <file>` | Import Claude JSON |
+| `import markdown <path>` | Import Markdown |
+| `import keep <zip>` | Import Google Keep |
+
+**Export subcommands:**
+| Command | Description |
+|---------|-------------|
+| `export bibtex -o file.bib` | BibTeX format |
+| `export markdown -o file.md` | Markdown format |
+| `export json -o file.json` | JSON format |
+| `export graph -o file.dot` | DOT graph |
+| `export subgraph <id>` | Export subtree |
+
+<details>
+<summary>OpenAIRE import options</summary>
+
+| Option | Description |
+|--------|-------------|
+| `-q, --query` | Search query (required) |
+| `-c, --country` | Country code (EE, US, etc.) |
+| `--fos` | Field of science |
+| `--from-year` | Start year |
+| `--to-year` | End year |
+| `-m, --max` | Max papers [default: 100] |
+| `--download-pdfs` | Download PDFs |
+| `--max-pdf-size` | Max PDF MB [default: 20] |
+
+</details>
 
 ### Examples
 
 ```bash
-# Select database interactively
+# First-time setup wizard
+mycelica-cli setup
+
+# Interactive database picker
 mycelica-cli db select
 
-# Import papers and run full setup
-mycelica-cli import openaire --query "machine learning" --max 100
-mycelica-cli hierarchy build
-mycelica-cli cluster run
+# Import papers from OpenAIRE
+mycelica-cli import openaire --query "machine learning" --country EE --max 500
 
-# Search and export results as JSON
-mycelica-cli --json node search "neural networks" > results.json
+# Import with PDF download
+mycelica-cli import openaire --query "neural" --download-pdfs --max-pdf-size 10
+
+# Global search
+mycelica-cli search "interoception" --limit 20
+
+# Export as BibTeX
+mycelica-cli export bibtex -o ~/papers.bib
+
+# JSON output for scripting
+mycelica-cli --json search "neural" | jq '.[].title'
+
+# Launch TUI
+mycelica-cli tui
 
 # Generate shell completions
 mycelica-cli completions bash >> ~/.bashrc
-mycelica-cli completions zsh >> ~/.zshrc
-mycelica-cli completions fish > ~/.config/fish/completions/mycelica-cli.fish
 ```
 
 ### TUI Mode
 
-Interactive terminal UI for browsing the knowledge graph:
-
+Interactive terminal UI with 3-column layout:
 ```bash
 mycelica-cli tui
 ```
 
-**Controls:**
+**Layout:** Tree (50%) | Pins + Recents (25%) | Preview (25%)
+
+**Hierarchy Navigation:**
 | Key | Action |
 |-----|--------|
-| `j/k` or `↑/↓` | Navigate up/down |
-| `Enter` or `l/→` | Expand node |
-| `h/←` | Collapse node |
+| `j/k` | Navigate up/down |
+| `Enter` | Enter cluster / open item |
+| `Backspace` / `-` | Go up one level |
+| `Tab` | Cycle panes |
 | `/` | Search mode |
-| `g` | Jump to top |
-| `G` | Jump to bottom |
-| `r` | Reload tree |
-| `?` | Show help |
+| `g/G` | Jump to top/bottom |
+| `r` | Reload |
 | `q` | Quit |
+
+**Leaf View:**
+| Key | Action |
+|-----|--------|
+| `Tab` | Cycle: Content → Similar → Edges |
+| `n/N` | Next/prev similar node |
+| `e` | Edit mode |
+| `v` | Open PDF externally |
+| `o` | Open URL in browser |
+| `Backspace` | Back to hierarchy |
+
+**Edit Mode:**
+| Key | Action |
+|-----|--------|
+| Arrow keys | Move cursor |
+| `Ctrl+S` | Save |
+| `Esc` | Cancel |
 
 ---
 
@@ -219,7 +285,7 @@ Universe (root)
 
 ### Processing Pipeline
 
-1. **Import** — Claude conversations or Markdown files
+1. **Import** — Claude conversations, Markdown, OpenAIRE papers, or Google Keep
 2. **AI Analysis** — Generate titles, summaries, tags, emojis
 3. **Clustering** — Group items into semantic topics
 4. **Hierarchy Build** — Create navigable structure (8-15 children per level)
