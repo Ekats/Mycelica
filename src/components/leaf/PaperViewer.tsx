@@ -4,6 +4,7 @@ import { Document, Page, pdfjs } from 'react-pdf';
 import ReactMarkdown from 'react-markdown';
 import { ChevronLeft, FileText, ExternalLink, Users, Calendar, BookOpen, ZoomIn, ZoomOut, RotateCcw } from 'lucide-react';
 import { useGraphStore } from '../../stores/graphStore';
+import { LeafSimilarNodes } from './LeafSimilarNodes';
 import mammoth from 'mammoth';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
@@ -52,6 +53,7 @@ const ZOOM_STEP = 100;
 
 export function PaperViewer({ nodeId, metadata, title, onBack }: PaperViewerProps) {
   const leafInitialView = useGraphStore(state => state.leafInitialView);
+  const openLeaf = useGraphStore(state => state.openLeaf);
   const [viewMode, setViewMode] = useState<'abstract' | 'document'>(
     leafInitialView === 'pdf' && metadata.pdfAvailable ? 'document' : 'abstract'
   );
@@ -299,8 +301,9 @@ export function PaperViewer({ nodeId, metadata, title, onBack }: PaperViewerProp
         </div>
       </div>
 
-      {/* Content area */}
-      <div className="flex-1 overflow-auto p-6">
+      {/* Content area with similar nodes sidebar */}
+      <div className="flex-1 flex overflow-hidden">
+        <div className="flex-1 overflow-auto p-6">
         {viewMode === 'abstract' ? (
           <div className="max-w-3xl mx-auto">
             <h2 className="text-lg font-semibold mb-4 text-gray-300">Abstract</h2>
@@ -489,6 +492,17 @@ export function PaperViewer({ nodeId, metadata, title, onBack }: PaperViewerProp
             ) : null}
           </div>
         )}
+        </div>
+
+        {/* Similar nodes sidebar */}
+        <aside className="w-96 border-l border-gray-700 bg-gray-800/50 overflow-y-auto flex-shrink-0">
+          <LeafSimilarNodes
+            nodeId={nodeId}
+            nodeTitle={title}
+            nodeEmoji="📄"
+            onNavigate={openLeaf}
+          />
+        </aside>
       </div>
     </div>
   );

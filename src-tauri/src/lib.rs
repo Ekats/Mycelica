@@ -41,7 +41,7 @@ use commands::{
     // Import commands
     import_claude_conversations, import_markdown_files, import_google_keep, import_openaire, count_openaire_papers, cancel_openaire, get_imported_paper_count,
     // Paper retrieval commands
-    get_paper_metadata, get_paper_pdf, get_paper_document, has_paper_pdf, open_paper_external, reformat_paper_abstracts, sync_paper_pdf_status, download_paper_on_demand,
+    get_paper_metadata, get_paper_pdf, get_paper_document, has_paper_pdf, open_paper_external, reformat_paper_abstracts, sync_paper_pdf_status, sync_paper_dates, download_paper_on_demand,
     // Quick access commands (Sidebar)
     set_node_pinned, touch_node, get_pinned_nodes, get_recent_nodes, clear_recent,
     // Semantic similarity commands
@@ -289,6 +289,7 @@ pub fn run() {
             open_paper_external,
             reformat_paper_abstracts,
             sync_paper_pdf_status,
+            sync_paper_dates,
             download_paper_on_demand,
             // Quick access (Sidebar)
             set_node_pinned,

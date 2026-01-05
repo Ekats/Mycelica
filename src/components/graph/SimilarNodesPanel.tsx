@@ -2,6 +2,7 @@ import { memo, useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { Pin, PinOff, Lock, LockOpen, GitBranch, GitMerge, MoreHorizontal } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import type { Node, Edge } from '../../types/graph';
+import { getSimilarityColor } from '../../utils/similarityColor';
 
 interface SimilarNode {
   id: string;
@@ -408,7 +409,7 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
           </span>
           <span
             className="text-xs shrink-0 font-medium"
-            style={{ color: groupIsInside ? '#4ade80' : `hsl(${displaySimilarity * 120}, 70%, 50%)` }}
+            style={{ color: groupIsInside ? '#4ade80' : getSimilarityColor(displaySimilarity) }}
           >
             {(displaySimilarity * 100).toFixed(0)}%
           </span>
@@ -452,8 +453,8 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
                     <span className="truncate">{item.title}</span>
                   </span>
                   <span
-                    className="text-xs shrink-0"
-                    style={{ color: isInside ? '#4ade80' : `hsl(${displaySimilarity * 120}, 70%, 50%)` }}
+                    className="text-xs shrink-0 font-medium"
+                    style={{ color: isInside ? '#4ade80' : getSimilarityColor(displaySimilarity) }}
                   >
                     {(displaySimilarity * 100).toFixed(0)}%
                   </span>
@@ -781,7 +782,7 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
                             </span>
                             <span
                               className="text-xs shrink-0 font-medium"
-                              style={{ color: `hsl(${weight * 120}, 70%, 50%)` }}
+                              style={{ color: getSimilarityColor(weight) }}
                             >
                               {(weight * 100).toFixed(0)}%
                             </span>

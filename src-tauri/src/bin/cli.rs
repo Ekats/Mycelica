@@ -10,7 +10,7 @@ use mycelica_lib::{db::{Database, Node, NodeType}, settings, import, hierarchy, 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::io::Write;
-use chrono::Utc;
+use chrono::{Timelike, Utc};
 
 // TUI imports
 use crossterm::{
@@ -293,6 +293,8 @@ enum HierarchyCommands {
     Flatten,
     /// Show hierarchy statistics
     Stats,
+    /// Fix Recent Notes position (move to Universe)
+    FixRecentNotes,
 }
 
 #[derive(Subcommand)]
@@ -404,6 +406,8 @@ enum PaperCommands {
     },
     /// Sync PDF availability status
     SyncPdfs,
+    /// Sync paper dates from publication_date to nodes.created_at
+    SyncDates,
     /// Reformat all paper abstracts
     ReformatAbstracts,
 }
@@ -1224,6 +1228,49 @@ async fn handle_hierarchy(cmd: HierarchyCommands, db: &Database, json: bool, qui
                 }
             }
         }
+        HierarchyCommands::FixRecentNotes => {
+            let recent_notes_id = settings::RECENT_NOTES_CONTAINER_ID;
+
+            // Check if Recent Notes exists
+            if let Some(recent_notes) = db.get_node(recent_notes_id).map_err(|e| e.to_string())? {
+                // Get Universe
+                let universe = db.get_universe().map_err(|e| e.to_string())?
+                    .ok_or("Universe not found - run 'hierarchy build' first")?;
+
+                let old_parent = recent_notes.parent_id.clone().unwrap_or_else(|| "none".to_string());
+
+                if old_parent == universe.id {
+                    if json {
+                        println!(r#"{{"status":"already_correct","parent":"{}"}}"#, universe.id);
+                    } else {
+                        println!("Recent Notes is already under Universe");
+                    }
+                } else {
+                    // Move Recent Notes to Universe at depth 1
+                    db.update_parent(recent_notes_id, &universe.id).map_err(|e| e.to_string())?;
+                    db.set_node_depth(recent_notes_id, 1).map_err(|e| e.to_string())?;
+
+                    // Update child counts
+                    db.recalculate_child_count(&old_parent).map_err(|e| e.to_string())?;
+                    db.recalculate_child_count(&universe.id).map_err(|e| e.to_string())?;
+
+                    // Propagate latest dates
+                    db.propagate_latest_dates().map_err(|e| e.to_string())?;
+
+                    if json {
+                        println!(r#"{{"status":"fixed","old_parent":"{}","new_parent":"{}"}}"#, old_parent, universe.id);
+                    } else {
+                        println!("Moved Recent Notes from '{}' to Universe (depth 1)", old_parent);
+                    }
+                }
+            } else {
+                if json {
+                    println!(r#"{{"status":"not_found"}}"#);
+                } else {
+                    println!("Recent Notes container not found");
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1675,6 +1722,17 @@ async fn handle_paper(cmd: PaperCommands, db: &Database, json: bool) -> Result<(
                 println!(r#"{{"status":"ok"}}"#);
             } else {
                 println!("PDF status synced");
+            }
+        }
+        PaperCommands::SyncDates => {
+            let (updated, unknown) = db.sync_paper_dates().map_err(|e| e.to_string())?;
+            // Also propagate latest dates to clusters
+            db.propagate_latest_dates().map_err(|e| e.to_string())?;
+            if json {
+                println!(r#"{{"updated":{},"unknown":{}}}"#, updated, unknown);
+            } else {
+                println!("Synced dates: {} updated, {} set to unknown", updated, unknown);
+                println!("Latest dates propagated to clusters");
             }
         }
         PaperCommands::ReformatAbstracts => {
@@ -2543,6 +2601,7 @@ struct TreeNode {
     is_universe: bool,
     children_loaded: bool,
     created_at: i64,
+    latest_child_date: Option<i64>,
 }
 
 /// Similar node for leaf view sidebar
@@ -2669,13 +2728,17 @@ impl TuiApp {
             // Load children of current root directly (flat list, not tree)
             let children = db.get_children(&self.current_root_id).map_err(|e| e.to_string())?;
 
-            // Calculate date range for color gradient
+            // Calculate date range for color gradient (use effective dates)
+            // Exclude Recent Notes from date range calculation (it skews the gradient)
+            let recent_notes_id = settings::RECENT_NOTES_CONTAINER_ID;
             if !children.is_empty() {
                 self.date_min = children.iter()
-                    .map(|n| n.created_at)
+                    .filter(|n| n.id != recent_notes_id)
+                    .map(|n| n.latest_child_date.unwrap_or(n.created_at))
                     .min()
                     .unwrap_or(0);
                 self.date_max = children.iter()
+                    .filter(|n| n.id != recent_notes_id)
                     .map(|n| n.latest_child_date.unwrap_or(n.created_at))
                     .max()
                     .unwrap_or(i64::MAX);
@@ -2694,6 +2757,7 @@ impl TuiApp {
                     is_universe: false,
                     children_loaded: false,
                     created_at: child.created_at,
+                    latest_child_date: child.latest_child_date,
                 });
             }
         }
@@ -2726,10 +2790,17 @@ impl TuiApp {
 
         let children = db.get_children(node_id).map_err(|e| e.to_string())?;
 
-        // Update date range
+        // Update date range (use effective dates)
+        // Exclude Recent Notes from date range calculation (it skews the gradient)
+        let recent_notes_id = settings::RECENT_NOTES_CONTAINER_ID;
         if !children.is_empty() {
-            self.date_min = children.iter().map(|n| n.created_at).min().unwrap_or(0);
+            self.date_min = children.iter()
+                .filter(|n| n.id != recent_notes_id)
+                .map(|n| n.latest_child_date.unwrap_or(n.created_at))
+                .min()
+                .unwrap_or(0);
             self.date_max = children.iter()
+                .filter(|n| n.id != recent_notes_id)
                 .map(|n| n.latest_child_date.unwrap_or(n.created_at))
                 .max()
                 .unwrap_or(i64::MAX);
@@ -2748,6 +2819,7 @@ impl TuiApp {
                 is_universe: false,
                 children_loaded: false,
                 created_at: child.created_at,
+                latest_child_date: child.latest_child_date,
             });
         }
 
@@ -2795,6 +2867,7 @@ impl TuiApp {
                 is_universe: false,
                 children_loaded: false,
                 created_at: child.created_at,
+                latest_child_date: child.latest_child_date,
             });
         }
 
@@ -3106,6 +3179,7 @@ impl TuiApp {
                 is_universe: false,
                 children_loaded: false,
                 created_at: child.created_at,
+                latest_child_date: child.latest_child_date,
             });
         }
 
@@ -3979,11 +4053,13 @@ fn draw_preview(f: &mut Frame, app: &TuiApp, area: Rect) {
             ]),
         ];
 
-        // Add date
-        let date_str = format_date_time(node.created_at);
+        // Add date (use derived date for clusters, own date for items)
+        let effective_date = node.latest_child_date.unwrap_or(node.created_at);
+        let date_str = format_date_time(effective_date);
+        let date_color = date_color(effective_date, app.date_min, app.date_max);
         lines.push(Line::from(vec![
             Span::styled("Date: ", Style::default().fg(Color::Yellow)),
-            Span::raw(date_str),
+            Span::styled(date_str, Style::default().fg(date_color)),
         ]));
 
         // Add tags if present
@@ -4002,13 +4078,13 @@ fn draw_preview(f: &mut Frame, app: &TuiApp, area: Rect) {
         if let Some(ref summary) = node.summary {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled("Summary:", Style::default().fg(Color::Magenta))));
-            // Wrap summary (short preview)
-            let preview = if summary.len() > 150 {
-                format!("{}...", &summary[..147])
+            // Wrap summary
+            let preview = if summary.len() > 500 {
+                format!("{}...", &summary[..497])
             } else {
                 summary.clone()
             };
-            for chunk in preview.chars().collect::<Vec<_>>().chunks(25) {
+            for chunk in preview.chars().collect::<Vec<_>>().chunks(45) {
                 lines.push(Line::from(chunk.iter().collect::<String>()));
             }
         }
@@ -4339,6 +4415,13 @@ fn draw_edit_mode(f: &mut Frame, app: &TuiApp) {
 }
 
 fn draw_tree(f: &mut Frame, app: &TuiApp, area: Rect) {
+    // Fixed date width: "01 Jan 2020" = 11 chars
+    const DATE_WIDTH: usize = 11;
+    // Account for: borders (2), highlight symbol "→ " (3), separator space (1)
+    let usable_width = area.width.saturating_sub(6) as usize;
+    // Reserve space for date at the end
+    let title_max_width = usable_width.saturating_sub(DATE_WIDTH + 1);
+
     let items: Vec<ListItem> = app.visible_nodes.iter().map(|&idx| {
         let node = &app.nodes[idx];
         let indent = "  ".repeat(node.depth as usize);
@@ -4360,18 +4443,36 @@ fn draw_tree(f: &mut Frame, app: &TuiApp, area: Rect) {
             String::new()
         };
 
+        // Use effective date (derived from children for clusters, own date for items)
+        let effective_date = node.latest_child_date.unwrap_or(node.created_at);
+
         // Calculate date color using graph-matching gradient (red=old → cyan=new)
-        let node_date_color = date_color(node.created_at, app.date_min, app.date_max);
+        let node_date_color = date_color(effective_date, app.date_min, app.date_max);
 
-        // Format date
-        let date_str = format_date_time(node.created_at);
+        // Format date (date only, no time, for hierarchy view)
+        let date_str = format_date_only(effective_date);
 
-        // Build as owned strings to avoid lifetime issues
-        let main_text = format!("{}{} {}{}", indent, prefix, node.title, count);
+        // Build title with indent, prefix, title, and count
+        let full_title = format!("{}{} {}{}", indent, prefix, node.title, count);
+
+        // Truncate title if needed, accounting for unicode graphemes
+        let title_chars: Vec<char> = full_title.chars().collect();
+        let truncated_title = if title_chars.len() > title_max_width {
+            let truncate_at = title_max_width.saturating_sub(1);
+            let truncated: String = title_chars.iter().take(truncate_at).collect();
+            format!("{}…", truncated)
+        } else {
+            full_title
+        };
+
+        // Pad title to align dates (left-aligned dates at fixed position)
+        let display_width = truncated_title.chars().count();
+        let padding = title_max_width.saturating_sub(display_width);
+        let padded_title = format!("{}{}", truncated_title, " ".repeat(padding));
 
         // Create styled content with colored date
         let content = Line::from(vec![
-            Span::raw(main_text),
+            Span::raw(padded_title),
             Span::raw(" "),
             Span::styled(date_str, Style::default().fg(node_date_color)),
         ]);
@@ -4472,10 +4573,31 @@ fn date_color(timestamp: i64, min_date: i64, max_date: i64) -> Color {
 }
 
 fn format_date_time(timestamp: i64) -> String {
-    // timestamp is in milliseconds
+    // timestamp is in milliseconds; 0 = unknown date
+    if timestamp == 0 {
+        return "Unknown".to_string();
+    }
     chrono::DateTime::from_timestamp_millis(timestamp)
-        .map(|dt| dt.format("%d %b %Y %H:%M").to_string())
+        .map(|dt| {
+            // Only show time if not midnight (papers only have dates, shown as 00:00)
+            if dt.hour() == 0 && dt.minute() == 0 {
+                dt.format("%d %b %Y").to_string()
+            } else {
+                dt.format("%d %b %Y %H:%M").to_string()
+            }
+        })
         .unwrap_or_else(|| "Unknown".to_string())
+}
+
+/// Format date only (no time) - fixed width of 11 chars for alignment
+fn format_date_only(timestamp: i64) -> String {
+    // timestamp is in milliseconds; 0 = unknown date
+    if timestamp == 0 {
+        return "    Unknown".to_string(); // Pad to 11 chars
+    }
+    chrono::DateTime::from_timestamp_millis(timestamp)
+        .map(|dt| dt.format("%d %b %Y").to_string()) // Always 11 chars: "01 Jan 2020"
+        .unwrap_or_else(|| "    Unknown".to_string())
 }
 
 // ============================================================================

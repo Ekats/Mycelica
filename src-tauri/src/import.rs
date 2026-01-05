@@ -819,12 +819,12 @@ async fn import_single_paper(
     // Get first PDF URL
     let pdf_url = paper.pdf_urls.first().cloned();
 
-    // Parse publication date to timestamp
+    // Parse publication date to timestamp (use 0 for unknown dates, not import time)
     let created_at = paper.publication_date
         .as_ref()
         .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
         .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis())
-        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        .unwrap_or(0);  // 0 = unknown date (epoch)
 
     let now = chrono::Utc::now().timestamp_millis();
 

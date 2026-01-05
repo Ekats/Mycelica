@@ -1226,14 +1226,19 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
     // Track created category IDs to update their child_count after reparenting
     let mut created_category_ids: Vec<String> = Vec::new();
 
+    // Recent Notes container should never be reparented
+    let recent_notes_id = crate::settings::RECENT_NOTES_CONTAINER_ID;
+
     for (idx, grouping) in groupings.iter().enumerate() {
         // Find ALL child nodes matching this grouping's labels
         // Deduplicate by node ID to handle duplicate labels in AI response
+        // Exclude Recent Notes container from reparenting
         let mut seen_ids = std::collections::HashSet::new();
         let matching_children: Vec<&Node> = grouping.children
             .iter()
             .flat_map(|label| label_to_children.get(label).cloned().unwrap_or_default())
             .filter(|node| seen_ids.insert(node.id.clone()))
+            .filter(|node| node.id != recent_notes_id)  // Never reparent Recent Notes
             .collect();
 
         if matching_children.is_empty() {

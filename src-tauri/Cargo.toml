@@ -1,8 +1,8 @@
 [package]
 name = "mycelica"
-version = "0.7.0"
+version = "0.7.1"
 description = "A visual knowledge graph for AI conversations"
-authors = ["you"]
+authors = ["Ekats"]
 edition = "2021"
 default-run = "mycelica"
 

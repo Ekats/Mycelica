@@ -1404,6 +1404,16 @@ impl Database {
         Ok(())
     }
 
+    /// Recalculate and update a node's child count from actual children
+    pub fn recalculate_child_count(&self, node_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE nodes SET child_count = (SELECT COUNT(*) FROM nodes WHERE parent_id = ?1) WHERE id = ?1",
+            params![node_id],
+        )?;
+        Ok(())
+    }
+
     /// Count children of a node
     #[allow(dead_code)]
     pub fn count_children(&self, parent_id: &str) -> Result<i32> {
@@ -3653,6 +3663,54 @@ impl Database {
         )?;
 
         Ok(count)
+    }
+
+    /// Sync paper dates from papers.publication_date to nodes.created_at
+    /// Re-parses publication_date strings and updates nodes
+    /// Papers with missing/unparseable dates get 0 (unknown)
+    /// Returns (updated_count, unknown_count)
+    pub fn sync_paper_dates(&self) -> Result<(usize, usize)> {
+        let conn = self.conn.lock().unwrap();
+
+        // Get ALL papers (including those with NULL publication_date)
+        let mut stmt = conn.prepare(
+            "SELECT p.node_id, p.publication_date, n.created_at
+             FROM papers p
+             JOIN nodes n ON n.id = p.node_id"
+        )?;
+
+        let papers: Vec<(String, Option<String>, i64)> = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?.filter_map(|r| r.ok()).collect();
+
+        let mut updated = 0;
+        let mut unknown = 0;
+
+        for (node_id, pub_date, current_created_at) in papers {
+            // Try to parse the publication date
+            let parsed_ts = pub_date
+                .as_ref()
+                .filter(|d| !d.is_empty())
+                .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .map(|dt| dt.and_utc().timestamp_millis())
+                .unwrap_or(0);  // 0 = unknown date
+
+            // Update if dates differ significantly (more than 1 day) or setting to unknown
+            if (parsed_ts - current_created_at).abs() > 86_400_000 || (parsed_ts == 0 && current_created_at != 0) {
+                conn.execute(
+                    "UPDATE nodes SET created_at = ?1 WHERE id = ?2",
+                    params![parsed_ts, node_id],
+                )?;
+                if parsed_ts == 0 {
+                    unknown += 1;
+                } else {
+                    updated += 1;
+                }
+            }
+        }
+
+        Ok((updated, unknown))
     }
 
     /// Get count of papers

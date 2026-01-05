@@ -6,6 +6,7 @@ import { useGraphStore } from '../../stores/graphStore';
 import { getEmojiForNode } from '../../utils/emojiMatcher';
 import { ConversationRenderer, isConversationContent } from './ConversationRenderer';
 import { PaperViewer } from './PaperViewer';
+import { LeafSimilarNodes } from './LeafSimilarNodes';
 import type { Node } from '../../types/graph';
 
 interface PaperMetadata {
@@ -339,10 +340,19 @@ export function LeafView({ nodeId, onBack }: LeafViewProps) {
           )}
         </main>
 
-        {/* Right sidebar - Associated items */}
-        {associatedItems.length > 0 && (
-          <aside className="w-72 border-l border-gray-700 bg-gray-800/50 overflow-y-auto flex-shrink-0">
-            <div className="p-4">
+        {/* Right sidebar - Similar nodes and associated items */}
+        <aside className="w-96 border-l border-gray-700 bg-gray-800/50 overflow-y-auto flex-shrink-0">
+          {/* Similar nodes */}
+          <LeafSimilarNodes
+            nodeId={nodeId}
+            nodeTitle={node.aiTitle || node.title}
+            nodeEmoji={node.emoji}
+            onNavigate={openLeaf}
+          />
+
+          {/* Associated items */}
+          {associatedItems.length > 0 && (
+            <div className="p-4 border-t border-gray-700">
               <h3 className="text-sm font-medium text-gray-400 mb-3">
                 Associated Items ({associatedItems.length})
               </h3>
@@ -369,8 +379,8 @@ export function LeafView({ nodeId, onBack }: LeafViewProps) {
                 ))}
               </div>
             </div>
-          </aside>
-        )}
+          )}
+        </aside>
       </div>
     </div>
   );

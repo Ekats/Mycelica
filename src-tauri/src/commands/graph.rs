@@ -1213,6 +1213,17 @@ pub fn sync_paper_pdf_status(state: State<AppState>) -> Result<usize, String> {
     Ok(count)
 }
 
+/// Sync paper dates from papers.publication_date to nodes.created_at
+/// Re-parses publication_date strings and fixes nodes with wrong dates
+/// Papers with missing/unparseable dates get 0 (unknown)
+#[tauri::command]
+pub fn sync_paper_dates(state: State<AppState>) -> Result<(usize, usize), String> {
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+    let (updated, unknown) = db.sync_paper_dates().map_err(|e| e.to_string())?;
+    eprintln!("[Papers] Synced dates: {} updated, {} set to unknown", updated, unknown);
+    Ok((updated, unknown))
+}
+
 // ==================== Quick Access Commands (Sidebar) ====================
 
 /// Pin or unpin a node for quick access
