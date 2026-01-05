@@ -149,16 +149,19 @@ mycelica-cli [OPTIONS] <COMMAND>
 
 <details>
 <summary>**Import subcommands:**</summary>
+
 | Command | Description |
 |---------|-------------|
 | `import openaire -q "..."` | Import from OpenAIRE |
 | `import claude <file>` | Import Claude JSON |
 | `import markdown <path>` | Import Markdown |
 | `import keep <zip>` | Import Google Keep |
+
 </details>
 
 <details>
 <summary>**Export subcommands:**</summary>
+
 | Command | Description |
 |---------|-------------|
 | `export bibtex -o file.bib` | BibTeX format |
@@ -166,6 +169,7 @@ mycelica-cli [OPTIONS] <COMMAND>
 | `export json -o file.json` | JSON format |
 | `export graph -o file.dot` | DOT graph |
 | `export subgraph <id>` | Export subtree |
+
 </details>
 
 <details>
@@ -226,6 +230,7 @@ mycelica-cli tui
 
 <details>
 <summary>**Hierarchy Navigation:**</summary>
+
 | Key | Action |
 |-----|--------|
 | `j/k` | Navigate up/down |
@@ -236,10 +241,12 @@ mycelica-cli tui
 | `g/G` | Jump to top/bottom |
 | `r` | Reload |
 | `q` | Quit |
+
 </details>
 
 <details>
 <summary>**Leaf View:**</summary>
+
 | Key | Action |
 |-----|--------|
 | `Tab` | Cycle: Content → Similar → Edges |
@@ -248,16 +255,20 @@ mycelica-cli tui
 | `v` | Open PDF externally |
 | `o` | Open URL in browser |
 | `Backspace` | Back to hierarchy |
+
 </details>
 
 <details>
 <summary>**Edit Mode:**</summary>
+
 | Key | Action |
 |-----|--------|
 | Arrow keys | Move cursor |
 | `Ctrl+S` | Save |
 | `Esc` | Cancel |
+
 </details>
+
 ---
 
 ## Architecture
