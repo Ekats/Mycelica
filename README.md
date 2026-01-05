@@ -108,6 +108,15 @@ cargo build --release --bin mycelica-cli
 
 ### CLI Usage
 
+### Quick Start
+```bash
+mycelica-cli tui                # Interactive terminal UI
+mycelica-cli search "query"     # Global search
+mycelica-cli import openaire -q "neural" --max 500
+mycelica-cli setup              # First-time wizard (for processing imports)
+mycelica-cli export bibtex -o papers.bib
+```
+
 ```bash
 mycelica-cli [OPTIONS] <COMMAND>
 
