@@ -120,7 +120,9 @@ mycelica-cli [OPTIONS] <COMMAND>
 
 ### Commands
 
-**Top-level:**
+<details>
+<summary>**Top-level:**</summary>
+
 | Command | Description |
 |---------|-------------|
 | `setup` | Interactive first-time setup wizard |
@@ -143,15 +145,20 @@ mycelica-cli [OPTIONS] <COMMAND>
 | `maintenance` | Database maintenance |
 | `completions` | Shell completions |
 
-**Import subcommands:**
+</details>
+
+<details>
+<summary>**Import subcommands:**</summary>
 | Command | Description |
 |---------|-------------|
 | `import openaire -q "..."` | Import from OpenAIRE |
 | `import claude <file>` | Import Claude JSON |
 | `import markdown <path>` | Import Markdown |
 | `import keep <zip>` | Import Google Keep |
+</details>
 
-**Export subcommands:**
+<details>
+<summary>**Export subcommands:**</summary>
 | Command | Description |
 |---------|-------------|
 | `export bibtex -o file.bib` | BibTeX format |
@@ -159,6 +166,7 @@ mycelica-cli [OPTIONS] <COMMAND>
 | `export json -o file.json` | JSON format |
 | `export graph -o file.dot` | DOT graph |
 | `export subgraph <id>` | Export subtree |
+</details>
 
 <details>
 <summary>OpenAIRE import options</summary>
@@ -216,7 +224,8 @@ mycelica-cli tui
 
 **Layout:** Tree (50%) | Pins + Recents (25%) | Preview (25%)
 
-**Hierarchy Navigation:**
+<details>
+<summary>**Hierarchy Navigation:**</summary>
 | Key | Action |
 |-----|--------|
 | `j/k` | Navigate up/down |
@@ -227,8 +236,10 @@ mycelica-cli tui
 | `g/G` | Jump to top/bottom |
 | `r` | Reload |
 | `q` | Quit |
+</details>
 
-**Leaf View:**
+<details>
+<summary>**Leaf View:**</summary>
 | Key | Action |
 |-----|--------|
 | `Tab` | Cycle: Content → Similar → Edges |
@@ -237,14 +248,16 @@ mycelica-cli tui
 | `v` | Open PDF externally |
 | `o` | Open URL in browser |
 | `Backspace` | Back to hierarchy |
+</details>
 
-**Edit Mode:**
+<details>
+<summary>**Edit Mode:**</summary>
 | Key | Action |
 |-----|--------|
 | Arrow keys | Move cursor |
 | `Ctrl+S` | Save |
 | `Esc` | Cancel |
-
+</details>
 ---
 
 ## Architecture
