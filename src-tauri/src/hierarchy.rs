@@ -612,6 +612,170 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
     })
 }
 
+/// Build hierarchy while preserving existing top-level parent nodes (e.g., FOS categories)
+/// Creates topic nodes UNDER each parent, not directly under Universe
+///
+/// Flow:
+/// 1. Get existing FOS nodes (depth 1, non-items)
+/// 2. Delete only topic nodes (depth > 1), preserve FOS nodes
+/// 3. For each FOS node, group its children by cluster_id
+/// 4. Create topic nodes under each FOS node
+pub fn build_hierarchy_preserving_parents(db: &Database) -> Result<HierarchyResult, String> {
+    // Step 1: Get existing top-level nodes (depth 1, non-items) - these are FOS nodes
+    let top_level_nodes = db.get_nodes_at_depth(1)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|n| !n.is_item)
+        .collect::<Vec<_>>();
+
+    if top_level_nodes.is_empty() {
+        println!("[Hierarchy] No top-level nodes found, falling back to regular hierarchy");
+        return build_hierarchy(db);
+    }
+
+    println!("[Hierarchy] Preserving {} top-level nodes (FOS categories)", top_level_nodes.len());
+
+    // Step 2: Delete ONLY topic nodes (depth > 1, non-items), preserve FOS nodes
+    let deleted = db.delete_hierarchy_nodes_below_depth(1)
+        .map_err(|e| e.to_string())?;
+    if deleted > 0 {
+        println!("[Hierarchy] Deleted {} old topic nodes (preserved FOS)", deleted);
+    }
+
+    // Step 3: Clear parent_id only on items that pointed to deleted nodes
+    db.clear_orphaned_item_parents().map_err(|e| e.to_string())?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    let mut topics_created = 0;
+    let mut items_organized = 0;
+    let topic_depth = 2;  // FOS is depth 1, topics are depth 2
+    let item_depth = 3;   // Items are depth 3
+
+    // Step 4: For each FOS node, build sub-hierarchy for its children
+    for fos_node in &top_level_nodes {
+        // Get items that belong to this FOS node
+        let fos_children = db.get_children(&fos_node.id)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|n| n.is_item)
+            .collect::<Vec<_>>();
+
+        if fos_children.is_empty() {
+            continue;
+        }
+
+        println!("[Hierarchy] FOS '{}': {} items", fos_node.title, fos_children.len());
+
+        // Group by cluster_id
+        let mut clusters: HashMap<i32, Vec<Node>> = HashMap::new();
+        let mut unclustered: Vec<Node> = Vec::new();
+
+        for item in fos_children {
+            if let Some(cid) = item.cluster_id {
+                clusters.entry(cid).or_default().push(item);
+            } else {
+                unclustered.push(item);
+            }
+        }
+
+        // Add unclustered items to their own group if any
+        if !unclustered.is_empty() {
+            clusters.insert(-1, unclustered);
+        }
+
+        // Create topic nodes under this FOS node
+        for (cluster_id, items) in &clusters {
+            // Get cluster label from first item with one
+            let cluster_label = items.iter()
+                .find_map(|item| item.cluster_label.clone())
+                .unwrap_or_else(|| {
+                    if *cluster_id == -1 {
+                        "Uncategorized".to_string()
+                    } else {
+                        format!("Topic {}", cluster_id)
+                    }
+                });
+
+            let topic_id = format!("topic-{}-{}", fos_node.id, cluster_id);
+
+            // Generate summary from first few children's titles
+            let child_titles: Vec<String> = items.iter()
+                .take(3)
+                .map(|n| n.ai_title.clone().unwrap_or_else(|| n.title.clone()))
+                .collect();
+            let summary = if child_titles.len() > 2 {
+                format!("{}, {} and {} more", child_titles[0], child_titles[1], items.len() - 2)
+            } else {
+                child_titles.join(", ")
+            };
+
+            let topic_node = Node {
+                id: topic_id.clone(),
+                node_type: NodeType::Cluster,
+                title: cluster_label.clone(),
+                url: None,
+                content: None,
+                position: Position { x: 0.0, y: 0.0 },
+                created_at: now,
+                updated_at: now,
+                cluster_id: Some(*cluster_id),
+                cluster_label: Some(cluster_label),
+                ai_title: None,
+                summary: Some(summary),
+                tags: None,
+                emoji: Some("📂".to_string()),
+                is_processed: true,
+                depth: topic_depth,
+                is_item: false,
+                is_universe: false,
+                parent_id: Some(fos_node.id.clone()), // Under FOS, not Universe!
+                child_count: items.len() as i32,
+                conversation_id: None,
+                sequence_index: None,
+                is_pinned: false,
+                last_accessed_at: None,
+                latest_child_date: None,
+                is_private: None,
+                privacy_reason: None,
+                source: None,
+                pdf_available: None,
+                content_type: None,
+                associated_idea_id: None,
+                privacy: None,
+            };
+
+            db.insert_node(&topic_node).map_err(|e| e.to_string())?;
+            topics_created += 1;
+
+            // Update items to point to this topic and set their depth
+            for item in items {
+                db.update_node_hierarchy(&item.id, Some(&topic_id), item_depth)
+                    .map_err(|e| e.to_string())?;
+                items_organized += 1;
+            }
+        }
+
+        // Update FOS node's child count
+        let fos_child_count = clusters.len() as i32;
+        db.update_child_count(&fos_node.id, fos_child_count)
+            .map_err(|e| e.to_string())?;
+    }
+
+    println!("[Hierarchy] Created {} topics under {} FOS categories, organized {} items",
+             topics_created, top_level_nodes.len(), items_organized);
+
+    Ok(HierarchyResult {
+        levels_created: 4,  // Universe, FOS, Topics, Items
+        intermediate_nodes_created: topics_created,
+        items_organized,
+        max_depth: item_depth,
+    })
+}
+
 /// Clean up existing hierarchy (delete intermediate nodes, clear item parents)
 fn cleanup_hierarchy(db: &Database) -> Result<(), String> {
     // Delete all intermediate nodes (non-items, non-universe)

@@ -113,6 +113,9 @@ enum Commands {
         /// Skip the processing pipeline
         #[arg(long)]
         skip_pipeline: bool,
+        /// Use FOS (Field of Science) pre-grouping for papers before clustering
+        #[arg(long)]
+        fos: bool,
     },
     /// Recent nodes
     Recent {
@@ -706,7 +709,7 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Privacy { cmd } => handle_privacy(cmd, &db, cli.json, cli.quiet).await,
         Commands::Paper { cmd } => handle_paper(cmd, &db, cli.json).await,
         Commands::Config { cmd } => handle_config(cmd, cli.json),
-        Commands::Setup { skip_pipeline } => handle_setup(&db, skip_pipeline, cli.quiet).await,
+        Commands::Setup { skip_pipeline, fos } => handle_setup(&db, skip_pipeline, fos, cli.quiet).await,
         Commands::Recent { cmd } => handle_recent(cmd, &db, cli.json),
         Commands::Pinned { cmd } => handle_pinned(cmd, &db, cli.json),
         Commands::Nav { cmd } => handle_nav(cmd, &db, cli.json).await,
@@ -1913,7 +1916,7 @@ fn handle_config(cmd: ConfigCommands, json: bool) -> Result<(), String> {
 // Setup Command
 // ============================================================================
 
-async fn handle_setup(db: &Database, skip_pipeline: bool, quiet: bool) -> Result<(), String> {
+async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: bool) -> Result<(), String> {
     use std::io::{Write, BufRead};
 
     println!("=== Mycelica Setup ===\n");
@@ -2044,10 +2047,50 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, quiet: bool) -> Result
 
     // Step 2: Clustering
     println!("[2/3] Clustering...");
-    if let Err(e) = hierarchy::build_hierarchy(db) {
-        eprintln!("  Warning: Clustering failed: {}", e);
+
+    // If FOS flag is set, run full FOS pipeline: FOS grouping → clustering → hierarchy
+    if use_fos {
+        // Step 2a: Create FOS parent nodes
+        println!("  Creating FOS (Field of Science) parent nodes...");
+        match clustering::cluster_with_fos_pregrouping(db).await {
+            Ok(result) => {
+                println!("  FOS grouping: {} papers assigned to {} FOS categories",
+                    result.items_assigned, result.clusters_created);
+            }
+            Err(e) => {
+                eprintln!("  Warning: FOS pre-grouping failed: {}", e);
+            }
+        }
+
+        // Step 2b: Run clustering within each FOS group (assigns cluster_id)
+        println!("  Clustering within FOS groups...");
+        match clustering::run_clustering(db, true).await {
+            Ok(result) => {
+                println!("  Clustered: {} items into {} clusters",
+                    result.items_assigned, result.clusters_created);
+            }
+            Err(e) => {
+                eprintln!("  Warning: Clustering failed: {}", e);
+            }
+        }
+
+        // Step 2c: Build hierarchy preserving FOS structure
+        println!("  Building sub-hierarchies under FOS nodes...");
+        match hierarchy::build_hierarchy_preserving_parents(db) {
+            Ok(result) => {
+                println!("  Hierarchy: Universe → FOS → {} Topics → {} items",
+                    result.intermediate_nodes_created, result.items_organized);
+            }
+            Err(e) => {
+                eprintln!("  Warning: Hierarchy build failed: {}", e);
+            }
+        }
     } else {
-        println!("  Hierarchy built.");
+        if let Err(e) = hierarchy::build_hierarchy(db) {
+            eprintln!("  Warning: Clustering failed: {}", e);
+        } else {
+            println!("  Hierarchy built.");
+        }
     }
 
     // Step 3: Embeddings
@@ -2409,12 +2452,14 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
         }
 
         MaintenanceCommands::ClearHierarchy { force } => {
-            if !force && !confirm_action("clear hierarchy (reparent all items to universe)")? {
+            if !force && !confirm_action("clear hierarchy (delete intermediate nodes, keep items)")? {
                 return Err("Operation cancelled".into());
             }
-            // Reparent all items to universe
+            // Clear parent_id on items
             db.clear_item_parents().map_err(|e| e.to_string())?;
-            println!("✓ Cleared item parents (run hierarchy build to rebuild structure)");
+            // Delete intermediate hierarchy nodes (clusters, categories)
+            let deleted = db.delete_hierarchy_nodes().map_err(|e| e.to_string())?;
+            println!("✓ Cleared hierarchy: {} intermediate nodes deleted", deleted);
         }
 
         MaintenanceCommands::ClearTags { force } => {

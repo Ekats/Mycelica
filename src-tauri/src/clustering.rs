@@ -558,6 +558,63 @@ async fn cluster_with_embeddings_impl(
     items: &[Node],
     use_ai_naming: bool,
 ) -> Result<ClusteringResult, String> {
+    // Group items by parent_id to preserve existing hierarchy (e.g., FOS categories)
+    // Items with same parent get clustered together; items without parent cluster together
+    let items_by_parent: HashMap<Option<String>, Vec<Node>> = items
+        .iter()
+        .cloned()
+        .fold(HashMap::new(), |mut acc, item| {
+            acc.entry(item.parent_id.clone()).or_default().push(item);
+            acc
+        });
+
+    let num_groups = items_by_parent.len();
+    if num_groups > 1 {
+        println!("[Clustering] Respecting {} parent groups (FOS/hierarchy preserved)", num_groups);
+    }
+
+    let mut total_result = ClusteringResult {
+        items_processed: 0,
+        clusters_created: 0,
+        items_assigned: 0,
+        edges_created: 0,
+        method: "embedding".to_string(),
+    };
+
+    // Cluster each parent group separately
+    for (parent_id, group_items) in items_by_parent {
+        let group_name = parent_id.as_deref().unwrap_or("(no parent)");
+        if num_groups > 1 {
+            println!("[Clustering] Processing group '{}' with {} items", group_name, group_items.len());
+        }
+
+        let result = cluster_single_group(db, &group_items, use_ai_naming).await?;
+
+        total_result.items_processed += result.items_processed;
+        total_result.clusters_created += result.clusters_created;
+        total_result.items_assigned += result.items_assigned;
+        total_result.edges_created += result.edges_created;
+    }
+
+    Ok(total_result)
+}
+
+/// Cluster a single group of items (all with same parent_id)
+async fn cluster_single_group(
+    db: &Database,
+    items: &[Node],
+    use_ai_naming: bool,
+) -> Result<ClusteringResult, String> {
+    if items.is_empty() {
+        return Ok(ClusteringResult {
+            items_processed: 0,
+            clusters_created: 0,
+            items_assigned: 0,
+            edges_created: 0,
+            method: "embedding".to_string(),
+        });
+    }
+
     println!("[Clustering] Using embedding-based clustering for {} items", items.len());
 
     // Step 1: Ensure all items have embeddings
@@ -1008,9 +1065,56 @@ pub async fn cluster_with_fos_pregrouping(db: &Database) -> Result<ClusteringRes
     let total_papers: usize = papers_by_fos.values().map(|v| v.len()).sum();
     println!("[Clustering FOS] {} papers across {} FOS categories", total_papers, papers_by_fos.len());
 
-    // Get universe node
-    let universe = db.get_universe().map_err(|e| e.to_string())?
-        .ok_or_else(|| "Universe node not found - run hierarchy build first".to_string())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    // Get or create universe node
+    let universe = match db.get_universe().map_err(|e| e.to_string())? {
+        Some(u) => u,
+        None => {
+            // Create Universe node
+            println!("[Clustering FOS] Creating Universe node");
+            let universe_node = Node {
+                id: "universe-root".to_string(),
+                node_type: NodeType::Cluster,
+                title: "All Knowledge".to_string(),
+                url: None,
+                content: Some("The root of everything".to_string()),
+                position: Position { x: 0.0, y: 0.0 },
+                created_at: now,
+                updated_at: now,
+                cluster_id: None,
+                cluster_label: Some("Universe".to_string()),
+                depth: 0,
+                is_item: false,
+                is_universe: true,
+                parent_id: None,
+                child_count: 0,
+                emoji: Some("🌌".to_string()),
+                summary: None,
+                ai_title: None,
+                tags: None,
+                is_processed: false,
+                is_pinned: false,
+                is_private: None,
+                last_accessed_at: None,
+                conversation_id: None,
+                sequence_index: None,
+                latest_child_date: None,
+                privacy_reason: None,
+                source: None,
+                pdf_available: None,
+                content_type: None,
+                associated_idea_id: None,
+                privacy: None,
+            };
+            db.insert_node(&universe_node).map_err(|e| e.to_string())?;
+            universe_node
+        }
+    };
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

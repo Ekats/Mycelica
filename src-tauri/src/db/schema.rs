@@ -1537,6 +1537,30 @@ impl Database {
         Ok(())
     }
 
+    /// Delete hierarchy nodes at depth > min_depth (preserves FOS nodes at depth 1)
+    /// Used when rebuilding hierarchy while preserving top-level structure
+    pub fn delete_hierarchy_nodes_below_depth(&self, min_depth: i32) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM nodes WHERE is_item = 0 AND is_universe = 0 AND depth > ?1",
+            [min_depth],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Clear parent_id only on items whose parent no longer exists
+    /// Used after deleting hierarchy nodes to clean up orphaned references
+    pub fn clear_orphaned_item_parents(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE nodes SET parent_id = NULL
+             WHERE is_item = 1 AND parent_id IS NOT NULL
+             AND parent_id NOT IN (SELECT id FROM nodes)",
+            [],
+        )?;
+        Ok(())
+    }
+
     /// Get all category/topic names in the hierarchy (for duplicate prevention)
     /// Returns distinct names from non-item nodes
     pub fn get_all_category_names(&self) -> Result<Vec<String>> {
