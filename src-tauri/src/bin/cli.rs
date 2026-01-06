@@ -334,6 +334,8 @@ enum ClusterCommands {
     Run,
     /// Recluster all items
     All,
+    /// Cluster with FOS (Field of Science) pre-grouping for papers
+    Fos,
     /// Reset clustering data
     Reset,
     /// Get or set clustering thresholds
@@ -1439,6 +1441,17 @@ async fn handle_cluster(cmd: ClusterCommands, db: &Database, json: bool, quiet: 
             } else {
                 println!("Processed {} items, created {} clusters, assigned {} items",
                     result.items_processed, result.clusters_created, result.items_assigned);
+            }
+        }
+        ClusterCommands::Fos => {
+            if !quiet { eprintln!("Clustering with FOS pre-grouping for papers..."); }
+            let result = clustering::cluster_with_fos_pregrouping(db).await?;
+            if json {
+                println!(r#"{{"items_processed":{},"clusters_created":{},"items_assigned":{},"edges_created":{}}}"#,
+                    result.items_processed, result.clusters_created, result.items_assigned, result.edges_created);
+            } else {
+                println!("Processed {} items, created {} clusters, assigned {} items, {} edges",
+                    result.items_processed, result.clusters_created, result.items_assigned, result.edges_created);
             }
         }
         ClusterCommands::Reset => {

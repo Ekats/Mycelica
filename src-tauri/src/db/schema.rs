@@ -1093,6 +1093,41 @@ impl Database {
         Ok(())
     }
 
+    /// Batch insert edges with transaction wrapping and INSERT OR IGNORE
+    pub fn insert_edges_batch(&self, edges: &[Edge]) -> Result<usize> {
+        if edges.is_empty() {
+            return Ok(0);
+        }
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO edges (id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+            )?;
+
+            for edge in edges {
+                stmt.execute(params![
+                    &edge.id,
+                    &edge.source,
+                    &edge.target,
+                    edge.edge_type.as_str(),
+                    &edge.label,
+                    &edge.weight,
+                    &edge.edge_source,
+                    &edge.evidence_id,
+                    &edge.confidence,
+                    &edge.created_at,
+                ])?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(edges.len())
+    }
+
     pub fn get_all_edges(&self) -> Result<Vec<Edge>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -2229,22 +2264,29 @@ impl Database {
     }
 
     /// Create semantic "Related" edges between nodes based on embedding similarity
+    /// Uses two-pass approach for fair top-K selection:
+    /// - Pass 1: Compute all similarities (upper triangle), store candidates for BOTH nodes
+    /// - Pass 2: Each node selects top-K, dedupe, batch insert
     /// Gives +0.2 bonus to siblings (same parent) so within-view edges are prioritized
     /// Uses lower threshold (min_similarity - 0.2) for category-to-category edges
     /// Returns the number of edges created
     pub fn create_semantic_edges(&self, min_similarity: f32, max_edges_per_node: usize) -> Result<usize> {
         use crate::similarity::cosine_similarity;
+        use std::collections::{HashMap, HashSet};
 
         // Get all nodes with embeddings
         let nodes_with_embeddings = self.get_nodes_with_embeddings()?;
-        if nodes_with_embeddings.len() < 2 {
+        let n = nodes_with_embeddings.len();
+        if n < 2 {
             return Ok(0);
         }
 
+        eprintln!("[Edges] Starting semantic edge generation for {} nodes", n);
+
         // Build parent_id and is_item lookup
         let (parent_map, is_item_map): (
-            std::collections::HashMap<String, Option<String>>,
-            std::collections::HashMap<String, bool>
+            HashMap<String, Option<String>>,
+            HashMap<String, bool>
         ) = {
             let conn = self.conn.lock().unwrap();
             let mut stmt = conn.prepare("SELECT id, parent_id, is_item FROM nodes WHERE embedding IS NOT NULL")?;
@@ -2255,8 +2297,8 @@ impl Database {
                     row.get::<_, bool>(2)?
                 ))
             })?;
-            let mut parents = std::collections::HashMap::new();
-            let mut items = std::collections::HashMap::new();
+            let mut parents = HashMap::new();
+            let mut items = HashMap::new();
             for row in rows.filter_map(|r| r.ok()) {
                 parents.insert(row.0.clone(), row.1);
                 items.insert(row.0, row.2);
@@ -2264,66 +2306,74 @@ impl Database {
             (parents, items)
         };
 
-        let now = chrono::Utc::now().timestamp_millis();
-        let mut edges_created = 0;
         const SIBLING_BONUS: f32 = 0.2;
         const CATEGORY_THRESHOLD_REDUCTION: f32 = 0.2;
 
-        // For each node, find most similar nodes and create edges
+        // Pass 1: Collect ALL candidate edges above threshold (store for BOTH nodes)
+        // This ensures every node gets fair top-K selection regardless of position
+        let mut candidates: HashMap<String, Vec<(String, f32, f32)>> = HashMap::new(); // node_id -> [(other_id, raw_sim, boosted_sim)]
+
         for (i, (node_id, embedding)) in nodes_with_embeddings.iter().enumerate() {
+            if i % 1000 == 0 {
+                eprintln!("[Edges] Pass 1: Comparing node {}/{} ({:.1}%)", i, n, (i as f64 / n as f64) * 100.0);
+            }
+
             let node_parent = parent_map.get(node_id).and_then(|p| p.clone());
             let node_is_item = *is_item_map.get(node_id).unwrap_or(&true);
 
-            // Compute similarities with all other nodes, applying sibling bonus
-            let mut similarities: Vec<(&String, f32, f32, bool)> = nodes_with_embeddings
-                .iter()
-                .skip(i + 1)  // Only compare with nodes after this one (avoid duplicates)
-                .map(|(other_id, other_emb)| {
-                    let raw_sim = cosine_similarity(embedding, other_emb);
-                    let other_parent = parent_map.get(other_id).and_then(|p| p.clone());
-                    let other_is_item = *is_item_map.get(other_id).unwrap_or(&true);
+            // Upper triangle only - but store for BOTH nodes
+            for (other_id, other_emb) in nodes_with_embeddings[i+1..].iter() {
+                let raw_sim = cosine_similarity(embedding, other_emb);
+                let other_parent = parent_map.get(other_id).and_then(|p| p.clone());
+                let other_is_item = *is_item_map.get(other_id).unwrap_or(&true);
 
-                    // Boost score if same parent (siblings will be visible together)
-                    let is_sibling = node_parent.is_some() && node_parent == other_parent;
-                    let boosted_sim = if is_sibling { raw_sim + SIBLING_BONUS } else { raw_sim };
+                // Boost score if same parent (siblings will be visible together)
+                let is_sibling = node_parent.is_some() && node_parent == other_parent;
+                let boosted_sim = if is_sibling { raw_sim + SIBLING_BONUS } else { raw_sim };
 
-                    // Use lower threshold for category-to-category edges
-                    let is_category_edge = !node_is_item && !other_is_item;
+                // Use lower threshold for category-to-category edges
+                let is_category_edge = !node_is_item && !other_is_item;
+                let effective_threshold = if is_category_edge {
+                    min_similarity - CATEGORY_THRESHOLD_REDUCTION
+                } else {
+                    min_similarity
+                };
 
-                    (other_id, raw_sim, boosted_sim, is_category_edge)
-                })
-                .filter(|(_, raw_sim, _, is_category_edge)| {
-                    let effective_threshold = if *is_category_edge {
-                        min_similarity - CATEGORY_THRESHOLD_REDUCTION
-                    } else {
-                        min_similarity
-                    };
-                    *raw_sim >= effective_threshold
-                })
-                .collect();
+                if raw_sim >= effective_threshold {
+                    // Store for BOTH nodes so each gets fair top-K selection
+                    candidates.entry(node_id.clone()).or_default().push((other_id.clone(), raw_sim, boosted_sim));
+                    candidates.entry(other_id.clone()).or_default().push((node_id.clone(), raw_sim, boosted_sim));
+                }
+            }
+        }
 
-            // Sort by boosted similarity descending and take top N
-            similarities.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-            similarities.truncate(max_edges_per_node);
+        eprintln!("[Edges] Pass 1 complete: {} nodes with candidates", candidates.len());
 
-            // Create edges (store raw similarity as weight, not boosted)
-            for (other_id, raw_similarity, _, _) in similarities {
-                let edge_id = format!("semantic-{}-{}", node_id, other_id);
+        // Pass 2: Truncate each node to top-K, dedupe, and batch insert
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut all_edges: Vec<Edge> = Vec::new();
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let mut edges_created = 0;
+        const BATCH_SIZE: usize = 10_000;
 
-                // Check if edge already exists
-                let conn = self.conn.lock().unwrap();
-                let exists: bool = conn.query_row(
-                    "SELECT COUNT(*) > 0 FROM edges WHERE id = ?1",
-                    params![&edge_id],
-                    |row| row.get(0),
-                ).unwrap_or(false);
-                drop(conn);
+        for (node_id, mut node_candidates) in candidates {
+            // Sort by boosted similarity descending
+            node_candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            node_candidates.truncate(max_edges_per_node);
 
-                if !exists {
-                    let edge = Edge {
-                        id: edge_id,
-                        source: node_id.clone(),
-                        target: other_id.clone(),
+            for (other_id, raw_similarity, _boosted) in node_candidates {
+                // Canonical order for deduplication (smaller ID first)
+                let key = if node_id < other_id {
+                    (node_id.clone(), other_id.clone())
+                } else {
+                    (other_id.clone(), node_id.clone())
+                };
+
+                if seen.insert(key.clone()) {
+                    all_edges.push(Edge {
+                        id: format!("semantic-{}-{}", key.0, key.1),
+                        source: key.0,
+                        target: key.1,
                         edge_type: EdgeType::Related,
                         label: Some(format!("{:.0}% similar", raw_similarity * 100.0)),
                         weight: Some(raw_similarity as f64),
@@ -2331,15 +2381,24 @@ impl Database {
                         evidence_id: None,
                         confidence: Some(raw_similarity as f64),
                         created_at: now,
-                    };
-
-                    if self.insert_edge(&edge).is_ok() {
-                        edges_created += 1;
-                    }
+                    });
                 }
+            }
+
+            // Batch insert every BATCH_SIZE edges
+            if all_edges.len() >= BATCH_SIZE {
+                edges_created += self.insert_edges_batch(&all_edges)?;
+                all_edges.clear();
+                eprintln!("[Edges] Pass 2: {} edges created so far", edges_created);
             }
         }
 
+        // Insert remaining edges
+        if !all_edges.is_empty() {
+            edges_created += self.insert_edges_batch(&all_edges)?;
+        }
+
+        eprintln!("[Edges] Complete: {} edges from {} nodes", edges_created, n);
         Ok(edges_created)
     }
 
@@ -3581,6 +3640,52 @@ impl Database {
         let params: Vec<&dyn rusqlite::ToSql> = openaire_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
         let count: i32 = conn.query_row(&sql, params.as_slice(), |row| row.get(0))?;
         Ok(count)
+    }
+
+    /// Get papers grouped by their top-level Field of Science (FOS)
+    /// Extracts 2-digit FOS codes and maps to standard category names
+    /// Returns a HashMap where keys are FOS names and values are lists of node IDs
+    pub fn get_papers_by_fos(&self) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        use crate::db::models::PaperSubject;
+
+        // Top-level FOS categories (2-digit codes)
+        let fos_names: std::collections::HashMap<&str, &str> = [
+            ("01", "Natural Sciences"),
+            ("02", "Engineering and Technology"),
+            ("03", "Medical and Health Sciences"),
+            ("04", "Agricultural and Veterinary Sciences"),
+            ("05", "Social Sciences"),
+            ("06", "Humanities and the Arts"),
+        ].into_iter().collect();
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT n.id, p.subjects FROM nodes n
+             JOIN papers p ON n.id = p.node_id
+             WHERE n.content_type = 'paper' AND p.subjects IS NOT NULL"
+        )?;
+
+        let mut by_fos: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+
+        for row in stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (node_id, subjects_json) = row?;
+            if let Ok(subjects) = serde_json::from_str::<Vec<PaperSubject>>(&subjects_json) {
+                // Find first FOS subject and extract top-level code (first 2 digits)
+                let fos = subjects.iter()
+                    .find(|s| s.scheme == "FOS")
+                    .and_then(|s| {
+                        // Extract 2-digit code from values like "0301 basic medicine" or "03 medical..."
+                        let code = s.value.chars().take(2).collect::<String>();
+                        fos_names.get(code.as_str()).map(|name| name.to_string())
+                    })
+                    .unwrap_or_else(|| "Other".to_string());
+                by_fos.entry(fos).or_default().push(node_id);
+            }
+        }
+
+        Ok(by_fos)
     }
 
     /// Get PDF blob for a paper
