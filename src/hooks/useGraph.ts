@@ -141,12 +141,10 @@ export function useGraph() {
     try {
       console.log('Loading graph from backend...');
 
-      const [backendNodes, backendEdges] = await Promise.all([
-        invoke<BackendNode[]>('get_nodes'),
-        invoke<BackendEdge[]>('get_edges'),
-      ]);
+      // Only load nodes on startup - edges are loaded per-view for performance
+      const backendNodes = await invoke<BackendNode[]>('get_nodes');
 
-      console.log(`Loaded ${backendNodes.length} nodes, ${backendEdges.length} edges`);
+      console.log(`Loaded ${backendNodes.length} nodes`);
       if (backendNodes.length > 0) {
         console.log('First node:', JSON.stringify(backendNodes[0], null, 2));
       }
@@ -156,19 +154,14 @@ export function useGraph() {
         nodeMap.set(n.id, mapBackendNode(n));
       }
 
-      const edgeMap = new Map<string, Edge>();
-      for (const e of backendEdges) {
-        edgeMap.set(e.id, mapBackendEdge(e));
-      }
-
       setNodes(nodeMap);
-      setEdges(edgeMap);
+      // Don't load all edges - they'll be loaded per-view via loadEdgesForView
       setLoaded(true);
     } catch (error) {
       console.error('Failed to load graph:', error);
       setLoaded(true); // Mark as loaded even on error so UI doesn't hang
     }
-  }, [setNodes, setEdges]);
+  }, [setNodes]);
 
   // Lazy load children of a parent node (for graph navigation)
   // Uses get_graph_children to exclude supporting items (code/debug/paste/trivial)
@@ -206,5 +199,51 @@ export function useGraph() {
     loadGraph();
   }, [loadGraph]);
 
-  return { nodes, edges, reload: loadGraph, loaded, loadChildren, isParentLoaded };
+  // Load edges for a specific view (where both endpoints are children of the given parent)
+  // Uses indexed lookup for O(1) performance instead of client-side filtering
+  const loadEdgesForView = useCallback(async (parentId: string) => {
+    try {
+      console.log(`Loading edges for view: ${parentId}`);
+      const backendEdges = await invoke<BackendEdge[]>('get_edges_for_view', { parentId });
+
+      const edgeMap = new Map<string, Edge>();
+      for (const e of backendEdges) {
+        edgeMap.set(e.id, mapBackendEdge(e));
+      }
+
+      setEdges(edgeMap);
+      console.log(`Loaded ${backendEdges.length} edges for view ${parentId}`);
+    } catch (err) {
+      console.error('Failed to load view edges:', err);
+    }
+  }, [setEdges]);
+
+  // Load precomputed edges for a FOS category (fast cached lookup)
+  // Falls back to loadEdgesForView if fos_edges table is empty
+  const loadEdgesForFos = useCallback(async (fosId: string) => {
+    try {
+      console.log(`Loading precomputed edges for FOS: ${fosId}`);
+      const backendEdges = await invoke<BackendEdge[]>('get_edges_for_fos', { fosId });
+
+      // Only use precomputed FOS edges if available
+      // Otherwise fall back to per-view loading
+      if (backendEdges.length === 0) {
+        console.log(`No precomputed FOS edges for ${fosId}, using per-view loading`);
+        await loadEdgesForView(fosId);
+        return;
+      }
+
+      const edgeMap = new Map<string, Edge>();
+      for (const e of backendEdges) {
+        edgeMap.set(e.id, mapBackendEdge(e));
+      }
+
+      setEdges(edgeMap);
+      console.log(`Loaded ${backendEdges.length} precomputed edges for FOS ${fosId}`);
+    } catch (err) {
+      console.error('Failed to load FOS edges:', err);
+    }
+  }, [setEdges, loadEdgesForView]);
+
+  return { nodes, edges, reload: loadGraph, loaded, loadChildren, isParentLoaded, loadEdgesForView, loadEdgesForFos };
 }

@@ -1459,26 +1459,29 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       .style('opacity', (d: GraphNode) => getOpacityFromData(d));
 
     // Update edge opacity and thickness based on selection
-    svg.selectAll<SVGPathElement, EdgeData>('.links path')
-      .transition().duration(150)
-      .attr('opacity', (e: EdgeData) => {
-        if (!activeNodeId) return 1;
-        if (e.source.id === activeNodeId || e.target.id === activeNodeId) return 1;
-        return 0.5;
-      })
-      .attr('stroke-width', (e: EdgeData) => {
-        const isConnected = activeNodeId && (e.source.id === activeNodeId || e.target.id === activeNodeId);
-        const baseWidth = e.type === 'contains' ? 6 : 6 + (e.weight * 18);
-        return isConnected ? baseWidth * 1.8 : baseWidth;
-      });
+    // Only update if reasonable number of edges, otherwise skip for performance
+    if (edgeData.length < 10000) {
+      svg.selectAll<SVGPathElement, EdgeData>('.links path')
+        .transition().duration(150)
+        .attr('opacity', (e: EdgeData) => {
+          if (!activeNodeId) return 1;
+          if (e.source.id === activeNodeId || e.target.id === activeNodeId) return 1;
+          return 0.5;
+        })
+        .attr('stroke-width', (e: EdgeData) => {
+          const isConnected = activeNodeId && (e.source.id === activeNodeId || e.target.id === activeNodeId);
+          const baseWidth = e.type === 'contains' ? 6 : 6 + (e.weight * 18);
+          return isConnected ? baseWidth * 1.8 : baseWidth;
+        });
 
-    // Update connection dots visibility - only show dots for edges connected to selected node
-    svg.selectAll<SVGCircleElement, { sourceId: string; targetId: string }>('circle.connection-dot')
-      .transition().duration(150)
-      .style('display', (d) => {
-        if (!activeNodeId) return null;
-        return (d.sourceId === activeNodeId || d.targetId === activeNodeId) ? null : 'none';
-      });
+      // Update connection dots visibility - only show dots for edges connected to selected node
+      svg.selectAll<SVGCircleElement, { sourceId: string; targetId: string }>('circle.connection-dot')
+        .transition().duration(150)
+        .style('display', (d) => {
+          if (!activeNodeId) return null;
+          return (d.sourceId === activeNodeId || d.targetId === activeNodeId) ? null : 'none';
+        });
+    }
 
     // Update Open/Enter button visibility based on selection
     svg.selectAll<SVGGElement, GraphNode>('.open-btn')

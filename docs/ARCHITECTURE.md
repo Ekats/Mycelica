@@ -1,6 +1,6 @@
 # Mycelica Architecture
 
-> Comprehensive map of the codebase. Last updated: 2025-12-26
+> Comprehensive map of the codebase. Last updated: 2026-01-08
 
 ## Overview
 
@@ -39,7 +39,7 @@
 │                         ▼                                        │
 │              ┌───────────────────┐                               │
 │              │      SQLite       │                               │
-│              │  6 tables + FTS5  │                               │
+│              │  8 tables + FTS5  │                               │
 │              └───────────────────┘                               │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -54,7 +54,7 @@
 UNIVERSE (depth=0)     ← Single root, always exists
     │
     ▼
-DYNAMIC LEVELS         ← As many as the collection needs (8-15 children per level)
+DYNAMIC LEVELS         ← As many as the collection needs (tiered limits: 10/25/50/100/150)
     │
     ▼
 ITEMS (is_item=true)   ← Imported content (conversations, notes)
@@ -101,6 +101,17 @@ Graph: Click Topic → navigateToNode() → get_children() → deeper
 Graph: Click Item → openLeaf() → get_leaf_content() → Leaf Mode
 Leaf: Back → closeLeaf() → Graph Mode
 ```
+
+### Edge Loading (View-Based)
+
+```
+View Change → loadEdgesForView(parentId) → get_edges_for_view() → edges for current view only
+```
+
+Edges are NOT loaded at startup. Instead, `useGraph.ts` loads edges per-view:
+- `loadEdgesForView(parentId)` fetches edges where both endpoints share the parent
+- Called on navigation via `Graph.tsx:385`
+- Uses indexed lookup on `(source_parent_id, target_parent_id)`
 
 ### Hierarchy Building
 
@@ -210,15 +221,17 @@ Edge { id, source, target, type, weight, edgeSource, evidenceId, confidence }
 
 ### Database (`db/`)
 
-**schema.rs** - SQLite tables (6 tables):
+**schema.rs** - SQLite tables (8 tables):
 
 ```sql
 nodes (32 columns) - All content
-edges (10 columns) - Relationships
+edges (12 columns) - Relationships (includes source_parent_id, target_parent_id for view-based loading)
+papers - Scientific paper metadata and PDFs
 tags - Persistent tag definitions
 item_tags - Item-to-tag assignments
 learned_emojis - AI emoji mappings
 db_metadata - Pipeline state tracking
+fos_edges (DEPRECATED) - Field of Science edge grouping
 nodes_fts - FTS5 virtual table
 ```
 
@@ -228,11 +241,12 @@ See `docs/specs/SCHEMA.md` for full schema.
 
 ### Commands
 
-**`commands/graph.rs`** (~2100 lines, ~70 commands)
+**`commands/graph.rs`** (~2800 lines, ~90 commands)
 - Node/Edge CRUD
 - Hierarchy navigation
 - AI processing
-- Import operations
+- Import operations (Claude, Markdown, Keep, OpenAIRE)
+- Paper operations
 - Quick access (pinned/recent)
 - Database management
 
@@ -257,20 +271,26 @@ See `docs/specs/COMMANDS.md` for full API reference.
 - Token usage tracking
 
 **clustering.rs**
-- AI method: Claude semantic grouping
-- TF-IDF fallback: keyword extraction
+- Embedding-based cosine similarity clustering (deterministic, local)
+- AI only for naming clusters (NAMING_BATCH_SIZE=30)
+- FOS pre-grouping for papers
 - Multi-path via BelongsTo edges
 - Cancellation support
 
 **hierarchy.rs**
 - Phase 1: Cluster items into topics
-- Phase 2: Recursively group until 8-15 children per level
+- Phase 2: Recursively group using tiered limits (10/25/50/100/150 by depth)
 - Cancellation support, progress events
 
 **classification.rs**
 - Pattern-based content type classification
-- 13 content types across 3 visibility tiers
+- 14 content types across 3 visibility tiers (added: paper)
 - No AI required (fast, consistent)
+
+**openaire.rs**
+- Scientific paper import from OpenAIRE API
+- PDF download and storage
+- FOS (Field of Science) extraction
 
 **similarity.rs** - Embedding-based semantic search
 - Cosine similarity comparison
@@ -297,6 +317,35 @@ See `docs/specs/COMMANDS.md` for full API reference.
 
 **lib.rs** - Tauri setup, command registration, AppState initialization
 **main.rs** - Minimal wrapper
+
+### CLI (`bin/cli.rs`)
+
+Standalone command-line interface (~5000 lines, 77 subcommands).
+
+```
+mycelica-cli [OPTIONS] <COMMAND>
+
+Commands:
+  db          Database operations (stats, path, switch)
+  import      Import data (claude, markdown, keep, openaire)
+  node        Node operations (get, search, set-private)
+  hierarchy   Hierarchy operations (build, rebuild, clear)
+  process     AI processing (run, status, reset)
+  cluster     Clustering (run, recluster, fos)
+  embeddings  Embedding operations (regenerate, clear, status)
+  privacy     Privacy operations (scan-items, status, set, reset)
+  paper       Paper operations (search, list, get, download)
+  config      Configuration (get, set, list)
+  nav         Navigation (recent, pinned)
+  maintenance Database maintenance (tidy, clear-*)
+  export      Export data (json, markdown, bibtex, graph)
+  setup       Setup wizard
+  tui         Interactive TUI
+  search      Full-text search
+  completions Shell completions
+```
+
+See [CLI.md](CLI.md) for complete reference.
 
 ---
 

@@ -14,11 +14,13 @@ Mycelica uses **SQLite** with **rusqlite** (not sqlx). Database location:
 | Table | Purpose |
 |-------|---------|
 | `nodes` | All content: items, categories, Universe |
-| `edges` | Relationships between nodes |
+| `edges` | Relationships between nodes (with parent columns for view-based loading) |
+| `papers` | Scientific paper metadata and PDFs (linked to nodes) |
 | `tags` | Persistent tag definitions for clustering |
 | `item_tags` | Item-to-tag assignments |
 | `learned_emojis` | AI-learned emoji mappings |
 | `db_metadata` | Pipeline state tracking |
+| `fos_edges` | **DEPRECATED** - FOS edge grouping (superseded by view-based edge loading) |
 | `nodes_fts` | Full-text search (FTS5 virtual table) |
 
 ---
@@ -85,7 +87,7 @@ CREATE TABLE nodes (
     associated_idea_id TEXT,         -- Links supporting item to idea
 
     -- Import tracking
-    source TEXT                      -- 'claude', 'googlekeep', 'markdown'
+    source TEXT                      -- 'claude', 'googlekeep', 'markdown', 'openaire'
 );
 ```
 
@@ -107,7 +109,7 @@ CREATE TABLE nodes (
 
 ```
 VISIBLE (shown in graph):
-  insight, idea, exploration, synthesis, question, planning
+  insight, exploration, synthesis, question, planning, paper
 
 SUPPORTING (lazy-loaded):
   investigation, discussion, reference, creative
@@ -115,6 +117,8 @@ SUPPORTING (lazy-loaded):
 HIDDEN (excluded):
   debug, code, paste, trivial
 ```
+
+See [TYPES.md](TYPES.md) for full content type definitions.
 
 ### Privacy Tiers
 
@@ -130,7 +134,7 @@ HIDDEN (excluded):
 
 ## edges
 
-Relationships between nodes.
+Relationships between nodes. Includes denormalized parent columns for fast per-view loading.
 
 ```sql
 CREATE TABLE edges (
@@ -143,9 +147,25 @@ CREATE TABLE edges (
     edge_source TEXT,                -- 'ai', 'user', or NULL
     evidence_id TEXT,                -- Node ID explaining reasoning
     confidence REAL,                 -- Certainty (0.0-1.0)
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    -- View-based loading columns (populated by update_edge_parents during hierarchy build)
+    source_parent_id TEXT,           -- Parent of source node (for indexed view lookup)
+    target_parent_id TEXT            -- Parent of target node (for indexed view lookup)
 );
 ```
+
+### Edge View Architecture
+
+Edges are loaded per-view using `get_edges_for_view(parent_id)`:
+- Returns edges where **both** source and target have the same parent
+- O(1) indexed lookup via `idx_edges_view(source_parent_id, target_parent_id)`
+- Parent columns updated during hierarchy build via `update_edge_parents()`
+- **Limitation**: Cross-parent edges (source.parent ≠ target.parent) don't appear in either view
+
+**Frontend Integration:**
+- `useGraph.ts:204` - `loadEdgesForView(parentId)` function
+- `Graph.tsx:385` - Calls `loadEdgesForView(currentParentId)` on view change
+- Startup no longer loads all edges (see `useGraph.ts:158`)
 
 ### Edge Types
 
@@ -209,6 +229,60 @@ CREATE TABLE learned_emojis (
 
 ---
 
+## papers
+
+Scientific paper metadata imported from OpenAIRE. Links to nodes via `node_id`.
+
+```sql
+CREATE TABLE papers (
+    id INTEGER PRIMARY KEY,
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    openaire_id TEXT UNIQUE,         -- OpenAIRE identifier
+    doi TEXT,                        -- Digital Object Identifier
+    authors TEXT,                    -- JSON array: [{fullName, orcid}, ...]
+    publication_date TEXT,           -- ISO date string
+    journal TEXT,
+    publisher TEXT,
+    abstract TEXT,                   -- Raw abstract
+    abstract_formatted TEXT,         -- Markdown with **Section** headers
+    abstract_sections TEXT,          -- JSON array of detected sections
+    pdf_blob BLOB,                   -- Stored PDF binary (up to 20MB)
+    pdf_url TEXT,                    -- Fallback external URL
+    pdf_available INTEGER NOT NULL DEFAULT 0,
+    subjects TEXT,                   -- JSON array: [{scheme, value}, ...]
+    access_right TEXT,               -- 'OPEN', 'CLOSED', 'EMBARGO', etc.
+    created_at INTEGER NOT NULL
+);
+```
+
+### Key Fields
+
+| Field | Description |
+|-------|-------------|
+| `node_id` | Links to associated node in `nodes` table |
+| `openaire_id` | Unique OpenAIRE identifier (e.g., `dedup_wf_001::abc123`) |
+| `abstract_formatted` | AI-formatted abstract with section headers |
+| `pdf_blob` | Embedded PDF (downloaded on-demand, max 20MB) |
+| `subjects` | Field of Science classifications |
+
+---
+
+## fos_edges (DEPRECATED)
+
+**Note: This table is deprecated.** Edge grouping is now handled via view-based loading with `source_parent_id` and `target_parent_id` columns in the `edges` table.
+
+```sql
+CREATE TABLE fos_edges (
+    fos_id TEXT NOT NULL REFERENCES nodes(id),
+    edge_id TEXT NOT NULL REFERENCES edges(id),
+    PRIMARY KEY (fos_id, edge_id)
+);
+```
+
+Originally used for grouping edges by Field of Science category. Superseded by per-view edge loading architecture.
+
+---
+
 ## db_metadata
 
 Key-value store for pipeline state.
@@ -236,6 +310,8 @@ CREATE TABLE db_metadata (
 CREATE INDEX idx_edges_source ON edges(source_id);
 CREATE INDEX idx_edges_target ON edges(target_id);
 CREATE INDEX idx_edges_type ON edges(type);
+-- Edge view loading (fast per-parent lookup)
+CREATE INDEX idx_edges_view ON edges(source_parent_id, target_parent_id);
 
 -- Node queries
 CREATE INDEX idx_nodes_type ON nodes(type);
@@ -252,6 +328,9 @@ CREATE INDEX idx_tags_parent ON tags(parent_tag_id);
 CREATE INDEX idx_tags_depth ON tags(depth);
 CREATE INDEX idx_item_tags_item ON item_tags(item_id);
 CREATE INDEX idx_item_tags_tag ON item_tags(tag_id);
+
+-- FOS edges (deprecated)
+CREATE INDEX idx_fos_edges_fos ON fos_edges(fos_id);
 ```
 
 ---
@@ -301,4 +380,4 @@ conn.execute(
 
 ---
 
-*Last updated: 2025-12-26*
+*Last updated: 2026-01-08*

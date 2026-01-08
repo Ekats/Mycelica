@@ -143,48 +143,50 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
     return items;
   }, []);
 
-  // Helper to count all descendants of a node in the graph (recursive)
-  const countNodeDescendants = useCallback((nodeId: string): number => {
-    let count = 0;
-    // Find all direct children
-    nodes.forEach((node) => {
-      if (node.parentId === nodeId) {
-        count += 1 + countNodeDescendants(node.id);
+  // Build parent→children index ONCE (O(N) total, then O(1) lookups)
+  const childrenByParent = useMemo(() => {
+    const map = new Map<string, Node[]>();
+    nodes.forEach(node => {
+      if (node.parentId) {
+        if (!map.has(node.parentId)) map.set(node.parentId, []);
+        map.get(node.parentId)!.push(node);
       }
     });
-    return count;
+    // Sort each group by latestChildDate/createdAt descending (newest first)
+    map.forEach((children) => {
+      children.sort((a, b) => {
+        const aDate = a.childCount > 0 && a.latestChildDate ? a.latestChildDate : a.createdAt;
+        const bDate = b.childCount > 0 && b.latestChildDate ? b.latestChildDate : b.createdAt;
+        return bDate - aDate;
+      });
+    });
+    return map;
   }, [nodes]);
 
-  // Get all descendant items of a node (recursive)
+  // Use childCount from DB instead of recursive counting - O(1)
+  const countNodeDescendants = useCallback((nodeId: string): number => {
+    const node = nodes.get(nodeId);
+    return node?.childCount || 0;
+  }, [nodes]);
+
+  // Get all descendant items of a node (uses index for O(1) child lookup)
   const getDescendantItems = useCallback((nodeId: string): Node[] => {
     const items: Node[] = [];
-    nodes.forEach((node) => {
-      if (node.parentId === nodeId) {
-        if (node.childCount === 0) {
-          items.push(node);
-        } else {
-          items.push(...getDescendantItems(node.id));
-        }
+    const children = childrenByParent.get(nodeId) || [];
+    for (const node of children) {
+      if (node.childCount === 0) {
+        items.push(node);
+      } else {
+        items.push(...getDescendantItems(node.id));
       }
-    });
+    }
     return items;
-  }, [nodes]);
+  }, [childrenByParent]);
 
-  // Get direct children of a node
+  // Get direct children of a node - O(1) lookup
   const getDirectChildren = useCallback((nodeId: string): Node[] => {
-    const children: Node[] = [];
-    nodes.forEach((node) => {
-      if (node.parentId === nodeId) {
-        children.push(node);
-      }
-    });
-    // Sort by latestChildDate/createdAt descending (newest first)
-    return children.sort((a, b) => {
-      const aDate = a.childCount > 0 && a.latestChildDate ? a.latestChildDate : a.createdAt;
-      const bDate = b.childCount > 0 && b.latestChildDate ? b.latestChildDate : b.createdAt;
-      return bDate - aDate;
-    });
-  }, [nodes]);
+    return childrenByParent.get(nodeId) || [];
+  }, [childrenByParent]);
 
   // Date range from current VIEW (siblings with same parent)
   // Uses displayed "Latest" date from each node

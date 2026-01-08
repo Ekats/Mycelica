@@ -47,6 +47,31 @@ Two things are fixed: **Universe** (the root) and **Leaf** (the reader). Everyth
 
 The middle levels exist to reduce cognitive overload. They're created based on **collection size**, not a fixed schema.
 
+### Tiered Child Limits
+
+The hierarchy enforces tiered limits on children per level:
+
+| Depth | Max Children | Purpose |
+|-------|--------------|---------|
+| 0-1 (Universe + L1) | 10 | Strict navigation, clean top level |
+| 2 | 25 | Buffer layer |
+| 3 | 50 | Topic groupings |
+| 4 | 100 | Normal max depth |
+| 5+ | 150 | Coherent mega-clusters only |
+
+```rust
+// From hierarchy.rs:165-172
+fn max_children_for_depth(depth: i32) -> usize {
+    match depth {
+        0 | 1 => 10,   // Universe + L1: strict navigation
+        2 => 25,       // L2: buffer layer
+        3 => 50,       // L3: topic groupings
+        4 => 100,      // L4: normal max depth
+        _ => 150,      // L5+: coherent mega-clusters only
+    }
+}
+```
+
 ### Threshold-Based Level Creation
 
 | Item Count | Structure | Example |
@@ -57,11 +82,11 @@ The middle levels exist to reduce cognitive overload. They're created based on *
 | 500-2000 | Universe → Galaxies → Domains → Topics → Items | Three layers |
 | 2000+ | Add more as needed | Deep hierarchies for massive collections |
 
-**The system should:**
-1. Count items at each level
-2. If a level has too many nodes (>30-50), cluster them
-3. If a level has too few nodes (<5), consider flattening
-4. Rebalance when imports significantly change the collection
+**The system:**
+1. Counts children at each level
+2. If a level exceeds its max (tiered by depth), creates intermediate clusters
+3. Merges up small clusters (< 3 children)
+4. Uses `cluster_hierarchy_level()` for AI-assisted grouping when needed
 
 ### Level Names Are Semantic
 
@@ -212,6 +237,14 @@ Run TF-IDF clustering on items
 
 ### Step 3: Build Hierarchy From Clusters
 
+Two functions available:
+
+| Function | Description |
+|----------|-------------|
+| `build_hierarchy(db)` | Basic: Creates parent nodes from clusters, enforces tiered limits |
+| `build_full_hierarchy(app, db)` | Full 7-step pipeline with AI: uber-categories, FOS grouping, edge indexing |
+
+**Basic build_hierarchy:**
 ```
 For each cluster:
   └── Create a parent node (Topic, Region, whatever scale fits)
@@ -219,13 +252,22 @@ For each cluster:
   └── New node gets depth = item_depth - 1
 
 If too many clusters at one level:
-  └── Cluster the clusters (meta-clustering)
-  └── Create another parent level
+  └── Apply tiered limits (10/25/50/100/150)
+  └── Create intermediate groupings
   └── Repeat until manageable
 
 Create Universe if not exists:
   └── Set top-level nodes' parent_id to Universe
 ```
+
+**Full build_full_hierarchy (7 steps):**
+1. Clear existing hierarchy (keep items)
+2. Create/verify Universe node
+3. Reparent items to Universe
+4. Build hierarchy from clusters
+5. Create uber-categories if Universe has >10 children
+6. Apply tiered limits at each depth
+7. Update edge parent columns for fast view loading
 
 ### Step 4: Rebalance
 
@@ -294,3 +336,7 @@ function zoomInto(nodeId: string) {
 **The graph is for navigation. The Leaf is for reading.**
 
 Middle levels are just scaffolding to make navigation manageable. Small collection? Few levels. Massive collection? Many levels. The system adapts.
+
+---
+
+*Last updated: 2026-01-08*

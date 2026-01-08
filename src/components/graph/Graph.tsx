@@ -4,6 +4,7 @@ import * as d3 from 'd3';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, emit } from '@tauri-apps/api/event';
 import { useGraphStore } from '../../stores/graphStore';
+import { useGraph } from '../../hooks/useGraph';
 import type { Node } from '../../types/graph';
 import { getEmojiForNode, initLearnedMappings } from '../../utils/emojiMatcher';
 import { ChevronRight, AlertTriangle, X, Lock, LockOpen } from 'lucide-react';
@@ -173,6 +174,7 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     showTips,
     setShowTips,
   } = useGraphStore();
+  const { loadEdgesForView, loadEdgesForFos } = useGraph();
   const [zoomLevel, setZoomLevel] = useState(1);
   const [devLogs, setDevLogs] = useState<DevConsoleLog[]>([]);
   const [showDevConsole, setShowDevConsole] = useState(false);
@@ -371,6 +373,20 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     };
     loadMaxDepth();
   }, [setMaxDepth]);
+
+  // Load edges for current view (O(1) indexed lookup instead of loading all 338k edges)
+  useEffect(() => {
+    if (currentParentId) {
+      // FOS views may have precomputed edges, try that first
+      if (currentParentId.startsWith('fos-')) {
+        loadEdgesForFos(currentParentId);
+      } else {
+        // Regular views use per-view indexed lookup
+        loadEdgesForView(currentParentId);
+      }
+    }
+    // Universe view (currentParentId = null) doesn't need edges - it shows top-level categories
+  }, [currentParentId, loadEdgesForView, loadEdgesForFos]);
 
   // Load pinned node IDs on mount
   useEffect(() => {

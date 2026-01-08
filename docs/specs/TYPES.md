@@ -63,15 +63,15 @@ type EdgeType =
 ### ContentType
 
 ```typescript
-// 13 content types across 3 visibility tiers
+// 14 content types across 3 visibility tiers
 type ContentType =
   // VISIBLE (shown in graph)
   | 'insight'       // Realization, conclusion, crystallized understanding
-  | 'idea'          // Alias for insight (backwards compat)
   | 'exploration'   // Researching, thinking out loud
   | 'synthesis'     // Summarizing, connecting threads
   | 'question'      // Inquiry that frames investigation
   | 'planning'      // Roadmap, TODO, intentions
+  | 'paper'         // Scientific paper (imported from OpenAIRE)
   // SUPPORTING (lazy-loaded in Leaf view)
   | 'investigation' // Problem-solving focused on fixing
   | 'discussion'    // Back-and-forth Q&A without synthesis
@@ -83,6 +83,8 @@ type ContentType =
   | 'paste'         // Logs, terminal output, data dumps
   | 'trivial';      // Greetings, acknowledgments, fragments
 ```
+
+Note: `idea` was previously used as an alias for `insight` but is deprecated.
 
 ### Node
 
@@ -140,7 +142,7 @@ interface Node {
   associatedIdeaId?: string;     // Links supporting item to specific idea node
 
   // --- Import tracking ---
-  source?: string;          // 'claude', 'googlekeep', 'markdown'
+  source?: string;          // 'claude', 'googlekeep', 'markdown', 'openaire'
 }
 ```
 
@@ -387,9 +389,9 @@ Content types map to visibility tiers:
 
 | Tier | Content Types | Behavior |
 |------|---------------|----------|
-| **Visible** | insight, idea, exploration, synthesis, question, planning | Shown in graph |
-| **Supporting** | investigation, discussion, reference, creative | Lazy-loaded in Leaf view |
-| **Hidden** | debug, code, paste, trivial | Excluded from graph entirely |
+| **Visible** (6) | insight, exploration, synthesis, question, planning, paper | Shown in graph |
+| **Supporting** (4) | investigation, discussion, reference, creative | Lazy-loaded in Leaf view |
+| **Hidden** (4) | debug, code, paste, trivial | Excluded from graph entirely |
 
 See `docs/specs/PRIVACY.md` for privacy classification details.
 
@@ -409,4 +411,4 @@ Embeddings are stored in the database but not loaded into Node structs due to si
 
 ---
 
-*Last updated: 2025-12-26*
+*Last updated: 2026-01-08*

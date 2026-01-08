@@ -166,9 +166,9 @@ Separate from privacy scoring, content classification determines visibility in t
 
 | Tier | Content Types | Display |
 |------|---------------|---------|
-| **Visible** | insight, exploration, synthesis, question, planning | Shown in graph |
-| **Supporting** | investigation, discussion, reference, creative | Lazy-loaded in Leaf view |
-| **Hidden** | debug, code, paste, trivial | Excluded from graph |
+| **Visible** (6) | insight, exploration, synthesis, question, planning, paper | Shown in graph |
+| **Supporting** (4) | investigation, discussion, reference, creative | Lazy-loaded in Leaf view |
+| **Hidden** (4) | debug, code, paste, trivial | Excluded from graph |
 
 ### Content Type Definitions
 
@@ -178,6 +178,7 @@ Separate from privacy scoring, content classification determines visibility in t
 - `synthesis` - Summarizing, connecting threads
 - `question` - Inquiry that frames investigation
 - `planning` - Roadmap, TODO, intentions
+- `paper` - Scientific paper (imported from OpenAIRE)
 
 **SUPPORTING (lazy-loaded):**
 - `investigation` - Problem-solving focused on fixing
@@ -217,7 +218,7 @@ Both systems work together:
               ▼                      ▼                      ▼
      ┌────────────────┐    ┌────────────────┐    ┌────────────────┐
      │    Privacy     │    │  Content Type  │    │   Visibility   │
-     │   0.0 - 1.0    │    │  (13 types)    │    │   (3 tiers)    │
+     │   0.0 - 1.0    │    │  (14 types)    │    │   (3 tiers)    │
      └────────────────┘    └────────────────┘    └────────────────┘
               │                      │                      │
               └──────────────────────┼──────────────────────┘
@@ -230,6 +231,20 @@ Both systems work together:
      │ - Visible type + public? → Show everywhere                    │
      └───────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## CLI vs GUI Availability
+
+| Operation | GUI | CLI |
+|-----------|-----|-----|
+| `privacy scan-items` | Full AI scoring | Full AI scoring |
+| `privacy status` | Yes | Yes |
+| `privacy set` | Yes | Yes |
+| `privacy reset` | Yes | Yes |
+| Progress events | Yes | No (use --verbose) |
+
+CLI `privacy scan-items` performs batched AI scoring (25 items/batch) with Haiku. See [CLI.md](../CLI.md) for command reference.
 
 ---
 
@@ -310,4 +325,4 @@ For large collections:
 
 ---
 
-*Last updated: 2025-12-26*
+*Last updated: 2026-01-08*

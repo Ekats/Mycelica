@@ -159,3 +159,19 @@ const related = await invoke('get_related_items', {
 ```
 
 The item "Tauri vs Electron" lives primarily in "Rust Development" but is also connected to three other topics with varying strengths.
+
+---
+
+## FOS-Based Edges (Papers)
+
+For scientific papers imported from OpenAIRE, Field of Science (FOS) categories provide additional cross-topic associations:
+
+- Papers can belong to multiple FOS categories
+- FOS edges created during `cluster_with_fos_pregrouping()`
+- Cross-FOS edges enable discovery across research domains
+
+See [AI_CLUSTERING.md](AI_CLUSTERING.md) for FOS clustering details.
+
+---
+
+*Last updated: 2026-01-08*

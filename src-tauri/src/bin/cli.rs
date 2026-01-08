@@ -6,7 +6,8 @@
 
 use clap::{Parser, Subcommand, CommandFactory};
 use clap_complete::{generate, Shell};
-use mycelica_lib::{db::{Database, Node, NodeType}, settings, import, hierarchy, similarity, clustering, openaire};
+use mycelica_lib::{db::{Database, Node, NodeType}, settings, import, hierarchy, similarity, clustering, openaire, ai_client};
+use serde_json;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::io::Write;
@@ -26,6 +27,58 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
+
+// Privacy scoring imports
+use serde::{Deserialize, Serialize};
+
+// ============================================================================
+// Privacy Scoring Constants and Structs
+// ============================================================================
+
+const PRIVACY_SCORING_PROMPT: &str = r#"Score each item 0.0-1.0 for public shareability:
+
+0.0-0.2: Highly private — real names, health/mental state, finances, relationships, personal struggles, private contact info
+0.3-0.4: Personal — work grievances, emotional venting, private project details, identifiable personal situations
+0.5-0.6: Semi-private — named companies/projects in neutral context, work discussions, some identifiable context
+0.7-0.8: Low risk — technical content with minor project context, professional discussions
+0.9-1.0: Public — generic concepts, public knowledge, tutorials, no identifying context
+
+When content spans multiple levels, use the LOWEST applicable score.
+
+Items to score:
+{items_json}
+
+Return ONLY a JSON array:
+[{"id": "...", "privacy": 0.7}, {"id": "...", "privacy": 0.3}]"#;
+
+#[derive(Serialize)]
+struct PrivacyApiRequest {
+    model: String,
+    max_tokens: u32,
+    messages: Vec<PrivacyApiMessage>,
+}
+
+#[derive(Serialize)]
+struct PrivacyApiMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct PrivacyApiResponse {
+    content: Vec<PrivacyContentBlock>,
+}
+
+#[derive(Deserialize)]
+struct PrivacyContentBlock {
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct PrivacyScoreResult {
+    id: String,
+    privacy: f64,
+}
 
 // ============================================================================
 // Main CLI Structure
@@ -587,6 +640,10 @@ enum MaintenanceCommands {
         #[arg(long, short)]
         verbose: bool,
     },
+    /// Precompute FOS edge sets for fast view loading
+    PrecomputeFosEdges,
+    /// Index edges by parent for fast per-view loading
+    IndexEdges,
 }
 
 #[derive(Subcommand)]
@@ -1374,9 +1431,16 @@ async fn handle_process(cmd: ProcessCommands, db: &Database, json: bool, quiet: 
                             &node.id,
                             &result.title,
                             &result.summary,
-                            &result.tags.join(","),
+                            &serde_json::to_string(&result.tags).unwrap_or_default(),
                             &result.content_type,
                         ).map_err(|e| e.to_string())?;
+
+                        // Generate embedding for the node
+                        let embed_text = safe_truncate(content, 1000);
+                        if let Ok(embedding) = ai_client::generate_embedding(embed_text).await {
+                            db.update_node_embedding(&node.id, &embedding).ok();
+                        }
+
                         processed_count += 1;
                     }
                     Err(e) => {
@@ -1595,13 +1659,144 @@ async fn handle_privacy(cmd: PrivacyCommands, db: &Database, json: bool, quiet: 
                 println!("Note: AI-powered privacy analysis requires the GUI interface");
             }
         }
-        PrivacyCommands::ScanItems { force: _ } => {
-            if !quiet { eprintln!("Checking privacy scoring status..."); }
-            let items = db.get_items_needing_privacy_scoring().map_err(|e| e.to_string())?;
-            if json {
-                println!(r#"{{"items_to_score":{}}}"#, items.len());
+        PrivacyCommands::ScanItems { force } => {
+            let api_key = settings::get_api_key().ok_or("ANTHROPIC_API_KEY not set. Set it with: mycelica-cli config set anthropic-key YOUR_KEY")?;
+
+            // Get items needing scoring
+            let items = if force {
+                db.get_items().map_err(|e| e.to_string())?
             } else {
-                println!("{} items need privacy scoring", items.len());
+                db.get_items_needing_privacy_scoring().map_err(|e| e.to_string())?
+            };
+
+            if items.is_empty() {
+                if json {
+                    println!(r#"{{"items_scored":0,"batches_processed":0,"error_count":0}}"#);
+                } else {
+                    println!("No items need privacy scoring");
+                }
+                return Ok(());
+            }
+
+            const BATCH_SIZE: usize = 25;
+            let batches: Vec<_> = items.chunks(BATCH_SIZE).collect();
+            let total_batches = batches.len();
+            let total_items = items.len();
+
+            if !quiet {
+                eprintln!("Scoring {} items in {} batches...", total_items, total_batches);
+            }
+
+            let mut items_scored = 0;
+            let mut error_count = 0;
+            let client = reqwest::Client::new();
+
+            for (batch_idx, batch) in batches.iter().enumerate() {
+                if !quiet {
+                    eprint!("\r[{}/{}] Processing batch...", batch_idx + 1, total_batches);
+                    std::io::stderr().flush().ok();
+                }
+
+                // Build items JSON for prompt
+                let items_for_prompt: Vec<serde_json::Value> = batch.iter().map(|item| {
+                    let title = item.ai_title.as_deref().unwrap_or(&item.title);
+                    let summary = item.summary.as_deref().unwrap_or("");
+                    let content = item.content.as_deref().unwrap_or("");
+                    let content_preview = safe_truncate(content, 500);
+
+                    serde_json::json!({
+                        "id": item.id,
+                        "title": title,
+                        "summary": summary,
+                        "content_preview": content_preview
+                    })
+                }).collect();
+
+                let items_json = serde_json::to_string_pretty(&items_for_prompt)
+                    .unwrap_or_else(|_| "[]".to_string());
+
+                let prompt = PRIVACY_SCORING_PROMPT.replace("{items_json}", &items_json);
+
+                let request = PrivacyApiRequest {
+                    model: "claude-haiku-4-5-20251001".to_string(),
+                    max_tokens: 2000,
+                    messages: vec![PrivacyApiMessage {
+                        role: "user".to_string(),
+                        content: prompt,
+                    }],
+                };
+
+                // Make API call
+                match client
+                    .post("https://api.anthropic.com/v1/messages")
+                    .header("x-api-key", &api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json")
+                    .json(&request)
+                    .send()
+                    .await
+                {
+                    Ok(response) => {
+                        if response.status().is_success() {
+                            if let Ok(api_response) = response.json::<PrivacyApiResponse>().await {
+                                let text = api_response
+                                    .content
+                                    .first()
+                                    .map(|c| c.text.clone())
+                                    .unwrap_or_default();
+
+                                match parse_privacy_scoring_response(&text) {
+                                    Ok(scores) => {
+                                        for score in scores {
+                                            if let Err(e) = db.update_privacy_score(&score.id, score.privacy) {
+                                                if !quiet {
+                                                    eprintln!("\n  Failed to update privacy for {}: {}", &score.id[..8], e);
+                                                }
+                                                error_count += 1;
+                                            } else {
+                                                items_scored += 1;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if !quiet {
+                                            eprintln!("\n  Batch {} parse error: {}", batch_idx + 1, e);
+                                        }
+                                        error_count += batch.len();
+                                    }
+                                }
+                            } else {
+                                if !quiet {
+                                    eprintln!("\n  Batch {} failed to parse API response", batch_idx + 1);
+                                }
+                                error_count += batch.len();
+                            }
+                        } else {
+                            if !quiet {
+                                eprintln!("\n  Batch {} API error: {}", batch_idx + 1, response.status());
+                            }
+                            error_count += batch.len();
+                        }
+                    }
+                    Err(e) => {
+                        if !quiet {
+                            eprintln!("\n  Batch {} request failed: {}", batch_idx + 1, e);
+                        }
+                        error_count += batch.len();
+                    }
+                }
+
+                // Small delay to avoid rate limits
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            }
+
+            if !quiet { eprintln!(); }
+
+            if json {
+                println!(r#"{{"items_scored":{},"batches_processed":{},"error_count":{}}}"#,
+                    items_scored, total_batches, error_count);
+            } else {
+                println!("Scored {} items ({} errors)", items_scored, error_count);
             }
         }
         PrivacyCommands::Stats => {
@@ -1968,14 +2163,19 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
     // Show database stats
     let items = db.get_items().map_err(|e| e.to_string())?;
     let total = items.len();
+    let papers = items.iter().filter(|n| n.content_type.as_deref() == Some("paper")).count();
+    let non_papers = total - papers;
     let processed = items.iter().filter(|n| n.is_processed).count();
+    let non_paper_processed = items.iter()
+        .filter(|n| n.is_processed && n.content_type.as_deref() != Some("paper"))
+        .count();
     let with_embeddings = items.iter().filter(|n| {
         db.get_node_embedding(&n.id).ok().flatten().is_some()
     }).count();
 
     println!("Database Stats:");
-    println!("  Items:      {}", total);
-    println!("  Processed:  {} / {}", processed, total);
+    println!("  Items:      {} ({} papers, {} other)", total, papers, non_papers);
+    println!("  Processed:  {} / {} (papers skip AI processing)", non_paper_processed, non_papers);
     println!("  Embeddings: {} / {}", with_embeddings, total);
     println!();
 
@@ -1985,7 +2185,8 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
     }
 
     // Ask to run pipeline if there's work to do
-    let needs_processing = processed < total;
+    // Papers don't need AI processing (they have metadata from OpenAIRE)
+    let needs_processing = non_paper_processed < non_papers;
     let needs_embeddings = with_embeddings < total;
 
     if !needs_processing && !needs_embeddings {
@@ -2010,7 +2211,10 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
     // Step 1: AI Processing
     if needs_processing && settings::has_api_key() {
         println!("[1/3] AI Processing...");
-        let unprocessed: Vec<_> = items.iter().filter(|n| !n.is_processed).collect();
+        // Skip papers - they already have titles/summaries from OpenAIRE import
+        let unprocessed: Vec<_> = items.iter()
+            .filter(|n| !n.is_processed && n.content_type.as_deref() != Some("paper"))
+            .collect();
 
         for (i, node) in unprocessed.iter().enumerate() {
             if !quiet && i % 5 == 0 {
@@ -2025,9 +2229,15 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
                         &node.id,
                         &result.title,
                         &result.summary,
-                        &result.tags.join(","),
+                        &serde_json::to_string(&result.tags).unwrap_or_default(),
                         &result.content_type,
                     ).ok();
+
+                    // Generate embedding for the node
+                    let embed_text = safe_truncate(content, 1000);
+                    if let Ok(embedding) = ai_client::generate_embedding(embed_text).await {
+                        db.update_node_embedding(&node.id, &embedding).ok();
+                    }
                 }
                 Err(e) => {
                     if !quiet {
@@ -2074,22 +2284,35 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
             }
         }
 
-        // Step 2c: Build hierarchy preserving FOS structure
-        println!("  Building sub-hierarchies under FOS nodes...");
-        match hierarchy::build_hierarchy_preserving_parents(db) {
+        // Step 2c: Build full hierarchy with recursive AI grouping
+        println!("  Building full hierarchy with AI grouping...");
+        match hierarchy::build_full_hierarchy(db, false, None).await {
             Ok(result) => {
-                println!("  Hierarchy: Universe → FOS → {} Topics → {} items",
-                    result.intermediate_nodes_created, result.items_organized);
+                println!("  Hierarchy: {} levels, {} items organized",
+                    result.hierarchy_result.max_depth, result.hierarchy_result.items_organized);
             }
             Err(e) => {
                 eprintln!("  Warning: Hierarchy build failed: {}", e);
             }
         }
+
+        // Step 2d: Precompute FOS edges for fast view loading
+        println!("  Precomputing FOS edge sets...");
+        match db.precompute_fos_edges() {
+            Ok(count) => println!("  FOS edges: {} edges precomputed", count),
+            Err(e) => eprintln!("  Warning: FOS edge precomputation failed: {}", e),
+        }
     } else {
-        if let Err(e) = hierarchy::build_hierarchy(db) {
-            eprintln!("  Warning: Clustering failed: {}", e);
-        } else {
-            println!("  Hierarchy built.");
+        // Non-FOS path: Use full 7-step hierarchy build with recursive AI grouping
+        println!("  Building full hierarchy with AI grouping...");
+        match hierarchy::build_full_hierarchy(db, true, None).await {
+            Ok(result) => {
+                println!("  Hierarchy: {} levels, {} items organized",
+                    result.hierarchy_result.max_depth, result.hierarchy_result.items_organized);
+            }
+            Err(e) => {
+                eprintln!("  Warning: Hierarchy build failed: {}", e);
+            }
         }
     }
 
@@ -2515,8 +2738,73 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
                 println!("✓ Pruned dead edges");
             }
         }
+
+        MaintenanceCommands::PrecomputeFosEdges => {
+            println!("Precomputing FOS edge sets...");
+            let count = db.precompute_fos_edges().map_err(|e| e.to_string())?;
+            println!("✓ Precomputed {} edges across FOS categories", count);
+        }
+
+        MaintenanceCommands::IndexEdges => {
+            println!("Indexing edges by parent for fast per-view loading...");
+            let count = db.update_edge_parents().map_err(|e| e.to_string())?;
+            println!("✓ Indexed {} edges", count);
+        }
     }
     Ok(())
+}
+
+/// Safely truncate a string to a maximum byte length, ensuring valid UTF-8
+fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+    if max_bytes >= s.len() {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Parse privacy scoring JSON array response from AI
+fn parse_privacy_scoring_response(text: &str) -> Result<Vec<PrivacyScoreResult>, String> {
+    let text = text.trim();
+
+    // Handle markdown code blocks
+    let json_text = if text.starts_with("```") {
+        text.lines()
+            .skip(1)
+            .take_while(|line| !line.starts_with("```"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        text.to_string()
+    };
+
+    // Find array start/end
+    let start = json_text.find('[').ok_or("No JSON array found")?;
+    let end = json_text.rfind(']').ok_or("No JSON array end found")?;
+    let array_text = &json_text[start..=end];
+
+    // Fix common AI JSON issues: trailing commas before ]
+    let mut cleaned = array_text.to_string();
+    while cleaned.contains(",]") || cleaned.contains(", ]") || cleaned.contains(",\n]") || cleaned.contains(",\r\n]") {
+        cleaned = cleaned
+            .replace(",\r\n]", "]")
+            .replace(",\n]", "]")
+            .replace(", ]", "]")
+            .replace(",]", "]");
+    }
+    // Handle comma followed by whitespace until ]
+    if let Some(last_comma) = cleaned.rfind(',') {
+        let after_comma = &cleaned[last_comma + 1..];
+        if after_comma.trim() == "]" {
+            cleaned = format!("{}]", &cleaned[..last_comma]);
+        }
+    }
+
+    serde_json::from_str::<Vec<PrivacyScoreResult>>(&cleaned)
+        .map_err(|e| format!("JSON parse error: {}", e))
 }
 
 fn confirm_action(action: &str) -> Result<bool, String> {
@@ -3812,8 +4100,8 @@ fn run_tui_loop(
                                 }
                             }
 
-                            // Backspace/-: Go up one level (cd ..)
-                            KeyCode::Backspace | KeyCode::Char('-') => {
+                            // Backspace/-/Esc: Go up one level (cd ..)
+                            KeyCode::Backspace | KeyCode::Char('-') | KeyCode::Esc => {
                                 if let Err(e) = app.cd_up(db) {
                                     app.status_message = format!("Error: {}", e);
                                 }
@@ -4420,7 +4708,7 @@ fn draw_breadcrumb(f: &mut Frame, app: &TuiApp, area: Rect) {
     // Add hint for going back
     if app.breadcrumb_path.len() > 1 {
         spans.push(Span::styled(
-            "   [Backspace: up]",
+            "   [Esc/Backspace: up]",
             Style::default().fg(Color::DarkGray).bg(Color::Rgb(40, 40, 60))
         ));
     }

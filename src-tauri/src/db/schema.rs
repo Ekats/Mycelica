@@ -162,6 +162,16 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_nodes_is_item ON nodes(is_item);
             CREATE INDEX IF NOT EXISTS idx_nodes_cluster_id ON nodes(cluster_id);
 
+            -- FOS edge cache for fast view loading
+            CREATE TABLE IF NOT EXISTS fos_edges (
+                fos_id TEXT NOT NULL,
+                edge_id TEXT NOT NULL,
+                PRIMARY KEY (fos_id, edge_id),
+                FOREIGN KEY (fos_id) REFERENCES nodes(id),
+                FOREIGN KEY (edge_id) REFERENCES edges(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_fos_edges_fos ON fos_edges(fos_id);
+
             -- Full-text search
             CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
                 title,
@@ -481,6 +491,19 @@ impl Database {
             eprintln!("Migration: Added doc_format column to papers");
         }
 
+        // Migration: Add parent columns to edges for fast per-view lookups
+        let has_source_parent: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('edges') WHERE name = 'source_parent_id'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !has_source_parent {
+            conn.execute("ALTER TABLE edges ADD COLUMN source_parent_id TEXT", [])?;
+            conn.execute("ALTER TABLE edges ADD COLUMN target_parent_id TEXT", [])?;
+            eprintln!("Migration: Added source_parent_id and target_parent_id columns to edges for fast view lookups");
+        }
+
         // Create indexes for dynamic hierarchy columns (after migrations ensure columns exist)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_depth ON nodes(depth)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_is_item ON nodes(is_item)", [])?;
@@ -493,6 +516,8 @@ impl Database {
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_content_type ON nodes(content_type)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_associated_idea ON nodes(associated_idea_id)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_privacy ON nodes(privacy)", [])?;
+        // Index for fast per-view edge lookups (edges where both endpoints share the same parent)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_view ON edges(source_parent_id, target_parent_id)", [])?;
 
         // Rebuild FTS index to fix any corruption from interrupted writes (e.g., HMR during dev)
         // This is safe to run on every startup - it rebuilds from the content table
@@ -1181,6 +1206,154 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM edges WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    // FOS Edge Cache
+
+    /// Clear the FOS edge cache
+    pub fn clear_fos_edges(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM fos_edges", [])?;
+        Ok(())
+    }
+
+    /// Precompute edges for each FOS category
+    /// For each FOS node, finds all edges where both source and target are descendants
+    pub fn precompute_fos_edges(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+
+        // Clear existing
+        conn.execute("DELETE FROM fos_edges", [])?;
+
+        // Get all FOS nodes (depth 1, id starts with "fos-")
+        let mut fos_stmt = conn.prepare(
+            "SELECT id FROM nodes WHERE depth = 1 AND id LIKE 'fos-%'"
+        )?;
+        let fos_ids: Vec<String> = fos_stmt.query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut total_edges = 0;
+
+        for fos_id in &fos_ids {
+            // Get all descendant node IDs (items with this FOS as ancestor)
+            let mut desc_stmt = conn.prepare(
+                "WITH RECURSIVE descendants AS (
+                    SELECT id FROM nodes WHERE parent_id = ?1
+                    UNION ALL
+                    SELECT n.id FROM nodes n JOIN descendants d ON n.parent_id = d.id
+                )
+                SELECT id FROM descendants"
+            )?;
+            let descendant_ids: Vec<String> = desc_stmt.query_map([fos_id], |r| r.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            if descendant_ids.is_empty() {
+                continue;
+            }
+
+            // Find edges where both endpoints are descendants
+            // Use temp table to avoid SQLite parameter limits
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS temp_descendants (id TEXT PRIMARY KEY)", [])?;
+            conn.execute("DELETE FROM temp_descendants", [])?;
+
+            {
+                let mut insert_stmt = conn.prepare("INSERT OR IGNORE INTO temp_descendants VALUES (?1)")?;
+                for id in &descendant_ids {
+                    insert_stmt.execute([id])?;
+                }
+            }
+
+            // Insert matching edges into fos_edges
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO fos_edges (fos_id, edge_id)
+                 SELECT ?1, e.id FROM edges e
+                 WHERE e.source_id IN (SELECT id FROM temp_descendants)
+                   AND e.target_id IN (SELECT id FROM temp_descendants)",
+                [fos_id]
+            )?;
+
+            println!("[FOS Edges] {}: {} descendants, {} edges", fos_id, descendant_ids.len(), inserted);
+            total_edges += inserted;
+        }
+
+        conn.execute("DROP TABLE IF EXISTS temp_descendants", [])?;
+
+        Ok(total_edges)
+    }
+
+    /// Get precomputed edges for a FOS category
+    pub fn get_edges_for_fos(&self, fos_id: &str) -> Result<Vec<Edge>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT e.id, e.source_id, e.target_id, e.type, e.label, e.weight,
+                    e.edge_source, e.evidence_id, e.confidence, e.created_at
+             FROM edges e
+             JOIN fos_edges fe ON e.id = fe.edge_id
+             WHERE fe.fos_id = ?1"
+        )?;
+
+        let edges = stmt.query_map([fos_id], |row| {
+            Ok(Edge {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                target: row.get(2)?,
+                edge_type: EdgeType::from_str(&row.get::<_, String>(3)?).unwrap_or(EdgeType::Related),
+                label: row.get(4)?,
+                weight: row.get(5)?,
+                edge_source: row.get(6)?,
+                evidence_id: row.get(7)?,
+                confidence: row.get(8)?,
+                created_at: row.get(9)?,
+            })
+        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(edges)
+    }
+
+    /// Update edge parent columns based on current node hierarchy
+    /// This enables O(1) edge lookups per view instead of O(E) filtering
+    pub fn update_edge_parents(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+
+        // Update source_parent_id and target_parent_id based on node.parent_id
+        let updated = conn.execute(
+            "UPDATE edges SET
+                source_parent_id = (SELECT parent_id FROM nodes WHERE id = edges.source_id),
+                target_parent_id = (SELECT parent_id FROM nodes WHERE id = edges.target_id)",
+            [],
+        )?;
+
+        println!("[Edge Parents] Updated {} edges with parent IDs", updated);
+        Ok(updated)
+    }
+
+    /// Get edges for a specific view (where both endpoints are children of the given parent)
+    /// Uses indexed lookup on (source_parent_id, target_parent_id) for O(1) performance
+    pub fn get_edges_for_view(&self, parent_id: &str) -> Result<Vec<Edge>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, source_id, target_id, type, label, weight,
+                    edge_source, evidence_id, confidence, created_at
+             FROM edges
+             WHERE source_parent_id = ?1 AND target_parent_id = ?1"
+        )?;
+
+        let edges = stmt.query_map([parent_id], |row| {
+            Ok(Edge {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                target: row.get(2)?,
+                edge_type: EdgeType::from_str(&row.get::<_, String>(3)?).unwrap_or(EdgeType::Related),
+                label: row.get(4)?,
+                weight: row.get(5)?,
+                edge_source: row.get(6)?,
+                evidence_id: row.get(7)?,
+                confidence: row.get(8)?,
+                created_at: row.get(9)?,
+            })
+        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(edges)
     }
 
     // Search
@@ -2297,6 +2470,9 @@ impl Database {
     pub fn create_semantic_edges(&self, min_similarity: f32, max_edges_per_node: usize) -> Result<usize> {
         use crate::similarity::cosine_similarity;
         use std::collections::{HashMap, HashSet};
+
+        // Clear FOS edge cache (edges changing, cache will be stale)
+        self.clear_fos_edges().ok();
 
         // Get all nodes with embeddings
         let nodes_with_embeddings = self.get_nodes_with_embeddings()?;

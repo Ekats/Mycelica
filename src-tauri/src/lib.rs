@@ -15,7 +15,7 @@ mod format_abstract;
 use commands::{
     AppState,
     get_nodes, get_node, create_node, add_note, update_node, update_node_content, delete_node,
-    get_edges, get_edges_for_node, create_edge, delete_edge,
+    get_edges, get_edges_for_node, get_edges_for_fos, get_edges_for_view, create_edge, delete_edge,
     search_nodes,
     // Clustering commands
     run_clustering, recluster_all, get_clustering_status,
@@ -220,6 +220,8 @@ pub fn run() {
             delete_node,
             get_edges,
             get_edges_for_node,
+            get_edges_for_fos,
+            get_edges_for_view,
             create_edge,
             delete_edge,
             search_nodes,

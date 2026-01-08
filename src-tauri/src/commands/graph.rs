@@ -265,6 +265,16 @@ pub fn get_edges_for_node(state: State<AppState>, node_id: String) -> Result<Vec
 }
 
 #[tauri::command]
+pub fn get_edges_for_fos(state: State<AppState>, fos_id: String) -> Result<Vec<Edge>, String> {
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_edges_for_fos(&fos_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_edges_for_view(state: State<AppState>, parent_id: String) -> Result<Vec<Edge>, String> {
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_edges_for_view(&parent_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn create_edge(state: State<AppState>, edge: Edge) -> Result<(), String> {
     state.db.read().map_err(|e| format!("DB lock error: {}", e))?.insert_edge(&edge).map_err(|e| e.to_string())
 }

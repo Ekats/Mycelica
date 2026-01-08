@@ -309,6 +309,18 @@ pub fn clear_hierarchy(db: &Database) -> Result<(), String> {
 /// 4. Build parent levels bottom-up
 /// 5. Create Universe root
 pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
+    // Check if FOS nodes exist - if so, preserve them and only rebuild topics underneath
+    let fos_nodes = db.get_nodes_at_depth(1)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|n| !n.is_item && n.id.starts_with("fos-"))
+        .count();
+
+    if fos_nodes > 0 {
+        println!("[Hierarchy] Found {} FOS category nodes - preserving them", fos_nodes);
+        return build_hierarchy_preserving_parents(db);
+    }
+
     // Step 1: Clean up old hierarchy completely
     cleanup_hierarchy(db)?;
 
@@ -604,6 +616,11 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
     println!("Hierarchy complete: Universe -> {} topics + Personal + Notes -> {} items",
              topics_created, total_items);
 
+    // Update edge parent columns for fast per-view lookups
+    if let Ok(count) = db.update_edge_parents() {
+        println!("[Hierarchy] Indexed {} edges for fast view lookups", count);
+    }
+
     Ok(HierarchyResult {
         levels_created: 3,  // Universe, Topics, Items
         intermediate_nodes_created: topics_created + 1 + (if private_count > 0 { 1 } else { 0 }),  // topics + universe + personal
@@ -767,6 +784,11 @@ pub fn build_hierarchy_preserving_parents(db: &Database) -> Result<HierarchyResu
 
     println!("[Hierarchy] Created {} topics under {} FOS categories, organized {} items",
              topics_created, top_level_nodes.len(), items_organized);
+
+    // Update edge parent columns for fast per-view lookups
+    if let Ok(count) = db.update_edge_parents() {
+        println!("[Hierarchy] Indexed {} edges for fast view lookups", count);
+    }
 
     Ok(HierarchyResult {
         levels_created: 4,  // Universe, FOS, Topics, Items
@@ -2076,6 +2098,9 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
         remaining_secs: None,
     });
 
+    // Clear FOS edge cache (will be stale after rebuild)
+    db.clear_fos_edges().ok();
+
     // Step 0: Clean up incomplete items (queries with no Claude response)
     emit_log(app, "info", "");
     emit_log(app, "info", "▶ Cleanup: Removing incomplete conversations");
@@ -2157,8 +2182,20 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
         estimate_secs: None,
         remaining_secs: None,
     });
-    emit_log(app, "info", "Creating Universe and topic nodes from clusters...");
-    let hierarchy_result = build_hierarchy(db)?;
+    // Check if FOS nodes exist - preserve them instead of wiping everything
+    let fos_nodes = db.get_nodes_at_depth(1)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|n| !n.is_item && n.id.starts_with("fos-"))
+        .count();
+
+    let hierarchy_result = if fos_nodes > 0 {
+        emit_log(app, "info", &format!("Found {} FOS category nodes - preserving them", fos_nodes));
+        build_hierarchy_preserving_parents(db)?
+    } else {
+        emit_log(app, "info", "Creating Universe and topic nodes from clusters...");
+        build_hierarchy(db)?
+    };
     emit_log(app, "info", &format!("✓ Created {} intermediate nodes, organized {} items", hierarchy_result.intermediate_nodes_created, hierarchy_result.items_organized));
 
     // Step 4: Detect and create project umbrellas
@@ -2715,6 +2752,21 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
         }
     };
 
+    // Update edge parent columns for fast per-view lookups
+    emit_log(app, "info", "");
+    emit_log(app, "info", "───────────────────────────────────────────────────────────");
+    emit_log(app, "info", "Updating edge parent indices...");
+    let edges_indexed = match db.update_edge_parents() {
+        Ok(count) => {
+            emit_log(app, "info", &format!("  ✓ Indexed {} edges for fast view lookups", count));
+            count
+        }
+        Err(e) => {
+            emit_log(app, "warn", &format!("  Failed to update edge parents: {}", e));
+            0
+        }
+    };
+
     let total_elapsed = total_start.elapsed().as_secs_f64();
     emit_log(app, "info", "");
     emit_log(app, "info", "═══════════════════════════════════════════════════════════");
@@ -2724,6 +2776,7 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
     emit_log(app, "info", &format!("  • {} grouping iterations", grouping_iterations));
     emit_log(app, "info", &format!("  • {} hierarchy levels (depth 0-{})", final_max_depth + 1, final_max_depth));
     emit_log(app, "info", &format!("  • {} semantic edges", semantic_edges_created));
+    emit_log(app, "info", &format!("  • {} edges indexed for views", edges_indexed));
     emit_log(app, "info", &format!("  • {} categories with propagated privacy", privacy_propagated));
     emit_log(app, "info", &format!("  • Total time: {:.1}s", total_elapsed));
     emit_log(app, "info", "═══════════════════════════════════════════════════════════");

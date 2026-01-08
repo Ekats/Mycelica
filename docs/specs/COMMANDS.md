@@ -11,22 +11,25 @@ All backend operations exposed via `invoke()`. Frontend calls these through `@ta
 | Category | Commands |
 |----------|----------|
 | [Node CRUD](#node-crud) | 7 commands |
-| [Edge Operations](#edge-operations) | 4 commands |
+| [Edge Operations](#edge-operations) | 6 commands |
 | [Hierarchy Navigation](#hierarchy-navigation) | 8 commands |
 | [Hierarchy Building](#hierarchy-building) | 9 commands |
-| [Clustering](#clustering) | 3 commands |
+| [Clustering](#clustering) | 4 commands |
 | [AI Processing](#ai-processing) | 5 commands |
 | [Content Classification](#content-classification) | 3 commands |
 | [Rebuild Lite](#rebuild-lite) | 4 commands |
-| [Import](#import) | 3 commands |
+| [Import](#import) | 7 commands |
+| [Paper Operations](#paper-operations) | 9 commands |
 | [Quick Access](#quick-access-sidebar) | 5 commands |
 | [Semantic Similarity](#semantic-similarity) | 3 commands |
 | [Privacy](#privacy) | 10 commands |
-| [Settings & State](#settings--state) | 13 commands |
+| [Settings & State](#settings--state) | 18 commands |
 | [Database Management](#database-management) | 11 commands |
-| [Cancellation](#cancellation) | 3 commands |
+| [Cancellation](#cancellation) | 4 commands |
 
-**Total: ~85 commands**
+**Total: ~120+ commands**
+
+> See also: [CLI.md](../CLI.md) for command-line interface reference
 
 ---
 
@@ -178,6 +181,34 @@ fn delete_edge(state: State<AppState>, id: String) -> Result<(), String>
 
 ```typescript
 await invoke('delete_edge', { id: 'edge-1' });
+```
+
+---
+
+### get_edges_for_view
+Get edges for a specific view (where both endpoints share the same parent).
+
+```rust
+fn get_edges_for_view(state: State<AppState>, parent_id: String) -> Result<Vec<Edge>, String>
+```
+
+Uses indexed lookup on `(source_parent_id, target_parent_id)` for O(1) performance.
+
+```typescript
+const edges = await invoke<Edge[]>('get_edges_for_view', { parentId: 'topic-id' });
+```
+
+---
+
+### get_edges_for_fos
+Get edges for a Field of Science category (papers).
+
+```rust
+fn get_edges_for_fos(state: State<AppState>, fos_id: String) -> Result<Vec<Edge>, String>
+```
+
+```typescript
+const edges = await invoke<Edge[]>('get_edges_for_fos', { fosId: 'computer-science-id' });
 ```
 
 ---
@@ -726,6 +757,136 @@ fn import_google_keep(state: State<AppState>, zip_path: String) -> Result<Google
 
 ```typescript
 const result = await invoke('import_google_keep', { zipPath: '/path/to/takeout.zip' });
+```
+
+---
+
+### import_openaire
+Import scientific papers from OpenAIRE API.
+
+```rust
+async fn import_openaire(
+    state: State<AppState>,
+    app: AppHandle,
+    query: String,
+    max_results: Option<usize>,
+) -> Result<OpenAireImportResult, String>
+```
+
+**Emits:** `openaire-progress` events
+
+```typescript
+const result = await invoke('import_openaire', { query: 'machine learning', maxResults: 100 });
+```
+
+---
+
+### count_openaire_papers
+Count papers that would match an OpenAIRE query.
+
+```rust
+async fn count_openaire_papers(query: String) -> Result<usize, String>
+```
+
+---
+
+### cancel_openaire
+Cancel ongoing OpenAIRE import.
+
+```rust
+fn cancel_openaire(state: State<AppState>) -> Result<(), String>
+```
+
+---
+
+### get_imported_paper_count
+Get count of imported papers.
+
+```rust
+fn get_imported_paper_count(state: State<AppState>) -> Result<usize, String>
+```
+
+---
+
+## Paper Operations
+
+### get_paper_metadata
+Get metadata for a paper by node ID.
+
+```rust
+fn get_paper_metadata(state: State<AppState>, node_id: String) -> Result<Option<Paper>, String>
+```
+
+---
+
+### get_paper_pdf
+Get stored PDF blob for a paper.
+
+```rust
+fn get_paper_pdf(state: State<AppState>, node_id: String) -> Result<Option<Vec<u8>>, String>
+```
+
+---
+
+### has_paper_pdf
+Check if a paper has a stored PDF.
+
+```rust
+fn has_paper_pdf(state: State<AppState>, node_id: String) -> Result<bool, String>
+```
+
+---
+
+### download_paper_on_demand
+Download and store PDF for a paper.
+
+```rust
+async fn download_paper_on_demand(state: State<AppState>, node_id: String) -> Result<bool, String>
+```
+
+---
+
+### open_paper_external
+Open paper PDF in external viewer.
+
+```rust
+fn open_paper_external(state: State<AppState>, node_id: String) -> Result<(), String>
+```
+
+---
+
+### get_paper_document
+Get paper as Document struct for Leaf view.
+
+```rust
+fn get_paper_document(state: State<AppState>, node_id: String) -> Result<Option<Document>, String>
+```
+
+---
+
+### reformat_paper_abstracts
+AI-format abstracts with section headers.
+
+```rust
+async fn reformat_paper_abstracts(state: State<AppState>, app: AppHandle) -> Result<usize, String>
+```
+
+---
+
+### sync_paper_pdf_status
+Sync `pdf_available` flag with actual storage.
+
+```rust
+fn sync_paper_pdf_status(state: State<AppState>) -> Result<usize, String>
+```
+
+---
+
+### sync_paper_dates
+Sync node dates with paper publication dates.
+
+```rust
+fn sync_paper_dates(state: State<AppState>) -> Result<usize, String>
 ```
 
 ---
@@ -1392,4 +1553,4 @@ try {
 
 ---
 
-*Last updated: 2025-12-26*
+*Last updated: 2026-01-08*

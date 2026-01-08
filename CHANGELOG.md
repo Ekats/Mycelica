@@ -78,7 +78,36 @@ All notable changes to Mycelica will be documented in this file.
 
 ## [Unreleased]
 
-### Added
+### Fixed (2026-01-08)
+- **CLI embedding generation**: `process run` and `setup` commands now generate embeddings after AI analysis, matching GUI behavior
+- **CLI tags format**: Changed from CSV (`tags.join(",")`) to JSON array (`serde_json::to_string(&tags)`), fixing frontend compatibility
+- **CLI privacy scoring**: Implemented full batched AI privacy scoring (25 items/batch) using Haiku model - was previously a stub
+
+### Added (2026-01-08)
+- **Edge view architecture**: Edges now loaded per-view instead of all at startup
+  - New columns: `edges.source_parent_id`, `edges.target_parent_id`
+  - New index: `idx_edges_view(source_parent_id, target_parent_id)` for O(1) lookups
+  - Backend: `get_edges_for_view(parent_id)` command
+  - Frontend: `loadEdgesForView(parentId)` in `useGraph.ts:204`, called on view change in `Graph.tsx:385`
+- **docs/CLI.md**: Complete CLI reference with all commands, examples, and workflows
+
+### Changed (2026-01-08)
+- **Documentation overhaul**: All specs updated to match actual implementation
+  - `AI_CLUSTERING.md`: Complete rewrite - now describes embedding-based cosine similarity clustering (not AI batch)
+  - `SCHEMA.md`: Added `papers` table, `fos_edges` (deprecated), edge view columns, frontend integration
+  - `HIERARCHY.md`: Added tiered child limits (10/25/50/100/150 by depth)
+  - `COMMANDS.md`: Added Paper Operations, OpenAIRE import, edge view commands (~120+ total)
+  - `TYPES.md`: Added `paper` content type (14 total)
+  - `PRIVACY.md`: Added CLI availability table
+  - `ARCHITECTURE.md`: Added CLI section, edge loading section, updated counts
+  - `MULTI_PATH.md`: Added FOS-based edges section
+
+### Deprecated (2026-01-08)
+- `fos_edges` table: Superseded by view-based edge loading with parent columns on `edges` table
+
+---
+
+### Added (Previous)
 - **Persistent tags system**: Tags that survive hierarchy rebuilds and guide clustering
   - Tags generated from existing `nodes.tags` JSON field (AI-assigned item tags)
   - Similar tag strings clustered (cosine > 0.75) and canonicalized (e.g., "rust", "Rust", "rust-lang" → "rust")
