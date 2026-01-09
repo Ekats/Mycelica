@@ -70,7 +70,6 @@ Thumbs.db
 # Claude Code
 # ===================
 .claude/
-CLAUDE.md
 
 # ===================
 # AUR packaging (aur-mycelica/ is separate repo)

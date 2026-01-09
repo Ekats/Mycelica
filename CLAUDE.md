@@ -1,0 +1,144 @@
+# CLAUDE.md
+
+Mycelica: Knowledge graph for conversations, notes, papers, and source code. Tauri (Rust + React) with CLI.
+
+**This codebase is indexed. Use `mycelica-cli` instead of grep/find.**
+
+## START HERE
+
+Run this now:
+```bash
+mycelica-cli db stats
+```
+
+If you see items and edges, proceed to "BEFORE WRITING CODE" section.
+
+If empty or error, run First-Time Setup below.
+
+---
+
+## First-Time Setup
+
+Run once. Database persists. **Skip if `.mycelica.db` exists.**
+
+```bash
+# Install CLI globally
+cd src-tauri
+cargo install --path . --bin mycelica-cli
+cd ..
+
+# Create project database in repo root
+mycelica-cli db new .mycelica.db
+mycelica-cli import code .
+mycelica-cli setup  # clusters + embeddings + call graph (~2-3 min)
+```
+
+Add `.mycelica.db` to `.gitignore`.
+
+**Auto-discovery:** Commands find `.mycelica.db` by walking up directories (like `.git`).
+
+---
+
+## BEFORE WRITING CODE: Explore
+
+**Use these commands first.** The graph knows relationships grep doesn't.
+
+```bash
+# Find relevant code
+mycelica-cli search "clustering"
+
+# View actual source code (reads file, shows line range)
+mycelica-cli code show <id>
+
+# Get node metadata (file path, line numbers in tags JSON)
+mycelica-cli node get <id>
+
+# Who calls this function?
+mycelica-cli nav edges <id> --type calls --direction incoming
+
+# What does this function call?
+mycelica-cli nav edges <id> --type calls --direction outgoing
+
+# What docs reference this code?
+mycelica-cli nav edges <id> --type documents --direction incoming
+
+# Browse file structure
+mycelica-cli nav folder src-tauri/src/db/
+```
+
+---
+
+## After Editing: MANDATORY
+
+**Run immediately after any code change:**
+```bash
+mycelica-cli import code <file-or-directory> --update
+```
+
+Do not proceed without updating the index. Deletes old nodes, reimports, regenerates embeddings, refreshes edges. Seconds, not minutes.
+
+---
+
+## Key Files
+
+| What | Where |
+|------|-------|
+| Database schema | `src-tauri/src/db/schema.rs` |
+| Data models | `src-tauri/src/db/models.rs` |
+| CLI commands | `src-tauri/src/bin/cli.rs` |
+| Tauri commands | `src-tauri/src/commands/graph.rs` |
+| Hierarchy build | `src-tauri/src/hierarchy.rs` |
+| Code parsing | `src-tauri/src/code/rust_parser.rs` |
+| Code import | `src-tauri/src/code/mod.rs` |
+| AI client | `src-tauri/src/ai_client.rs` |
+| Local embeddings | `src-tauri/src/local_embeddings.rs` |
+
+---
+
+## Edge Types
+
+| Edge | Meaning |
+|------|---------|
+| `Calls` | Function calls function |
+| `DefinedIn` | Code item in file/module |
+| `Documents` | Markdown doc references code |
+
+---
+
+## Constraints
+
+- **No emoji** — Removed from AI prompts
+- **No OpenAI embeddings** — Local only (all-MiniLM-L6-v2)
+- **Code items skip AI** — Keep signatures as titles
+- **Edge columns** — `source_id`/`target_id` (not `source`/`target`)
+
+---
+
+## Common Patterns
+
+### Add CLI Command
+1. Add enum variant in `cli.rs` (find `enum Commands`)
+2. Add `async fn handle_X()`
+3. Wire in `run_cli()` match
+
+### Add Edge Type
+1. Add to `EdgeType` in `db/models.rs`
+2. Add string conversion
+3. Use `db.insert_edge()`
+
+---
+
+## Quick Reference
+
+| Task | Command |
+|------|---------|
+| Find code | `mycelica-cli search "query"` |
+| View source | `mycelica-cli code show <id>` |
+| Node metadata | `mycelica-cli node get <id>` |
+| Who calls X? | `mycelica-cli nav edges <id> --type calls --direction incoming` |
+| X calls who? | `mycelica-cli nav edges <id> --type calls --direction outgoing` |
+| Browse files | `mycelica-cli nav folder src-tauri/src/` |
+| Update after edit | `mycelica-cli import code <file> --update` |
+| Rebuild call graph | `mycelica-cli analyze code-edges` |
+| Stats | `mycelica-cli db stats` |
+| Interactive browser | `mycelica-cli tui` |

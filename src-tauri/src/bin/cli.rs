@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand, CommandFactory};
 use clap_complete::{generate, Shell};
 use mycelica_lib::{db::{Database, Node, NodeType, EdgeType}, settings, import, hierarchy, similarity, clustering, openaire, ai_client};
 use serde_json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::io::Write;
 use chrono::{Timelike, Utc};
@@ -199,6 +199,11 @@ enum Commands {
     Analyze {
         #[command(subcommand)]
         cmd: AnalyzeCommands,
+    },
+    /// Code intelligence commands
+    Code {
+        #[command(subcommand)]
+        cmd: CodeCommands,
     },
     /// Global search across all nodes
     Search {
@@ -765,6 +770,15 @@ enum AnalyzeCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum CodeCommands {
+    /// Show source code for a code node (reads actual file)
+    Show {
+        /// Node ID (e.g., code-abc123...)
+        id: String,
+    },
+}
+
 // ============================================================================
 // Main Entry Point
 // ============================================================================
@@ -820,6 +834,7 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Maintenance { cmd } => handle_maintenance(cmd, &db, cli.json).await,
         Commands::Export { cmd } => handle_export(cmd, &db, cli.quiet).await,
         Commands::Analyze { cmd } => handle_analyze(cmd, &db, cli.json, cli.quiet).await,
+        Commands::Code { cmd } => handle_code(cmd, &db, &db_path).await,
         Commands::Search { query, type_filter, limit } => handle_search(&query, &type_filter, limit, &db, cli.json).await,
         Commands::Tui => run_tui(&db).await,
         Commands::Completions { .. } => unreachable!(),
@@ -3843,6 +3858,72 @@ fn find_called_functions(content: &str, known_functions: &std::collections::Hash
     }
 
     called
+}
+
+// ============================================================================
+// Code Commands
+// ============================================================================
+
+async fn handle_code(cmd: CodeCommands, db: &Database, db_path: &PathBuf) -> Result<(), String> {
+    match cmd {
+        CodeCommands::Show { id } => {
+            // Get the node
+            let node = db.get_node(&id).map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("Node not found: {}", id))?;
+
+            // Parse tags JSON to get file_path, line_start, line_end
+            let tags = node.tags.as_ref()
+                .ok_or("Node has no tags metadata")?;
+
+            #[derive(serde::Deserialize)]
+            struct CodeMetadata {
+                file_path: String,
+                line_start: usize,
+                line_end: usize,
+            }
+
+            let metadata: CodeMetadata = serde_json::from_str(tags)
+                .map_err(|e| format!("Failed to parse tags JSON: {}. Tags: {}", e, tags))?;
+
+            // Resolve file path - if relative, resolve from database directory
+            let file_path = PathBuf::from(&metadata.file_path);
+            let file_path = if file_path.is_relative() {
+                // Get the directory containing the database
+                let db_dir = db_path.parent().unwrap_or(Path::new("."));
+                db_dir.join(&file_path)
+            } else {
+                file_path
+            };
+
+            // Read the actual file
+            let file_content = std::fs::read_to_string(&file_path)
+                .map_err(|e| format!("Failed to read file '{}': {}", file_path.display(), e))?;
+
+            let lines: Vec<&str> = file_content.lines().collect();
+
+            // Validate line range
+            if metadata.line_start == 0 || metadata.line_start > lines.len() {
+                return Err(format!("Invalid line_start: {} (file has {} lines)", metadata.line_start, lines.len()));
+            }
+            let line_end = metadata.line_end.min(lines.len());
+
+            // Extract the code range (1-indexed to 0-indexed)
+            let code_lines = &lines[metadata.line_start - 1..line_end];
+
+            // Print header
+            println!("=== {} ===", node.title);
+            println!("File: {}", metadata.file_path);
+            println!("Lines: {}-{}", metadata.line_start, line_end);
+            println!();
+
+            // Print code with line numbers
+            for (i, line) in code_lines.iter().enumerate() {
+                let line_num = metadata.line_start + i;
+                println!("{:4} | {}", line_num, line);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn export_dot(nodes: &[Node], db: &Database, include_edges: bool) -> Result<String, String> {
