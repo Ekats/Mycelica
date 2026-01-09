@@ -447,6 +447,11 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
             continue;
         }
 
+        // Skip bookmarks (web captures have fixed content_type, never reclassify)
+        if node.content_type.as_deref() == Some("bookmark") {
+            continue;
+        }
+
         // Calculate time estimates
         let elapsed = start_time.elapsed().as_secs_f64();
         let (estimate, remaining) = if current > 1 {
@@ -2169,6 +2174,11 @@ pub async fn reclassify_ai(
 
         // Skip papers (fixed content_type, never reclassify)
         if item.content_type.as_deref() == Some("paper") {
+            continue;
+        }
+
+        // Skip bookmarks (web captures have fixed content_type, never reclassify)
+        if item.content_type.as_deref() == Some("bookmark") {
             continue;
         }
 

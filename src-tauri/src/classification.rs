@@ -749,6 +749,12 @@ pub fn classify_all_items(db: &Database) -> Result<usize, String> {
             continue;
         }
 
+        // Skip bookmarks (web captures have fixed content_type, never reclassify)
+        if item.content_type.as_deref() == Some("bookmark") {
+            already_classified += 1;
+            continue;
+        }
+
         // Skip already classified items (likely from AI processing)
         if item.content_type.is_some() {
             already_classified += 1;

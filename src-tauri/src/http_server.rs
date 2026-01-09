@@ -138,7 +138,7 @@ fn handle_capture(db: &Database, body: &str) -> Response<std::io::Cursor<Vec<u8>
         privacy_reason: None,
         source: Some("firefox".to_string()),
         pdf_available: Some(false),
-        content_type: Some("reference".to_string()),
+        content_type: Some("bookmark".to_string()),
         associated_idea_id: None,
         privacy: None,
     };

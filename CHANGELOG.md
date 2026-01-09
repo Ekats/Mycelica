@@ -10,10 +10,11 @@ All notable changes to Mycelica will be documented in this file.
   - `GET /search?q=<query>`: Full-text search across nodes
   - `GET /status`: Connection check and version info
   - CORS headers for browser extension access
-- **Bookmark node type**: New `bookmark` type for web captures (source: "firefox", content_type: "reference")
+- **Bookmark node type**: New `bookmark` type for web captures (source: "firefox", content_type: "bookmark")
 
 ### Fixed
 - TUI leaf view: Similar and Calls panels now use dynamic width to fill available space
+- Bookmarks preserve their content_type ("bookmark") during AI processing and reclassification
 
 ---
 
