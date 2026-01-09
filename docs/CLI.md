@@ -41,7 +41,10 @@ Options:
 ```bash
 mycelica-cli db stats              # Show database statistics
 mycelica-cli db path               # Print database file path
-mycelica-cli db switch <PATH>      # Switch to different database
+mycelica-cli db select             # Select database interactively
+mycelica-cli db new <PATH>         # Create a new database
+mycelica-cli db export <PATH>      # Export trimmed database (no PDFs)
+mycelica-cli db tidy               # Vacuum, fix counts, prune edges
 ```
 
 ### import - Data Import
@@ -170,12 +173,20 @@ mycelica-cli pinned remove <ID>        # Unpin a node
 ### maintenance - Database Maintenance
 
 ```bash
-mycelica-cli maintenance tidy          # Clean orphan edges, recount children
-mycelica-cli maintenance clear-all     # Delete all data
-mycelica-cli maintenance clear-hierarchy  # Clear just hierarchy
-mycelica-cli maintenance clear-embeddings # Clear embeddings + semantic edges
-mycelica-cli maintenance clear-tags    # Clear tags and item_tags
-mycelica-cli maintenance delete-empty  # Delete empty nodes
+mycelica-cli maintenance wipe              # Delete ALL data
+mycelica-cli maintenance reset-ai          # Reset AI processing
+mycelica-cli maintenance reset-clusters    # Reset clustering data
+mycelica-cli maintenance reset-privacy     # Reset privacy scores
+mycelica-cli maintenance clear-embeddings  # Clear embeddings
+mycelica-cli maintenance clear-hierarchy   # Clear hierarchy
+mycelica-cli maintenance clear-tags        # Clear tags
+mycelica-cli maintenance delete-empty      # Delete empty nodes
+mycelica-cli maintenance vacuum            # Vacuum database
+mycelica-cli maintenance fix-counts        # Fix child counts
+mycelica-cli maintenance fix-depths        # Fix node depths
+mycelica-cli maintenance prune-edges       # Prune dead edges
+mycelica-cli maintenance precompute-fos-edges  # Precompute FOS edge sets
+mycelica-cli maintenance index-edges       # Index edges by parent
 ```
 
 ### export - Data Export
@@ -300,7 +311,7 @@ mycelica-cli --json node search "rust" | jq '.[].title'
 ## CLI vs GUI Features
 
 ### Fully Implemented in Both
-- Import (all 4 types: claude, markdown, keep, openaire)
+- Import (all 5 types: claude, markdown, keep, openaire, code)
 - Clustering (run, recluster, fos)
 - Hierarchy build/rebuild
 - Embeddings (regenerate, clear, status)
@@ -313,6 +324,8 @@ mycelica-cli --json node search "rust" | jq '.[].title'
 - Interactive TUI
 - Setup wizard
 - Shell completions
+- Code call graph analysis (`analyze code-edges`)
+- Folder-based code navigation (`nav folder`)
 
 ### GUI-Only Features
 - Visual graph navigation
@@ -320,6 +333,7 @@ mycelica-cli --json node search "rust" | jq '.[].title'
 - Real-time progress events
 - Manual hierarchy editing (unsplit_node, cluster_hierarchy_level)
 - Paper PDF viewer integration
+- Hide private nodes toggle
 
 ---
 
@@ -329,4 +343,4 @@ CLI operations can be cancelled with Ctrl+C. This is different from GUI which us
 
 ---
 
-*Last updated: 2026-01-08*
+*Last updated: 2026-01-10*

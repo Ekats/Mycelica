@@ -2,7 +2,7 @@
 
 Mycelica: Knowledge graph for conversations, notes, papers, and source code. Tauri (Rust + React) with CLI.
 
-**This codebase is indexed. Use `mycelica-cli` instead of grep/find or explore agents — it's faster.**
+**This codebase is indexed. Use `mycelica-cli` instead of grep/find — it's faster. (See "For Explore Agents" below.)**
 
 ## START HERE
 
@@ -67,6 +67,19 @@ mycelica-cli nav edges <id> --type documents --direction incoming
 # Browse file structure
 mycelica-cli nav folder src-tauri/src/db/
 ```
+
+---
+
+## For Explore Agents
+
+When spawning explore agents for this repo, include in prompt:
+
+"This codebase is indexed with mycelica-cli. Use it instead of grep/glob:
+- `mycelica-cli search "query"` — semantic search (faster than grep)
+- `mycelica-cli code show <id>` — view source code
+- `mycelica-cli nav edges <id> --type calls --direction incoming` — who calls this?
+- `mycelica-cli nav folder <path>` — browse by file path
+- `mycelica-cli node get <id>` — get node metadata"
 
 ---
 

@@ -1,6 +1,6 @@
 # Mycelica Architecture
 
-> Comprehensive map of the codebase. Last updated: 2026-01-08
+> Comprehensive map of the codebase. Last updated: 2026-01-10
 
 ## Overview
 
@@ -245,7 +245,7 @@ See `docs/specs/SCHEMA.md` for full schema.
 - Node/Edge CRUD
 - Hierarchy navigation
 - AI processing
-- Import operations (Claude, Markdown, Keep, OpenAIRE)
+- Import operations (Claude, Markdown, Keep, OpenAIRE, Code)
 - Paper operations
 - Quick access (pinned/recent)
 - Database management
@@ -284,7 +284,7 @@ See `docs/specs/COMMANDS.md` for full API reference.
 
 **classification.rs**
 - Pattern-based content type classification
-- 14 content types across 3 visibility tiers (added: paper)
+- 15 content types across 3 visibility tiers (paper, bookmark, code_*)
 - No AI required (fast, consistent)
 
 **openaire.rs**
@@ -305,6 +305,10 @@ See `docs/specs/COMMANDS.md` for full API reference.
 - `import_markdown_files()` - Markdown files
 - `import_google_keep()` - Google Keep Takeout
 
+**code/mod.rs**
+- `import_code()` - Source code (Rust, TypeScript, Markdown)
+- Respects .gitignore, creates DefinedIn and Documents edges
+
 **settings.rs** - Configuration persistence
 - API keys (Anthropic, OpenAI)
 - Custom database path
@@ -312,6 +316,16 @@ See `docs/specs/COMMANDS.md` for full API reference.
 - Recent Notes protection
 
 **tags.rs** - Persistent tag system for clustering guidance
+
+**utils.rs** - Shared utility functions
+
+**format_abstract.rs** - Paper abstract formatting with section headers
+
+**http_server.rs** - HTTP server for browser extension integration
+
+**code/types.rs** - Code parsing type definitions
+
+**bin/batch_import.rs** - Batch import utility
 
 ### Entry Points
 
@@ -326,8 +340,8 @@ Standalone command-line interface (~6200 lines, 77+ subcommands).
 mycelica-cli [OPTIONS] <COMMAND>
 
 Commands:
-  db          Database operations (stats, path, switch)
-  import      Import data (claude, markdown, keep, openaire)
+  db          Database operations (stats, path, select, new, export, tidy)
+  import      Import data (claude, markdown, keep, openaire, code)
   node        Node operations (get, search, set-private)
   hierarchy   Hierarchy operations (build, rebuild, clear)
   process     AI processing (run, status, reset)
@@ -382,22 +396,39 @@ src/
 ├── components/
 │   ├── graph/
 │   │   ├── Graph.tsx           # Main visualization (3300+ lines)
+│   │   ├── GraphCanvas.tsx     # D3 canvas component
+│   │   ├── GraphStatusBar.tsx  # Status bar below graph
+│   │   ├── DevConsole.tsx      # Developer console toggle
+│   │   ├── NodeContextMenu.tsx # Right-click context menu
+│   │   ├── NoteModal.tsx       # Quick note creation
 │   │   └── SimilarNodesPanel.tsx
 │   ├── leaf/
 │   │   ├── LeafView.tsx        # Content reader
-│   │   └── ConversationRenderer.tsx
+│   │   ├── ConversationRenderer.tsx
+│   │   ├── LeafSimilarNodes.tsx
+│   │   ├── PaperViewer.tsx     # PDF paper viewer
+│   │   └── SupportingItemsPanel.tsx
 │   ├── sidebar/Sidebar.tsx
-│   ├── settings/SettingsPanel.tsx
+│   ├── settings/
+│   │   ├── SettingsPanel.tsx
+│   │   └── ConfirmDialog.tsx
 │   └── ErrorBoundary.tsx       # Reusable error boundary
 ├── stores/graphStore.ts        # Zustand state
 ├── types/graph.ts              # TypeScript interfaces
-└── hooks/useGraph.ts           # Data fetching
+├── hooks/useGraph.ts           # Data fetching
+└── utils/
+    ├── emojiMatcher.ts         # Emoji matching utility
+    ├── nodeColors.ts           # Node color utilities
+    └── similarityColor.ts      # Similarity coloring
 
 src-tauri/src/
 ├── lib.rs                      # Tauri setup, AppState
 ├── main.rs                     # Entry point
+├── bin/
+│   ├── cli.rs                  # CLI application (~6200 lines)
+│   └── batch_import.rs         # Batch import utility
 ├── commands/
-│   ├── graph.rs                # ~70 commands
+│   ├── graph.rs                # ~90 commands
 │   ├── privacy.rs              # Privacy commands
 │   ├── settings.rs             # Settings commands
 │   └── mod.rs
@@ -405,15 +436,23 @@ src-tauri/src/
 │   ├── schema.rs               # SQLite tables + migrations
 │   ├── models.rs               # Rust structs
 │   └── mod.rs                  # DB interface
+├── code/
+│   ├── mod.rs                  # Code import
+│   ├── rust_parser.rs          # Rust parsing
+│   └── types.rs                # Code types
 ├── ai_client.rs                # Claude API
-├── clustering.rs               # TF-IDF + AI clustering
+├── clustering.rs               # Embedding-based clustering
 ├── classification.rs           # Content type classification
 ├── hierarchy.rs                # Dynamic levels
 ├── similarity.rs               # Semantic search
 ├── local_embeddings.rs         # On-device embeddings
 ├── import.rs                   # Data import
+├── openaire.rs                 # OpenAIRE paper import
+├── format_abstract.rs          # Paper abstract formatting
+├── http_server.rs              # HTTP server for browser extension
 ├── settings.rs                 # Config persistence
-└── tags.rs                     # Persistent tag system
+├── tags.rs                     # Persistent tag system
+└── utils.rs                    # Shared utilities
 ```
 
 ---

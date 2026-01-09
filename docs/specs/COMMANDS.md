@@ -18,12 +18,12 @@ All backend operations exposed via `invoke()`. Frontend calls these through `@ta
 | [AI Processing](#ai-processing) | 5 commands |
 | [Content Classification](#content-classification) | 3 commands |
 | [Rebuild Lite](#rebuild-lite) | 4 commands |
-| [Import](#import) | 7 commands |
+| [Import](#import) | 8 commands |
 | [Paper Operations](#paper-operations) | 9 commands |
 | [Quick Access](#quick-access-sidebar) | 5 commands |
 | [Semantic Similarity](#semantic-similarity) | 3 commands |
 | [Privacy](#privacy) | 10 commands |
-| [Settings & State](#settings--state) | 18 commands |
+| [Settings & State](#settings--state) | 27 commands |
 | [Database Management](#database-management) | 11 commands |
 | [Cancellation](#cancellation) | 4 commands |
 
@@ -433,6 +433,19 @@ const result = await invoke('quick_add_to_hierarchy');
 
 ---
 
+### smart_add_to_hierarchy
+Smart placement of orphan items using embedding similarity.
+
+```rust
+async fn smart_add_to_hierarchy(state: State<AppState>) -> Result<SmartAddResult, String>
+```
+
+```typescript
+const result = await invoke<{ itemsPlaced: number; categoriesCreated: number }>('smart_add_to_hierarchy');
+```
+
+---
+
 ### propagate_latest_dates
 Bubble up `latest_child_date` from descendants to ancestors.
 
@@ -804,6 +817,72 @@ Get count of imported papers.
 
 ```rust
 fn get_imported_paper_count(state: State<AppState>) -> Result<usize, String>
+```
+
+---
+
+### import_code
+Import source code from a directory. Parses Rust, TypeScript, and Markdown files. Respects .gitignore.
+
+```rust
+fn import_code(
+    state: State<AppState>,
+    path: String,
+    language: Option<String>,
+) -> Result<CodeImportResult, String>
+```
+
+**Returns:**
+```typescript
+interface CodeImportResult {
+  functions: number;
+  structs: number;
+  enums: number;
+  traits: number;
+  impls: number;
+  modules: number;
+  macros: number;
+  docs: number;
+  files_processed: number;
+  files_skipped: number;
+  edges_created: number;
+  doc_edges: number;
+  errors: string[];
+}
+```
+
+```typescript
+const result = await invoke<CodeImportResult>('import_code', {
+  path: '/path/to/project',
+  language: null  // or 'rust', 'typescript'
+});
+```
+
+---
+
+### analyze_code_edges
+Analyze code and create "Calls" edges between functions.
+
+```rust
+fn analyze_code_edges(
+    state: State<AppState>,
+    path_filter: Option<String>,
+) -> Result<CodeEdgesResult, String>
+```
+
+**Returns:**
+```typescript
+interface CodeEdgesResult {
+  functions_analyzed: number;
+  edges_found: number;
+  edges_created: number;
+}
+```
+
+```typescript
+const result = await invoke<CodeEdgesResult>('analyze_code_edges', {
+  pathFilter: 'src/'  // optional path filter
+});
 ```
 
 ---
@@ -1240,6 +1319,33 @@ fn clear_openai_api_key() -> Result<(), String>
 
 ---
 
+### get_openaire_api_key_status
+Get OpenAIRE API key status.
+
+```rust
+fn get_openaire_api_key_status() -> Result<Option<String>, String>
+```
+
+---
+
+### save_openaire_api_key
+Save OpenAIRE API key.
+
+```rust
+fn save_openaire_api_key(key: String) -> Result<(), String>
+```
+
+---
+
+### clear_openaire_api_key
+Remove OpenAIRE API key.
+
+```rust
+fn clear_openaire_api_key() -> Result<(), String>
+```
+
+---
+
 ### get_pipeline_state
 Get current pipeline processing state.
 
@@ -1311,6 +1417,46 @@ Toggle protection of Recent Notes from AI processing.
 ```rust
 fn get_protect_recent_notes() -> bool
 fn set_protect_recent_notes(protected: bool) -> Result<(), String>
+```
+
+---
+
+### get_clustering_thresholds / set_clustering_thresholds
+Get/set clustering similarity thresholds.
+
+```rust
+fn get_clustering_thresholds() -> (Option<f32>, Option<f32>)
+fn set_clustering_thresholds(primary: Option<f32>, secondary: Option<f32>) -> Result<(), String>
+```
+
+```typescript
+const [primary, secondary] = await invoke<[number | null, number | null]>('get_clustering_thresholds');
+await invoke('set_clustering_thresholds', { primary: 0.7, secondary: 0.5 });
+```
+
+---
+
+### get_privacy_threshold / set_privacy_threshold
+Get/set privacy score threshold for filtering.
+
+```rust
+fn get_privacy_threshold() -> f32
+fn set_privacy_threshold(threshold: f32) -> Result<(), String>
+```
+
+```typescript
+const threshold = await invoke<number>('get_privacy_threshold');
+await invoke('set_privacy_threshold', { threshold: 0.7 });
+```
+
+---
+
+### get_show_tips / set_show_tips
+Toggle UI tips display.
+
+```rust
+fn get_show_tips() -> bool
+fn set_show_tips(enabled: bool) -> Result<(), String>
 ```
 
 ---
@@ -1416,6 +1562,21 @@ Remove items with no content.
 
 ```rust
 fn delete_empty_nodes(state: State<AppState>) -> Result<usize, String>
+```
+
+---
+
+### export_trimmed_database
+Export database without PDF blobs (smaller file size).
+
+```rust
+fn export_trimmed_database(state: State<AppState>, output_path: String) -> Result<String, String>
+```
+
+```typescript
+const exportPath = await invoke<string>('export_trimmed_database', {
+  outputPath: '/path/to/export.db'
+});
 ```
 
 ---
@@ -1553,4 +1714,4 @@ try {
 
 ---
 
-*Last updated: 2026-01-08*
+*Last updated: 2026-01-10*

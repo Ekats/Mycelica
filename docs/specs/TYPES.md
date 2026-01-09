@@ -53,17 +53,26 @@ type NodeType =
 
 ```typescript
 type EdgeType =
+  // General relationships
   | 'reference'    // Citation or link
   | 'because'      // Causal relationship
   | 'related'      // Semantic similarity
   | 'contains'     // Parent-child containment
-  | 'belongs_to';  // Multi-path category membership
+  | 'belongs_to'   // Multi-path category membership
+  // Code relationships
+  | 'calls'        // Function calls function
+  | 'uses_type'    // Function references struct/enum
+  | 'implements'   // Impl implements trait
+  | 'defined_in'   // Code item defined in module/file
+  | 'imports'      // Module imports module
+  | 'tests'        // Test function tests function
+  | 'documents';   // Doc references code (backtick refs)
 ```
 
 ### ContentType
 
 ```typescript
-// 14 content types across 3 visibility tiers
+// 15 content types across 3 visibility tiers
 type ContentType =
   // VISIBLE (shown in graph)
   | 'insight'       // Realization, conclusion, crystallized understanding
@@ -72,6 +81,7 @@ type ContentType =
   | 'question'      // Inquiry that frames investigation
   | 'planning'      // Roadmap, TODO, intentions
   | 'paper'         // Scientific paper (imported from OpenAIRE)
+  | 'bookmark'      // Web capture from browser extension
   // SUPPORTING (lazy-loaded in Leaf view)
   | 'investigation' // Problem-solving focused on fixing
   | 'discussion'    // Back-and-forth Q&A without synthesis
@@ -84,7 +94,7 @@ type ContentType =
   | 'trivial';      // Greetings, acknowledgments, fragments
 ```
 
-Note: `idea` was previously used as an alias for `insight` but is deprecated.
+Note: `idea` was previously used as an alias for `insight` but is deprecated. Code imports create `code_*` types (code_function, code_struct, code_enum, etc.) which are also visible.
 
 ### Node
 
@@ -207,11 +217,20 @@ Note: The Rust enum is smaller than the TypeScript type. Additional types like `
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum EdgeType {
+    // General relationships
     Reference,   // Citation or link
     Because,     // Causal relationship
     Related,     // Semantic similarity
     Contains,    // Parent-child containment
     BelongsTo,   // Multi-path category membership
+    // Code relationships
+    Calls,       // Function calls function
+    UsesType,    // Function references struct/enum
+    Implements,  // Impl implements trait
+    DefinedIn,   // Code item defined in module/file
+    Imports,     // Module imports module
+    Tests,       // Test function tests function
+    Documents,   // Doc references code (backtick refs)
 }
 ```
 
@@ -389,7 +408,7 @@ Content types map to visibility tiers:
 
 | Tier | Content Types | Behavior |
 |------|---------------|----------|
-| **Visible** (6) | insight, exploration, synthesis, question, planning, paper | Shown in graph |
+| **Visible** (7+) | insight, exploration, synthesis, question, planning, paper, bookmark, code_* | Shown in graph |
 | **Supporting** (4) | investigation, discussion, reference, creative | Lazy-loaded in Leaf view |
 | **Hidden** (4) | debug, code, paste, trivial | Excluded from graph entirely |
 
@@ -411,4 +430,4 @@ Embeddings are stored in the database but not loaded into Node structs due to si
 
 ---
 
-*Last updated: 2026-01-08*
+*Last updated: 2026-01-10*
