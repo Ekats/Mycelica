@@ -6159,17 +6159,17 @@ fn find_project_db() -> Option<PathBuf> {
 }
 
 fn find_database() -> PathBuf {
-    // 1. Check custom path from settings first
+    // 1. Auto-discover project-specific database (highest priority when in a repo)
+    if let Some(project_db) = find_project_db() {
+        return project_db;
+    }
+
+    // 2. Check custom path from settings
     if let Some(custom_path) = settings::get_custom_db_path() {
         let path = PathBuf::from(&custom_path);
         if path.exists() {
             return path;
         }
-    }
-
-    // 2. Auto-discover project-specific database
-    if let Some(project_db) = find_project_db() {
-        return project_db;
     }
 
     // 3. Check specific known system paths
