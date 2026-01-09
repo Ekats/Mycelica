@@ -2,6 +2,21 @@
 
 All notable changes to Mycelica will be documented in this file.
 
+## [0.7.4] - 2026-01-10
+
+### Added
+- **HTTP server for browser extension** (localhost:9876): Enables Firefox extension integration
+  - `POST /capture`: Create bookmark nodes from web content with auto-generated embeddings
+  - `GET /search?q=<query>`: Full-text search across nodes
+  - `GET /status`: Connection check and version info
+  - CORS headers for browser extension access
+- **Bookmark node type**: New `bookmark` type for web captures (source: "firefox", content_type: "reference")
+
+### Fixed
+- TUI leaf view: Similar and Calls panels now use dynamic width to fill available space
+
+---
+
 ## [0.7.3] - 2026-01-09
 
 ### Added
