@@ -2,7 +2,7 @@
 
 Mycelica: Knowledge graph for conversations, notes, papers, and source code. Tauri (Rust + React) with CLI.
 
-**This codebase is indexed. Use `mycelica-cli` instead of grep/find.**
+**This codebase is indexed. Use `mycelica-cli` instead of grep/find or explore agents — it's faster.**
 
 ## START HERE
 
@@ -42,6 +42,8 @@ Add `.mycelica.db` to `.gitignore`.
 ## BEFORE WRITING CODE: Explore
 
 **Use these commands first.** The graph knows relationships grep doesn't.
+
+**Why faster than explore agents:** Pre-computed embeddings enable instant semantic search (no LLM calls), call graph is pre-indexed, and it's a single SQLite query vs. iterative file traversal.
 
 ```bash
 # Find relevant code

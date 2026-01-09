@@ -821,6 +821,52 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     }
   };
 
+  // Code folder import handler
+  const handleImportCode = async () => {
+    setImporting(true);
+    setImportResult(null);
+    setSuggestedOperation(null);
+    try {
+      const folder = await openDialog({
+        title: 'Select code folder to import',
+        directory: true,
+        multiple: false,
+      });
+      if (folder && typeof folder === 'string') {
+        const result = await invoke<{
+          functions: number;
+          structs: number;
+          enums: number;
+          traits: number;
+          impls: number;
+          modules: number;
+          macros: number;
+          docs: number;
+          files_processed: number;
+          files_skipped: number;
+          edges_created: number;
+          doc_edges: number;
+          errors: string[];
+        }>('import_code', { path: folder, language: null });
+        await loadDbStats();
+        onDataChanged?.();
+
+        const totalItems = result.functions + result.structs + result.enums + result.traits + result.impls + result.modules + result.macros + result.docs;
+        const errorMsg = result.errors.length > 0 ? ` (${result.errors.length} errors)` : '';
+        setImportResult(`Imported ${totalItems} code items from ${result.files_processed} files${errorMsg}`);
+
+        // Show smart operation suggestion if items were imported
+        if (totalItems > 0) {
+          suggestOperationAfterImport(totalItems);
+        }
+      }
+    } catch (err) {
+      setImportResult(`Error: ${err}`);
+    } finally {
+      setImporting(false);
+    }
+  };
+
   // OpenAIRE tag handlers
   const handleAddOpenAireTag = () => {
     const trimmed = openAireQueryInput.trim();
@@ -1667,6 +1713,15 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                       <span className="text-2xl">{importing ? <Loader2 className="w-6 h-6 animate-spin" /> : '📚'}</span>
                       <span className="text-xs text-gray-300">Papers</span>
                       <span className="text-xs text-gray-500">OpenAIRE</span>
+                    </button>
+                    <button
+                      onClick={handleImportCode}
+                      disabled={importing}
+                      className="flex-1 flex flex-col items-center gap-2 p-3 bg-gray-800/50 hover:bg-gray-800 rounded-lg transition-colors disabled:opacity-50"
+                    >
+                      <span className="text-2xl">{importing ? <Loader2 className="w-6 h-6 animate-spin" /> : '💻'}</span>
+                      <span className="text-xs text-gray-300">Code</span>
+                      <span className="text-xs text-gray-500">folder</span>
                     </button>
                   </div>
                 </div>

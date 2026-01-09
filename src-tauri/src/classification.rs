@@ -37,6 +37,7 @@ pub enum ContentType {
     Question,      // Inquiry that frames investigation
     Planning,      // Roadmap, TODO, intentions
     Paper,         // Scientific paper (fixed type, never reclassified)
+    Bookmark,      // Web capture from browser extension (fixed type, never reclassified)
 
     // SUPPORTING - lazy-loaded in leaf view
     Investigation, // Problem-solving focused on fixing
@@ -68,6 +69,7 @@ impl ContentType {
             ContentType::Question => "question",
             ContentType::Planning => "planning",
             ContentType::Paper => "paper",
+            ContentType::Bookmark => "bookmark",
             ContentType::Investigation => "investigation",
             ContentType::Discussion => "discussion",
             ContentType::Reference => "reference",
@@ -88,6 +90,7 @@ impl ContentType {
             "question" => Some(ContentType::Question),
             "planning" => Some(ContentType::Planning),
             "paper" => Some(ContentType::Paper),
+            "bookmark" => Some(ContentType::Bookmark),
             // Supporting
             "investigation" => Some(ContentType::Investigation),
             "discussion" => Some(ContentType::Discussion),
@@ -105,7 +108,8 @@ impl ContentType {
     pub fn visibility(&self) -> VisibilityTier {
         match self {
             ContentType::Insight | ContentType::Exploration | ContentType::Synthesis |
-            ContentType::Question | ContentType::Planning | ContentType::Paper => VisibilityTier::Visible,
+            ContentType::Question | ContentType::Planning | ContentType::Paper |
+            ContentType::Bookmark => VisibilityTier::Visible,
 
             ContentType::Investigation | ContentType::Discussion |
             ContentType::Reference | ContentType::Creative => VisibilityTier::Supporting,

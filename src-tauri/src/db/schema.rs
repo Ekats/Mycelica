@@ -726,7 +726,7 @@ impl Database {
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes
              WHERE content_type IS NULL
-                OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper')
+                OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper', 'bookmark')
                 OR content_type LIKE 'code_%'
              ORDER BY created_at DESC",
             Self::NODE_COLUMNS
@@ -1535,7 +1535,7 @@ impl Database {
     /// SQL fragment for VISIBLE content types (for graph rendering)
     /// Includes: standard visible types + code_* types from code import
     const VISIBLE_CONTENT_TYPES: &'static str =
-        "content_type IS NULL OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper') OR content_type LIKE 'code_%'";
+        "content_type IS NULL OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper', 'bookmark') OR content_type LIKE 'code_%'";
 
     /// Get only VISIBLE tier nodes for graph rendering
     /// Categories (is_item = 0) are always included
@@ -1633,7 +1633,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE is_item = 1
-             AND (content_type IN ('insight', 'exploration', 'synthesis', 'question', 'planning', 'paper')
+             AND (content_type IN ('insight', 'exploration', 'synthesis', 'question', 'planning', 'paper', 'bookmark')
                   OR content_type LIKE 'code_%')
              ORDER BY created_at DESC",
             Self::NODE_COLUMNS
@@ -2487,7 +2487,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT id, embedding FROM nodes
              WHERE embedding IS NOT NULL
-               AND (content_type IS NULL OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper') OR content_type LIKE 'code_%')"
+               AND (content_type IS NULL OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper', 'bookmark') OR content_type LIKE 'code_%')"
         )?;
 
         let results = stmt.query_map([], |row| {
@@ -3069,11 +3069,11 @@ impl Database {
                 "SELECT n.id, n.child_count,
                         (SELECT COUNT(*) FROM nodes c
                          WHERE c.parent_id = n.id
-                           AND (c.content_type IS NULL OR c.content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper') OR c.content_type LIKE 'code_%')) as actual
+                           AND (c.content_type IS NULL OR c.content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper', 'bookmark') OR c.content_type LIKE 'code_%')) as actual
                  FROM nodes n
                  WHERE n.child_count != (SELECT COUNT(*) FROM nodes c
                                          WHERE c.parent_id = n.id
-                                           AND (c.content_type IS NULL OR c.content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper') OR c.content_type LIKE 'code_%'))"
+                                           AND (c.content_type IS NULL OR c.content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper', 'bookmark') OR c.content_type LIKE 'code_%'))"
             )?;
             let results: Vec<_> = stmt.query_map([], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
