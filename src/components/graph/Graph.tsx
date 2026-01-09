@@ -1026,7 +1026,10 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
           const isLastChild = i === displayChildren.length - 1 && hiddenCount === 0;
           const connector = isLastChild ? '└── ' : '├── ';
           const emoji = child.emoji || (child.isItem ? '📄' : '📁');
-          const title = child.clusterLabel || child.aiTitle || child.title || 'Untitled';
+          // Items use their own title, categories use clusterLabel
+          const title = child.isItem
+            ? (child.aiTitle || child.title || 'Untitled')
+            : (child.clusterLabel || child.aiTitle || child.title || 'Untitled');
           const childCount = child.childCount || 0;
           const itemTag = child.isItem ? ' [ITEM]' : '';
           const countTag = childCount > 0 ? ` (${childCount})` : '';
@@ -1122,7 +1125,10 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
           const isLastChild = i === sortedChildren.length - 1;
           const connector = isLastChild ? '└── ' : '├── ';
           const emoji = child.emoji || (child.isItem ? '📄' : '📁');
-          const title = child.clusterLabel || child.aiTitle || child.title || 'Untitled';
+          // Items use their own title, categories use clusterLabel
+          const title = child.isItem
+            ? (child.aiTitle || child.title || 'Untitled')
+            : (child.clusterLabel || child.aiTitle || child.title || 'Untitled');
           const childCount = child.childCount || 0;
           const itemTag = child.isItem ? ' [item]' : '';
           const countTag = childCount > 0 ? ` (${childCount})` : '';
