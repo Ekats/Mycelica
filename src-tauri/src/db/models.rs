@@ -7,7 +7,8 @@ pub enum NodeType {
     Thought,
     Context,
     Cluster,
-    Paper,  // Scientific paper from OpenAIRE
+    Paper,     // Scientific paper from OpenAIRE
+    Bookmark,  // Web capture from browser extension
 }
 
 impl NodeType {
@@ -18,6 +19,7 @@ impl NodeType {
             NodeType::Context => "context",
             NodeType::Cluster => "cluster",
             NodeType::Paper => "paper",
+            NodeType::Bookmark => "bookmark",
         }
     }
 
@@ -28,6 +30,7 @@ impl NodeType {
             "context" => Some(NodeType::Context),
             "cluster" => Some(NodeType::Cluster),
             "paper" => Some(NodeType::Paper),
+            "bookmark" => Some(NodeType::Bookmark),
             _ => None,
         }
     }

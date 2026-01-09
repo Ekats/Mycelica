@@ -5752,13 +5752,18 @@ fn draw_leaf_sidebar(f: &mut Frame, app: &TuiApp, area: Rect) {
         (min as f64, max as f64)
     };
 
+    // Calculate available width for titles (area width - borders - emoji - percentage - spaces)
+    let available_width = area.width.saturating_sub(2 + 2 + 5) as usize; // borders + emoji + " XX%"
+    let title_max_len = available_width.saturating_sub(2).max(10); // at least 10 chars
+
     let similar_items: Vec<ListItem> = app.similar_nodes.iter().enumerate().map(|(i, sim)| {
         let emoji = sim.emoji.as_deref().unwrap_or("📄");
         let similarity_pct = (sim.similarity * 100.0) as i32;
         // Normalized gradient: spreads colors across visible range (red→yellow | blue→cyan)
         let color = similarity_color_normalized(sim.similarity as f64, min_sim, max_sim);
 
-        let content = format!("{} {} {}%", emoji, &sim.title[..sim.title.len().min(25)], similarity_pct);
+        let truncated_title = utils::safe_truncate(&sim.title, title_max_len);
+        let content = format!("{} {} {}%", emoji, truncated_title, similarity_pct);
 
         // Highlight selected item when Similar section is focused
         if i == app.similar_selected && app.leaf_focus == LeafFocus::Similar {
@@ -5783,10 +5788,14 @@ fn draw_leaf_sidebar(f: &mut Frame, app: &TuiApp, area: Rect) {
             Style::default().fg(Color::DarkGray)
         };
 
+        // Calculate available width for call titles (area width - borders - arrow - space)
+        let calls_title_max = area.width.saturating_sub(2 + 2 + 1) as usize; // borders + "→ "
+
         let call_items: Vec<ListItem> = app.calls_for_node.iter().enumerate().map(|(i, (_, title, is_outgoing))| {
             // Direction indicator: → for outgoing (calls), ← for incoming (called by)
             let arrow = if *is_outgoing { "→" } else { "←" };
-            let content = format!("{} {}", arrow, &title[..title.len().min(30)]);
+            let truncated_title = utils::safe_truncate(title, calls_title_max.max(10));
+            let content = format!("{} {}", arrow, truncated_title);
 
             // Highlight selected item when Calls section is focused
             if i == app.calls_selected && app.leaf_focus == LeafFocus::Calls {

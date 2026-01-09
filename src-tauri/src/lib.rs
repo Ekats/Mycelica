@@ -1,6 +1,7 @@
 pub mod db;
 mod commands;
 pub mod utils;
+mod http_server;
 pub mod clustering;
 pub mod ai_client;
 pub mod settings;
@@ -163,10 +164,16 @@ pub fn run() {
                 }
             }
 
+            // Wrap in Arc for sharing between Tauri and HTTP server
+            let db = Arc::new(db);
+
+            // Start HTTP server for browser extension (localhost:9876)
+            http_server::start(db.clone());
+
             // Use configurable cache TTL from settings
             let cache_ttl = settings::similarity_cache_ttl_secs();
             app.manage(AppState {
-                db: std::sync::RwLock::new(Arc::new(db)),
+                db: std::sync::RwLock::new(db),
                 similarity_cache: std::sync::RwLock::new(commands::SimilarityCache::new(cache_ttl)),
                 openaire_cancel: std::sync::atomic::AtomicBool::new(false),
             });
