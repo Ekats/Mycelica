@@ -14,16 +14,7 @@ use crate::ai_client::{self, MultiClusterAssignment};
 use crate::commands::{is_rebuild_cancelled, reset_rebuild_cancel};
 use serde::Serialize;
 use rand::seq::SliceRandom;
-
-/// Safely truncate a string at a UTF-8 boundary
-fn safe_truncate(s: &str, max_bytes: usize) -> &str {
-    if max_bytes >= s.len() { return s; }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
+use crate::utils::safe_truncate;
 
 /// Result of clustering operation
 #[derive(Debug, Clone, Serialize)]

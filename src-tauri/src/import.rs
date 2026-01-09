@@ -823,7 +823,8 @@ async fn import_single_paper(
     let created_at = paper.publication_date
         .as_ref()
         .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
-        .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis())
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| dt.and_utc().timestamp_millis())
         .unwrap_or(0);  // 0 = unknown date (epoch)
 
     let now = chrono::Utc::now().timestamp_millis();

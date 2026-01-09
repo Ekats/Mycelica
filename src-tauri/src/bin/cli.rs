@@ -6,7 +6,7 @@
 
 use clap::{Parser, Subcommand, CommandFactory};
 use clap_complete::{generate, Shell};
-use mycelica_lib::{db::{Database, Node, NodeType, EdgeType}, settings, import, hierarchy, similarity, clustering, openaire, ai_client};
+use mycelica_lib::{db::{Database, Node, NodeType, EdgeType}, settings, import, hierarchy, similarity, clustering, openaire, ai_client, utils};
 use serde_json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1235,7 +1235,7 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
                         if db.get_node_embedding(node_id).ok().flatten().is_none() {
                             if let Ok(Some(node)) = db.get_node(node_id) {
                                 let text = format!("{}\n{}", node.title, node.content.as_deref().unwrap_or(""));
-                                let embed_text = safe_truncate(&text, 1000);
+                                let embed_text = utils::safe_truncate(&text, 1000);
                                 if let Ok(embedding) = ai_client::generate_embedding(embed_text).await {
                                     db.update_node_embedding(node_id, &embedding).ok();
                                     embeddings_generated += 1;
@@ -1699,7 +1699,7 @@ async fn handle_process(cmd: ProcessCommands, db: &Database, json: bool, quiet: 
                         ).map_err(|e| e.to_string())?;
 
                         // Generate embedding for the node
-                        let embed_text = safe_truncate(content, 1000);
+                        let embed_text = utils::safe_truncate(content, 1000);
                         if let Ok(embedding) = ai_client::generate_embedding(embed_text).await {
                             db.update_node_embedding(&node.id, &embedding).ok();
                         }
@@ -1965,7 +1965,7 @@ async fn handle_privacy(cmd: PrivacyCommands, db: &Database, json: bool, quiet: 
                     let title = item.ai_title.as_deref().unwrap_or(&item.title);
                     let summary = item.summary.as_deref().unwrap_or("");
                     let content = item.content.as_deref().unwrap_or("");
-                    let content_preview = safe_truncate(content, 500);
+                    let content_preview = utils::safe_truncate(content, 500);
 
                     serde_json::json!({
                         "id": item.id,
@@ -2517,7 +2517,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
                     ).ok();
 
                     // Generate embedding for the node
-                    let embed_text = safe_truncate(content, 1000);
+                    let embed_text = utils::safe_truncate(content, 1000);
                     if let Ok(embedding) = ai_client::generate_embedding(embed_text).await {
                         db.update_node_embedding(&node.id, &embedding).ok();
                     }
@@ -2602,7 +2602,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
                 node.title,
                 node.content.as_deref().unwrap_or("")
             );
-            let embed_text = safe_truncate(&text, 1000);
+            let embed_text = utils::safe_truncate(&text, 1000);
 
             if let Ok(embedding) = ai_client::generate_embedding(embed_text).await {
                 db.update_node_embedding(&node.id, &embedding).ok();
@@ -3364,18 +3364,6 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
         }
     }
     Ok(())
-}
-
-/// Safely truncate a string to a maximum byte length, ensuring valid UTF-8
-fn safe_truncate(s: &str, max_bytes: usize) -> &str {
-    if max_bytes >= s.len() {
-        return s;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 /// Parse privacy scoring JSON array response from AI

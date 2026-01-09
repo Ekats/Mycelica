@@ -13,19 +13,11 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use serde::Serialize;
 
+use crate::utils::safe_truncate;
+
 // Global cancellation flags
 static CANCEL_PROCESSING: AtomicBool = AtomicBool::new(false);
 pub static CANCEL_REBUILD: AtomicBool = AtomicBool::new(false);
-
-/// Safely truncate a string at a UTF-8 boundary
-fn safe_truncate(s: &str, max_bytes: usize) -> &str {
-    if max_bytes >= s.len() { return s; }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
 
 /// Cache for similarity search results with TTL
 pub struct SimilarityCache {

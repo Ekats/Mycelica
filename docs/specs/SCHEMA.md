@@ -27,7 +27,7 @@ Mycelica uses **SQLite** with **rusqlite** (not sqlx). Database location:
 
 ## nodes
 
-The primary table containing all graph content (32 columns).
+The primary table containing all graph content (34 columns including migration additions).
 
 ```sql
 CREATE TABLE nodes (

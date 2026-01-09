@@ -1,7 +1,8 @@
-// @ts-nocheck
+// @ts-nocheck - D3 type inference requires extensive annotations
 import React, { useRef, useEffect, useState } from 'react';
 import * as d3 from 'd3';
 import type { Node } from '../../types/graph';
+import { generateClusterColor, getDirectConnectionColor, getChainConnectionColor, getStructuralDepth, getMutedClusterColor } from '../../utils/nodeColors';
 
 // =============================================================================
 // TYPES
@@ -55,38 +56,6 @@ export interface GraphCanvasProps {
 // HELPER FUNCTIONS
 // =============================================================================
 
-// Generate colors for clusters dynamically
-const generateClusterColor = (clusterId: number): string => {
-  const hue = (clusterId * 137.508) % 360;
-  return `hsl(${hue}, 55%, 35%)`;
-};
-
-// Direct connection color: red→yellow→blue→cyan
-const getDirectConnectionColor = (weight: number): string => {
-  let hue: number;
-  if (weight < 0.5) {
-    hue = weight * 2 * 60;
-  } else {
-    hue = 210 - (weight - 0.5) * 2 * 30;
-  }
-  return `hsl(${hue}, 80%, 40%)`;
-};
-
-// Chain connection color: darker red tint for indirect connections
-const getChainConnectionColor = (hopDistance: number): string => {
-  const lightness = Math.max(25, 35 - hopDistance * 3);
-  return `hsl(0, 60%, ${lightness}%)`;
-};
-
-// Calculate structural depth for shadow stacking
-const getStructuralDepth = (childCount: number, isItem: boolean): number => {
-  if (isItem) return 0;
-  if (childCount >= 16) return 4;
-  if (childCount >= 6) return 3;
-  if (childCount >= 2) return 2;
-  return 1;
-};
-
 // Card dimensions at 100% zoom (unified for all nodes)
 const NOTE_WIDTH = 320;
 const NOTE_HEIGHT = 320;
@@ -95,13 +64,6 @@ const DOT_SIZE = 24;
 // Zoom limits
 const MIN_ZOOM = 0.05;
 const MAX_ZOOM = 2;
-
-// Get muted cluster color (gray with hint of cluster hue)
-const getMutedClusterColor = (d: GraphNode): string => {
-  if (d.renderClusterId < 0) return '#374151';
-  const hue = (d.renderClusterId * 137.508) % 360;
-  return `hsl(${hue}, 12%, 28%)`;
-};
 
 // Get node color based on connection distance
 const getNodeColor = (

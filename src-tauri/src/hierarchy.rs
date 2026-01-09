@@ -21,16 +21,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::Instant;
-
-/// Safely truncate a string at a UTF-8 boundary
-fn safe_truncate(s: &str, max_bytes: usize) -> &str {
-    if max_bytes >= s.len() { return s; }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
+use crate::utils::safe_truncate;
 
 /// Compute and store centroid embedding for a parent node from its children's embeddings
 /// This enables similarity-based grouping of intermediate nodes (topics/categories)

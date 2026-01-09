@@ -60,6 +60,10 @@ mycelica-cli import keep <ZIP_FILE>
 # Import scientific papers from OpenAIRE
 mycelica-cli import openaire <QUERY> [--max-results N]
 mycelica-cli import openaire "machine learning" --max-results 100
+
+# Import source code (Rust, TypeScript, Markdown)
+mycelica-cli import code <PATH>              # Import codebase
+mycelica-cli import code src/ --update       # Update after edits (re-index)
 ```
 
 ### node - Node Operations
@@ -134,14 +138,33 @@ mycelica-cli config set openai-key <KEY>   # Set OpenAI API key
 mycelica-cli config set local-embeddings <true|false>
 ```
 
-### nav - Navigation
+### nav - Graph Navigation
 
 ```bash
-mycelica-cli nav recent [--limit N]    # Show recently accessed nodes
-mycelica-cli nav pinned                # Show pinned nodes
-mycelica-cli nav touch <ID>            # Mark node as accessed
-mycelica-cli nav pin <ID>              # Pin a node
-mycelica-cli nav unpin <ID>            # Unpin a node
+mycelica-cli nav ls <ID>               # List children of a node (use "root" for Universe)
+mycelica-cli nav ls <ID> --long        # Long format with details
+mycelica-cli nav tree <ID>             # Show subtree
+mycelica-cli nav tree <ID> --depth 5   # Show subtree with custom depth
+mycelica-cli nav path <FROM> <TO>      # Find path between nodes
+mycelica-cli nav edges <ID>            # Show edges for a node
+mycelica-cli nav edges <ID> --type calls --direction incoming  # Filter edges
+mycelica-cli nav similar <ID>          # Find similar nodes by embedding
+mycelica-cli nav folder <PATH>         # Browse code by file path
+```
+
+### recent - Recent Nodes
+
+```bash
+mycelica-cli recent list [--limit N]   # Show recently accessed nodes
+mycelica-cli recent clear              # Clear recent history
+```
+
+### pinned - Pinned Nodes
+
+```bash
+mycelica-cli pinned list               # Show pinned nodes
+mycelica-cli pinned add <ID>           # Pin a node
+mycelica-cli pinned remove <ID>        # Unpin a node
 ```
 
 ### maintenance - Database Maintenance
@@ -169,6 +192,22 @@ mycelica-cli export bibtex [--output FILE]
 
 # Export graph structure
 mycelica-cli export graph [--output FILE]
+```
+
+### analyze - Code Analysis
+
+```bash
+# Create/refresh Calls edges between functions
+mycelica-cli analyze code-edges
+mycelica-cli analyze code-edges --dry-run    # Preview without writing
+mycelica-cli analyze code-edges --path src/  # Limit to path
+```
+
+### code - Code Intelligence
+
+```bash
+# View source code for a code node (reads actual file)
+mycelica-cli code show <ID>
 ```
 
 ### Special Commands

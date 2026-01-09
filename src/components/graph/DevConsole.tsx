@@ -21,7 +21,7 @@ interface DevConsoleProps {
   autoScroll: boolean;
   setAutoScroll: (value: boolean) => void;
   consoleSize: { width: number; height: number };
-  consoleRef: RefObject<HTMLDivElement>;
+  consoleRef: RefObject<HTMLDivElement | null>;
   onClear: () => void;
   onListNodes: () => void;
   onListPath: () => void;

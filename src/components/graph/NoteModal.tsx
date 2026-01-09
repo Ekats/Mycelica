@@ -1,12 +1,12 @@
 import React, { useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import type { Node } from '../../types/graph';
+import type { Node, NodeType } from '../../types/graph';
 
 interface NoteModalProps {
   isOpen: boolean;
   onClose: () => void;
   nodes: Map<string, Node>;
-  addNode: (node: Partial<Node>) => void;
+  addNode: (node: Partial<Node> & { id: string; type: NodeType; title: string }) => void;
   updateNode: (id: string, updates: Partial<Node>) => void;
 }
 

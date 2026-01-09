@@ -1,5 +1,6 @@
 pub mod db;
 mod commands;
+pub mod utils;
 pub mod clustering;
 pub mod ai_client;
 pub mod settings;

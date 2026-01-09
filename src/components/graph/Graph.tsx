@@ -1,12 +1,13 @@
-// @ts-nocheck
+// @ts-nocheck - Unused workflow variables kept for future use; D3 imports used dynamically
 import { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import * as d3 from 'd3';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, emit } from '@tauri-apps/api/event';
 import { useGraphStore } from '../../stores/graphStore';
 import { useGraph } from '../../hooks/useGraph';
-import type { Node } from '../../types/graph';
+import type { Node, NodeType } from '../../types/graph';
 import { getEmojiForNode, initLearnedMappings } from '../../utils/emojiMatcher';
+import { generateClusterColor, getDirectConnectionColor, getChainConnectionColor, getStructuralDepth } from '../../utils/nodeColors';
 import { ChevronRight, AlertTriangle, X, Lock, LockOpen } from 'lucide-react';
 import { SimilarNodesPanel, SimilarNodesLoading } from './SimilarNodesPanel';
 import { ComponentErrorBoundary } from '../ErrorBoundary';
@@ -89,46 +90,6 @@ interface SimilarNode {
   summary: string | null;
   similarity: number;
 }
-
-// Generate colors for clusters dynamically
-const generateClusterColor = (clusterId: number): string => {
-  const hue = (clusterId * 137.508) % 360; // Golden angle for good color distribution
-  return `hsl(${hue}, 55%, 35%)`;
-};
-
-// Direct connection color: red→yellow→blue→cyan matching edge colors
-// Skips green for colorblind accessibility
-const getDirectConnectionColor = (weight: number): string => {
-  let hue: number;
-  if (weight < 0.5) {
-    // First half: red (0°) → yellow (60°)
-    hue = weight * 2 * 60;
-  } else {
-    // Second half: blue (210°) → cyan (180°)
-    hue = 210 - (weight - 0.5) * 2 * 30;
-  }
-  return `hsl(${hue}, 80%, 40%)`; // Match edge saturation (80%), slightly darker
-};
-
-// Chain connection color: darker red tint for indirect connections
-const getChainConnectionColor = (hopDistance: number): string => {
-  // Further = darker/more faded red
-  const lightness = Math.max(25, 35 - hopDistance * 3); // 35% → 25% as distance increases
-  return `hsl(0, 60%, ${lightness}%)`; // Red hue, moderate saturation
-};
-
-// getUnconnectedColor removed - using getMutedClusterColor for unconnected nodes
-
-// Calculate structural depth for shadow stacking
-// Items: 0 (no stack, just subtle shadow)
-// Topics: 1-4 (violet base + 0-3 cluster shadows)
-const getStructuralDepth = (childCount: number, isItem: boolean): number => {
-  if (isItem) return 0;
-  if (childCount >= 16) return 4;  // violet + 3 cluster
-  if (childCount >= 6) return 3;   // violet + 2 cluster
-  if (childCount >= 2) return 2;   // violet + 1 cluster
-  return 1;  // just violet (all topics)
-};
 
 // Simple hash function to generate consistent number from string
 const hashString = (str: string): number => {
@@ -331,10 +292,10 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
         let neighborId: string | null = null;
         let weight = edge.weight || 0.5;
 
-        if (edge.sourceId === nodeId && !connectionMap.has(edge.targetId)) {
-          neighborId = edge.targetId;
-        } else if (edge.targetId === nodeId && !connectionMap.has(edge.sourceId)) {
-          neighborId = edge.sourceId;
+        if (edge.source === nodeId && !connectionMap.has(edge.target)) {
+          neighborId = edge.target;
+        } else if (edge.target === nodeId && !connectionMap.has(edge.source)) {
+          neighborId = edge.source;
         }
 
         if (neighborId) {
@@ -1713,7 +1674,7 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
         isOpen={showNoteModal}
         onClose={() => setShowNoteModal(false)}
         nodes={nodes}
-        addNode={addNode}
+        addNode={addNode as unknown as (node: Partial<Node> & { id: string; type: NodeType; title: string }) => void}
         updateNode={updateNode}
       />
     </div>

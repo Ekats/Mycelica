@@ -320,7 +320,7 @@ See `docs/specs/COMMANDS.md` for full API reference.
 
 ### CLI (`bin/cli.rs`)
 
-Standalone command-line interface (~5000 lines, 77 subcommands).
+Standalone command-line interface (~6200 lines, 77+ subcommands).
 
 ```
 mycelica-cli [OPTIONS] <COMMAND>
