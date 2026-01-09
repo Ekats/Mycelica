@@ -727,6 +727,7 @@ impl Database {
             "SELECT {} FROM nodes
              WHERE content_type IS NULL
                 OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper')
+                OR content_type LIKE 'code_%'
              ORDER BY created_at DESC",
             Self::NODE_COLUMNS
         ))?;
@@ -801,6 +802,55 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM nodes WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    /// Delete all nodes from a specific file path (stored in tags JSON)
+    /// Also deletes edges where source OR target is in the deleted set
+    pub fn delete_nodes_by_file_path(&self, file_path: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+
+        // First get IDs to delete (needed for edge cleanup)
+        let mut stmt = conn.prepare(
+            "SELECT id FROM nodes WHERE JSON_EXTRACT(tags, '$.file_path') = ?1"
+        )?;
+        let ids: Vec<String> = stmt.query_map([file_path], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Delete edges where source OR target is in deleted set
+        for id in &ids {
+            conn.execute("DELETE FROM edges WHERE source_id = ?1 OR target_id = ?1", params![id])?;
+        }
+
+        // Delete the nodes
+        let deleted = conn.execute(
+            "DELETE FROM nodes WHERE JSON_EXTRACT(tags, '$.file_path') = ?1",
+            params![file_path],
+        )?;
+
+        Ok(deleted)
+    }
+
+    /// Get node IDs for a specific file path (for targeted edge refresh)
+    pub fn get_node_ids_by_file_path(&self, file_path: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM nodes WHERE JSON_EXTRACT(tags, '$.file_path') = ?1"
+        )?;
+        let ids: Vec<String> = stmt.query_map([file_path], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(ids)
+    }
+
+    /// Delete edges by source and edge type
+    pub fn delete_edges_by_source_and_type(&self, source_id: &str, edge_type: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM edges WHERE source = ?1 AND edge_type = ?2",
+            params![source_id, edge_type],
+        )?;
+        Ok(deleted)
     }
 
     // Privacy operations - sets both legacy is_private AND new privacy score
@@ -1392,6 +1442,16 @@ impl Database {
         Ok(())
     }
 
+    // Update only ai_title and summary (preserves tags, content_type) - for code items
+    pub fn update_node_ai_summary_only(&self, node_id: &str, ai_title: &str, summary: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE nodes SET ai_title = ?2, summary = ?3, is_processed = 1 WHERE id = ?1",
+            params![node_id, ai_title, summary],
+        )?;
+        Ok(())
+    }
+
     // Get items that haven't been processed by AI yet
     pub fn get_unprocessed_nodes(&self) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
@@ -1470,10 +1530,12 @@ impl Database {
     // VISIBLE tier: insight, idea, exploration, synthesis, question, planning, paper
     // SUPPORTING tier: investigation, discussion, reference, creative
     // HIDDEN tier: debug, code, paste, trivial
+    // NOTE: code_* types (code_function, code_struct, etc.) are VISIBLE for Code Intelligence
 
     /// SQL fragment for VISIBLE content types (for graph rendering)
+    /// Includes: standard visible types + code_* types from code import
     const VISIBLE_CONTENT_TYPES: &'static str =
-        "content_type IS NULL OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper')";
+        "content_type IS NULL OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper') OR content_type LIKE 'code_%'";
 
     /// Get only VISIBLE tier nodes for graph rendering
     /// Categories (is_item = 0) are always included
@@ -1564,14 +1626,15 @@ impl Database {
     }
 
     /// Get only VISIBLE tier items for hierarchy building
-    /// VISIBLE: insight, exploration, synthesis, question, planning, paper
+    /// VISIBLE: insight, exploration, synthesis, question, planning, paper, code_*
     /// Excludes SUPPORTING (investigation, discussion, reference, creative)
     /// Excludes HIDDEN (debug, code, paste, trivial)
     pub fn get_visible_items(&self) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE is_item = 1
-             AND content_type IN ('insight', 'exploration', 'synthesis', 'question', 'planning', 'paper')
+             AND (content_type IN ('insight', 'exploration', 'synthesis', 'question', 'planning', 'paper')
+                  OR content_type LIKE 'code_%')
              ORDER BY created_at DESC",
             Self::NODE_COLUMNS
         ))?;
@@ -2424,7 +2487,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT id, embedding FROM nodes
              WHERE embedding IS NOT NULL
-               AND (content_type IS NULL OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper'))"
+               AND (content_type IS NULL OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper') OR content_type LIKE 'code_%')"
         )?;
 
         let results = stmt.query_map([], |row| {
@@ -3000,17 +3063,17 @@ impl Database {
         let conn = self.conn.lock().unwrap();
 
         // Find all mismatches
-        // Count only VISIBLE tier children (insight, idea, exploration, synthesis, question, planning, paper)
+        // Count only VISIBLE tier children (insight, idea, exploration, synthesis, question, planning, paper, code_*)
         let mismatches: Vec<(String, i32, i32)> = {
             let mut stmt = conn.prepare(
                 "SELECT n.id, n.child_count,
                         (SELECT COUNT(*) FROM nodes c
                          WHERE c.parent_id = n.id
-                           AND (c.content_type IS NULL OR c.content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper'))) as actual
+                           AND (c.content_type IS NULL OR c.content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper') OR c.content_type LIKE 'code_%')) as actual
                  FROM nodes n
                  WHERE n.child_count != (SELECT COUNT(*) FROM nodes c
                                          WHERE c.parent_id = n.id
-                                           AND (c.content_type IS NULL OR c.content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper')))"
+                                           AND (c.content_type IS NULL OR c.content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper') OR c.content_type LIKE 'code_%'))"
             )?;
             let results: Vec<_> = stmt.query_map([], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))

@@ -52,6 +52,15 @@ candle-transformers = "0.8"
 tokenizers = "0.20"
 hf-hub = "0.3"
 
+# Code parsing
+syn = { version = "2.0", features = ["full", "parsing", "extra-traits"] }
+quote = "1.0"
+proc-macro2 = { version = "1.0", features = ["span-locations"] }
+ignore = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+
 # Optimize heavy numerical packages even in dev mode (10-100x faster inference)
 [profile.dev.package.candle-core]
 opt-level = 3

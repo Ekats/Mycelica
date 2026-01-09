@@ -6,7 +6,7 @@
 
 use clap::{Parser, Subcommand, CommandFactory};
 use clap_complete::{generate, Shell};
-use mycelica_lib::{db::{Database, Node, NodeType}, settings, import, hierarchy, similarity, clustering, openaire, ai_client};
+use mycelica_lib::{db::{Database, Node, NodeType, EdgeType}, settings, import, hierarchy, similarity, clustering, openaire, ai_client};
 use serde_json;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -195,6 +195,11 @@ enum Commands {
         #[command(subcommand)]
         cmd: ExportCommands,
     },
+    /// Analyze code relationships
+    Analyze {
+        #[command(subcommand)]
+        cmd: AnalyzeCommands,
+    },
     /// Global search across all nodes
     Search {
         /// Search query
@@ -288,6 +293,18 @@ enum ImportCommands {
     Keep {
         /// Path to Google Takeout ZIP file
         path: String,
+    },
+    /// Import source code files (Rust, TypeScript, Markdown)
+    /// Respects .gitignore automatically
+    Code {
+        /// Path to source file or directory
+        path: String,
+        /// Language filter: rust, typescript, markdown (default: auto-detect all)
+        #[arg(long, short)]
+        language: Option<String>,
+        /// Update mode: delete existing nodes from file(s) before import
+        #[arg(long, short)]
+        update: bool,
     },
 }
 
@@ -559,6 +576,12 @@ enum NavCommands {
     Edges {
         /// Node ID
         id: String,
+        /// Filter by edge type (calls, defined_in, uses_type, implements, related, etc.)
+        #[arg(long = "type", short = 't')]
+        edge_type: Option<String>,
+        /// Filter by direction: incoming, outgoing, or both (default: both)
+        #[arg(long, short, default_value = "both")]
+        direction: String,
     },
     /// Find similar nodes by embedding
     Similar {
@@ -567,6 +590,17 @@ enum NavCommands {
         /// Number of results
         #[arg(long, short, default_value = "10")]
         top: usize,
+    },
+    /// View code nodes as folder tree (extracted from file_path metadata)
+    Folder {
+        /// Filter by path prefix (e.g., "src/", "src-tauri/src/db")
+        path: Option<String>,
+        /// Maximum depth
+        #[arg(long, short, default_value = "10")]
+        depth: usize,
+        /// Show item counts only, not individual items
+        #[arg(long, short)]
+        summary: bool,
     },
 }
 
@@ -718,6 +752,19 @@ enum ExportCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum AnalyzeCommands {
+    /// Analyze code and create "Calls" edges between functions
+    CodeEdges {
+        /// Only analyze functions from this path prefix
+        #[arg(long)]
+        path: Option<String>,
+        /// Dry run - show what would be created without inserting
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
 // ============================================================================
 // Main Entry Point
 // ============================================================================
@@ -772,6 +819,7 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Nav { cmd } => handle_nav(cmd, &db, cli.json).await,
         Commands::Maintenance { cmd } => handle_maintenance(cmd, &db, cli.json).await,
         Commands::Export { cmd } => handle_export(cmd, &db, cli.quiet).await,
+        Commands::Analyze { cmd } => handle_analyze(cmd, &db, cli.json, cli.quiet).await,
         Commands::Search { query, type_filter, limit } => handle_search(&query, &type_filter, limit, &db, cli.json).await,
         Commands::Tui => run_tui(&db).await,
         Commands::Completions { .. } => unreachable!(),
@@ -1089,6 +1137,195 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
                     result.notes_imported, result.skipped, result.errors.len());
             } else {
                 println!("Imported {} notes, {} skipped", result.notes_imported, result.skipped);
+            }
+        }
+        ImportCommands::Code { path, language, update } => {
+            use mycelica_lib::code;
+            use mycelica_lib::ai_client;
+
+            if !quiet {
+                if update {
+                    eprintln!("[Code] Update mode: {} (will replace existing nodes)", path);
+                } else {
+                    eprintln!("[Code] Scanning: {} (respects .gitignore)", path);
+                }
+                if let Some(ref lang) = language {
+                    eprintln!("[Code]   Language filter: {}", lang);
+                }
+            }
+
+            // In update mode, collect files first and delete existing nodes
+            let mut total_deleted = 0;
+            if update {
+                let file_path = std::path::Path::new(&path);
+                let files_to_delete: Vec<String> = if file_path.is_file() {
+                    vec![path.clone()]
+                } else {
+                    // Get list of files we'll be importing (respects .gitignore)
+                    code::collect_code_files(file_path, language.as_deref())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect()
+                };
+
+                for file in &files_to_delete {
+                    match db.delete_nodes_by_file_path(file) {
+                        Ok(deleted) if deleted > 0 => {
+                            if !quiet {
+                                eprintln!("  Deleted {} nodes from {}", deleted, file);
+                            }
+                            total_deleted += deleted;
+                        }
+                        _ => {}
+                    }
+                }
+                if !quiet && total_deleted > 0 {
+                    eprintln!("[Code] Deleted {} existing nodes", total_deleted);
+                }
+            }
+
+            let result = code::import_code(db, &path, language.as_deref())?;
+
+            // In update mode, generate embeddings for new nodes and refresh Calls edges
+            let mut embeddings_generated = 0;
+            let mut calls_edges_created = 0;
+            if update && result.total_items() > 0 {
+                // Get the newly imported node IDs
+                let file_path = std::path::Path::new(&path);
+                let imported_files: Vec<String> = if file_path.is_file() {
+                    vec![path.clone()]
+                } else {
+                    code::collect_code_files(file_path, language.as_deref())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect()
+                };
+
+                // Collect all newly imported node IDs
+                let mut new_node_ids: Vec<String> = Vec::new();
+                for file in &imported_files {
+                    if let Ok(ids) = db.get_node_ids_by_file_path(file) {
+                        new_node_ids.extend(ids);
+                    }
+                }
+
+                // Generate embeddings for nodes without them
+                if !new_node_ids.is_empty() {
+                    if !quiet {
+                        eprintln!("[Code] Generating embeddings for {} nodes...", new_node_ids.len());
+                    }
+                    for node_id in &new_node_ids {
+                        if db.get_node_embedding(node_id).ok().flatten().is_none() {
+                            if let Ok(Some(node)) = db.get_node(node_id) {
+                                let text = format!("{}\n{}", node.title, node.content.as_deref().unwrap_or(""));
+                                let embed_text = safe_truncate(&text, 1000);
+                                if let Ok(embedding) = ai_client::generate_embedding(embed_text).await {
+                                    db.update_node_embedding(node_id, &embedding).ok();
+                                    embeddings_generated += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Refresh Calls edges for functions
+                let functions: Vec<_> = new_node_ids.iter()
+                    .filter_map(|id| db.get_node(id).ok().flatten())
+                    .filter(|n| n.content_type.as_deref() == Some("code_function"))
+                    .collect();
+
+                if !functions.is_empty() {
+                    if !quiet {
+                        eprintln!("[Code] Refreshing Calls edges for {} functions...", functions.len());
+                    }
+
+                    // Build function name index
+                    let all_functions: Vec<_> = db.get_items()
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .filter(|n| n.content_type.as_deref() == Some("code_function"))
+                        .collect();
+
+                    let fn_name_to_id: std::collections::HashMap<String, String> = all_functions.iter()
+                        .filter_map(|f| {
+                            // Extract function name from title (e.g., "pub fn foo(...)" -> "foo")
+                            let title = &f.title;
+                            let name = title.split('(').next()
+                                .and_then(|s| s.split_whitespace().last())
+                                .map(|s| s.to_string());
+                            name.map(|n| (n, f.id.clone()))
+                        })
+                        .collect();
+
+                    // For each function, find calls in its body
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64;
+
+                    for func in &functions {
+                        if let Some(content) = &func.content {
+                            for (fn_name, target_id) in &fn_name_to_id {
+                                if target_id != &func.id && content.contains(&format!("{}(", fn_name)) {
+                                    // Create Calls edge
+                                    let edge = mycelica_lib::db::Edge {
+                                        id: format!("calls-{}-{}", func.id, target_id),
+                                        source: func.id.clone(),
+                                        target: target_id.clone(),
+                                        edge_type: mycelica_lib::db::EdgeType::Calls,
+                                        label: None,
+                                        weight: Some(1.0),
+                                        edge_source: Some("code-analysis".to_string()),
+                                        evidence_id: None,
+                                        confidence: None,
+                                        created_at: now,
+                                    };
+                                    if db.insert_edge(&edge).is_ok() {
+                                        calls_edges_created += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if json {
+                println!("{}", serde_json::to_string(&result).map_err(|e| e.to_string())?);
+            } else {
+                if update && total_deleted > 0 {
+                    println!("Updated {} files (replaced {} existing nodes):", result.files_processed, total_deleted);
+                } else {
+                    println!("Imported {} items from {} files:", result.total_items(), result.files_processed);
+                }
+                if result.functions > 0 { println!("  Functions: {}", result.functions); }
+                if result.structs > 0 { println!("  Structs: {}", result.structs); }
+                if result.enums > 0 { println!("  Enums: {}", result.enums); }
+                if result.traits > 0 { println!("  Traits: {}", result.traits); }
+                if result.impls > 0 { println!("  Impl blocks: {}", result.impls); }
+                if result.modules > 0 { println!("  Modules: {}", result.modules); }
+                if result.macros > 0 { println!("  Macros: {}", result.macros); }
+                if result.docs > 0 { println!("  Docs: {}", result.docs); }
+                println!("  Edges created: {}", result.edges_created);
+                if result.doc_edges > 0 { println!("  Doc→code edges: {}", result.doc_edges); }
+                if update {
+                    if embeddings_generated > 0 { println!("  Embeddings generated: {}", embeddings_generated); }
+                    if calls_edges_created > 0 { println!("  Calls edges refreshed: {}", calls_edges_created); }
+                }
+                if result.files_skipped > 0 {
+                    println!("  Files skipped: {}", result.files_skipped);
+                }
+                if !result.errors.is_empty() {
+                    eprintln!("\nErrors ({}):", result.errors.len());
+                    for err in &result.errors[..result.errors.len().min(5)] {
+                        eprintln!("  {}", err);
+                    }
+                    if result.errors.len() > 5 {
+                        eprintln!("  ... and {} more", result.errors.len() - 5);
+                    }
+                }
             }
         }
     }
@@ -1427,12 +1664,23 @@ async fn handle_process(cmd: ProcessCommands, db: &Database, json: bool, quiet: 
                 let content = node.content.as_deref().unwrap_or(&node.title);
                 match mycelica_lib::ai_client::analyze_node(&node.title, content).await {
                     Ok(result) => {
+                        // Preserve code_* content_types (from code import)
+                        let final_content_type = if node.content_type
+                            .as_ref()
+                            .map(|ct| ct.starts_with("code_"))
+                            .unwrap_or(false)
+                        {
+                            node.content_type.clone().unwrap_or_default()
+                        } else {
+                            result.content_type.clone()
+                        };
+
                         db.update_node_ai(
                             &node.id,
                             &result.title,
                             &result.summary,
                             &serde_json::to_string(&result.tags).unwrap_or_default(),
-                            &result.content_type,
+                            &final_content_type,
                         ).map_err(|e| e.to_string())?;
 
                         // Generate embedding for the node
@@ -2207,19 +2455,39 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
     }
 
     println!();
+    println!("═══════════════════════════════════════════════════════════");
+    println!("Starting Mycelica Pipeline");
+    println!("═══════════════════════════════════════════════════════════");
 
-    // Step 1: AI Processing
-    if needs_processing && settings::has_api_key() {
-        println!("[1/3] AI Processing...");
-        // Skip papers - they already have titles/summaries from OpenAIRE import
-        let unprocessed: Vec<_> = items.iter()
-            .filter(|n| !n.is_processed && n.content_type.as_deref() != Some("paper"))
-            .collect();
+    // Step 1: AI Processing + Embeddings
+    println!();
+    println!("▶ STEP 1/3: AI Processing + Embeddings");
+    println!("───────────────────────────────────────────────────────────");
 
-        for (i, node) in unprocessed.iter().enumerate() {
-            if !quiet && i % 5 == 0 {
-                eprint!("\r  Processing {}/{}...", i + 1, unprocessed.len());
-                std::io::stderr().flush().ok();
+    // 1a: AI process non-paper, non-code items
+    // Papers have metadata from OpenAIRE, code items use their signature as title
+    let unprocessed_non_papers: Vec<_> = items.iter()
+        .filter(|n| !n.is_processed)
+        .filter(|n| n.content_type.as_deref() != Some("paper"))
+        .filter(|n| !n.content_type.as_ref().map(|ct| ct.starts_with("code_")).unwrap_or(false))
+        .collect();
+
+    if !unprocessed_non_papers.is_empty() && settings::has_api_key() {
+        println!("[1a] AI Processing {} items...", unprocessed_non_papers.len());
+
+        let mut success_count = 0;
+        let mut error_count = 0;
+        let step_start = std::time::Instant::now();
+
+        for (i, node) in unprocessed_non_papers.iter().enumerate() {
+            if !quiet {
+                let title_preview: String = node.title.chars().take(50).collect();
+                println!("  [{}/{}] {}{}",
+                    i + 1,
+                    unprocessed_non_papers.len(),
+                    title_preview,
+                    if node.title.len() > 50 { "..." } else { "" }
+                );
             }
 
             let content = node.content.as_deref().unwrap_or(&node.title);
@@ -2238,95 +2506,44 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
                     if let Ok(embedding) = ai_client::generate_embedding(embed_text).await {
                         db.update_node_embedding(&node.id, &embedding).ok();
                     }
+
+                    if !quiet {
+                        println!("    → \"{}\" ({})", result.title, result.content_type);
+                    }
+                    success_count += 1;
                 }
                 Err(e) => {
                     if !quiet {
-                        eprintln!("\n  Warning: Failed to process '{}': {}", node.title, e);
+                        eprintln!("    ✗ Error: {}", e);
                     }
+                    error_count += 1;
                 }
             }
         }
-        if !quiet {
-            eprintln!("\r  Processed {} items.          ", unprocessed.len());
-        }
-    } else if needs_processing {
-        println!("[1/3] AI Processing... SKIPPED (no Anthropic API key)");
+        let elapsed = step_start.elapsed().as_secs_f64();
+        println!("  ✓ Processed {} items in {:.1}s ({} errors)", success_count, elapsed, error_count);
+    } else if !unprocessed_non_papers.is_empty() {
+        println!("[1a] AI Processing... ⊘ SKIPPED (no Anthropic API key)");
     } else {
-        println!("[1/3] AI Processing... already complete");
+        println!("[1a] AI Processing... ✓ already complete");
     }
 
-    // Step 2: Clustering
-    println!("[2/3] Clustering...");
+    // 1b: Generate embeddings for papers (they have metadata but need embeddings)
+    let papers_needing_embeddings: Vec<_> = items.iter()
+        .filter(|n| n.content_type.as_deref() == Some("paper"))
+        .filter(|n| db.get_node_embedding(&n.id).ok().flatten().is_none())
+        .collect();
 
-    // If FOS flag is set, run full FOS pipeline: FOS grouping → clustering → hierarchy
-    if use_fos {
-        // Step 2a: Create FOS parent nodes
-        println!("  Creating FOS (Field of Science) parent nodes...");
-        match clustering::cluster_with_fos_pregrouping(db).await {
-            Ok(result) => {
-                println!("  FOS grouping: {} papers assigned to {} FOS categories",
-                    result.items_assigned, result.clusters_created);
-            }
-            Err(e) => {
-                eprintln!("  Warning: FOS pre-grouping failed: {}", e);
-            }
-        }
+    if !papers_needing_embeddings.is_empty() && settings::has_openai_api_key() {
+        println!("[1b] Embedding {} papers...", papers_needing_embeddings.len());
 
-        // Step 2b: Run clustering within each FOS group (assigns cluster_id)
-        println!("  Clustering within FOS groups...");
-        match clustering::run_clustering(db, true).await {
-            Ok(result) => {
-                println!("  Clustered: {} items into {} clusters",
-                    result.items_assigned, result.clusters_created);
-            }
-            Err(e) => {
-                eprintln!("  Warning: Clustering failed: {}", e);
-            }
-        }
+        let mut success_count = 0;
+        let step_start = std::time::Instant::now();
 
-        // Step 2c: Build full hierarchy with recursive AI grouping
-        println!("  Building full hierarchy with AI grouping...");
-        match hierarchy::build_full_hierarchy(db, false, None).await {
-            Ok(result) => {
-                println!("  Hierarchy: {} levels, {} items organized",
-                    result.hierarchy_result.max_depth, result.hierarchy_result.items_organized);
-            }
-            Err(e) => {
-                eprintln!("  Warning: Hierarchy build failed: {}", e);
-            }
-        }
-
-        // Step 2d: Precompute FOS edges for fast view loading
-        println!("  Precomputing FOS edge sets...");
-        match db.precompute_fos_edges() {
-            Ok(count) => println!("  FOS edges: {} edges precomputed", count),
-            Err(e) => eprintln!("  Warning: FOS edge precomputation failed: {}", e),
-        }
-    } else {
-        // Non-FOS path: Use full 7-step hierarchy build with recursive AI grouping
-        println!("  Building full hierarchy with AI grouping...");
-        match hierarchy::build_full_hierarchy(db, true, None).await {
-            Ok(result) => {
-                println!("  Hierarchy: {} levels, {} items organized",
-                    result.hierarchy_result.max_depth, result.hierarchy_result.items_organized);
-            }
-            Err(e) => {
-                eprintln!("  Warning: Hierarchy build failed: {}", e);
-            }
-        }
-    }
-
-    // Step 3: Embeddings
-    if needs_embeddings && settings::has_openai_api_key() {
-        println!("[3/3] Generating embeddings...");
-        let items_needing = items.iter().filter(|n| {
-            db.get_node_embedding(&n.id).ok().flatten().is_none()
-        }).collect::<Vec<_>>();
-
-        for (i, node) in items_needing.iter().enumerate() {
-            if !quiet && i % 10 == 0 {
-                eprint!("\r  Embedding {}/{}...", i + 1, items_needing.len());
-                std::io::stderr().flush().ok();
+        for (i, node) in papers_needing_embeddings.iter().enumerate() {
+            if !quiet && (i % 10 == 0 || i == papers_needing_embeddings.len() - 1) {
+                println!("  [{}/{}] {}", i + 1, papers_needing_embeddings.len(),
+                    node.title.chars().take(50).collect::<String>());
             }
 
             let text = format!("{} {}",
@@ -2334,27 +2551,220 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
                 node.summary.as_deref().unwrap_or("")
             );
 
-            match mycelica_lib::ai_client::generate_embedding(&text).await {
-                Ok(embedding) => {
-                    db.update_node_embedding(&node.id, &embedding).ok();
+            if let Ok(embedding) = ai_client::generate_embedding(&text).await {
+                db.update_node_embedding(&node.id, &embedding).ok();
+                success_count += 1;
+            }
+        }
+        let elapsed = step_start.elapsed().as_secs_f64();
+        println!("  ✓ Embedded {} papers in {:.1}s", success_count, elapsed);
+    } else if !papers_needing_embeddings.is_empty() {
+        println!("[1b] Paper embeddings... ⊘ SKIPPED (no OpenAI API key)");
+    } else if papers > 0 {
+        println!("[1b] Paper embeddings... ✓ already complete");
+    }
+
+    // 1c: Generate embeddings for code items (skip AI, just embeddings)
+    let code_needing_embeddings: Vec<_> = items.iter()
+        .filter(|n| n.content_type.as_ref().map(|ct| ct.starts_with("code_")).unwrap_or(false))
+        .filter(|n| db.get_node_embedding(&n.id).ok().flatten().is_none())
+        .collect();
+
+    if !code_needing_embeddings.is_empty() {
+        println!("[1c] Embedding {} code items (skipping AI)...", code_needing_embeddings.len());
+
+        let mut success_count = 0;
+        let step_start = std::time::Instant::now();
+
+        for (i, node) in code_needing_embeddings.iter().enumerate() {
+            if !quiet && (i % 25 == 0 || i == code_needing_embeddings.len() - 1) {
+                println!("  [{}/{}] {}", i + 1, code_needing_embeddings.len(),
+                    node.title.chars().take(50).collect::<String>());
+            }
+
+            // Embed signature + content for semantic search
+            let text = format!("{}\n{}",
+                node.title,
+                node.content.as_deref().unwrap_or("")
+            );
+            let embed_text = safe_truncate(&text, 1000);
+
+            if let Ok(embedding) = ai_client::generate_embedding(embed_text).await {
+                db.update_node_embedding(&node.id, &embedding).ok();
+                success_count += 1;
+            }
+        }
+        let elapsed = step_start.elapsed().as_secs_f64();
+        println!("  ✓ Embedded {} code items in {:.1}s", success_count, elapsed);
+    } else {
+        let code_count = items.iter()
+            .filter(|n| n.content_type.as_ref().map(|ct| ct.starts_with("code_")).unwrap_or(false))
+            .count();
+        if code_count > 0 {
+            println!("[1c] Code embeddings... ✓ already complete");
+        }
+    }
+
+    // Step 2: Clustering & Hierarchy
+    // Note: hierarchy::build_full_hierarchy has its own verbose logging via emit_log()
+    println!();
+    println!("▶ STEP 2/3: Clustering & Hierarchy");
+    println!("───────────────────────────────────────────────────────────");
+
+    // If FOS flag is set, run full FOS pipeline: FOS grouping → clustering → hierarchy
+    if use_fos {
+        println!("Running FOS (Field of Science) pipeline...");
+        println!();
+
+        // Step 2a: Create FOS parent nodes
+        println!("  [2a] Creating FOS parent nodes...");
+        match clustering::cluster_with_fos_pregrouping(db).await {
+            Ok(result) => {
+                println!("  ✓ FOS grouping: {} papers → {} FOS categories",
+                    result.items_assigned, result.clusters_created);
+            }
+            Err(e) => {
+                eprintln!("  ✗ FOS pre-grouping failed: {}", e);
+            }
+        }
+
+        // Step 2b: Run clustering within each FOS group (assigns cluster_id)
+        println!("  [2b] Clustering within FOS groups...");
+        match clustering::run_clustering(db, true).await {
+            Ok(result) => {
+                println!("  ✓ Clustered: {} items → {} clusters",
+                    result.items_assigned, result.clusters_created);
+            }
+            Err(e) => {
+                eprintln!("  ✗ Clustering failed: {}", e);
+            }
+        }
+
+        // Step 2c: Build full hierarchy with recursive AI grouping
+        println!("  [2c] Building hierarchy with AI grouping...");
+        println!();
+        match hierarchy::build_full_hierarchy(db, false, None).await {
+            Ok(result) => {
+                println!();
+                println!("  ✓ Hierarchy complete: {} levels, {} items organized",
+                    result.hierarchy_result.max_depth, result.hierarchy_result.items_organized);
+            }
+            Err(e) => {
+                eprintln!("  ✗ Hierarchy build failed: {}", e);
+            }
+        }
+
+        // Step 2d: Precompute FOS edges for fast view loading
+        println!("  [2d] Precomputing FOS edge sets...");
+        match db.precompute_fos_edges() {
+            Ok(count) => println!("  ✓ FOS edges: {} edges precomputed", count),
+            Err(e) => eprintln!("  ✗ FOS edge precomputation failed: {}", e),
+        }
+    } else {
+        // Non-FOS path: Use full 7-step hierarchy build with recursive AI grouping
+        println!("Running full hierarchy build (7 steps)...");
+        println!();
+        match hierarchy::build_full_hierarchy(db, true, None).await {
+            Ok(result) => {
+                println!();
+                println!("✓ Hierarchy complete: {} levels, {} items organized",
+                    result.hierarchy_result.max_depth, result.hierarchy_result.items_organized);
+            }
+            Err(e) => {
+                eprintln!("✗ Hierarchy build failed: {}", e);
+            }
+        }
+    }
+
+    // Step 3: Code edges (only if code nodes exist)
+    // Note: Category embeddings handled by Hierarchy Step 6/7
+    println!();
+    println!("▶ STEP 3/3: Code Analysis");
+    println!("───────────────────────────────────────────────────────────");
+
+    let code_functions: Vec<_> = items.iter()
+        .filter(|n| n.content_type.as_deref() == Some("code_function"))
+        .collect();
+
+    if !code_functions.is_empty() {
+        println!("Analyzing {} code functions for call relationships...", code_functions.len());
+        // Run analyze_code_edges inline (simplified version)
+        use std::collections::{HashMap, HashSet};
+
+        // Build function name -> id map
+        let mut name_to_id: HashMap<String, String> = HashMap::new();
+        for func in &code_functions {
+            if let Some(name) = extract_function_name(&func.title) {
+                name_to_id.insert(name, func.id.clone());
+            }
+        }
+
+        // Get existing Calls edges
+        let existing_edges: HashSet<(String, String)> = db
+            .get_all_edges()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| e.edge_type == EdgeType::Calls)
+            .map(|e| (e.source, e.target))
+            .collect();
+
+        let mut edges_created = 0;
+        for func in &code_functions {
+            let content = match &func.content {
+                Some(c) => c,
+                None => continue,
+            };
+
+            let caller_name = extract_function_name(&func.title).unwrap_or_default();
+            let called_names = find_called_functions(content, &name_to_id);
+
+            for called_name in called_names {
+                if called_name == caller_name {
+                    continue;
                 }
-                Err(e) => {
-                    if !quiet {
-                        eprintln!("\n  Warning: Failed embedding for '{}': {}", node.title, e);
+
+                if let Some(callee_id) = name_to_id.get(&called_name) {
+                    if existing_edges.contains(&(func.id.clone(), callee_id.clone())) {
+                        continue;
+                    }
+
+                    let edge = mycelica_lib::db::Edge {
+                        id: format!("edge-call-{}-{}", &func.id[..8.min(func.id.len())], &callee_id[..8.min(callee_id.len())]),
+                        source: func.id.clone(),
+                        target: callee_id.clone(),
+                        edge_type: EdgeType::Calls,
+                        label: None,
+                        weight: Some(1.0),
+                        edge_source: Some("code-analysis".to_string()),
+                        evidence_id: None,
+                        confidence: Some(0.8),
+                        created_at: chrono::Utc::now().timestamp_millis(),
+                    };
+
+                    if db.insert_edge(&edge).is_ok() {
+                        edges_created += 1;
                     }
                 }
             }
         }
-        if !quiet {
-            eprintln!("\r  Generated {} embeddings.      ", items_needing.len());
+
+        println!("  Indexed {} function names", name_to_id.len());
+        println!("  Found {} existing call edges", existing_edges.len());
+
+        if edges_created > 0 {
+            println!("✓ Created {} new call edges", edges_created);
+        } else {
+            println!("✓ No new edges needed (already analyzed or no calls found)");
         }
-    } else if needs_embeddings {
-        println!("[3/3] Embeddings... SKIPPED (no OpenAI API key)");
     } else {
-        println!("[3/3] Embeddings... already complete");
+        println!("⊘ SKIPPED (no code_function nodes found)");
+        println!("  Run 'mycelica-cli import code <path>' to import code first");
     }
 
-    println!("\nSetup complete!");
+    println!();
+    println!("═══════════════════════════════════════════════════════════");
+    println!("✓ Setup Complete!");
+    println!("═══════════════════════════════════════════════════════════");
     Ok(())
 }
 
@@ -2518,8 +2928,27 @@ async fn handle_nav(cmd: NavCommands, db: &Database, json: bool) -> Result<(), S
                 println!("To:   {}", to_path.join(" > "));
             }
         }
-        NavCommands::Edges { id } => {
-            let edges = db.get_edges_for_node(&id).map_err(|e| e.to_string())?;
+        NavCommands::Edges { id, edge_type, direction } => {
+            let all_edges = db.get_edges_for_node(&id).map_err(|e| e.to_string())?;
+
+            // Filter by edge type if specified
+            let edges: Vec<_> = all_edges.into_iter()
+                .filter(|e| {
+                    if let Some(ref type_filter) = edge_type {
+                        let edge_type_str = format!("{:?}", e.edge_type).to_lowercase();
+                        edge_type_str == type_filter.to_lowercase()
+                    } else {
+                        true
+                    }
+                })
+                .filter(|e| {
+                    match direction.to_lowercase().as_str() {
+                        "outgoing" | "out" => e.source == id,
+                        "incoming" | "in" => e.target == id,
+                        _ => true, // "both" or anything else
+                    }
+                })
+                .collect();
 
             if json {
                 let items: Vec<String> = edges.iter().map(|e| {
@@ -2529,13 +2958,21 @@ async fn handle_nav(cmd: NavCommands, db: &Database, json: bool) -> Result<(), S
                 }).collect();
                 println!("[{}]", items.join(","));
             } else {
-                for edge in &edges {
-                    let direction = if edge.source == id { "→" } else { "←" };
-                    let other = if edge.source == id { &edge.target } else { &edge.source };
-                    if let Ok(Some(node)) = db.get_node(other) {
-                        println!("{} {:?} {} ({})", direction, edge.edge_type, node.title,
-                            edge.weight.map(|w| format!("{:.0}%", w * 100.0)).unwrap_or_default());
+                if edges.is_empty() {
+                    println!("No edges found{}",
+                        edge_type.as_ref().map(|t| format!(" of type '{}'", t)).unwrap_or_default());
+                } else {
+                    for edge in &edges {
+                        let dir_marker = if edge.source == id { "→" } else { "←" };
+                        let other = if edge.source == id { &edge.target } else { &edge.source };
+                        if let Ok(Some(node)) = db.get_node(other) {
+                            let weight_str = edge.weight.map(|w| format!(" ({:.0}%)", w * 100.0)).unwrap_or_default();
+                            println!("{} {:?} {}{}", dir_marker, edge.edge_type, node.title, weight_str);
+                        } else {
+                            println!("{} {:?} {}", dir_marker, edge.edge_type, other);
+                        }
                     }
+                    println!("\n{} edge(s)", edges.len());
                 }
             }
         }
@@ -2558,6 +2995,166 @@ async fn handle_nav(cmd: NavCommands, db: &Database, json: bool) -> Result<(), S
                 }
             } else {
                 return Err("No embedding for this node".to_string());
+            }
+        }
+        NavCommands::Folder { path, depth, summary } => {
+            // Get all code nodes
+            let items = db.get_items().map_err(|e| e.to_string())?;
+            let code_nodes: Vec<_> = items.iter()
+                .filter(|n| n.source.as_ref().map(|s| s.starts_with("code-")).unwrap_or(false))
+                .collect();
+
+            // Extract file paths from tags metadata
+            #[derive(serde::Deserialize)]
+            struct CodeMeta {
+                file_path: Option<String>,
+            }
+
+            // Build folder tree: path -> (files_here, subdirs)
+            use std::collections::BTreeMap;
+
+            #[derive(Default)]
+            struct FolderNode {
+                items: Vec<(String, String)>,  // (node_id, title)
+                children: BTreeMap<String, FolderNode>,
+            }
+
+            let mut root = FolderNode::default();
+            let path_filter = path.as_deref().unwrap_or("");
+
+            for node in &code_nodes {
+                let file_path = node.tags.as_ref()
+                    .and_then(|t| serde_json::from_str::<CodeMeta>(t).ok())
+                    .and_then(|m| m.file_path)
+                    .unwrap_or_default();
+
+                if file_path.is_empty() { continue; }
+
+                // Apply path filter
+                if !path_filter.is_empty() && !file_path.contains(path_filter) {
+                    continue;
+                }
+
+                // Split path into components
+                let parts: Vec<&str> = file_path.split('/').collect();
+
+                // Navigate/create tree structure
+                let mut current = &mut root;
+                for (i, part) in parts.iter().enumerate() {
+                    if i == parts.len() - 1 {
+                        // This is the file - add item here
+                        current.items.push((node.id.clone(), node.title.clone()));
+                    } else {
+                        // This is a directory - descend
+                        current = current.children.entry(part.to_string()).or_default();
+                    }
+                }
+            }
+
+            // Count totals
+            fn count_items(node: &FolderNode) -> usize {
+                node.items.len() + node.children.values().map(count_items).sum::<usize>()
+            }
+
+            // Print tree
+            fn print_folder_tree(
+                name: &str,
+                node: &FolderNode,
+                prefix: &str,
+                current_depth: usize,
+                max_depth: usize,
+                summary: bool,
+                json: bool,
+            ) {
+                if current_depth > max_depth { return; }
+
+                let item_count = count_items(node);
+                let has_children = !node.children.is_empty();
+                let has_items = !node.items.is_empty();
+
+                if !json {
+                    if has_children || has_items {
+                        if summary {
+                            println!("{}📁 {} ({} items)", prefix, name, item_count);
+                        } else {
+                            println!("{}📁 {}", prefix, name);
+                        }
+                    }
+
+                    // Print items in this folder (unless summary mode)
+                    if !summary {
+                        for (i, (id, title)) in node.items.iter().enumerate() {
+                            let is_last_item = i == node.items.len() - 1 && node.children.is_empty();
+                            let item_prefix = if is_last_item { "└─" } else { "├─" };
+                            // Truncate title for display
+                            let display_title = if title.len() > 60 {
+                                format!("{}...", &title[..57])
+                            } else {
+                                title.clone()
+                            };
+                            println!("{}  {} 📄 {} ({})", prefix, item_prefix, display_title, &id[..12]);
+                        }
+                    }
+
+                    // Print subdirectories
+                    let child_count = node.children.len();
+                    for (i, (child_name, child_node)) in node.children.iter().enumerate() {
+                        let is_last = i == child_count - 1;
+                        let child_prefix = format!("{}  {}", prefix, if is_last { "└─" } else { "├─" });
+                        let next_prefix = format!("{}  {}", prefix, if is_last { "  " } else { "│ " });
+                        print!("{}", child_prefix.trim_end());
+                        print_folder_tree(
+                            child_name,
+                            child_node,
+                            &next_prefix,
+                            current_depth + 1,
+                            max_depth,
+                            summary,
+                            json,
+                        );
+                    }
+                }
+            }
+
+            let total_items = count_items(&root);
+            let total_files = root.children.len();
+
+            if json {
+                // JSON output: flat list of paths with counts
+                fn collect_paths(node: &FolderNode, current_path: &str, paths: &mut Vec<(String, usize)>) {
+                    if !node.items.is_empty() {
+                        paths.push((current_path.to_string(), node.items.len()));
+                    }
+                    for (name, child) in &node.children {
+                        let child_path = if current_path.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{}/{}", current_path, name)
+                        };
+                        collect_paths(child, &child_path, paths);
+                    }
+                }
+                let mut paths = Vec::new();
+                collect_paths(&root, "", &mut paths);
+                let items: Vec<String> = paths.iter()
+                    .map(|(p, c)| format!(r#"{{"path":"{}","count":{}}}"#, p, c))
+                    .collect();
+                println!("[{}]", items.join(","));
+            } else {
+                if path_filter.is_empty() {
+                    println!("Code folder tree ({} items in {} top-level dirs):\n", total_items, total_files);
+                } else {
+                    println!("Code folder tree (filter: '{}', {} items):\n", path_filter, total_items);
+                }
+
+                // Print from root children (skip empty root)
+                for (name, child_node) in &root.children {
+                    print_folder_tree(name, child_node, "", 0, depth, summary, false);
+                }
+
+                if total_items == 0 {
+                    println!("No code nodes found. Run: mycelica-cli import code <PATH>");
+                }
             }
         }
     }
@@ -2604,7 +3201,7 @@ async fn handle_search(query: &str, type_filter: &str, limit: u32, db: &Database
                 let emoji = node.emoji.as_deref().unwrap_or(if node.is_item { "📄" } else { "📁" });
                 let title = node.ai_title.as_ref().unwrap_or(&node.title);
                 let type_str = if node.is_item { "item" } else { "cat " };
-                println!("{} {} [{}] {}", emoji, title, type_str, &node.id[..8]);
+                println!("{} {} [{}] {}", emoji, title, type_str, &node.id);
             }
         }
     }
@@ -3017,6 +3614,237 @@ fn collect_descendants(db: &Database, parent_id: &str, max_depth: usize, nodes: 
     Ok(())
 }
 
+// ============================================================================
+// Analyze Commands
+// ============================================================================
+
+async fn handle_analyze(cmd: AnalyzeCommands, db: &Database, json: bool, quiet: bool) -> Result<(), String> {
+    match cmd {
+        AnalyzeCommands::CodeEdges { path, dry_run } => {
+            analyze_code_edges(db, path.as_deref(), dry_run, json, quiet)?;
+        }
+    }
+    Ok(())
+}
+
+/// Analyze code and create "Calls" edges between functions.
+/// Uses simple heuristic: find identifiers in function bodies that match known function names.
+fn analyze_code_edges(
+    db: &Database,
+    path_filter: Option<&str>,
+    dry_run: bool,
+    json: bool,
+    quiet: bool,
+) -> Result<(), String> {
+    use std::collections::{HashMap, HashSet};
+    use mycelica_lib::db::EdgeType;
+
+    // Get all code function nodes
+    let all_nodes = db.get_items().map_err(|e| e.to_string())?;
+    let code_functions: Vec<_> = all_nodes
+        .iter()
+        .filter(|n| {
+            n.content_type.as_deref() == Some("code_function")
+                && n.source.as_deref().map(|s| s.starts_with("code-")).unwrap_or(false)
+        })
+        .filter(|n| {
+            // Apply path filter if provided
+            if let Some(filter) = path_filter {
+                if let Some(ref tags) = n.tags {
+                    tags.contains(filter)
+                } else {
+                    false
+                }
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    if !quiet {
+        eprintln!("[Analyze] Found {} functions to analyze", code_functions.len());
+    }
+
+    // Build a map of function name -> node ID
+    // Extract function name from title (e.g., "pub fn foo_bar(...)" -> "foo_bar")
+    let mut name_to_id: HashMap<String, String> = HashMap::new();
+    for func in &code_functions {
+        if let Some(name) = extract_function_name(&func.title) {
+            name_to_id.insert(name, func.id.clone());
+        }
+    }
+
+    if !quiet {
+        eprintln!("[Analyze] Built index of {} function names", name_to_id.len());
+    }
+
+    // Get existing edges to avoid duplicates
+    let existing_edges: HashSet<(String, String)> = db
+        .get_all_edges()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e.edge_type == EdgeType::Calls)
+        .map(|e| (e.source, e.target))
+        .collect();
+
+    let mut edges_created = 0;
+    let mut edges_found = Vec::new();
+
+    // For each function, scan its body for calls to other functions
+    for func in &code_functions {
+        let content = match &func.content {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let caller_id = &func.id;
+        let caller_name = extract_function_name(&func.title).unwrap_or_default();
+
+        // Find all identifiers in the content that match known function names
+        let called_names = find_called_functions(content, &name_to_id);
+
+        for called_name in called_names {
+            // Don't create self-edges
+            if called_name == caller_name {
+                continue;
+            }
+
+            if let Some(callee_id) = name_to_id.get(&called_name) {
+                // Skip if edge already exists
+                if existing_edges.contains(&(caller_id.clone(), callee_id.clone())) {
+                    continue;
+                }
+
+                edges_found.push((caller_name.clone(), called_name.clone(), caller_id.clone(), callee_id.clone()));
+
+                if !dry_run {
+                    let edge = mycelica_lib::db::Edge {
+                        id: format!("calls-{}-{}", &caller_id[..8.min(caller_id.len())], &callee_id[..8.min(callee_id.len())]),
+                        source: caller_id.clone(),
+                        target: callee_id.clone(),
+                        edge_type: EdgeType::Calls,
+                        label: Some(format!("{} -> {}", caller_name, called_name)),
+                        weight: Some(1.0),
+                        edge_source: Some("code-analysis".to_string()),
+                        evidence_id: None,
+                        confidence: Some(0.8), // Heuristic confidence
+                        created_at: chrono::Utc::now().timestamp_millis(),
+                    };
+
+                    if db.insert_edge(&edge).is_ok() {
+                        edges_created += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Output results
+    if json {
+        let result = serde_json::json!({
+            "functions_analyzed": code_functions.len(),
+            "edges_found": edges_found.len(),
+            "edges_created": edges_created,
+            "dry_run": dry_run,
+        });
+        println!("{}", serde_json::to_string(&result).unwrap());
+    } else {
+        println!("Analyzed {} functions", code_functions.len());
+        println!("Found {} call relationships", edges_found.len());
+
+        if dry_run {
+            println!("\nDry run - edges that would be created:");
+            for (caller, callee, _, _) in edges_found.iter().take(20) {
+                println!("  {} -> {}", caller, callee);
+            }
+            if edges_found.len() > 20 {
+                println!("  ... and {} more", edges_found.len() - 20);
+            }
+        } else {
+            println!("Created {} new Calls edges", edges_created);
+        }
+    }
+
+    Ok(())
+}
+
+/// Extract function name from a title like "pub fn foo_bar(...)" or "fn baz<T>(...)"
+fn extract_function_name(title: &str) -> Option<String> {
+    // Look for "fn name" pattern
+    let fn_idx = title.find("fn ")?;
+    let after_fn = &title[fn_idx + 3..];
+
+    // Find the end of the function name (first non-identifier char)
+    let name_end = after_fn
+        .find(|c: char| !c.is_alphanumeric() && c != '_')
+        .unwrap_or(after_fn.len());
+
+    let name = &after_fn[..name_end];
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Find function names that appear to be called in the given code content.
+/// Uses simple heuristic: identifier followed by '(' that matches a known function name.
+fn find_called_functions(content: &str, known_functions: &std::collections::HashMap<String, String>) -> Vec<String> {
+    let mut called = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // Simple tokenization: find word boundaries and check if followed by '('
+    let chars: Vec<char> = content.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        // Skip non-identifier starts
+        if !chars[i].is_alphabetic() && chars[i] != '_' {
+            i += 1;
+            continue;
+        }
+
+        // Collect identifier
+        let start = i;
+        while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        let ident: String = chars[start..i].iter().collect();
+
+        // Skip whitespace
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+
+        // Check if followed by '(' - indicates a function call
+        if i < chars.len() && chars[i] == '(' {
+            // Also accept method calls like .foo() and turbofish foo::<T>()
+            if known_functions.contains_key(&ident) && !seen.contains(&ident) {
+                called.push(ident.clone());
+                seen.insert(ident);
+            }
+        }
+
+        // Skip any colons for turbofish
+        while i < chars.len() && (chars[i] == ':' || chars[i] == '<') {
+            // Skip through generic params
+            if chars[i] == '<' {
+                let mut depth = 1;
+                i += 1;
+                while i < chars.len() && depth > 0 {
+                    if chars[i] == '<' { depth += 1; }
+                    if chars[i] == '>' { depth -= 1; }
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    called
+}
+
 fn export_dot(nodes: &[Node], db: &Database, include_edges: bool) -> Result<String, String> {
     let mut dot = String::from("digraph Mycelica {\n");
     dot.push_str("  rankdir=TB;\n");
@@ -3164,7 +3992,7 @@ enum NavFocus {
 enum LeafFocus {
     Content,
     Similar,
-    Edges,
+    Calls,  // Only shown for code nodes
 }
 
 /// Tree node for TUI display
@@ -3226,9 +4054,10 @@ struct TuiApp {
     similar_nodes: Vec<SimilarNodeInfo>,
     similar_selected: usize,
 
-    // Edges for current leaf
-    edges_for_node: Vec<(String, String, f64)>,  // (target_id, title, weight)
-    edges_selected: usize,
+    // Calls for current leaf (only for code nodes)
+    calls_for_node: Vec<(String, String, bool)>,  // (target_id, title, is_outgoing)
+    calls_selected: usize,
+    is_code_node: bool,  // Whether current leaf is a code node
 
     // Pins and recents
     pinned_nodes: Vec<Node>,
@@ -3275,8 +4104,9 @@ impl TuiApp {
             leaf_focus: LeafFocus::Content,
             similar_nodes: Vec::new(),
             similar_selected: 0,
-            edges_for_node: Vec::new(),
-            edges_selected: 0,
+            calls_for_node: Vec::new(),
+            calls_selected: 0,
+            is_code_node: false,
             pinned_nodes: Vec::new(),
             recent_nodes: Vec::new(),
             search_mode: false,
@@ -3470,9 +4300,12 @@ impl TuiApp {
         self.leaf_content = node.content.clone();
         self.leaf_scroll_offset = 0;
         self.leaf_focus = LeafFocus::Content;
-        self.edges_selected = 0;
+        self.calls_selected = 0;
         self.similar_nodes.clear();
         self.similar_selected = 0;
+
+        // Check if this is a code node
+        self.is_code_node = node.content_type.as_ref().map(|ct| ct.starts_with("code_")).unwrap_or(false);
 
         // Store selected node for header display
         self.selected_node = Some(node.clone());
@@ -3503,15 +4336,22 @@ impl TuiApp {
             }
         }
 
-        // Load edges for this node
-        self.edges_for_node.clear();
-        if let Ok(edges) = db.get_edges_for_node(node_id) {
-            for edge in edges {
-                let target_id = if edge.source == node_id { &edge.target } else { &edge.source };
-                if let Ok(Some(target)) = db.get_node(target_id) {
-                    let title = target.ai_title.unwrap_or(target.title);
-                    let weight = edge.weight.unwrap_or(0.0);
-                    self.edges_for_node.push((target_id.to_string(), title, weight));
+        // Load Calls edges for code nodes only
+        self.calls_for_node.clear();
+        if self.is_code_node {
+            if let Ok(edges) = db.get_edges_for_node(node_id) {
+                for edge in edges {
+                    // Only process Calls edges
+                    if edge.edge_type != EdgeType::Calls {
+                        continue;
+                    }
+                    // Determine direction: outgoing if this node is source
+                    let is_outgoing = edge.source == node_id;
+                    let other_id = if is_outgoing { &edge.target } else { &edge.source };
+                    if let Ok(Some(other_node)) = db.get_node(other_id) {
+                        let title = other_node.ai_title.unwrap_or(other_node.title);
+                        self.calls_for_node.push((other_id.to_string(), title, is_outgoing));
+                    }
                 }
             }
         }
@@ -3534,7 +4374,8 @@ impl TuiApp {
         self.leaf_node_id = None;
         self.leaf_content = None;
         self.similar_nodes.clear();
-        self.edges_for_node.clear();
+        self.calls_for_node.clear();
+        self.is_code_node = false;
         self.status_message = "Back to navigation".to_string();
     }
 
@@ -4201,9 +5042,9 @@ fn run_tui_loop(
                                             app.similar_selected = (app.similar_selected + 1).min(app.similar_nodes.len() - 1);
                                         }
                                     }
-                                    LeafFocus::Edges => {
-                                        if !app.edges_for_node.is_empty() {
-                                            app.edges_selected = (app.edges_selected + 1).min(app.edges_for_node.len() - 1);
+                                    LeafFocus::Calls => {
+                                        if !app.calls_for_node.is_empty() {
+                                            app.calls_selected = (app.calls_selected + 1).min(app.calls_for_node.len() - 1);
                                         }
                                     }
                                 }
@@ -4216,8 +5057,8 @@ fn run_tui_loop(
                                     LeafFocus::Similar => {
                                         app.similar_selected = app.similar_selected.saturating_sub(1);
                                     }
-                                    LeafFocus::Edges => {
-                                        app.edges_selected = app.edges_selected.saturating_sub(1);
+                                    LeafFocus::Calls => {
+                                        app.calls_selected = app.calls_selected.saturating_sub(1);
                                     }
                                 }
                             }
@@ -4251,30 +5092,44 @@ fn run_tui_loop(
                                 }
                             }
 
-                            // Tab: Cycle focus Content → Similar → Edges
+                            // Tab: Cycle focus Content → Similar → Calls (if code node)
                             KeyCode::Tab => {
                                 app.leaf_focus = match app.leaf_focus {
                                     LeafFocus::Content => LeafFocus::Similar,
-                                    LeafFocus::Similar => LeafFocus::Edges,
-                                    LeafFocus::Edges => LeafFocus::Content,
+                                    LeafFocus::Similar => {
+                                        // Only cycle to Calls if this is a code node with call edges
+                                        if app.is_code_node && !app.calls_for_node.is_empty() {
+                                            LeafFocus::Calls
+                                        } else {
+                                            LeafFocus::Content
+                                        }
+                                    }
+                                    LeafFocus::Calls => LeafFocus::Content,
                                 };
                                 app.status_message = match app.leaf_focus {
                                     LeafFocus::Content => "Focus: Content".to_string(),
                                     LeafFocus::Similar => "Focus: Similar".to_string(),
-                                    LeafFocus::Edges => "Focus: Edges".to_string(),
+                                    LeafFocus::Calls => "Focus: Calls".to_string(),
                                 };
                             }
                             // Shift+Tab: Cycle focus in reverse
                             KeyCode::BackTab => {
                                 app.leaf_focus = match app.leaf_focus {
-                                    LeafFocus::Content => LeafFocus::Edges,
+                                    LeafFocus::Content => {
+                                        // Only cycle to Calls if this is a code node with call edges
+                                        if app.is_code_node && !app.calls_for_node.is_empty() {
+                                            LeafFocus::Calls
+                                        } else {
+                                            LeafFocus::Similar
+                                        }
+                                    }
                                     LeafFocus::Similar => LeafFocus::Content,
-                                    LeafFocus::Edges => LeafFocus::Similar,
+                                    LeafFocus::Calls => LeafFocus::Similar,
                                 };
                                 app.status_message = match app.leaf_focus {
                                     LeafFocus::Content => "Focus: Content".to_string(),
                                     LeafFocus::Similar => "Focus: Similar".to_string(),
-                                    LeafFocus::Edges => "Focus: Edges".to_string(),
+                                    LeafFocus::Calls => "Focus: Calls".to_string(),
                                 };
                             }
 
@@ -4294,14 +5149,14 @@ fn run_tui_loop(
                                 }
                             }
 
-                            // Enter: Navigate to selected similar/edge node
+                            // Enter: Navigate to selected similar/call node
                             KeyCode::Enter => {
                                 let target_id = match app.leaf_focus {
                                     LeafFocus::Similar if !app.similar_nodes.is_empty() => {
                                         Some(app.similar_nodes[app.similar_selected].id.clone())
                                     }
-                                    LeafFocus::Edges if !app.edges_for_node.is_empty() => {
-                                        Some(app.edges_for_node[app.edges_selected].0.clone())
+                                    LeafFocus::Calls if !app.calls_for_node.is_empty() => {
+                                        Some(app.calls_for_node[app.calls_selected].0.clone())
                                     }
                                     _ => None,
                                 };
@@ -4793,21 +5648,26 @@ fn draw_leaf_content(f: &mut Frame, app: &TuiApp, area: Rect) {
 }
 
 fn draw_leaf_sidebar(f: &mut Frame, app: &TuiApp, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(50),  // Similar nodes
-            Constraint::Percentage(50),  // Edges
-        ])
-        .split(area);
+    // Only show Calls section for code nodes with call edges
+    let show_calls = app.is_code_node && !app.calls_for_node.is_empty();
 
-    // Separate border styles for Similar and Edges sections
-    let similar_border = if app.leaf_focus == LeafFocus::Similar {
-        Style::default().fg(Color::Cyan)
+    let chunks = if show_calls {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(50),  // Similar nodes
+                Constraint::Percentage(50),  // Calls
+            ])
+            .split(area)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(100)])  // Only Similar
+            .split(area)
     };
-    let edges_border = if app.leaf_focus == LeafFocus::Edges {
+
+    // Border style for Similar section
+    let similar_border = if app.leaf_focus == LeafFocus::Similar {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)
@@ -4846,25 +5706,36 @@ fn draw_leaf_sidebar(f: &mut Frame, app: &TuiApp, area: Rect) {
             .title(format!(" Similar ({}) ", app.similar_nodes.len())));
     f.render_widget(similar_list, chunks[0]);
 
-    // Edges section with selection highlight
-    let edge_items: Vec<ListItem> = app.edges_for_node.iter().enumerate().map(|(i, (_, title, weight))| {
-        let weight_pct = (weight * 100.0) as i32;
-        let content = format!("→ {} ({}%)", &title[..title.len().min(25)], weight_pct);
-
-        // Highlight selected item when Edges section is focused
-        if i == app.edges_selected && app.leaf_focus == LeafFocus::Edges {
-            ListItem::new(Span::styled(content, Style::default().bg(Color::Blue).fg(Color::White)))
+    // Calls section - only shown for code nodes with call edges
+    if show_calls {
+        let calls_border = if app.leaf_focus == LeafFocus::Calls {
+            Style::default().fg(Color::Cyan)
         } else {
-            ListItem::new(content)
-        }
-    }).collect();
+            Style::default().fg(Color::DarkGray)
+        };
 
-    let edges_list = List::new(edge_items)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_style(edges_border)
-            .title(format!(" Edges ({}) ", app.edges_for_node.len())));
-    f.render_widget(edges_list, chunks[1]);
+        let call_items: Vec<ListItem> = app.calls_for_node.iter().enumerate().map(|(i, (_, title, is_outgoing))| {
+            // Direction indicator: → for outgoing (calls), ← for incoming (called by)
+            let arrow = if *is_outgoing { "→" } else { "←" };
+            let content = format!("{} {}", arrow, &title[..title.len().min(30)]);
+
+            // Highlight selected item when Calls section is focused
+            if i == app.calls_selected && app.leaf_focus == LeafFocus::Calls {
+                ListItem::new(Span::styled(content, Style::default().bg(Color::Blue).fg(Color::White)))
+            } else {
+                // Color by direction: outgoing = green, incoming = yellow
+                let color = if *is_outgoing { Color::Green } else { Color::Yellow };
+                ListItem::new(Span::styled(content, Style::default().fg(color)))
+            }
+        }).collect();
+
+        let calls_list = List::new(call_items)
+            .block(Block::default()
+                .borders(Borders::ALL)
+                .border_style(calls_border)
+                .title(format!(" Calls ({}) ", app.calls_for_node.len())));
+        f.render_widget(calls_list, chunks[1]);
+    }
 }
 
 fn draw_edit_mode(f: &mut Frame, app: &TuiApp) {
@@ -5184,8 +6055,30 @@ fn format_date_only(timestamp: i64) -> String {
 // Utility Functions
 // ============================================================================
 
+/// Auto-discover project-specific database by walking up from current directory.
+/// Looks for .mycelica.db in each directory up to root.
+fn find_project_db() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        // Check for .mycelica.db in this directory
+        let db_path = dir.join(".mycelica.db");
+        if db_path.exists() {
+            return Some(db_path);
+        }
+        // Check docs/.mycelica.db (common location)
+        let docs_db = dir.join("docs/.mycelica.db");
+        if docs_db.exists() {
+            return Some(docs_db);
+        }
+        // Go up one directory
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 fn find_database() -> PathBuf {
-    // Check custom path from settings first
+    // 1. Check custom path from settings first
     if let Some(custom_path) = settings::get_custom_db_path() {
         let path = PathBuf::from(&custom_path);
         if path.exists() {
@@ -5193,7 +6086,12 @@ fn find_database() -> PathBuf {
         }
     }
 
-    // Check specific known paths
+    // 2. Auto-discover project-specific database
+    if let Some(project_db) = find_project_db() {
+        return project_db;
+    }
+
+    // 3. Check specific known system paths
     let known_paths = [
         dirs::data_dir().map(|p| p.join("com.mycelica.app").join("mycelica.db")),
         dirs::data_dir().map(|p| p.join("com.mycelica.dev").join("mycelica.db")),
@@ -5208,7 +6106,7 @@ fn find_database() -> PathBuf {
         }
     }
 
-    // Fall back to app data dir
+    // 4. Fall back to app data dir
     dirs::data_dir()
         .map(|p| p.join("com.mycelica.dev").join("mycelica.db"))
         .unwrap_or_else(|| PathBuf::from("mycelica.db"))

@@ -41,6 +41,14 @@ pub enum EdgeType {
     Related,
     Contains,
     BelongsTo,  // Item belongs to category (multi-path associations)
+    // Code relationships
+    Calls,      // function -> function it calls
+    UsesType,   // function -> struct/enum it references
+    Implements, // impl -> trait it implements
+    DefinedIn,  // code item -> module/file it's defined in
+    Imports,    // module -> module it imports
+    Tests,      // test function -> function it tests
+    Documents,  // doc -> code item it documents (via backtick references)
 }
 
 impl EdgeType {
@@ -51,6 +59,13 @@ impl EdgeType {
             EdgeType::Related => "related",
             EdgeType::Contains => "contains",
             EdgeType::BelongsTo => "belongs_to",
+            EdgeType::Calls => "calls",
+            EdgeType::UsesType => "uses_type",
+            EdgeType::Implements => "implements",
+            EdgeType::DefinedIn => "defined_in",
+            EdgeType::Imports => "imports",
+            EdgeType::Tests => "tests",
+            EdgeType::Documents => "documents",
         }
     }
 
@@ -61,6 +76,13 @@ impl EdgeType {
             "related" => Some(EdgeType::Related),
             "contains" => Some(EdgeType::Contains),
             "belongs_to" => Some(EdgeType::BelongsTo),
+            "calls" => Some(EdgeType::Calls),
+            "uses_type" => Some(EdgeType::UsesType),
+            "implements" => Some(EdgeType::Implements),
+            "defined_in" => Some(EdgeType::DefinedIn),
+            "imports" => Some(EdgeType::Imports),
+            "tests" => Some(EdgeType::Tests),
+            "documents" => Some(EdgeType::Documents),
             _ => None,
         }
     }

@@ -2115,12 +2115,12 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
     // Step 1: Classify content types BEFORE clustering
     // This ensures supporting items (code/debug/paste) are excluded from clustering
     emit_log(app, "info", "");
-    emit_log(app, "info", "▶ STEP 1/7: Classifying content types");
+    emit_log(app, "info", "▶ Phase 1: Classifying content types");
     emit_log(app, "info", "───────────────────────────────────────────────────────────");
     emit_progress(app, AiProgressEvent {
         current: 1,
         total: 7,
-        node_title: "Step 1/7: Classification".to_string(),
+        node_title: "Phase 1: Classification".to_string(),
         new_title: "Classifying content types...".to_string(),
         emoji: Some("🏷️".to_string()),
         status: "processing".to_string(),
@@ -2135,12 +2135,12 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
 
     // Step 2: Optionally run clustering (only on ideas, not supporting items)
     emit_log(app, "info", "");
-    emit_log(app, "info", "▶ STEP 2/7: Clustering ideas into topics");
+    emit_log(app, "info", "▶ Phase 2: Clustering ideas into topics");
     emit_log(app, "info", "───────────────────────────────────────────────────────────");
     emit_progress(app, AiProgressEvent {
         current: 2,
         total: 7,
-        node_title: "Step 2/7: Clustering".to_string(),
+        node_title: "Phase 2: Clustering".to_string(),
         new_title: if run_clustering { "Clustering ideas into topics..." } else { "Skipping (using existing clusters)" }.to_string(),
         emoji: Some("🧩".to_string()),
         status: "processing".to_string(),
@@ -2168,12 +2168,12 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
 
     // Step 3: Build initial hierarchy
     emit_log(app, "info", "");
-    emit_log(app, "info", "▶ STEP 3/7: Building initial hierarchy structure");
+    emit_log(app, "info", "▶ Phase 3: Building initial hierarchy structure");
     emit_log(app, "info", "───────────────────────────────────────────────────────────");
     emit_progress(app, AiProgressEvent {
         current: 3,
         total: 7,
-        node_title: "Step 3/7: Building hierarchy".to_string(),
+        node_title: "Phase 3: Building hierarchy".to_string(),
         new_title: "Creating Universe and topic nodes...".to_string(),
         emoji: Some("🏗️".to_string()),
         status: "processing".to_string(),
@@ -2198,27 +2198,54 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
     };
     emit_log(app, "info", &format!("✓ Created {} intermediate nodes, organized {} items", hierarchy_result.intermediate_nodes_created, hierarchy_result.items_organized));
 
-    // Step 4: Detect and create project umbrellas
-    emit_log(app, "info", "");
-    emit_log(app, "info", "▶ STEP 4/7: Creating project umbrella categories");
-    emit_log(app, "info", "───────────────────────────────────────────────────────────");
-    emit_progress(app, AiProgressEvent {
-        current: 4,
-        total: 7,
-        node_title: "Step 4/7: Project detection".to_string(),
-        new_title: "Detecting major projects...".to_string(),
-        emoji: Some("📦".to_string()),
-        status: "processing".to_string(),
-        error_message: None,
-        elapsed_secs: Some(total_start.elapsed().as_secs_f64()),
-        estimate_secs: None,
-        remaining_secs: None,
+    // Check if this is a code-only database (skip project detection for code)
+    let all_items = db.get_items().map_err(|e| e.to_string())?;
+    let is_code_only = !all_items.is_empty() && all_items.iter().all(|n| {
+        n.content_type.as_ref()
+            .map(|ct| ct.starts_with("code_"))
+            .unwrap_or(false)
     });
-    emit_log(app, "info", "Collecting capitalized words from titles...");
 
-    // Step 1: Collect ALL capitalized words (very loose, 5+ occurrences)
-    let candidates = ai_client::collect_capitalized_words(db);
     let mut project_umbrellas_created = 0;
+
+    if is_code_only {
+        // Step 4: Skip for code-only databases
+        emit_log(app, "info", "");
+        emit_log(app, "info", "▶ Phase 4: Skipped (code-only database, no project detection needed)");
+        emit_log(app, "info", "───────────────────────────────────────────────────────────");
+        emit_progress(app, AiProgressEvent {
+            current: 4,
+            total: 7,
+            node_title: "Phase 4: Skipped".to_string(),
+            new_title: "Code-only database".to_string(),
+            emoji: Some("⏭️".to_string()),
+            status: "processing".to_string(),
+            error_message: None,
+            elapsed_secs: Some(total_start.elapsed().as_secs_f64()),
+            estimate_secs: None,
+            remaining_secs: None,
+        });
+    } else {
+        // Step 4: Detect and create project umbrellas
+        emit_log(app, "info", "");
+        emit_log(app, "info", "▶ Phase 4: Creating project umbrella categories");
+        emit_log(app, "info", "───────────────────────────────────────────────────────────");
+        emit_progress(app, AiProgressEvent {
+            current: 4,
+            total: 7,
+            node_title: "Phase 4: Project detection".to_string(),
+            new_title: "Detecting major projects...".to_string(),
+            emoji: Some("📦".to_string()),
+            status: "processing".to_string(),
+            error_message: None,
+            elapsed_secs: Some(total_start.elapsed().as_secs_f64()),
+            estimate_secs: None,
+            remaining_secs: None,
+        });
+        emit_log(app, "info", "Collecting capitalized words from titles...");
+
+        // Step 1: Collect ALL capitalized words (very loose, 5+ occurrences)
+        let candidates = ai_client::collect_capitalized_words(db);
 
     if candidates.is_empty() {
         emit_log(app, "info", "No capitalized words found (need 5+ occurrences)");
@@ -2340,6 +2367,7 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
     if project_umbrellas_created > 0 {
         emit_log(app, "info", &format!("✓ Created {} project umbrella categories", project_umbrellas_created));
     }
+    } // end else (not code-only)
 
     // Step 4.5: Consolidate Universe into uber-categories if it has too many direct children
     let universe = db.get_universe().map_err(|e| e.to_string())?
@@ -2493,7 +2521,7 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
 
     // Step 5: Recursively group levels with too many children
     emit_log(app, "info", "");
-    emit_log(app, "info", "▶ STEP 5/7: Recursive grouping (tiered limits: L0-1=10, L2=25, L3=50, L4=100)");
+    emit_log(app, "info", "▶ Phase 5: Recursive grouping (tiered limits: L0-1=10, L2=25, L3=50, L4=100)");
     emit_log(app, "info", "───────────────────────────────────────────────────────────");
     let mut grouping_iterations = 0;
     let max_iterations = 50; // Safety limit
@@ -2504,7 +2532,7 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
     emit_progress(app, AiProgressEvent {
         current: 5,
         total: 7,
-        node_title: "Step 5/7: Recursive grouping".to_string(),
+        node_title: "Phase 5: Recursive grouping".to_string(),
         new_title: "Analyzing structure for grouping...".to_string(),
         emoji: Some("🔄".to_string()),
         status: "processing".to_string(),
@@ -2542,7 +2570,7 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
                 emit_progress(app, AiProgressEvent {
                     current: 5,
                     total: 7,
-                    node_title: format!("Step 5/7: Grouping (iter {})", grouping_iterations + 1),
+                    node_title: format!("Phase 5: Grouping (iter {})", grouping_iterations + 1),
                     new_title: format!("Organizing {}...", node_name),
                     emoji: Some("🧠".to_string()),
                     status: "processing".to_string(),
@@ -2581,7 +2609,7 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
 
     // Log Step 5 completion time
     let grouping_elapsed = grouping_start.elapsed().as_secs_f64();
-    emit_log(app, "info", &format!("  Step 5 completed in {:.1}s ({} iterations)", grouping_elapsed, grouping_iterations));
+    emit_log(app, "info", &format!("  Phase 5 completed in {:.1}s ({} iterations)", grouping_elapsed, grouping_iterations));
 
     // Recalculate final depth
     let final_max_depth = db.get_max_depth().map_err(|e| e.to_string())?;
@@ -2589,12 +2617,12 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
 
     // Step 6: Generate embeddings for ALL nodes that need them (if OpenAI key available)
     emit_log(app, "info", "");
-    emit_log(app, "info", "▶ STEP 6/7: Generating embeddings for semantic search");
+    emit_log(app, "info", "▶ Phase 6: Generating embeddings for semantic search");
     emit_log(app, "info", "───────────────────────────────────────────────────────────");
     emit_progress(app, AiProgressEvent {
         current: 6,
         total: 7,
-        node_title: "Step 6/7: Embeddings".to_string(),
+        node_title: "Phase 6: Embeddings".to_string(),
         new_title: "Generating semantic embeddings...".to_string(),
         emoji: Some("🔢".to_string()),
         status: "processing".to_string(),
@@ -2644,7 +2672,7 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
                 emit_progress(app, AiProgressEvent {
                     current: 6,
                     total: 7,
-                    node_title: format!("Step 6/7: Embeddings ({}/{})", current, total_needing),
+                    node_title: format!("Phase 6: Embeddings ({}/{})", current, total_needing),
                     new_title: format!("Processing {}...", safe_truncate(title, 30)),
                     emoji: None,
                     status: "processing".to_string(),
@@ -2709,15 +2737,15 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
     };
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 7/7: Associate supporting items with ideas
+    // Phase 7: Associate supporting items with ideas
     // ═══════════════════════════════════════════════════════════════════════════
     emit_log(app, "info", "");
-    emit_log(app, "info", "▶ STEP 7/7: Associating supporting items with ideas");
+    emit_log(app, "info", "▶ Phase 7: Associating supporting items with ideas");
     emit_log(app, "info", "───────────────────────────────────────────────────────────");
     emit_progress(app, AiProgressEvent {
         current: 7,
         total: 7,
-        node_title: "Step 7/7: Associations".to_string(),
+        node_title: "Phase 7: Associations".to_string(),
         new_title: "Linking supporting items to ideas...".to_string(),
         emoji: Some("🔗".to_string()),
         status: "processing".to_string(),

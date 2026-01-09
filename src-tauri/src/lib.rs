@@ -11,6 +11,7 @@ pub mod classification;
 mod tags;
 pub mod openaire;
 mod format_abstract;
+pub mod code;
 
 use commands::{
     AppState,
@@ -40,6 +41,8 @@ use commands::{
     get_conversation_context,
     // Import commands
     import_claude_conversations, import_markdown_files, import_google_keep, import_openaire, count_openaire_papers, cancel_openaire, get_imported_paper_count,
+    // Code import commands
+    import_code, analyze_code_edges,
     // Paper retrieval commands
     get_paper_metadata, get_paper_pdf, get_paper_document, has_paper_pdf, open_paper_external, reformat_paper_abstracts, sync_paper_pdf_status, sync_paper_dates, download_paper_on_demand,
     // Quick access commands (Sidebar)
@@ -283,6 +286,9 @@ pub fn run() {
             count_openaire_papers,
             cancel_openaire,
             get_imported_paper_count,
+            // Code import
+            import_code,
+            analyze_code_edges,
             // Paper retrieval
             get_paper_metadata,
             get_paper_pdf,

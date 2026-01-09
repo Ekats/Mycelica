@@ -485,12 +485,23 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
             Ok(result) => {
                 let tags_json = serde_json::to_string(&result.tags).unwrap_or_default();
 
+                // Preserve code_* content_types (from code import), use AI classification for others
+                let final_content_type = if node.content_type
+                    .as_ref()
+                    .map(|ct| ct.starts_with("code_"))
+                    .unwrap_or(false)
+                {
+                    node.content_type.clone().unwrap_or_default()
+                } else {
+                    result.content_type.clone()
+                };
+
                 if let Err(e) = db.update_node_ai(
                     &node.id,
                     &result.title,
                     &result.summary,
                     &tags_json,
-                    &result.content_type,
+                    &final_content_type,
                 ) {
                     let err_msg = format!("DB save failed: {}", e);
                     errors.push(format!("Failed to save node {}: {}", node.id, e));
@@ -2777,4 +2788,176 @@ pub async fn smart_add_to_hierarchy(
         sent_to_inbox,
         processing_time_ms: elapsed,
     })
+}
+
+// ============================================================================
+// Code Import Commands
+// ============================================================================
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CodeImportResult {
+    pub functions: usize,
+    pub structs: usize,
+    pub enums: usize,
+    pub traits: usize,
+    pub impls: usize,
+    pub modules: usize,
+    pub macros: usize,
+    pub docs: usize,
+    pub files_processed: usize,
+    pub files_skipped: usize,
+    pub edges_created: usize,
+    pub doc_edges: usize,
+    pub errors: Vec<String>,
+}
+
+impl From<crate::code::CodeImportResult> for CodeImportResult {
+    fn from(r: crate::code::CodeImportResult) -> Self {
+        Self {
+            functions: r.functions,
+            structs: r.structs,
+            enums: r.enums,
+            traits: r.traits,
+            impls: r.impls,
+            modules: r.modules,
+            macros: r.macros,
+            docs: r.docs,
+            files_processed: r.files_processed,
+            files_skipped: r.files_skipped,
+            edges_created: r.edges_created,
+            doc_edges: r.doc_edges,
+            errors: r.errors,
+        }
+    }
+}
+
+/// Import source code from a directory into the graph.
+/// Respects .gitignore automatically.
+#[tauri::command]
+pub fn import_code(
+    state: State<AppState>,
+    path: String,
+    language: Option<String>,
+) -> Result<CodeImportResult, String> {
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+
+    let result = crate::code::import_code(&db, &path, language.as_deref())?;
+
+    Ok(result.into())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CodeEdgesResult {
+    pub functions_analyzed: usize,
+    pub edges_found: usize,
+    pub edges_created: usize,
+}
+
+/// Analyze code and create "Calls" edges between functions.
+#[tauri::command]
+pub fn analyze_code_edges(
+    state: State<AppState>,
+    path_filter: Option<String>,
+) -> Result<CodeEdgesResult, String> {
+    use std::collections::{HashMap, HashSet};
+    use crate::db::EdgeType;
+
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+
+    // Get all code function nodes
+    let all_nodes = db.get_items().map_err(|e| e.to_string())?;
+    let code_functions: Vec<_> = all_nodes
+        .iter()
+        .filter(|n| {
+            n.content_type.as_deref() == Some("code_function")
+                && n.source.as_deref().map(|s| s.starts_with("code-")).unwrap_or(false)
+        })
+        .filter(|n| {
+            if let Some(ref filter) = path_filter {
+                n.tags.as_ref().map(|t| t.contains(filter)).unwrap_or(false)
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    // Build function name -> node ID map
+    let mut name_to_id: HashMap<String, String> = HashMap::new();
+    for func in &code_functions {
+        if let Some(name) = extract_fn_name(&func.title) {
+            name_to_id.insert(name, func.id.clone());
+        }
+    }
+
+    // Get existing Calls edges
+    let existing_edges: HashSet<(String, String)> = db
+        .get_all_edges()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e.edge_type == EdgeType::Calls)
+        .map(|e| (e.source, e.target))
+        .collect();
+
+    let mut edges_created = 0;
+    let mut edges_found = 0;
+
+    for func in &code_functions {
+        let content = match &func.content {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let caller_id = &func.id;
+        let caller_name = extract_fn_name(&func.title).unwrap_or_default();
+
+        // Find called functions
+        for (name, callee_id) in &name_to_id {
+            if *name == caller_name {
+                continue; // Skip self
+            }
+
+            // Simple heuristic: name followed by '(' in content
+            let call_pattern = format!("{}(", name);
+            if content.contains(&call_pattern) {
+                if existing_edges.contains(&(caller_id.clone(), callee_id.clone())) {
+                    continue;
+                }
+
+                edges_found += 1;
+
+                let edge = crate::db::Edge {
+                    id: format!("calls-{}-{}", &caller_id[..8.min(caller_id.len())], &callee_id[..8.min(callee_id.len())]),
+                    source: caller_id.clone(),
+                    target: callee_id.clone(),
+                    edge_type: EdgeType::Calls,
+                    label: Some(format!("{} -> {}", caller_name, name)),
+                    weight: Some(1.0),
+                    edge_source: Some("code-analysis".to_string()),
+                    evidence_id: None,
+                    confidence: Some(0.8),
+                    created_at: chrono::Utc::now().timestamp_millis(),
+                };
+
+                if db.insert_edge(&edge).is_ok() {
+                    edges_created += 1;
+                }
+            }
+        }
+    }
+
+    Ok(CodeEdgesResult {
+        functions_analyzed: code_functions.len(),
+        edges_found,
+        edges_created,
+    })
+}
+
+fn extract_fn_name(title: &str) -> Option<String> {
+    let fn_idx = title.find("fn ")?;
+    let after_fn = &title[fn_idx + 3..];
+    let name_end = after_fn
+        .find(|c: char| !c.is_alphanumeric() && c != '_')
+        .unwrap_or(after_fn.len());
+    let name = &after_fn[..name_end];
+    if name.is_empty() { None } else { Some(name.to_string()) }
 }

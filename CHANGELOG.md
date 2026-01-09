@@ -2,6 +2,23 @@
 
 All notable changes to Mycelica will be documented in this file.
 
+## [0.7.3] - 2026-01-09
+
+### Added
+- **Incremental code import** (`--update` flag): Surgically update single files/directories instead of full reimport. Deletes old nodes, reimports, regenerates embeddings, refreshes Calls edges.
+- **Auto-discovery**: CLI finds `.mycelica.db` by walking up directories (like `.git`). No config needed.
+- **New CLAUDE.md**: Instructs AI agents to use `mycelica-cli` instead of grep for code exploration.
+
+### Fixed
+- Search results now show full node IDs instead of truncated 8-character IDs
+- Edge deletion uses correct column names (`source_id`/`target_id`)
+
+### Changed
+- Code items skip AI processing entirely (keep signatures as titles, only generate embeddings)
+- Code-only databases skip project detection in Phase 4
+
+---
+
 ## [0.7.0] - 2026-01-04
 
 ### Added

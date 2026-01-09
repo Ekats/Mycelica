@@ -78,7 +78,9 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
   const [collapsedSimilar, setCollapsedSimilar] = useState<Set<string>>(() =>
     new Set(Array.from(similarNodesMap.keys())) // Collapsed by default
   );
-  const [collapsedHierarchy, setCollapsedHierarchy] = useState<Set<string>>(new Set());
+  const [collapsedHierarchy, setCollapsedHierarchy] = useState<Set<string>>(() =>
+    new Set(Array.from(similarNodesMap.keys())) // Collapsed by default
+  );
   const [expandedHierarchyNodes, setExpandedHierarchyNodes] = useState<Set<string>>(new Set());
   const [moreMenuOpen, setMoreMenuOpen] = useState<string | null>(null);
   const moreMenuRef = useRef<HTMLDivElement>(null);

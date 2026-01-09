@@ -15,6 +15,7 @@ archive/
 docs/private/
 docs/implementation/
 *.db
+!.mycelica.db
 mycelica-openAIRE-preview.db
 src-tauri/resources/mycelica-testing-preview.
 mycelica-somatic-neuroscience.db
