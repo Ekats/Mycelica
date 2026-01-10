@@ -721,16 +721,25 @@ impl Database {
     /// Get nodes for graph view (only VISIBLE tier + unclassified)
     /// SUPPORTING (investigation, discussion, reference, creative) and
     /// HIDDEN (debug, code, paste, trivial) are lazy-loaded in leaf view
-    pub fn get_all_nodes(&self) -> Result<Vec<Node>> {
+    /// If include_hidden is true, includes all items regardless of content_type
+    pub fn get_all_nodes(&self, include_hidden: bool) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {} FROM nodes
-             WHERE content_type IS NULL
-                OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper', 'bookmark')
-                OR content_type LIKE 'code_%'
-             ORDER BY created_at DESC",
-            Self::NODE_COLUMNS
-        ))?;
+        let query = if include_hidden {
+            format!(
+                "SELECT {} FROM nodes ORDER BY created_at DESC",
+                Self::NODE_COLUMNS
+            )
+        } else {
+            format!(
+                "SELECT {} FROM nodes
+                 WHERE content_type IS NULL
+                    OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper', 'bookmark')
+                    OR content_type LIKE 'code_%'
+                 ORDER BY created_at DESC",
+                Self::NODE_COLUMNS
+            )
+        };
+        let mut stmt = conn.prepare(&query)?;
 
         let nodes = stmt.query_map([], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
         Ok(nodes)
@@ -1539,12 +1548,23 @@ impl Database {
 
     /// Get only VISIBLE tier nodes for graph rendering
     /// Categories (is_item = 0) are always included
-    pub fn get_graph_children(&self, parent_id: &str) -> Result<Vec<Node>> {
+    /// If include_hidden is true, also includes HIDDEN tier (debug, code, paste, trivial)
+    pub fn get_graph_children(&self, parent_id: &str, include_hidden: bool) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {} FROM nodes WHERE parent_id = ?1 AND (is_item = 0 OR ({})) ORDER BY child_count DESC, title",
-            Self::NODE_COLUMNS, Self::VISIBLE_CONTENT_TYPES
-        ))?;
+        let query = if include_hidden {
+            // Include all items (VISIBLE + SUPPORTING + HIDDEN)
+            format!(
+                "SELECT {} FROM nodes WHERE parent_id = ?1 ORDER BY child_count DESC, title",
+                Self::NODE_COLUMNS
+            )
+        } else {
+            // Only VISIBLE tier items
+            format!(
+                "SELECT {} FROM nodes WHERE parent_id = ?1 AND (is_item = 0 OR ({})) ORDER BY child_count DESC, title",
+                Self::NODE_COLUMNS, Self::VISIBLE_CONTENT_TYPES
+            )
+        };
+        let mut stmt = conn.prepare(&query)?;
 
         let nodes = stmt.query_map(params![parent_id], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
         Ok(nodes)

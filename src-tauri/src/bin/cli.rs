@@ -1376,7 +1376,7 @@ async fn handle_node(cmd: NodeCommands, db: &Database, json: bool) -> Result<(),
             let nodes = if node_type.as_deref() == Some("item") {
                 db.get_items().map_err(|e| e.to_string())?
             } else {
-                db.get_all_nodes().map_err(|e| e.to_string())?
+                db.get_all_nodes(false).map_err(|e| e.to_string())?
             };
 
             let filtered: Vec<_> = nodes.into_iter()

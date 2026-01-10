@@ -201,7 +201,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const [protectRecentNotes, setProtectRecentNotes] = useState(true);
 
   // Tips setting from store (shared with Graph)
-  const { showTips, setShowTips } = useGraphStore();
+  const { showTips, setShowTips, showHidden, setShowHidden } = useGraphStore();
 
   // Local embeddings
   const [useLocalEmbeddings, setUseLocalEmbeddings] = useState(false);
@@ -1673,6 +1673,26 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                     <span
                       className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
                         showTips ? 'translate-x-6' : 'translate-x-1'
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                {/* Show Hidden Items toggle */}
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-sm font-medium text-gray-200">Show Hidden Items</div>
+                    <div className="text-xs text-gray-500 mt-0.5">Show debug, code snippets, and trivial items in graph</div>
+                  </div>
+                  <button
+                    onClick={() => setShowHidden(!showHidden)}
+                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                      showHidden ? 'bg-amber-500' : 'bg-gray-600'
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                        showHidden ? 'translate-x-6' : 'translate-x-1'
                       }`}
                     />
                   </button>

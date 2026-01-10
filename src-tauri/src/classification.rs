@@ -946,7 +946,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Compute associations for all topics in the database
 pub fn compute_all_associations(db: &Database) -> Result<usize, String> {
     // Get all non-item nodes (topics/clusters) that have children
-    let topics = db.get_all_nodes().map_err(|e| e.to_string())?;
+    let topics = db.get_all_nodes(false).map_err(|e| e.to_string())?;
     let mut total_associated = 0;
 
     for topic in topics {

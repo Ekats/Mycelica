@@ -38,6 +38,9 @@ interface GraphState {
   privacyThreshold: number;         // 0.0-1.0, nodes with privacy < threshold are hidden
   hidePrivate: boolean;             // Toggle for privacy filtering
 
+  // Content visibility
+  showHidden: boolean;              // Show hidden content types (debug, code, paste, trivial)
+
   // UI preferences
   showTips: boolean;                // Show popup hints on selected nodes
 
@@ -72,6 +75,9 @@ interface GraphState {
   setPrivacyThreshold: (threshold: number) => void;
   setHidePrivate: (hide: boolean) => void;
 
+  // Content visibility actions
+  setShowHidden: (show: boolean) => void;
+
   // UI preference actions
   setShowTips: (show: boolean) => void;
 }
@@ -97,6 +103,9 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   // Privacy filter state - default threshold 0.3 (keeps most content)
   privacyThreshold: 0.3,
   hidePrivate: false,
+
+  // Content visibility - hidden items off by default
+  showHidden: false,
 
   // UI preferences
   showTips: true,
@@ -291,6 +300,9 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   // Privacy actions
   setPrivacyThreshold: (threshold) => set({ privacyThreshold: threshold }),
   setHidePrivate: (hide) => set({ hidePrivate: hide }),
+
+  // Content visibility actions
+  setShowHidden: (show) => set({ showHidden: show }),
 
   // UI preference actions
   setShowTips: (show) => set({ showTips: show }),

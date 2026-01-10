@@ -1079,7 +1079,7 @@ pub async fn score_privacy_all_items(
     // Get items needing scoring
     let items = if force_rescore {
         // Get ALL items if force rescore
-        state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_all_nodes()
+        state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_all_nodes(false)
             .map_err(|e| e.to_string())?
             .into_iter()
             .filter(|n| n.is_item)

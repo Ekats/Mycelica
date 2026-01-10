@@ -133,16 +133,16 @@ function mapBackendEdge(e: BackendEdge): Edge {
 }
 
 export function useGraph() {
-  const { setNodes, setEdges, nodes, edges } = useGraphStore();
+  const { setNodes, setEdges, nodes, edges, showHidden } = useGraphStore();
   const [loaded, setLoaded] = useState(false);
   const [loadedParents, setLoadedParents] = useState<Set<string>>(new Set());
 
-  const loadGraph = useCallback(async () => {
+  const loadGraph = useCallback(async (includeHidden: boolean) => {
     try {
-      console.log('Loading graph from backend...');
+      console.log(`Loading graph from backend (includeHidden=${includeHidden})...`);
 
       // Only load nodes on startup - edges are loaded per-view for performance
-      const backendNodes = await invoke<BackendNode[]>('get_nodes');
+      const backendNodes = await invoke<BackendNode[]>('get_nodes', { includeHidden });
 
       console.log(`Loaded ${backendNodes.length} nodes`);
       if (backendNodes.length > 0) {
@@ -155,6 +155,8 @@ export function useGraph() {
       }
 
       setNodes(nodeMap);
+      // Clear loaded parents cache when reloading with different visibility
+      setLoadedParents(new Set());
       // Don't load all edges - they'll be loaded per-view via loadEdgesForView
       setLoaded(true);
     } catch (error) {
@@ -165,6 +167,7 @@ export function useGraph() {
 
   // Lazy load children of a parent node (for graph navigation)
   // Uses get_graph_children to exclude supporting items (code/debug/paste/trivial)
+  // unless showHidden is true
   const loadChildren = useCallback(async (parentId: string, _limit: number = 100) => {
     // Skip if already loaded
     if (loadedParents.has(parentId)) {
@@ -172,8 +175,8 @@ export function useGraph() {
     }
 
     try {
-      console.log(`Lazy loading children of ${parentId}...`);
-      const backendNodes = await invoke<BackendNode[]>('get_graph_children', { parentId });
+      console.log(`Lazy loading children of ${parentId} (showHidden=${showHidden})...`);
+      const backendNodes = await invoke<BackendNode[]>('get_graph_children', { parentId, includeHidden: showHidden });
 
       // Merge new nodes into existing map
       const newNodes = new Map(nodes);
@@ -188,16 +191,22 @@ export function useGraph() {
     } catch (error) {
       console.error(`Failed to load children of ${parentId}:`, error);
     }
-  }, [nodes, setNodes, loadedParents]);
+  }, [nodes, setNodes, loadedParents, showHidden]);
 
   // Check if a parent's children are loaded
   const isParentLoaded = useCallback((parentId: string) => {
     return loadedParents.has(parentId);
   }, [loadedParents]);
 
+  // Load graph on mount and reload when showHidden changes
   useEffect(() => {
-    loadGraph();
-  }, [loadGraph]);
+    loadGraph(showHidden);
+  }, [loadGraph, showHidden]);
+
+  // Simple reload function that uses current showHidden value
+  const reload = useCallback(() => {
+    loadGraph(showHidden);
+  }, [loadGraph, showHidden]);
 
   // Load edges for a specific view (where both endpoints are children of the given parent)
   // Uses indexed lookup for O(1) performance instead of client-side filtering
@@ -245,5 +254,5 @@ export function useGraph() {
     }
   }, [setEdges, loadEdgesForView]);
 
-  return { nodes, edges, reload: loadGraph, loaded, loadChildren, isParentLoaded, loadEdgesForView, loadEdgesForFos };
+  return { nodes, edges, reload, loaded, loadChildren, isParentLoaded, loadEdgesForView, loadEdgesForFos };
 }

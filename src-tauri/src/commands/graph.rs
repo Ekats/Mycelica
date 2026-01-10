@@ -55,8 +55,8 @@ pub struct AppState {
 }
 
 #[tauri::command]
-pub fn get_nodes(state: State<AppState>) -> Result<Vec<Node>, String> {
-    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_all_nodes().map_err(|e| e.to_string())
+pub fn get_nodes(state: State<AppState>, include_hidden: Option<bool>) -> Result<Vec<Node>, String> {
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_all_nodes(include_hidden.unwrap_or(false)).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -332,7 +332,7 @@ pub struct AiStatus {
 
 #[tauri::command]
 pub fn get_ai_status(state: State<AppState>) -> Result<AiStatus, String> {
-    let all_nodes = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_all_nodes().map_err(|e| e.to_string())?;
+    let all_nodes = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_all_nodes(false).map_err(|e| e.to_string())?;
     let unprocessed = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_unprocessed_nodes().map_err(|e| e.to_string())?;
 
     Ok(AiStatus {
@@ -769,9 +769,10 @@ pub fn get_children_flat(state: State<AppState>, parent_id: String) -> Result<Ve
 // ==================== Mini-Clustering Commands ====================
 
 /// Get only idea nodes for graph rendering (filters out code/debug/paste)
+/// If include_hidden is true, also includes HIDDEN tier items
 #[tauri::command]
-pub fn get_graph_children(state: State<AppState>, parent_id: String) -> Result<Vec<Node>, String> {
-    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_graph_children(&parent_id).map_err(|e| e.to_string())
+pub fn get_graph_children(state: State<AppState>, parent_id: String, include_hidden: Option<bool>) -> Result<Vec<Node>, String> {
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_graph_children(&parent_id, include_hidden.unwrap_or(false)).map_err(|e| e.to_string())
 }
 
 /// Get supporting items (code/debug/paste) under a parent
@@ -2571,7 +2572,7 @@ pub async fn smart_add_to_hierarchy(
     let mut topic_centroids: HashMap<String, Vec<f32>> = HashMap::new();
 
     // Get all non-item nodes as potential topics
-    let all_nodes = db.get_all_nodes().map_err(|e| e.to_string())?;
+    let all_nodes = db.get_all_nodes(false).map_err(|e| e.to_string())?;
     let topic_nodes: Vec<&Node> = all_nodes.iter()
         .filter(|n| !n.is_item && !n.is_universe && n.id != INBOX_ID)
         .collect();
