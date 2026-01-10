@@ -1114,8 +1114,12 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     setIsFullSetup(true);
     setSetupResult(null);
     try {
-      // Step 1: Process AI
-      setFullSetupStep('Processing AI (titles, summaries, embeddings)...');
+      // Step 0: Pre-classify (pattern matching, FREE)
+      setFullSetupStep('Classifying items (pattern matching)...');
+      const classifyResult = await invoke<{ classified: number; hiddenCount: number; visibleCount: number }>('preclassify_items');
+
+      // Step 1: Process AI (skips hidden items)
+      setFullSetupStep(`Processing AI (${classifyResult.hiddenCount} hidden items will skip)...`);
       const aiResult = await invoke<{ processed: number; skipped: number }>('process_nodes');
 
       // Step 2: Cluster

@@ -389,20 +389,37 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
     // Clone the Arc to use across await points
     let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clone();
 
-    // Get unprocessed nodes, excluding protected (Recent Notes)
+    // Get unprocessed nodes, excluding protected (Recent Notes) and hidden content types
     let all_unprocessed = db.get_unprocessed_nodes().map_err(|e| e.to_string())?;
     let protected_ids = db.get_protected_node_ids();
+
+    let mut hidden_count = 0;
     let unprocessed: Vec<_> = all_unprocessed
         .into_iter()
         .filter(|node| !protected_ids.contains(&node.id))
+        .filter(|node| {
+            // Skip items already classified as hidden (debug, code, paste, trivial)
+            if let Some(ct) = &node.content_type {
+                if let Some(content_type) = crate::classification::ContentType::from_str(ct) {
+                    if content_type.is_hidden() {
+                        hidden_count += 1;
+                        return false;
+                    }
+                }
+            }
+            true
+        })
         .collect();
 
     if !protected_ids.is_empty() {
         println!("[AI Processing] Excluding {} protected items (Recent Notes)", protected_ids.len());
     }
+    if hidden_count > 0 {
+        println!("[AI Processing] Skipping {} hidden items (pre-classified)", hidden_count);
+    }
 
     let total = unprocessed.len();
-    println!("[AI Processing] Found {} unprocessed nodes", total);
+    println!("[AI Processing] Processing {} nodes", total);
 
     // Reset cancel flag at start
     CANCEL_PROCESSING.store(false, Ordering::SeqCst);
@@ -451,6 +468,8 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
         if node.content_type.as_deref() == Some("bookmark") {
             continue;
         }
+
+        // Note: Hidden items (debug, code, paste, trivial) are filtered out before the loop
 
         // Calculate time estimates
         let elapsed = start_time.elapsed().as_secs_f64();
@@ -2106,6 +2125,60 @@ pub struct RebuildLiteResult {
     pub clusters_created: usize,
     pub hierarchy_levels: usize,
     pub method: String,  // "pattern" or "ai"
+}
+
+/// Pre-classify unclassified items using pattern matching (FREE, instant)
+///
+/// Only classifies items without content_type.
+/// Preserves existing classifications (paper, bookmark, code_*, etc.)
+/// Use this BEFORE AI processing to identify hidden items that can skip AI.
+#[tauri::command]
+pub fn preclassify_items(state: State<AppState>) -> Result<PreclassifyResult, String> {
+    use crate::classification::{self, ContentType};
+
+    println!("[Preclassify] === STARTING ===");
+    println!("[Preclassify] Mode: Pattern matching (FREE)");
+
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+
+    // Classify only items without content_type (preserves existing)
+    let classified = classification::classify_all_items(&db)?;
+
+    // Count how many are now hidden (will skip AI)
+    let items = db.get_items().map_err(|e| e.to_string())?;
+    let hidden_count = items.iter()
+        .filter(|n| n.content_type.as_ref()
+            .and_then(|ct| ContentType::from_str(ct))
+            .map(|ct| ct.is_hidden())
+            .unwrap_or(false))
+        .count();
+
+    let visible_count = items.iter()
+        .filter(|n| n.content_type.as_ref()
+            .and_then(|ct| ContentType::from_str(ct))
+            .map(|ct| ct.is_visible())
+            .unwrap_or(false))
+        .count();
+
+    println!("[Preclassify] === COMPLETE ===");
+    println!("  Classified: {}", classified);
+    println!("  Hidden (will skip AI): {}", hidden_count);
+    println!("  Visible (will process): {}", visible_count);
+
+    Ok(PreclassifyResult {
+        classified,
+        hidden_count,
+        visible_count,
+    })
+}
+
+/// Result of pre-classification
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreclassifyResult {
+    pub classified: usize,
+    pub hidden_count: usize,
+    pub visible_count: usize,
 }
 
 /// Reclassify all items using pattern matching (FREE, instant)

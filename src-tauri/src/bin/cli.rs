@@ -6,7 +6,7 @@
 
 use clap::{Parser, Subcommand, CommandFactory};
 use clap_complete::{generate, Shell};
-use mycelica_lib::{db::{Database, Node, NodeType, EdgeType}, settings, import, hierarchy, similarity, clustering, openaire, ai_client, utils};
+use mycelica_lib::{db::{Database, Node, NodeType, EdgeType}, settings, import, hierarchy, similarity, clustering, openaire, ai_client, utils, classification};
 use serde_json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2493,17 +2493,49 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
     println!("Starting Mycelica Pipeline");
     println!("═══════════════════════════════════════════════════════════");
 
+    // Step 0: Pattern Classification (FREE, identifies hidden items to skip)
+    println!();
+    println!("▶ STEP 0/5: Pattern Classification");
+    println!("───────────────────────────────────────────────────────────");
+    println!("  Classifying items using pattern matching (FREE)...");
+
+    let classified = classification::classify_all_items(db)?;
+
+    // Re-fetch items with updated content_types
+    let items = db.get_items().map_err(|e| e.to_string())?;
+
+    // Count hidden items that will skip AI
+    let hidden_count = items.iter()
+        .filter(|n| n.content_type.as_ref()
+            .and_then(|ct| classification::ContentType::from_str(ct))
+            .map(|ct| ct.is_hidden())
+            .unwrap_or(false))
+        .filter(|n| !n.is_processed)
+        .count();
+
+    println!("  ✓ Classified {} items", classified);
+    if hidden_count > 0 {
+        println!("  → {} items classified as hidden (will skip AI processing)", hidden_count);
+    }
+
     // Step 1: AI Processing + Embeddings
     println!();
-    println!("▶ STEP 1/4: AI Processing + Embeddings");
+    println!("▶ STEP 1/5: AI Processing + Embeddings");
     println!("───────────────────────────────────────────────────────────");
 
-    // 1a: AI process non-paper, non-code items
+    // 1a: AI process non-paper, non-code, non-hidden items
     // Papers have metadata from OpenAIRE, code items use their signature as title
+    // Hidden items (debug, code, paste, trivial) skip AI processing
     let unprocessed_non_papers: Vec<_> = items.iter()
         .filter(|n| !n.is_processed)
         .filter(|n| n.content_type.as_deref() != Some("paper"))
+        .filter(|n| n.content_type.as_deref() != Some("bookmark"))
         .filter(|n| !n.content_type.as_ref().map(|ct| ct.starts_with("code_")).unwrap_or(false))
+        // Skip hidden items (already classified by pattern matching in Step 0)
+        .filter(|n| !n.content_type.as_ref()
+            .and_then(|ct| classification::ContentType::from_str(ct))
+            .map(|ct| ct.is_hidden())
+            .unwrap_or(false))
         .collect();
 
     if !unprocessed_non_papers.is_empty() && settings::has_api_key() {
@@ -2642,7 +2674,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
     // Step 2: Clustering & Hierarchy
     // Note: hierarchy::build_full_hierarchy has its own verbose logging via emit_log()
     println!();
-    println!("▶ STEP 2/4: Clustering & Hierarchy");
+    println!("▶ STEP 2/5: Clustering & Hierarchy");
     println!("───────────────────────────────────────────────────────────");
 
     // If FOS flag is set, run full FOS pipeline: FOS grouping → clustering → hierarchy
@@ -2713,7 +2745,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
     // Step 3: Code edges (only if code nodes exist)
     // Note: Category embeddings handled by Hierarchy Step 6/7
     println!();
-    println!("▶ STEP 3/4: Code Analysis");
+    println!("▶ STEP 3/5: Code Analysis");
     println!("───────────────────────────────────────────────────────────");
 
     let code_functions: Vec<_> = items.iter()
@@ -2797,7 +2829,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
 
     // Step 4: Flatten hierarchy (remove empty intermediate levels)
     println!();
-    println!("▶ STEP 4/4: Flatten Hierarchy");
+    println!("▶ STEP 4/5: Flatten Hierarchy");
     println!("───────────────────────────────────────────────────────────");
     match db.flatten_empty_levels() {
         Ok(removed) => {

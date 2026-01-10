@@ -38,7 +38,7 @@ use commands::{
     get_graph_children, get_supporting_items, get_associated_items, get_supporting_counts,
     classify_and_associate, classify_and_associate_children,
     // Rebuild Lite commands
-    reclassify_pattern, reclassify_ai, rebuild_lite, rebuild_hierarchy_only,
+    preclassify_items, reclassify_pattern, reclassify_ai, rebuild_lite, rebuild_hierarchy_only,
     // Conversation context commands
     get_conversation_context,
     // Import commands
@@ -280,6 +280,7 @@ pub fn run() {
             classify_and_associate,
             classify_and_associate_children,
             // Rebuild Lite
+            preclassify_items,
             reclassify_pattern,
             reclassify_ai,
             rebuild_lite,
