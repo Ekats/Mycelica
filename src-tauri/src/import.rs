@@ -659,6 +659,440 @@ fn pair_messages(messages: &[ClaudeMessage]) -> Vec<Exchange> {
     exchanges
 }
 
+// =============================================================================
+// ChatGPT Import
+// =============================================================================
+
+use std::collections::HashMap;
+
+/// ChatGPT conversation export format
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct ChatGPTConversation {
+    pub id: Option<String>,
+    pub conversation_id: Option<String>,
+    pub title: Option<String>,
+    pub create_time: Option<f64>,
+    pub update_time: Option<f64>,
+    pub mapping: HashMap<String, ChatGPTNode>,
+    pub current_node: Option<String>,
+    pub is_archived: Option<bool>,
+    pub gizmo_id: Option<String>,
+    pub default_model_slug: Option<String>,
+}
+
+/// ChatGPT tree node in mapping
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct ChatGPTNode {
+    pub id: String,
+    pub message: Option<ChatGPTMessage>,
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub children: Vec<String>,
+}
+
+/// ChatGPT message format
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct ChatGPTMessage {
+    pub id: String,
+    pub author: ChatGPTAuthor,
+    pub create_time: Option<f64>,
+    pub content: ChatGPTContent,
+}
+
+/// ChatGPT author info
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct ChatGPTAuthor {
+    pub role: String,
+    pub name: Option<String>,
+}
+
+/// ChatGPT content (various types)
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct ChatGPTContent {
+    pub content_type: Option<String>,
+    pub parts: Option<Vec<serde_json::Value>>,
+    // Code content
+    pub language: Option<String>,
+    pub text: Option<String>,
+    // Quote content
+    pub url: Option<String>,
+    pub title: Option<String>,
+    // Reasoning recap
+    pub content: Option<String>,
+}
+
+/// Import ChatGPT conversations from JSON string.
+///
+/// Creates exchange nodes: each user message paired with its assistant response.
+/// Handles tree structure by linearizing to message chain.
+///
+/// Format: "Human: {question}\n\nAssistant: {response}"
+pub fn import_chatgpt_conversations(db: &Database, json_content: &str) -> Result<ImportResult, String> {
+    let conversations: Vec<ChatGPTConversation> = serde_json::from_str(json_content)
+        .map_err(|e| format!("Failed to parse ChatGPT JSON: {}", e))?;
+
+    let mut result = ImportResult {
+        conversations_imported: 0,
+        exchanges_imported: 0,
+        skipped: 0,
+        errors: Vec::new(),
+    };
+
+    let n_convos = conversations.len();
+    let radius = 300.0;
+
+    for (i, conv) in conversations.into_iter().enumerate() {
+        // Get conversation ID
+        let conv_id = conv.conversation_id
+            .or(conv.id)
+            .unwrap_or_else(|| format!("chatgpt-{}", uuid::Uuid::new_v4()));
+
+        // Check if conversation already exists
+        if let Ok(Some(_)) = db.get_node(&conv_id) {
+            result.skipped += 1;
+            continue;
+        }
+
+        // Linearize tree structure to message list
+        let messages = linearize_chatgpt_tree(&conv.mapping, conv.current_node.as_deref());
+
+        // Pair messages into exchanges
+        let exchanges = pair_chatgpt_messages(&messages);
+
+        if exchanges.is_empty() {
+            result.skipped += 1;
+            continue;
+        }
+
+        // Calculate position in circle
+        let angle = (2.0 * std::f64::consts::PI * i as f64) / n_convos.max(1) as f64;
+        let x = radius * angle.cos();
+        let y = radius * angle.sin();
+
+        let created_at = conv.create_time
+            .map(|t| (t * 1000.0) as i64)
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        let updated_at = conv.update_time
+            .map(|t| (t * 1000.0) as i64)
+            .unwrap_or(created_at);
+
+        let exchange_count = exchanges.len();
+
+        // 1. Create conversation container node
+        let container = Node {
+            id: conv_id.clone(),
+            node_type: NodeType::Context,
+            title: conv.title.clone().unwrap_or_else(|| "Untitled".to_string()),
+            url: None,
+            content: Some(format!("{} exchanges", exchange_count)),
+            position: Position { x, y },
+            created_at,
+            updated_at,
+            cluster_id: None,
+            cluster_label: None,
+            depth: 0,
+            is_item: false,
+            is_universe: false,
+            parent_id: None,
+            child_count: exchange_count as i32,
+            ai_title: None,
+            summary: None,
+            tags: None,
+            emoji: Some("💬".to_string()),
+            is_processed: false,
+            conversation_id: None,
+            sequence_index: None,
+            is_pinned: false,
+            last_accessed_at: None,
+            latest_child_date: None,
+            is_private: None,
+            privacy_reason: None,
+            source: Some("chatgpt".to_string()),
+            pdf_available: None,
+            content_type: None,
+            associated_idea_id: None,
+            privacy: None,
+        };
+
+        if let Err(e) = db.insert_node(&container) {
+            result.errors.push(format!("Failed to insert conversation {}: {}", conv_id, e));
+            continue;
+        }
+
+        result.conversations_imported += 1;
+
+        // 2. Create exchange nodes
+        let exchange_radius = 80.0;
+
+        for (index, exchange) in exchanges.into_iter().enumerate() {
+            let exchange_id = format!("{}-ex-{}", conv_id, index);
+
+            let ex_angle = (2.0 * std::f64::consts::PI * index as f64) / exchange_count.max(1) as f64;
+            let ex_x = x + exchange_radius * ex_angle.cos();
+            let ex_y = y + exchange_radius * ex_angle.sin();
+
+            let exchange_node = Node {
+                id: exchange_id.clone(),
+                node_type: NodeType::Thought,
+                title: exchange.title,
+                url: None,
+                content: Some(exchange.content),
+                position: Position { x: ex_x, y: ex_y },
+                created_at: exchange.created_at,
+                updated_at: exchange.created_at,
+                cluster_id: None,
+                cluster_label: None,
+                depth: 0,
+                is_item: true,
+                is_universe: false,
+                parent_id: None,
+                child_count: 0,
+                ai_title: None,
+                summary: None,
+                tags: None,
+                emoji: Some("💬".to_string()),
+                is_processed: false,
+                conversation_id: Some(conv_id.clone()),
+                sequence_index: Some(index as i32),
+                is_pinned: false,
+                last_accessed_at: None,
+                latest_child_date: None,
+                is_private: None,
+                privacy_reason: None,
+                source: Some("chatgpt".to_string()),
+                pdf_available: None,
+                content_type: None,
+                associated_idea_id: None,
+                privacy: None,
+            };
+
+            if let Err(e) = db.insert_node(&exchange_node) {
+                result.errors.push(format!("Failed to insert exchange {}: {}", exchange_id, e));
+                continue;
+            }
+
+            result.exchanges_imported += 1;
+        }
+    }
+
+    Ok(result)
+}
+
+/// Linearized message from ChatGPT tree
+struct ChatGPTLinearMessage {
+    role: String,
+    text: String,
+    create_time: Option<f64>,
+}
+
+/// Linearize ChatGPT tree structure to ordered message list
+fn linearize_chatgpt_tree(mapping: &HashMap<String, ChatGPTNode>, current_node: Option<&str>) -> Vec<ChatGPTLinearMessage> {
+    // Find root node (parent = None)
+    let root_id = mapping.iter()
+        .find(|(_, node)| node.parent.is_none())
+        .map(|(id, _)| id.clone());
+
+    let Some(root_id) = root_id else {
+        return Vec::new();
+    };
+
+    let mut messages = Vec::new();
+    let mut current = Some(root_id);
+    let mut visited = std::collections::HashSet::new();
+
+    while let Some(ref node_id) = current {
+        if visited.contains(node_id) {
+            break;
+        }
+        visited.insert(node_id.clone());
+
+        if let Some(node) = mapping.get(node_id) {
+            // Extract message if present
+            if let Some(ref msg) = node.message {
+                if let Some(text) = extract_chatgpt_content(&msg.content) {
+                    let role = msg.author.role.clone();
+
+                    // Skip system and tool messages for cleaner output
+                    if role == "user" || role == "assistant" {
+                        messages.push(ChatGPTLinearMessage {
+                            role,
+                            text,
+                            create_time: msg.create_time,
+                        });
+                    }
+                }
+            }
+
+            // Move to next node
+            // Prefer current_node path if we're at a branch point
+            if node.children.is_empty() {
+                current = None;
+            } else if node.children.len() == 1 {
+                current = Some(node.children[0].clone());
+            } else {
+                // Multiple children - try to follow current_node hint
+                if let Some(target) = current_node {
+                    // Check if any child leads to current_node
+                    let mut found = false;
+                    for child_id in &node.children {
+                        if child_id == target || is_ancestor_of(mapping, child_id, target) {
+                            current = Some(child_id.clone());
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        current = Some(node.children[0].clone());
+                    }
+                } else {
+                    current = Some(node.children[0].clone());
+                }
+            }
+        } else {
+            current = None;
+        }
+    }
+
+    messages
+}
+
+/// Check if node_id is an ancestor of target_id in the tree
+fn is_ancestor_of(mapping: &HashMap<String, ChatGPTNode>, node_id: &str, target_id: &str) -> bool {
+    let mut current = Some(target_id.to_string());
+    let mut depth = 0;
+
+    while let Some(ref id) = current {
+        if depth > 1000 {
+            return false; // Prevent infinite loops
+        }
+        if id == node_id {
+            return true;
+        }
+        current = mapping.get(id).and_then(|n| n.parent.clone());
+        depth += 1;
+    }
+    false
+}
+
+/// Extract text content from ChatGPT content object
+fn extract_chatgpt_content(content: &ChatGPTContent) -> Option<String> {
+    let content_type = content.content_type.as_deref().unwrap_or("text");
+
+    match content_type {
+        "text" => {
+            // Join text parts
+            content.parts.as_ref().map(|parts| {
+                parts.iter()
+                    .filter_map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }).filter(|s| !s.trim().is_empty())
+        }
+        "code" => {
+            // Format as code block
+            content.text.as_ref().map(|text| {
+                let lang = content.language.as_deref().unwrap_or("");
+                format!("```{}\n{}\n```", lang, text)
+            })
+        }
+        "multimodal_text" => {
+            // Extract text parts, note images
+            content.parts.as_ref().map(|parts| {
+                let mut texts = Vec::new();
+                let mut image_count = 0;
+
+                for part in parts {
+                    if let Some(text) = part.as_str() {
+                        if !text.trim().is_empty() {
+                            texts.push(text.to_string());
+                        }
+                    } else if part.is_object() {
+                        // Image or other attachment
+                        image_count += 1;
+                    }
+                }
+
+                if image_count > 0 {
+                    texts.push(format!("[{} image(s) attached]", image_count));
+                }
+
+                texts.join("\n")
+            }).filter(|s| !s.trim().is_empty())
+        }
+        "tether_quote" => {
+            // Web quote - format as blockquote
+            content.text.as_ref().map(|text| {
+                let url = content.url.as_deref().unwrap_or("source");
+                format!("> {}\n> — {}", text, url)
+            })
+        }
+        "execution_output" => {
+            // Code execution output
+            content.text.as_ref().map(|text| {
+                format!("Output:\n```\n{}\n```", text)
+            })
+        }
+        "reasoning_recap" => {
+            // o1 reasoning recap
+            content.content.clone()
+        }
+        _ => None, // Skip thoughts, system_error, etc.
+    }
+}
+
+/// Pair ChatGPT messages into exchanges (user + assistant)
+fn pair_chatgpt_messages(messages: &[ChatGPTLinearMessage]) -> Vec<Exchange> {
+    let mut exchanges = Vec::new();
+    let mut i = 0;
+
+    while i < messages.len() {
+        let msg = &messages[i];
+
+        if msg.role == "user" {
+            let human_text = msg.text.clone();
+            let human_time = msg.create_time
+                .map(|t| (t * 1000.0) as i64)
+                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+
+            // Collect all following assistant messages (may have multiple parts)
+            let mut assistant_parts = Vec::new();
+            while i + 1 < messages.len() && messages[i + 1].role == "assistant" {
+                i += 1;
+                assistant_parts.push(messages[i].text.clone());
+            }
+
+            if !assistant_parts.is_empty() {
+                let assistant_text = assistant_parts.join("\n\n");
+                exchanges.push(Exchange {
+                    title: create_exchange_title(&human_text),
+                    content: format!("Human: {}\n\nAssistant: {}", human_text, assistant_text),
+                    created_at: human_time,
+                });
+            }
+        } else if msg.role == "assistant" {
+            // Orphan assistant message
+            let time = msg.create_time
+                .map(|t| (t * 1000.0) as i64)
+                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+
+            exchanges.push(Exchange {
+                title: create_exchange_title(&msg.text),
+                content: format!("Assistant: {}", msg.text),
+                created_at: time,
+            });
+        }
+
+        i += 1;
+    }
+
+    exchanges
+}
+
 // ==================== OpenAIRE Paper Import ====================
 
 /// OpenAIRE import result summary

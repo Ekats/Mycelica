@@ -245,7 +245,7 @@ See `docs/specs/SCHEMA.md` for full schema.
 - Node/Edge CRUD
 - Hierarchy navigation
 - AI processing
-- Import operations (Claude, Markdown, Keep, OpenAIRE, Code)
+- Import operations (Claude, ChatGPT, Markdown, Keep, OpenAIRE, Code)
 - Paper operations
 - Quick access (pinned/recent)
 - Database management
@@ -302,6 +302,7 @@ See `docs/specs/COMMANDS.md` for full API reference.
 
 **import.rs**
 - `import_claude_conversations()` - Claude JSON export
+- `import_chatgpt_conversations()` - ChatGPT JSON export
 - `import_markdown_files()` - Markdown files
 - `import_google_keep()` - Google Keep Takeout
 

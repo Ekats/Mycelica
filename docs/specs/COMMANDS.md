@@ -746,6 +746,21 @@ const result = await invoke<ImportResult>('import_claude_conversations', { jsonC
 
 ---
 
+### import_chatgpt_conversations
+Import ChatGPT conversation JSON export.
+
+```rust
+fn import_chatgpt_conversations(state: State<AppState>, json_content: String) -> Result<ImportResult, String>
+```
+
+Handles ChatGPT's tree-structured conversation format. Linearizes branches and creates exchange nodes (user + assistant pairs).
+
+```typescript
+const result = await invoke<ImportResult>('import_chatgpt_conversations', { jsonContent: rawJson });
+```
+
+---
+
 ### import_markdown_files
 Import markdown files.
 

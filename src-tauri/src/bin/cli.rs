@@ -294,6 +294,11 @@ enum ImportCommands {
         /// Path to Claude export JSON file
         path: String,
     },
+    /// Import ChatGPT conversation export (JSON)
+    Chatgpt {
+        /// Path to ChatGPT conversations.json file
+        path: String,
+    },
     /// Import Google Keep (from Takeout ZIP)
     Keep {
         /// Path to Google Takeout ZIP file
@@ -1135,6 +1140,20 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
                 .map_err(|e| format!("Failed to read file: {}", e))?;
 
             let result = import::import_claude_conversations(db, &content)?;
+
+            if json {
+                println!(r#"{{"conversations_imported":{},"exchanges_imported":{},"skipped":{},"errors":{}}}"#,
+                    result.conversations_imported, result.exchanges_imported, result.skipped, result.errors.len());
+            } else {
+                println!("Imported {} conversations, {} exchanges",
+                    result.conversations_imported, result.exchanges_imported);
+            }
+        }
+        ImportCommands::Chatgpt { path } => {
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| format!("Failed to read file: {}", e))?;
+
+            let result = import::import_chatgpt_conversations(db, &content)?;
 
             if json {
                 println!(r#"{{"conversations_imported":{},"exchanges_imported":{},"skipped":{},"errors":{}}}"#,
@@ -2476,7 +2495,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
 
     // Step 1: AI Processing + Embeddings
     println!();
-    println!("▶ STEP 1/3: AI Processing + Embeddings");
+    println!("▶ STEP 1/4: AI Processing + Embeddings");
     println!("───────────────────────────────────────────────────────────");
 
     // 1a: AI process non-paper, non-code items
@@ -2623,7 +2642,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
     // Step 2: Clustering & Hierarchy
     // Note: hierarchy::build_full_hierarchy has its own verbose logging via emit_log()
     println!();
-    println!("▶ STEP 2/3: Clustering & Hierarchy");
+    println!("▶ STEP 2/4: Clustering & Hierarchy");
     println!("───────────────────────────────────────────────────────────");
 
     // If FOS flag is set, run full FOS pipeline: FOS grouping → clustering → hierarchy
@@ -2694,7 +2713,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
     // Step 3: Code edges (only if code nodes exist)
     // Note: Category embeddings handled by Hierarchy Step 6/7
     println!();
-    println!("▶ STEP 3/3: Code Analysis");
+    println!("▶ STEP 3/4: Code Analysis");
     println!("───────────────────────────────────────────────────────────");
 
     let code_functions: Vec<_> = items.iter()
@@ -2774,6 +2793,23 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
     } else {
         println!("⊘ SKIPPED (no code_function nodes found)");
         println!("  Run 'mycelica-cli import code <path>' to import code first");
+    }
+
+    // Step 4: Flatten hierarchy (remove empty intermediate levels)
+    println!();
+    println!("▶ STEP 4/4: Flatten Hierarchy");
+    println!("───────────────────────────────────────────────────────────");
+    match db.flatten_empty_levels() {
+        Ok(removed) => {
+            if removed > 0 {
+                println!("✓ Flattened: removed {} empty intermediate levels", removed);
+            } else {
+                println!("✓ Hierarchy already flat (no empty levels)");
+            }
+        }
+        Err(e) => {
+            eprintln!("✗ Flatten failed: {}", e);
+        }
     }
 
     println!();

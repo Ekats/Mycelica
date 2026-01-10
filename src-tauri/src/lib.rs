@@ -42,7 +42,7 @@ use commands::{
     // Conversation context commands
     get_conversation_context,
     // Import commands
-    import_claude_conversations, import_markdown_files, import_google_keep, import_openaire, count_openaire_papers, cancel_openaire, get_imported_paper_count,
+    import_claude_conversations, import_chatgpt_conversations, import_markdown_files, import_google_keep, import_openaire, count_openaire_papers, cancel_openaire, get_imported_paper_count,
     // Code import commands
     import_code, analyze_code_edges,
     // Paper retrieval commands
@@ -288,6 +288,7 @@ pub fn run() {
             get_conversation_context,
             // Import
             import_claude_conversations,
+            import_chatgpt_conversations,
             import_markdown_files,
             import_google_keep,
             import_openaire,

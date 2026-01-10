@@ -53,6 +53,9 @@ mycelica-cli db tidy               # Vacuum, fix counts, prune edges
 # Import Claude conversations (JSON export)
 mycelica-cli import claude <FILE>
 
+# Import ChatGPT conversations (JSON export)
+mycelica-cli import chatgpt <FILE>
+
 # Import markdown files
 mycelica-cli import markdown <FILE>...
 mycelica-cli import markdown ./notes/*.md

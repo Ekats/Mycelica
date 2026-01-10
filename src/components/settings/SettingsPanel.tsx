@@ -751,6 +751,40 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     }
   };
 
+  // ChatGPT import handler
+  const handleImportChatGPT = async () => {
+    setImporting(true);
+    setImportResult(null);
+    setSuggestedOperation(null);
+    try {
+      const file = await openDialog({
+        title: 'Select ChatGPT conversations.json',
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      });
+      if (file && typeof file === 'string') {
+        const content = await readTextFile(file);
+        const result = await invoke<{ conversationsImported: number; exchangesImported: number }>(
+          'import_chatgpt_conversations',
+          { jsonContent: content }
+        );
+        await loadDbStats();
+        onDataChanged?.();
+
+        // Show smart operation suggestion if items were imported
+        if (result.conversationsImported > 0) {
+          setImportResult(`Imported ${result.conversationsImported} ChatGPT conversations`);
+          suggestOperationAfterImport(result.conversationsImported);
+        } else {
+          setImportResult(`No new conversations found`);
+        }
+      }
+    } catch (err) {
+      setImportResult(`Error: ${err}`);
+    } finally {
+      setImporting(false);
+    }
+  };
+
   // Markdown import handler
   const handleImportMarkdown = async () => {
     setImporting(true);
@@ -1097,8 +1131,13 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
         groupingIterations: number;
       }>('build_full_hierarchy', { runClustering: false });
 
+      // Step 4: Flatten hierarchy (remove empty intermediate levels)
+      setFullSetupStep('Flattening hierarchy...');
+      const flattenResult = await invoke<number>('flatten_hierarchy');
+
       setFullSetupStep('');
-      setSetupResult(`Full setup complete: ${aiResult.processed} items processed, ${clusterResult.clusters_created} clusters, ${hierarchyResult.levelsCreated} hierarchy levels`);
+      const flattenMsg = flattenResult > 0 ? `, ${flattenResult} empty levels removed` : '';
+      setSetupResult(`Full setup complete: ${aiResult.processed} items processed, ${clusterResult.clusters_created} clusters, ${hierarchyResult.levelsCreated} hierarchy levels${flattenMsg}`);
       await loadDbStats();
       onDataChanged?.();
       window.location.reload();
@@ -1681,9 +1720,19 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                               <div className="text-xs text-gray-500">conversations.json</div>
                             </div>
                           </button>
-                          <div className="px-4 py-2 text-xs text-gray-600 border-t border-gray-700">
-                            More sources coming soon...
-                          </div>
+                          <button
+                            onClick={() => {
+                              setShowImportSources(false);
+                              handleImportChatGPT();
+                            }}
+                            className="w-full flex items-center gap-3 px-4 py-3 hover:bg-gray-700 transition-colors text-left border-t border-gray-700"
+                          >
+                            <span className="text-xl">🟢</span>
+                            <div>
+                              <div className="text-sm text-gray-200">ChatGPT</div>
+                              <div className="text-xs text-gray-500">conversations.json</div>
+                            </div>
+                          </button>
                         </div>
                       )}
                     </div>

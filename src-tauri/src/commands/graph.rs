@@ -923,6 +923,16 @@ pub fn import_claude_conversations(state: State<AppState>, json_content: String)
     import::import_claude_conversations(&db, &json_content)
 }
 
+/// Import ChatGPT conversations from JSON export
+///
+/// Handles tree-structured conversations from ChatGPT data export.
+/// Creates exchange nodes (user + assistant pairs).
+#[tauri::command]
+pub fn import_chatgpt_conversations(state: State<AppState>, json_content: String) -> Result<import::ImportResult, String> {
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+    import::import_chatgpt_conversations(&db, &json_content)
+}
+
 /// Import markdown files as notes
 ///
 /// Each .md file becomes a note under "Recent Notes" container.
