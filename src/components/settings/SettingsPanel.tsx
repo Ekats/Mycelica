@@ -63,7 +63,7 @@ interface SettingsPanelProps {
   onDataChanged?: () => void;
 }
 
-type ConfirmAction = 'deleteAll' | 'resetAi' | 'resetClustering' | 'clearEmbeddings' | 'clearHierarchy' | 'clearTags' | 'resetPrivacy' | 'fullRebuild' | 'flattenHierarchy' | 'consolidateRoot' | 'tidyDatabase' | 'scorePrivacy' | 'reclassifyPattern' | 'reclassifyAi' | 'rebuildLite' | 'resetProcessing' | 'clearStructure' | null;
+type ConfirmAction = 'deleteAll' | 'resetAi' | 'resetClustering' | 'clearEmbeddings' | 'clearHierarchy' | 'clearTags' | 'resetPrivacy' | 'fullRebuild' | 'flattenHierarchy' | 'consolidateRoot' | 'tidyDatabase' | 'scorePrivacy' | 'reclassifyPattern' | 'reclassifyAi' | 'rebuildLite' | 'nameClusters' | 'resetProcessing' | 'clearStructure' | null;
 
 interface TidyReport {
   sameNameMerged: number;
@@ -179,6 +179,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const [isReclassifyingPattern, setIsReclassifyingPattern] = useState(false);
   const [isReclassifyingAi, setIsReclassifyingAi] = useState(false);
   const [isRebuildingLite, setIsRebuildingLite] = useState(false);
+  const [isNamingClusters, setIsNamingClusters] = useState(false);
   const [operationResult, setOperationResult] = useState<string | null>(null);
 
   // Setup flow operations
@@ -1392,6 +1393,22 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
         }
       },
     },
+    nameClusters: {
+      title: 'Name Clusters (AI)',
+      message: 'Name clusters that have keyword-only names using AI. This improves cluster names without re-clustering.',
+      handler: async () => {
+        setIsNamingClusters(true);
+        setOperationResult(null);
+        try {
+          const result = await invoke<{ clustersNamed: number; clustersSkipped: number }>('name_clusters');
+          const msg = `Named ${result.clustersNamed} clusters, skipped ${result.clustersSkipped}`;
+          setOperationResult(msg);
+          return msg;
+        } finally {
+          setIsNamingClusters(false);
+        }
+      },
+    },
     resetProcessing: {
       title: 'Reset Processing',
       message: 'This will reset AI processing AND embeddings. Items will be re-analyzed and get new embeddings. Run "Full Rebuild" after.',
@@ -2365,6 +2382,25 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                     style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-green-700 hover:bg-green-800 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isRebuildingLite ? <Loader2 className="w-5 h-5 animate-spin" /> : '🔄'}
+                  </button>
+                </div>
+
+                {/* Name Clusters (AI) */}
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-amber-600 flex items-center justify-center text-white text-sm">
+                    <Cpu className="w-3.5 h-3.5" />
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Name Clusters (AI)</div>
+                    <div className="text-xs text-gray-500">Improve cluster names using AI (after Rebuild Lite)</div>
+                    <div className="text-xs text-amber-400 mt-0.5">Haiku · Names keyword-only clusters</div>
+                  </div>
+                  <button
+                    onClick={() => setConfirmAction('nameClusters')}
+                    disabled={isNamingClusters || isRebuildingLite || isFullRebuilding}
+                    style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-amber-600 hover:bg-amber-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                  >
+                    {isNamingClusters ? <Loader2 className="w-5 h-5 animate-spin" /> : '🏷️'}
                   </button>
                 </div>
 

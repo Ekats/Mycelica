@@ -322,6 +322,24 @@ pub async fn recluster_all(state: State<'_, AppState>, use_ai: Option<bool>) -> 
     clustering::recluster_all(&db, use_ai).await
 }
 
+/// Result of cluster naming operation
+#[derive(Serialize)]
+pub struct NamingResult {
+    pub clusters_named: usize,
+    pub clusters_skipped: usize,
+}
+
+/// Name clusters that have keyword-only names (runs AI naming)
+#[tauri::command]
+pub async fn name_clusters(state: State<'_, AppState>) -> Result<NamingResult, String> {
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clone();
+    let result = clustering::name_unnamed_clusters(&db).await?;
+    Ok(NamingResult {
+        clusters_named: result.clusters_named,
+        clusters_skipped: result.clusters_skipped,
+    })
+}
+
 #[derive(Serialize)]
 pub struct AiStatus {
     pub available: bool,

@@ -21,7 +21,7 @@ use commands::{
     get_edges, get_edges_for_node, get_edges_for_fos, get_edges_for_view, create_edge, delete_edge,
     search_nodes,
     // Clustering commands
-    run_clustering, recluster_all, get_clustering_status,
+    run_clustering, recluster_all, name_clusters, get_clustering_status,
     // AI processing commands
     process_nodes, get_ai_status, cancel_processing, cancel_rebuild, cancel_all,
     get_api_key_status, save_api_key, clear_api_key,
@@ -239,6 +239,7 @@ pub fn run() {
             // Clustering
             run_clustering,
             recluster_all,
+            name_clusters,
             get_clustering_status,
             // AI processing
             process_nodes,

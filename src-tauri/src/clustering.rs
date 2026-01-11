@@ -125,7 +125,7 @@ fn capitalize(s: &str) -> String {
 /// Uses embedding-based clustering (primary), with TF-IDF fallback for items without embeddings
 /// NOTE: Only clusters items where content_type = 'idea' OR content_type IS NULL
 /// Items with content_type = 'code', 'debug', or 'paste' are skipped (supporting items)
-pub async fn run_clustering(db: &Database, _use_ai: bool) -> Result<ClusteringResult, String> {
+pub async fn run_clustering(db: &Database, use_ai: bool) -> Result<ClusteringResult, String> {
     // Reset cancel flag at start
     reset_rebuild_cancel();
 
@@ -188,10 +188,10 @@ pub async fn run_clustering(db: &Database, _use_ai: bool) -> Result<ClusteringRe
         });
     }
 
-    println!("[Clustering] Starting embedding-based clustering for {} items", items.len());
+    println!("[Clustering] Starting embedding-based clustering for {} items (use_ai={})", items.len(), use_ai);
 
     // Use embedding-based clustering (generates embeddings on-demand if missing)
-    cluster_with_embeddings(db, &items).await
+    cluster_with_embeddings_impl(db, &items, use_ai).await
 }
 
 /// Apply multi-path assignments: primary → cluster_id, all → BelongsTo edges
@@ -596,6 +596,8 @@ async fn cluster_single_group(
     items: &[Node],
     use_ai_naming: bool,
 ) -> Result<ClusteringResult, String> {
+    use std::time::Instant;
+
     if items.is_empty() {
         return Ok(ClusteringResult {
             items_processed: 0,
@@ -606,10 +608,13 @@ async fn cluster_single_group(
         });
     }
 
+    let total_start = Instant::now();
     println!("[Clustering] Using embedding-based clustering for {} items", items.len());
 
     // Step 1: Ensure all items have embeddings
+    let embed_start = Instant::now();
     let items_with_embeddings = ensure_embeddings(db, items).await?;
+    println!("[Timing] Embeddings loaded/generated: {:.2}s", embed_start.elapsed().as_secs_f64());
 
     if items_with_embeddings.is_empty() {
         return Ok(ClusteringResult {
@@ -632,53 +637,177 @@ async fn cluster_single_group(
     }
 
     // Step 3: Prepare embeddings for clustering (with conversation_id for bonus)
-    let mut embeddings: Vec<(String, Vec<f32>, Option<String>)> = items_with_embeddings
+    let embeddings: Vec<(String, Vec<f32>, Option<String>)> = items_with_embeddings
         .iter()
         .map(|(node, emb)| (node.id.clone(), emb.clone(), node.conversation_id.clone()))
         .collect();
 
-    // Shuffle to spread similar items across batches
-    // (prevents systematic separation of related items that happen to be adjacent)
-    embeddings.shuffle(&mut rand::thread_rng());
-
-    // Step 4: Mini-batch clustering for scalability
+    // Step 4: Global vs Batch clustering based on dataset size
+    // Global: Better cluster quality (no fragmentation/contamination) for small datasets
+    // Batch + refinement: Required for large datasets (papers) to avoid O(n²) explosion
+    const GLOBAL_THRESHOLD: usize = 10_000;
     const BATCH_SIZE: usize = 300;
-    let mut all_clusters: Vec<(Vec<f32>, Vec<usize>)> = Vec::new();
-    let mut global_offset = 0;
-    let num_batches = (embeddings.len() + BATCH_SIZE - 1) / BATCH_SIZE;
 
-    // Cluster each batch independently
-    for batch_start in (0..embeddings.len()).step_by(BATCH_SIZE) {
-        let batch_end = (batch_start + BATCH_SIZE).min(embeddings.len());
-        let batch: Vec<(String, Vec<f32>, Option<String>)> = embeddings[batch_start..batch_end]
-            .iter()
-            .cloned()
-            .collect();
-
-        println!("[Clustering] Processing batch {}-{} of {} ({}/{})",
-                 batch_start, batch_end, embeddings.len(),
-                 batch_start / BATCH_SIZE + 1, num_batches);
-
-        let batch_clusters = cluster_batch(&batch, primary_threshold, &item_tags);
-
-        // Adjust indices to global offset
-        for (centroid, local_indices) in batch_clusters {
-            let global_indices: Vec<usize> = local_indices.iter()
-                .map(|&i| i + global_offset)
-                .collect();
-            all_clusters.push((centroid, global_indices));
-        }
-        global_offset = batch_end;
+    // Time estimate for large datasets
+    let comparisons = embeddings.len() * (embeddings.len() - 1) / 2;
+    let estimate_secs = comparisons as f64 / 1_000_000.0;
+    if estimate_secs > 60.0 {
+        println!("[Clustering] Estimated time: {:.1} minutes (one-time cost for quality)",
+                 estimate_secs / 60.0);
     }
 
-    println!("[Clustering] {} clusters from {} batches, merging similar...",
-             all_clusters.len(), num_batches);
+    let mut all_clusters: Vec<(Vec<f32>, Vec<usize>)> = if embeddings.len() < GLOBAL_THRESHOLD {
+        // GLOBAL CLUSTERING: Compare all items to all items
+        // O(n²) but fast for small datasets: 5000 items = 12.5M comparisons ≈ 12.5s at 1M cmp/s
+        println!("[Clustering] Using GLOBAL clustering for {} items (< {} threshold)",
+                 embeddings.len(), GLOBAL_THRESHOLD);
 
-    // Merge similar clusters across batches
-    let merge_threshold = primary_threshold * 0.95;
-    merge_similar_clusters(&mut all_clusters, merge_threshold);
+        let cluster_start = Instant::now();
 
-    println!("[Clustering] After merge: {} clusters", all_clusters.len());
+        let batch_clusters = cluster_batch(&embeddings, primary_threshold, &item_tags);
+
+        let elapsed = cluster_start.elapsed().as_secs_f64();
+        println!("[Timing] Global clustering: {:.2}s for {} comparisons ({:.0} cmp/s)",
+                 elapsed, comparisons, comparisons as f64 / elapsed.max(0.001));
+
+        batch_clusters
+    } else {
+        // BATCH CLUSTERING + K-MEANS REFINEMENT
+        // For large datasets: batch → merge → iterative reassignment
+        println!("[Clustering] Using BATCH clustering for {} items (>= {} threshold)",
+                 embeddings.len(), GLOBAL_THRESHOLD);
+
+        // Shuffle to spread similar items across batches
+        let mut shuffled = embeddings.clone();
+        shuffled.shuffle(&mut rand::thread_rng());
+
+        let mut batch_clusters: Vec<(Vec<f32>, Vec<usize>)> = Vec::new();
+        let mut global_offset = 0;
+        let num_batches = (shuffled.len() + BATCH_SIZE - 1) / BATCH_SIZE;
+        let mut total_similarity_time = 0.0f64;
+
+        for batch_start in (0..shuffled.len()).step_by(BATCH_SIZE) {
+            let batch_end = (batch_start + BATCH_SIZE).min(shuffled.len());
+            let batch: Vec<(String, Vec<f32>, Option<String>)> = shuffled[batch_start..batch_end]
+                .iter()
+                .cloned()
+                .collect();
+
+            let batch_start_time = Instant::now();
+            println!("[Clustering] Processing batch {}-{} of {} ({}/{})",
+                     batch_start, batch_end, shuffled.len(),
+                     batch_start / BATCH_SIZE + 1, num_batches);
+
+            let clusters = cluster_batch(&batch, primary_threshold, &item_tags);
+            let batch_elapsed = batch_start_time.elapsed().as_secs_f64();
+            total_similarity_time += batch_elapsed;
+
+            let batch_size_actual = batch_end - batch_start;
+            let batch_comparisons = batch_size_actual * (batch_size_actual - 1) / 2;
+            println!("[Timing] Batch {}/{}: {:.3}s for {} comparisons ({:.0} cmp/s)",
+                     batch_start / BATCH_SIZE + 1, num_batches,
+                     batch_elapsed, batch_comparisons,
+                     batch_comparisons as f64 / batch_elapsed.max(0.001));
+
+            // Adjust indices to global offset
+            for (centroid, local_indices) in clusters {
+                let global_indices: Vec<usize> = local_indices.iter()
+                    .map(|&i| i + global_offset)
+                    .collect();
+                batch_clusters.push((centroid, global_indices));
+            }
+            global_offset = batch_end;
+        }
+
+        println!("[Timing] All batches complete: {:.2}s total similarity computation", total_similarity_time);
+        println!("[Clustering] {} clusters from {} batches, merging similar...",
+                 batch_clusters.len(), num_batches);
+
+        // Merge similar clusters across batches
+        let merge_start = Instant::now();
+        let merge_threshold = primary_threshold * 0.95;
+        merge_similar_clusters(&mut batch_clusters, merge_threshold);
+        println!("[Timing] Cluster merge: {:.3}s for {} clusters",
+                 merge_start.elapsed().as_secs_f64(), batch_clusters.len());
+
+        // K-MEANS REFINEMENT: Iteratively reassign items to nearest centroid globally
+        // Fixes fragmentation from batch boundaries (sock leaves MBTI, joins household)
+        println!("[Clustering] Running k-means refinement to fix batch fragmentation...");
+        let refine_start = Instant::now();
+        let mut iteration = 0;
+        const MAX_ITERATIONS: usize = 10;
+
+        loop {
+            iteration += 1;
+            let mut changed = 0usize;
+
+            // Build item → cluster assignment map
+            let mut item_cluster: Vec<usize> = vec![0; shuffled.len()];
+            for (cluster_idx, (_, indices)) in batch_clusters.iter().enumerate() {
+                for &item_idx in indices {
+                    item_cluster[item_idx] = cluster_idx;
+                }
+            }
+
+            // For each item, find nearest centroid globally
+            for item_idx in 0..shuffled.len() {
+                let item_embedding = &shuffled[item_idx].1;
+                let current_cluster = item_cluster[item_idx];
+
+                // Find best cluster by similarity to centroid
+                let mut best_cluster = current_cluster;
+                let mut best_sim = cosine_similarity(item_embedding, &batch_clusters[current_cluster].0);
+
+                for (cluster_idx, (centroid, _)) in batch_clusters.iter().enumerate() {
+                    if cluster_idx == current_cluster {
+                        continue;
+                    }
+                    let sim = cosine_similarity(item_embedding, centroid);
+                    if sim > best_sim {
+                        best_sim = sim;
+                        best_cluster = cluster_idx;
+                    }
+                }
+
+                if best_cluster != current_cluster {
+                    // Reassign: remove from old, add to new
+                    batch_clusters[current_cluster].1.retain(|&i| i != item_idx);
+                    batch_clusters[best_cluster].1.push(item_idx);
+                    changed += 1;
+                }
+            }
+
+            // Recompute centroids after reassignments
+            for (centroid, indices) in &mut batch_clusters {
+                if indices.is_empty() {
+                    continue;
+                }
+                let member_embeddings: Vec<&[f32]> = indices.iter()
+                    .map(|&i| shuffled[i].1.as_slice())
+                    .collect();
+                if let Some(new_centroid) = compute_centroid(&member_embeddings) {
+                    *centroid = new_centroid;
+                }
+            }
+
+            // Remove empty clusters
+            batch_clusters.retain(|(_, indices)| !indices.is_empty());
+
+            println!("[Refinement] Iteration {}: {} items reassigned, {} clusters remaining",
+                     iteration, changed, batch_clusters.len());
+
+            if changed == 0 || iteration >= MAX_ITERATIONS {
+                break;
+            }
+        }
+
+        println!("[Timing] K-means refinement: {:.2}s ({} iterations)",
+                 refine_start.elapsed().as_secs_f64(), iteration);
+
+        batch_clusters
+    };
+
+    println!("[Clustering] After clustering: {} clusters", all_clusters.len());
 
     // Convert to cluster_groups format
     let cluster_groups: Vec<Vec<usize>> = all_clusters.iter()
@@ -697,27 +826,35 @@ async fn cluster_single_group(
     println!("[Clustering] Formed {} clusters", cluster_groups.len());
 
     // Step 5: Name clusters (AI or reuse existing names)
+    let naming_start = Instant::now();
     let cluster_names = if use_ai_naming {
         name_clusters_with_ai(db, &cluster_data, &items_with_embeddings).await?
     } else {
         // LITE mode: reuse existing cluster_label from items, fallback to keywords
         reuse_existing_cluster_names(&cluster_data, &items_with_embeddings)
     };
+    println!("[Timing] Cluster naming: {:.2}s (ai={})", naming_start.elapsed().as_secs_f64(), use_ai_naming);
 
     // Step 6: Build multi-path assignments
+    let assign_start = Instant::now();
     let assignments = build_multipath_assignments(
         &items_with_embeddings,
         &cluster_data,
         &cluster_names,
         secondary_threshold,
     );
+    println!("[Timing] Build assignments: {:.3}s for {} items", assign_start.elapsed().as_secs_f64(), assignments.len());
 
     // Step 7: Apply assignments using existing function
+    let db_write_start = Instant::now();
     let (assigned, _new_clusters, edges) = apply_multipath_assignments(db, &assignments, next_cluster_id)?;
+    println!("[Timing] DB writes: {:.2}s for {} assignments + {} edges", db_write_start.elapsed().as_secs_f64(), assigned, edges);
+
     let actual_cluster_count = cluster_data.len();
 
     println!("[Clustering] Embedding clustering complete: {} items assigned to {} clusters, {} edges",
              assigned, actual_cluster_count, edges);
+    println!("[Timing] TOTAL cluster_single_group: {:.2}s", total_start.elapsed().as_secs_f64());
 
     Ok(ClusteringResult {
         items_processed: items.len(),
@@ -1199,6 +1336,97 @@ pub async fn recluster_all(db: &Database, use_ai: bool) -> Result<ClusteringResu
 
     // Run clustering
     run_clustering(db, use_ai).await
+}
+
+// ==================== Cluster Naming (Standalone) ====================
+
+/// Result of cluster naming operation
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NamingResult {
+    pub clusters_named: usize,
+    pub clusters_skipped: usize,
+}
+
+/// Name clusters that don't have AI-generated names yet
+/// Finds clusters with keyword-only names (contain commas) or generic names
+/// and runs AI naming on them
+pub async fn name_unnamed_clusters(db: &Database) -> Result<NamingResult, String> {
+    use std::time::Instant;
+
+    let start = Instant::now();
+
+    // Get all unique cluster_ids with their labels
+    let clusters = db.get_clusters_needing_names().map_err(|e| e.to_string())?;
+
+    if clusters.is_empty() {
+        println!("[Naming] No clusters need naming");
+        return Ok(NamingResult {
+            clusters_named: 0,
+            clusters_skipped: 0,
+        });
+    }
+
+    println!("[Naming] Found {} clusters needing AI names", clusters.len());
+
+    // Build cluster info for AI naming: (cluster_id, sample_titles)
+    let mut clusters_info: Vec<(i32, Vec<String>)> = Vec::new();
+
+    for (cluster_id, _current_label) in &clusters {
+        // Get sample items from this cluster
+        let sample_items = db.get_cluster_sample_items(*cluster_id, 10)
+            .map_err(|e| e.to_string())?;
+
+        let titles: Vec<String> = sample_items
+            .iter()
+            .map(|node| node.ai_title.clone().unwrap_or_else(|| node.title.clone()))
+            .collect();
+
+        if !titles.is_empty() {
+            clusters_info.push((*cluster_id, titles));
+        }
+    }
+
+    if clusters_info.is_empty() {
+        return Ok(NamingResult {
+            clusters_named: 0,
+            clusters_skipped: clusters.len(),
+        });
+    }
+
+    // Batch AI naming (same logic as name_clusters_with_ai)
+    let num_batches = (clusters_info.len() + NAMING_BATCH_SIZE - 1) / NAMING_BATCH_SIZE;
+    println!("[Naming] Naming {} clusters in {} batches", clusters_info.len(), num_batches);
+
+    let mut named_count = 0;
+
+    for (batch_idx, batch) in clusters_info.chunks(NAMING_BATCH_SIZE).enumerate() {
+        println!("[Naming] Batch {}/{} ({} clusters)", batch_idx + 1, num_batches, batch.len());
+
+        match ai_client::name_clusters(batch).await {
+            Ok(ai_names) => {
+                for (cluster_id, name) in ai_names {
+                    // Update all items in this cluster with the new label
+                    if let Err(e) = db.update_cluster_label(cluster_id, &name) {
+                        eprintln!("[Naming] Failed to update cluster {}: {}", cluster_id, e);
+                    } else {
+                        named_count += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[Naming] AI naming failed for batch {}: {}", batch_idx + 1, e);
+            }
+        }
+    }
+
+    println!("[Naming] Complete: {} clusters named in {:.1}s",
+             named_count, start.elapsed().as_secs_f64());
+
+    Ok(NamingResult {
+        clusters_named: named_count,
+        clusters_skipped: clusters.len() - named_count,
+    })
 }
 
 #[cfg(test)]

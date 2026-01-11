@@ -1970,6 +1970,51 @@ impl Database {
         Ok(updated)
     }
 
+    /// Get clusters that need AI naming
+    /// Returns clusters where the label looks like keyword-generated (contains comma)
+    /// or is a generic "Cluster N" name
+    pub fn get_clusters_needing_names(&self) -> Result<Vec<(i32, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT cluster_id, cluster_label FROM nodes
+             WHERE cluster_id IS NOT NULL
+               AND cluster_label IS NOT NULL
+               AND (cluster_label LIKE '%,%' OR cluster_label LIKE 'Cluster %')
+             ORDER BY cluster_id"
+        )?;
+
+        let clusters = stmt.query_map([], |row| {
+            Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(clusters)
+    }
+
+    /// Get sample items from a cluster for naming
+    pub fn get_cluster_sample_items(&self, cluster_id: i32, limit: usize) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let query = format!(
+            "SELECT {} FROM nodes WHERE cluster_id = ?1 AND is_item = 1 LIMIT ?2",
+            Self::NODE_COLUMNS
+        );
+        let mut stmt = conn.prepare(&query)?;
+        let nodes = stmt
+            .query_map(params![cluster_id, limit as i64], Self::row_to_node)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(nodes)
+    }
+
+    /// Update cluster label for all items in a cluster
+    pub fn update_cluster_label(&self, cluster_id: i32, new_label: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE nodes SET cluster_label = ?2 WHERE cluster_id = ?1",
+            params![cluster_id, new_label],
+        )?;
+        Ok(updated)
+    }
+
     // ==================== Multi-Path Edge Operations ====================
 
     /// Delete AI-generated BelongsTo edges for a node (preserves user-edited edges)

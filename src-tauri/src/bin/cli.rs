@@ -414,9 +414,19 @@ enum ProcessCommands {
 #[derive(Subcommand)]
 enum ClusterCommands {
     /// Run clustering on new items
-    Run,
+    Run {
+        /// Use keyword-based naming instead of AI (faster, free)
+        #[arg(long)]
+        lite: bool,
+    },
     /// Recluster all items
-    All,
+    All {
+        /// Use keyword-based naming instead of AI (faster, free)
+        #[arg(long)]
+        lite: bool,
+    },
+    /// Name clusters that have keyword-only names (runs AI naming)
+    Name,
     /// Cluster with FOS (Field of Science) pre-grouping for papers
     Fos,
     /// Reset clustering data
@@ -1770,9 +1780,15 @@ async fn handle_process(cmd: ProcessCommands, db: &Database, json: bool, quiet: 
 
 async fn handle_cluster(cmd: ClusterCommands, db: &Database, json: bool, quiet: bool) -> Result<(), String> {
     match cmd {
-        ClusterCommands::Run => {
-            if !quiet { eprintln!("Running clustering..."); }
-            let result = clustering::run_clustering(db, true).await?;
+        ClusterCommands::Run { lite } => {
+            if !quiet {
+                if lite {
+                    eprintln!("Running clustering (lite mode, no AI naming)...");
+                } else {
+                    eprintln!("Running clustering...");
+                }
+            }
+            let result = clustering::run_clustering(db, !lite).await?;
             if json {
                 println!(r#"{{"items_processed":{},"clusters_created":{},"items_assigned":{}}}"#,
                     result.items_processed, result.clusters_created, result.items_assigned);
@@ -1781,9 +1797,25 @@ async fn handle_cluster(cmd: ClusterCommands, db: &Database, json: bool, quiet: 
                     result.items_processed, result.clusters_created, result.items_assigned);
             }
         }
-        ClusterCommands::All => {
-            if !quiet { eprintln!("Reclustering all items..."); }
-            let result = clustering::recluster_all(db, true).await?;
+        ClusterCommands::Name => {
+            if !quiet { eprintln!("Naming clusters with AI..."); }
+            let result = clustering::name_unnamed_clusters(db).await?;
+            if json {
+                println!(r#"{{"clusters_named":{},"clusters_skipped":{}}}"#,
+                    result.clusters_named, result.clusters_skipped);
+            } else {
+                println!("Named {} clusters, skipped {}", result.clusters_named, result.clusters_skipped);
+            }
+        }
+        ClusterCommands::All { lite } => {
+            if !quiet {
+                if lite {
+                    eprintln!("Reclustering all items (lite mode, no AI)...");
+                } else {
+                    eprintln!("Reclustering all items...");
+                }
+            }
+            let result = clustering::recluster_all(db, !lite).await?;
             if json {
                 println!(r#"{{"items_processed":{},"clusters_created":{},"items_assigned":{}}}"#,
                     result.items_processed, result.clusters_created, result.items_assigned);
