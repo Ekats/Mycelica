@@ -46,10 +46,10 @@ tui-tree-widget = "0.19"
 nucleo = "0.5"
 arboard = "3"
 
-# Local embeddings via candle
-candle-core = "0.8"
-candle-nn = "0.8"
-candle-transformers = "0.8"
+# Local embeddings via candle (git main for CUDA 13.x, requires nightly)
+candle-core = { git = "https://github.com/huggingface/candle", features = ["cuda"] }
+candle-nn = { git = "https://github.com/huggingface/candle", features = ["cuda"] }
+candle-transformers = { git = "https://github.com/huggingface/candle", features = ["cuda"] }
 tokenizers = "0.20"
 hf-hub = "0.3"
 
