@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::io::Write;
 use chrono::{Timelike, Utc};
+use futures::{stream, StreamExt};
 
 // TUI imports
 use crossterm::{
@@ -1696,18 +1697,34 @@ async fn handle_process(cmd: ProcessCommands, db: &Database, json: bool, quiet: 
                 eprintln!("Processing {} nodes...", to_process.len());
             }
 
-            // Process nodes one by one
+            // Process nodes with 10 concurrent API calls
+            const CONCURRENT_REQUESTS: usize = 10;
+            if !quiet {
+                eprintln!("[Processing {} nodes with {} concurrent API calls]",
+                         to_process.len(), CONCURRENT_REQUESTS);
+            }
+
+            // Run AI analysis in parallel, collect results
+            let results: Vec<_> = stream::iter(to_process.iter().cloned())
+                .map(|node| async move {
+                    let content = node.content.as_deref().unwrap_or(&node.title).to_string();
+                    let result = mycelica_lib::ai_client::analyze_node(&node.title, &content).await;
+                    (node, content, result)
+                })
+                .buffer_unordered(CONCURRENT_REQUESTS)
+                .collect()
+                .await;
+
+            // Apply results to DB (sequential for thread safety)
             let mut processed_count = 0;
-            for (i, node) in to_process.iter().enumerate() {
-                if !quiet && i % 10 == 0 {
-                    eprint!("\r[{}/{}] Processing...", i, to_process.len());
+            for (i, (node, content, result)) in results.into_iter().enumerate() {
+                if !quiet && i % 50 == 0 {
+                    eprint!("\r[{}/{}] Saving...", i, to_process.len());
                     std::io::stderr().flush().ok();
                 }
 
-                // Use AI to analyze node
-                let content = node.content.as_deref().unwrap_or(&node.title);
-                match mycelica_lib::ai_client::analyze_node(&node.title, content).await {
-                    Ok(result) => {
+                match result {
+                    Ok(ai_result) => {
                         // Preserve code_* content_types (from code import)
                         let final_content_type = if node.content_type
                             .as_ref()
@@ -1716,19 +1733,19 @@ async fn handle_process(cmd: ProcessCommands, db: &Database, json: bool, quiet: 
                         {
                             node.content_type.clone().unwrap_or_default()
                         } else {
-                            result.content_type.clone()
+                            ai_result.content_type.clone()
                         };
 
                         db.update_node_ai(
                             &node.id,
-                            &result.title,
-                            &result.summary,
-                            &serde_json::to_string(&result.tags).unwrap_or_default(),
+                            &ai_result.title,
+                            &ai_result.summary,
+                            &serde_json::to_string(&ai_result.tags).unwrap_or_default(),
                             &final_content_type,
                         ).map_err(|e| e.to_string())?;
 
                         // Generate embedding for the node
-                        let embed_text = utils::safe_truncate(content, 1000);
+                        let embed_text = utils::safe_truncate(&content, 1000);
                         if let Ok(embedding) = ai_client::generate_embedding(embed_text).await {
                             db.update_node_embedding(&node.id, &embedding).ok();
                         }

@@ -15,6 +15,7 @@ use crate::commands::{is_rebuild_cancelled, reset_rebuild_cancel};
 use serde::Serialize;
 use rand::seq::SliceRandom;
 use crate::utils::safe_truncate;
+use futures::{stream, StreamExt};
 
 /// Result of clustering operation
 #[derive(Debug, Clone, Serialize)]
@@ -896,20 +897,34 @@ async fn name_clusters_with_ai(
     }
 
     // Batch clusters for AI naming to prevent response truncation
+    // Run up to 10 concurrent API calls
+    const CONCURRENT_REQUESTS: usize = 10;
     let num_batches = (clusters_info.len() + NAMING_BATCH_SIZE - 1) / NAMING_BATCH_SIZE;
     if num_batches > 1 {
-        println!("[Clustering] Naming {} clusters in {} batches of ~{}",
-                 clusters_info.len(), num_batches, NAMING_BATCH_SIZE);
+        println!("[Clustering] Naming {} clusters in {} batches (~{} each, {} concurrent)",
+                 clusters_info.len(), num_batches, NAMING_BATCH_SIZE, CONCURRENT_REQUESTS.min(num_batches));
     }
 
-    for (batch_idx, batch) in clusters_info.chunks(NAMING_BATCH_SIZE).enumerate() {
-        if num_batches > 1 {
-            println!("[Clustering] Naming batch {}/{} ({} clusters)",
-                     batch_idx + 1, num_batches, batch.len());
-        }
+    // Create batch data with indices for tracking
+    let batches: Vec<(usize, Vec<(i32, Vec<String>)>)> = clusters_info
+        .chunks(NAMING_BATCH_SIZE)
+        .enumerate()
+        .map(|(idx, chunk)| (idx, chunk.to_vec()))
+        .collect();
 
-        // Call AI to name this batch of clusters
-        match ai_client::name_clusters(batch).await {
+    // Process batches in parallel with concurrency limit
+    let results: Vec<_> = stream::iter(batches)
+        .map(|(batch_idx, batch)| async move {
+            let result = ai_client::name_clusters(&batch).await;
+            (batch_idx, batch, result)
+        })
+        .buffer_unordered(CONCURRENT_REQUESTS)
+        .collect()
+        .await;
+
+    // Process results
+    for (batch_idx, batch, result) in results {
+        match result {
             Ok(ai_names) => {
                 for (cluster_id, name) in ai_names {
                     names.insert(cluster_id, name);
@@ -919,7 +934,7 @@ async fn name_clusters_with_ai(
                 eprintln!("[Clustering] AI naming failed for batch {}, using keyword fallback: {}",
                          batch_idx + 1, e);
                 // Fallback: use keywords from titles for this batch
-                for (cluster_id, titles) in batch {
+                for (cluster_id, titles) in &batch {
                     let combined = titles.join(" ");
                     let keywords = extract_keywords(&combined, 3);
                     let name = if keywords.is_empty() {
@@ -1394,16 +1409,33 @@ pub async fn name_unnamed_clusters(db: &Database) -> Result<NamingResult, String
         });
     }
 
-    // Batch AI naming (same logic as name_clusters_with_ai)
+    // Batch AI naming with parallel API calls (up to 10 concurrent)
+    const CONCURRENT_REQUESTS: usize = 10;
     let num_batches = (clusters_info.len() + NAMING_BATCH_SIZE - 1) / NAMING_BATCH_SIZE;
-    println!("[Naming] Naming {} clusters in {} batches", clusters_info.len(), num_batches);
+    println!("[Naming] Naming {} clusters in {} batches ({} concurrent)",
+             clusters_info.len(), num_batches, CONCURRENT_REQUESTS.min(num_batches));
 
+    // Create batch data with indices
+    let batches: Vec<(usize, Vec<(i32, Vec<String>)>)> = clusters_info
+        .chunks(NAMING_BATCH_SIZE)
+        .enumerate()
+        .map(|(idx, chunk)| (idx, chunk.to_vec()))
+        .collect();
+
+    // Process batches in parallel
+    let results: Vec<_> = stream::iter(batches)
+        .map(|(batch_idx, batch)| async move {
+            let result = ai_client::name_clusters(&batch).await;
+            (batch_idx, result)
+        })
+        .buffer_unordered(CONCURRENT_REQUESTS)
+        .collect()
+        .await;
+
+    // Apply results to database
     let mut named_count = 0;
-
-    for (batch_idx, batch) in clusters_info.chunks(NAMING_BATCH_SIZE).enumerate() {
-        println!("[Naming] Batch {}/{} ({} clusters)", batch_idx + 1, num_batches, batch.len());
-
-        match ai_client::name_clusters(batch).await {
+    for (batch_idx, result) in results {
+        match result {
             Ok(ai_names) => {
                 for (cluster_id, name) in ai_names {
                     // Update all items in this cluster with the new label

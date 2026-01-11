@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::settings;
 use crate::local_embeddings;
 use crate::classification::{classify_content, ContentType};
+use futures::{stream, StreamExt};
 
 /// Result of AI analysis for a node
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,20 +325,25 @@ Classification:"#,
 
 /// Batch classify multiple items using AI - CHEAP
 /// Returns a map of item_id -> content_type
+/// Runs up to 10 concurrent API calls
 pub async fn classify_batch_ai(items: &[(String, String)]) -> Result<Vec<(String, String)>, String> {
-    let mut results = Vec::new();
+    const CONCURRENT_REQUESTS: usize = 10;
 
-    for (id, content) in items {
-        match classify_content_ai(content).await {
-            Ok(content_type) => results.push((id.clone(), content_type)),
-            Err(e) => {
-                eprintln!("[AI Classify] Failed for {}: {}", id, e);
-                // Use pattern matcher fallback
-                let fallback = classify_content(content);
-                results.push((id.clone(), fallback.as_str().to_string()));
+    let results: Vec<_> = stream::iter(items.iter().cloned())
+        .map(|(id, content)| async move {
+            match classify_content_ai(&content).await {
+                Ok(content_type) => (id, content_type),
+                Err(e) => {
+                    eprintln!("[AI Classify] Failed for {}: {}", id, e);
+                    // Use pattern matcher fallback
+                    let fallback = classify_content(&content);
+                    (id, fallback.as_str().to_string())
+                }
             }
-        }
-    }
+        })
+        .buffer_unordered(CONCURRENT_REQUESTS)
+        .collect()
+        .await;
 
     Ok(results)
 }
