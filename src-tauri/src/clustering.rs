@@ -646,7 +646,7 @@ async fn cluster_single_group(
     // Global: Better cluster quality (no fragmentation/contamination) for small datasets
     // Batch + refinement: Required for large datasets (papers) to avoid O(n²) explosion
     const GLOBAL_THRESHOLD: usize = 10_000;
-    const BATCH_SIZE: usize = 300;
+    const BATCH_SIZE: usize = 10_000;
 
     // Time estimate for large datasets
     let comparisons = embeddings.len() * (embeddings.len() - 1) / 2;

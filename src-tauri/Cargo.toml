@@ -12,6 +12,12 @@ default-run = "mycelica"
 name = "mycelica_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+default = []
+# cuda feature: for CUDA <= 12.x with stable Rust
+# for CUDA 13.x, see patch section at end of file
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -46,10 +52,12 @@ tui-tree-widget = "0.19"
 nucleo = "0.5"
 arboard = "3"
 
-# Local embeddings via candle (git main for CUDA 13.x, requires nightly)
-candle-core = { git = "https://github.com/huggingface/candle", features = ["cuda"] }
-candle-nn = { git = "https://github.com/huggingface/candle", features = ["cuda"] }
-candle-transformers = { git = "https://github.com/huggingface/candle", features = ["cuda"] }
+# Local embeddings via candle
+# Current: git main (requires nightly Rust, supports CUDA 13.x)
+# For stable Rust (CPU only or CUDA ≤12.x): use version = "0.8" instead
+candle-core = { git = "https://github.com/huggingface/candle" }
+candle-nn = { git = "https://github.com/huggingface/candle" }
+candle-transformers = { git = "https://github.com/huggingface/candle" }
 tokenizers = "0.20"
 hf-hub = "0.3"
 
@@ -87,3 +95,14 @@ path = "src/bin/batch_import.rs"
 [[bin]]
 name = "mycelica-cli"
 path = "src/bin/cli.rs"
+
+# =============================================================================
+# Build Instructions
+# =============================================================================
+# With git candle (current config, requires nightly):
+#   CPU:        cargo +nightly build --release
+#   CUDA 13.x:  cargo +nightly build --release --features cuda
+#
+# For stable Rust, change candle deps above to version = "0.8":
+#   CPU:        cargo build --release
+#   CUDA ≤12.x: cargo build --release --features cuda

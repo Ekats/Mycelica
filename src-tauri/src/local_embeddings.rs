@@ -25,7 +25,8 @@ pub struct LocalEmbedder {
 impl LocalEmbedder {
     /// Load model from Hugging Face Hub (downloads on first use)
     pub fn new() -> Result<Self, String> {
-        // Try CUDA first, fall back to CPU if unavailable
+        // Try CUDA if feature enabled, otherwise CPU only
+        #[cfg(feature = "cuda")]
         let device = if candle_core::utils::cuda_is_available() {
             match Device::new_cuda(0) {
                 Ok(dev) => {
@@ -39,6 +40,12 @@ impl LocalEmbedder {
             }
         } else {
             println!("[LocalEmbeddings] CUDA not available, using CPU");
+            Device::Cpu
+        };
+
+        #[cfg(not(feature = "cuda"))]
+        let device = {
+            println!("[LocalEmbeddings] Using CPU (cuda feature not enabled)");
             Device::Cpu
         };
 
