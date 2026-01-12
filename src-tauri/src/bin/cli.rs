@@ -1002,14 +1002,14 @@ async fn handle_db(cmd: DbCommands, db: &Database, json: bool) -> Result<(), Str
                 println!(r#"{{"path":"{}","items":{},"categories":{},"edges":{},"processed":{},"embeddings":{}}}"#,
                     db.get_path(), total_items, categories, edges.len(), processed_items, items_with_embeddings);
             } else {
-                println!("Database:   {}", db.get_path());
-                println!("Items:      {:>6}", total_items);
-                println!("Categories: {:>6}", categories);
-                println!("Edges:      {:>6}", edges.len());
-                println!("Processed:  {:>6} / {}", processed_items, total_items);
-                println!("Embeddings: {:>6} / {}", items_with_embeddings, total_items);
+                log!("Database:   {}", db.get_path());
+                log!("Items:      {:>6}", total_items);
+                log!("Categories: {:>6}", categories);
+                log!("Edges:      {:>6}", edges.len());
+                log!("Processed:  {:>6} / {}", processed_items, total_items);
+                log!("Embeddings: {:>6} / {}", items_with_embeddings, total_items);
                 if let Some(u) = universe {
-                    println!("Hierarchy:  {} levels, root=\"{}\"", max_depth, u.title);
+                    log!("Hierarchy:  {} levels, root=\"{}\"", max_depth, u.title);
                 }
             }
         }
@@ -1185,9 +1185,9 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
             let api_key = settings::get_openaire_api_key();
 
             if !quiet {
-                eprintln!("[OpenAIRE] Searching: \"{}\"", query);
+                log!("[OpenAIRE] Searching: \"{}\"", query);
                 if let Some(ref c) = country {
-                    eprintln!("[OpenAIRE]   Country: {}", c);
+                    log!("[OpenAIRE]   Country: {}", c);
                 }
             }
 
@@ -1213,19 +1213,19 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
             ).await?;
 
             if !quiet {
-                eprintln!();
+                log!("");
             }
 
             if json {
                 println!(r#"{{"papers_imported":{},"pdfs_downloaded":{},"duplicates_skipped":{},"errors":{}}}"#,
                     result.papers_imported, result.pdfs_downloaded, result.duplicates_skipped, result.errors.len());
             } else {
-                println!("Imported {} papers, {} PDFs, {} duplicates skipped",
+                log!("Imported {} papers, {} PDFs, {} duplicates skipped",
                     result.papers_imported, result.pdfs_downloaded, result.duplicates_skipped);
                 if !result.errors.is_empty() {
-                    println!("Errors: {}", result.errors.len());
+                    log!("Errors: {}", result.errors.len());
                     for (i, err) in result.errors.iter().take(5).enumerate() {
-                        println!("  {}. {}", i + 1, err);
+                        log!("  {}. {}", i + 1, err);
                     }
                 }
             }
@@ -1248,7 +1248,7 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
                 println!(r#"{{"conversations_imported":{},"exchanges_imported":{},"skipped":{},"errors":{}}}"#,
                     result.conversations_imported, result.exchanges_imported, result.skipped, result.errors.len());
             } else {
-                println!("Imported {} files, {} items", result.conversations_imported, result.exchanges_imported);
+                log!("Imported {} files, {} items", result.conversations_imported, result.exchanges_imported);
             }
         }
         ImportCommands::Claude { path } => {
@@ -1261,7 +1261,7 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
                 println!(r#"{{"conversations_imported":{},"exchanges_imported":{},"skipped":{},"errors":{}}}"#,
                     result.conversations_imported, result.exchanges_imported, result.skipped, result.errors.len());
             } else {
-                println!("Imported {} conversations, {} exchanges",
+                log!("Imported {} conversations, {} exchanges",
                     result.conversations_imported, result.exchanges_imported);
             }
         }
@@ -1275,7 +1275,7 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
                 println!(r#"{{"conversations_imported":{},"exchanges_imported":{},"skipped":{},"errors":{}}}"#,
                     result.conversations_imported, result.exchanges_imported, result.skipped, result.errors.len());
             } else {
-                println!("Imported {} conversations, {} exchanges",
+                log!("Imported {} conversations, {} exchanges",
                     result.conversations_imported, result.exchanges_imported);
             }
         }
@@ -1286,7 +1286,7 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
                 println!(r#"{{"notes_imported":{},"skipped":{},"errors":{}}}"#,
                     result.notes_imported, result.skipped, result.errors.len());
             } else {
-                println!("Imported {} notes, {} skipped", result.notes_imported, result.skipped);
+                log!("Imported {} notes, {} skipped", result.notes_imported, result.skipped);
             }
         }
         ImportCommands::Code { path, language, update } => {
@@ -1295,12 +1295,12 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
 
             if !quiet {
                 if update {
-                    eprintln!("[Code] Update mode: {} (will replace existing nodes)", path);
+                    log!("[Code] Update mode: {} (will replace existing nodes)", path);
                 } else {
-                    eprintln!("[Code] Scanning: {} (respects .gitignore)", path);
+                    log!("[Code] Scanning: {} (respects .gitignore)", path);
                 }
                 if let Some(ref lang) = language {
-                    eprintln!("[Code]   Language filter: {}", lang);
+                    log!("[Code]   Language filter: {}", lang);
                 }
             }
 
@@ -1323,7 +1323,7 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
                     match db.delete_nodes_by_file_path(file) {
                         Ok(deleted) if deleted > 0 => {
                             if !quiet {
-                                eprintln!("  Deleted {} nodes from {}", deleted, file);
+                                log!("  Deleted {} nodes from {}", deleted, file);
                             }
                             total_deleted += deleted;
                         }
@@ -1331,7 +1331,7 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
                     }
                 }
                 if !quiet && total_deleted > 0 {
-                    eprintln!("[Code] Deleted {} existing nodes", total_deleted);
+                    log!("[Code] Deleted {} existing nodes", total_deleted);
                 }
             }
 
@@ -1364,7 +1364,7 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
                 // Generate embeddings for nodes without them
                 if !new_node_ids.is_empty() {
                     if !quiet {
-                        eprintln!("[Code] Generating embeddings for {} nodes...", new_node_ids.len());
+                        log!("[Code] Generating embeddings for {} nodes...", new_node_ids.len());
                     }
                     for node_id in &new_node_ids {
                         if db.get_node_embedding(node_id).ok().flatten().is_none() {
@@ -1388,7 +1388,7 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
 
                 if !functions.is_empty() {
                     if !quiet {
-                        eprintln!("[Code] Refreshing Calls edges for {} functions...", functions.len());
+                        log!("[Code] Refreshing Calls edges for {} functions...", functions.len());
                     }
 
                     // Build function name index
@@ -1446,34 +1446,34 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
                 println!("{}", serde_json::to_string(&result).map_err(|e| e.to_string())?);
             } else {
                 if update && total_deleted > 0 {
-                    println!("Updated {} files (replaced {} existing nodes):", result.files_processed, total_deleted);
+                    log!("Updated {} files (replaced {} existing nodes):", result.files_processed, total_deleted);
                 } else {
-                    println!("Imported {} items from {} files:", result.total_items(), result.files_processed);
+                    log!("Imported {} items from {} files:", result.total_items(), result.files_processed);
                 }
-                if result.functions > 0 { println!("  Functions: {}", result.functions); }
-                if result.structs > 0 { println!("  Structs: {}", result.structs); }
-                if result.enums > 0 { println!("  Enums: {}", result.enums); }
-                if result.traits > 0 { println!("  Traits: {}", result.traits); }
-                if result.impls > 0 { println!("  Impl blocks: {}", result.impls); }
-                if result.modules > 0 { println!("  Modules: {}", result.modules); }
-                if result.macros > 0 { println!("  Macros: {}", result.macros); }
-                if result.docs > 0 { println!("  Docs: {}", result.docs); }
-                println!("  Edges created: {}", result.edges_created);
-                if result.doc_edges > 0 { println!("  Doc→code edges: {}", result.doc_edges); }
+                if result.functions > 0 { log!("  Functions: {}", result.functions); }
+                if result.structs > 0 { log!("  Structs: {}", result.structs); }
+                if result.enums > 0 { log!("  Enums: {}", result.enums); }
+                if result.traits > 0 { log!("  Traits: {}", result.traits); }
+                if result.impls > 0 { log!("  Impl blocks: {}", result.impls); }
+                if result.modules > 0 { log!("  Modules: {}", result.modules); }
+                if result.macros > 0 { log!("  Macros: {}", result.macros); }
+                if result.docs > 0 { log!("  Docs: {}", result.docs); }
+                log!("  Edges created: {}", result.edges_created);
+                if result.doc_edges > 0 { log!("  Doc→code edges: {}", result.doc_edges); }
                 if update {
-                    if embeddings_generated > 0 { println!("  Embeddings generated: {}", embeddings_generated); }
-                    if calls_edges_created > 0 { println!("  Calls edges refreshed: {}", calls_edges_created); }
+                    if embeddings_generated > 0 { log!("  Embeddings generated: {}", embeddings_generated); }
+                    if calls_edges_created > 0 { log!("  Calls edges refreshed: {}", calls_edges_created); }
                 }
                 if result.files_skipped > 0 {
-                    println!("  Files skipped: {}", result.files_skipped);
+                    log!("  Files skipped: {}", result.files_skipped);
                 }
                 if !result.errors.is_empty() {
-                    eprintln!("\nErrors ({}):", result.errors.len());
+                    elog!("\nErrors ({}):", result.errors.len());
                     for err in &result.errors[..result.errors.len().min(5)] {
-                        eprintln!("  {}", err);
+                        elog!("  {}", err);
                     }
                     if result.errors.len() > 5 {
-                        eprintln!("  ... and {} more", result.errors.len() - 5);
+                        elog!("  ... and {} more", result.errors.len() - 5);
                     }
                 }
             }
@@ -1513,11 +1513,11 @@ async fn handle_node(cmd: NodeCommands, db: &Database, json: bool) -> Result<(),
                 println!("[{}]", items.join(","));
             } else {
                 for node in &filtered {
-                    let marker = if node.is_item { "📄" } else { "📁" };
-                    let processed_marker = if node.is_processed { "✓" } else { "○" };
-                    println!("{} {} {} {}", marker, processed_marker, &node.id[..8], node.title);
+                    let marker = if node.is_item { "[I]" } else { "[C]" };
+                    let processed_marker = if node.is_processed { "+" } else { "o" };
+                    log!("{} {} {} {}", marker, processed_marker, &node.id[..8], node.title);
                 }
-                println!("\n{} nodes", filtered.len());
+                log!("\n{} nodes", filtered.len());
             }
         }
         NodeCommands::Get { id } => {
@@ -1536,20 +1536,20 @@ async fn handle_node(cmd: NodeCommands, db: &Database, json: bool) -> Result<(),
                     node.parent_id.as_ref().map(|p| format!("\"{}\"", p)).unwrap_or("null".to_string())
                 );
             } else {
-                println!("ID:       {}", node.id);
-                println!("Title:    {}", node.title);
-                println!("Type:     {}", if node.is_item { "Item" } else { "Category" });
-                println!("Depth:    {}", node.depth);
-                println!("Children: {}", node.child_count);
+                log!("ID:       {}", node.id);
+                log!("Title:    {}", node.title);
+                log!("Type:     {}", if node.is_item { "Item" } else { "Category" });
+                log!("Depth:    {}", node.depth);
+                log!("Children: {}", node.child_count);
                 if let Some(ref parent) = node.parent_id {
-                    println!("Parent:   {}", parent);
+                    log!("Parent:   {}", parent);
                 }
                 if let Some(ref summary) = node.summary {
-                    println!("\nSummary:\n{}", summary);
+                    log!("\nSummary:\n{}", summary);
                 }
                 if let Some(ref content) = node.content {
                     let preview = if content.len() > 500 { &content[..500] } else { content };
-                    println!("\nContent:\n{}", preview);
+                    log!("\nContent:\n{}", preview);
                 }
             }
         }
@@ -3431,14 +3431,14 @@ async fn handle_search(query: &str, type_filter: &str, limit: u32, db: &Database
         println!("[{}]", items.join(","));
     } else {
         if filtered.is_empty() {
-            println!("No results for '{}'", query);
+            log!("No results for '{}'", query);
         } else {
-            println!("Found {} results for '{}':\n", filtered.len(), query);
+            log!("Found {} results for '{}':\n", filtered.len(), query);
             for node in &filtered {
-                let emoji = node.emoji.as_deref().unwrap_or(if node.is_item { "📄" } else { "📁" });
+                let emoji = if node.is_item { "[I]" } else { "[C]" };
                 let title = node.ai_title.as_ref().unwrap_or(&node.title);
                 let type_str = if node.is_item { "item" } else { "cat " };
-                println!("{} {} [{}] {}", emoji, title, type_str, &node.id);
+                log!("{} {} [{}] {}", emoji, title, type_str, &node.id);
             }
         }
     }
@@ -3457,8 +3457,8 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
             let (total, _, _, _, _, _, _, _) = db.get_stats().map_err(|e| e.to_string())?;
 
             if !force {
-                println!("\n⚠️  WARNING: This will permanently delete {} nodes!", total);
-                println!("This action CANNOT be undone.\n");
+                log!("\nWARNING: This will permanently delete {} nodes!", total);
+                log!("This action CANNOT be undone.\n");
                 print!("Type 'yes' to confirm: ");
                 std::io::stdout().flush().ok();
 
@@ -3472,7 +3472,7 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
 
             db.delete_all_nodes().map_err(|e| e.to_string())?;
             db.delete_all_edges().map_err(|e| e.to_string())?;
-            println!("✓ Deleted {} nodes and all edges", total);
+            log!("Deleted {} nodes and all edges", total);
         }
 
         MaintenanceCommands::ResetAi { force } => {
@@ -3480,7 +3480,7 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
                 return Err("Operation cancelled".into());
             }
             let count = db.reset_ai_processing().map_err(|e| e.to_string())?;
-            println!("✓ Reset AI processing for {} nodes", count);
+            log!("Reset AI processing for {} nodes", count);
         }
 
         MaintenanceCommands::ResetClusters { force } => {
@@ -3491,7 +3491,7 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
             db.clear_item_parents().map_err(|e| e.to_string())?;
             // Reset needs_clustering flag so items get re-clustered
             let count = db.mark_all_items_need_clustering().map_err(|e| e.to_string())?;
-            println!("✓ Reset clustering for {} items (cleared parents, cluster_id, cluster_label, needs_clustering=1)", count);
+            log!("Reset clustering for {} items (cleared parents, cluster_id, cluster_label, needs_clustering=1)", count);
         }
 
         MaintenanceCommands::ResetPrivacy { force } => {
@@ -3499,7 +3499,7 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
                 return Err("Operation cancelled".into());
             }
             let count = db.reset_all_privacy_flags().map_err(|e| e.to_string())?;
-            println!("✓ Reset privacy scores for {} nodes", count);
+            log!("Reset privacy scores for {} nodes", count);
         }
 
         MaintenanceCommands::ClearEmbeddings { force } => {
@@ -3507,7 +3507,7 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
                 return Err("Operation cancelled".into());
             }
             let count = db.clear_all_embeddings().map_err(|e| e.to_string())?;
-            println!("✓ Cleared {} embeddings", count);
+            log!("Cleared {} embeddings", count);
         }
 
         MaintenanceCommands::ClearHierarchy { force } => {
@@ -3518,7 +3518,7 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
             db.clear_item_parents().map_err(|e| e.to_string())?;
             // Delete intermediate hierarchy nodes (clusters, categories)
             let deleted = db.delete_hierarchy_nodes().map_err(|e| e.to_string())?;
-            println!("✓ Cleared hierarchy: {} intermediate nodes deleted", deleted);
+            log!("Cleared hierarchy: {} intermediate nodes deleted", deleted);
         }
 
         MaintenanceCommands::ClearTags { force } => {
@@ -3526,7 +3526,7 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
                 return Err("Operation cancelled".into());
             }
             db.delete_all_tags().map_err(|e| e.to_string())?;
-            println!("✓ Cleared all tags");
+            log!("Cleared all tags");
         }
 
         MaintenanceCommands::DeleteEmpty { force } => {
@@ -3536,55 +3536,55 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
             }
 
             let deleted = db.delete_empty_items().map_err(|e| e.to_string())?;
-            println!("✓ Deleted {} empty items", deleted);
+            log!("Deleted {} empty items", deleted);
         }
 
         MaintenanceCommands::Vacuum => {
             // Fix counts, depths, and prune edges
-            println!("Tidying database...");
+            log!("Tidying database...");
             db.fix_all_child_counts().map_err(|e| e.to_string())?;
             db.fix_all_depths().map_err(|e| e.to_string())?;
             db.prune_dead_edges().map_err(|e| e.to_string())?;
-            println!("✓ Database tidied (for VACUUM, use: sqlite3 <db> 'VACUUM')");
+            log!("Database tidied (for VACUUM, use: sqlite3 <db> 'VACUUM')");
         }
 
         MaintenanceCommands::FixCounts { verbose } => {
             let fixed = db.fix_all_child_counts().map_err(|e| e.to_string())?;
             if verbose {
-                println!("Fixed {} node child counts", fixed);
+                log!("Fixed {} node child counts", fixed);
             } else {
-                println!("✓ Fixed child counts");
+                log!("Fixed child counts");
             }
         }
 
         MaintenanceCommands::FixDepths { verbose } => {
             let fixed = db.fix_all_depths().map_err(|e| e.to_string())?;
             if verbose {
-                println!("Fixed {} node depths", fixed);
+                log!("Fixed {} node depths", fixed);
             } else {
-                println!("✓ Fixed depths");
+                log!("Fixed depths");
             }
         }
 
         MaintenanceCommands::PruneEdges { verbose } => {
             let pruned = db.prune_dead_edges().map_err(|e| e.to_string())?;
             if verbose {
-                println!("Pruned {} dead edges", pruned);
+                log!("Pruned {} dead edges", pruned);
             } else {
-                println!("✓ Pruned dead edges");
+                log!("Pruned dead edges");
             }
         }
 
         MaintenanceCommands::PrecomputeFosEdges => {
-            println!("Precomputing FOS edge sets...");
+            log!("Precomputing FOS edge sets...");
             let count = db.precompute_fos_edges().map_err(|e| e.to_string())?;
-            println!("✓ Precomputed {} edges across FOS categories", count);
+            log!("Precomputed {} edges across FOS categories", count);
         }
 
         MaintenanceCommands::IndexEdges => {
-            println!("Indexing edges by parent for fast per-view loading...");
+            log!("Indexing edges by parent for fast per-view loading...");
             let count = db.update_edge_parents().map_err(|e| e.to_string())?;
-            println!("✓ Indexed {} edges", count);
+            log!("Indexed {} edges", count);
         }
     }
     Ok(())
