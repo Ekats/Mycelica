@@ -74,6 +74,8 @@ use commands::{
     get_privacy_threshold, set_privacy_threshold,
     // Tips commands
     get_show_tips, set_show_tips,
+    // Ollama / LLM backend commands
+    check_ollama_status, get_llm_backend, set_llm_backend, get_ollama_model, set_ollama_model,
 };
 use db::Database;
 use std::sync::Arc;
@@ -373,6 +375,12 @@ pub fn run() {
             set_privacy_threshold,
             get_show_tips,
             set_show_tips,
+            // Ollama / LLM backend
+            check_ollama_status,
+            get_llm_backend,
+            set_llm_backend,
+            get_ollama_model,
+            set_ollama_model,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

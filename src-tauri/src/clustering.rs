@@ -646,8 +646,8 @@ async fn cluster_single_group(
     // Step 4: Global vs Batch clustering based on dataset size
     // Global: Better cluster quality (no fragmentation/contamination) for small datasets
     // Batch + refinement: Required for large datasets (papers) to avoid O(n²) explosion
-    const GLOBAL_THRESHOLD: usize = 10_000;
-    const BATCH_SIZE: usize = 10_000;
+    const GLOBAL_THRESHOLD: usize = 50_000;  // Use global clustering up to 50k items
+    const BATCH_SIZE: usize = 25_000;
 
     // Time estimate for large datasets
     let comparisons = embeddings.len() * (embeddings.len() - 1) / 2;

@@ -54,17 +54,30 @@ pub fn generate_tags_from_item_vocabulary(db: &Database) -> Result<usize, String
 
     println!("[Tags] Found {} unique tag strings across items", tag_occurrences.len());
 
-    // 3. Embed each unique tag
+    // 3. Embed each unique tag (batched to avoid memory issues)
     let tag_strings: Vec<&str> = tag_occurrences.keys().map(|s| s.as_str()).collect();
 
     println!("[Tags] Embedding {} tags...", tag_strings.len());
-    let embeddings = local_embeddings::generate_batch(&tag_strings)
-        .map_err(|e| format!("Failed to embed tags: {}", e))?;
+
+    const TAG_BATCH_SIZE: usize = 1000;
+    let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(tag_strings.len());
+
+    for (batch_idx, batch) in tag_strings.chunks(TAG_BATCH_SIZE).enumerate() {
+        if tag_strings.len() > TAG_BATCH_SIZE {
+            println!("[Tags] Embedding batch {}/{} ({} tags)...",
+                batch_idx + 1,
+                (tag_strings.len() + TAG_BATCH_SIZE - 1) / TAG_BATCH_SIZE,
+                batch.len());
+        }
+        let batch_embeddings = local_embeddings::generate_batch(batch)
+            .map_err(|e| format!("Failed to embed tags batch {}: {}", batch_idx, e))?;
+        all_embeddings.extend(batch_embeddings);
+    }
 
     // Build tag -> embedding map
     let tag_embeddings: HashMap<&str, &Vec<f32>> = tag_strings
         .iter()
-        .zip(embeddings.iter())
+        .zip(all_embeddings.iter())
         .map(|(&tag, emb)| (tag, emb))
         .collect();
 

@@ -65,6 +65,20 @@ pub struct Settings {
     /// Show tips/hints in the UI (default: true)
     #[serde(default = "default_true")]
     pub show_tips: bool,
+    /// LLM backend: "anthropic" or "ollama" (default: "anthropic")
+    #[serde(default = "default_llm_backend")]
+    pub llm_backend: String,
+    /// Ollama model name (default: "qwen2.5:7b")
+    #[serde(default = "default_ollama_model")]
+    pub ollama_model: String,
+}
+
+fn default_llm_backend() -> String {
+    "anthropic".to_string()
+}
+
+fn default_ollama_model() -> String {
+    "qwen2.5:7b".to_string()
 }
 
 fn default_cache_ttl() -> u64 {
@@ -94,6 +108,8 @@ impl Default for Settings {
             clustering_secondary_threshold: Some(0.60), // Secondary assignment threshold
             privacy_threshold: 0.5, // Items below this go to Personal category
             show_tips: true, // Show tips by default
+            llm_backend: "anthropic".to_string(), // Use Anthropic by default
+            ollama_model: "qwen2.5:7b".to_string(), // Default Ollama model
         }
     }
 }
@@ -604,5 +620,76 @@ pub fn set_show_tips(enabled: bool) -> Result<(), String> {
     settings.save(&config_path)?;
 
     println!("Show tips set to: {}", enabled);
+    Ok(())
+}
+
+// ==================== LLM Backend ====================
+
+/// Get LLM backend: "anthropic" or "ollama" (default: "anthropic")
+pub fn get_llm_backend() -> String {
+    let guard = SETTINGS.read().ok();
+    guard
+        .as_ref()
+        .and_then(|g| g.as_ref())
+        .map(|s| s.llm_backend.clone())
+        .unwrap_or_else(|| "anthropic".to_string())
+}
+
+/// Set LLM backend: "anthropic" or "ollama"
+pub fn set_llm_backend(backend: String) -> Result<(), String> {
+    // Validate backend
+    if backend != "anthropic" && backend != "ollama" {
+        return Err(format!("Invalid LLM backend: {}. Must be 'anthropic' or 'ollama'", backend));
+    }
+
+    let mut settings_guard = SETTINGS.write()
+        .map_err(|_| "Failed to acquire settings lock")?;
+
+    let settings = settings_guard.get_or_insert_with(Settings::default);
+    settings.llm_backend = backend.clone();
+
+    // Save to disk
+    let config_path = CONFIG_PATH.read()
+        .map_err(|_| "Failed to acquire config path lock")?
+        .clone()
+        .ok_or("Settings not initialized")?;
+
+    settings.save(&config_path)?;
+
+    println!("LLM backend set to: {}", backend);
+    Ok(())
+}
+
+/// Get Ollama model name (default: "qwen2.5:7b")
+pub fn get_ollama_model() -> String {
+    let guard = SETTINGS.read().ok();
+    guard
+        .as_ref()
+        .and_then(|g| g.as_ref())
+        .map(|s| s.ollama_model.clone())
+        .unwrap_or_else(|| "qwen2.5:7b".to_string())
+}
+
+/// Set Ollama model name
+pub fn set_ollama_model(model: String) -> Result<(), String> {
+    if model.is_empty() {
+        return Err("Ollama model name cannot be empty".to_string());
+    }
+
+    let mut settings_guard = SETTINGS.write()
+        .map_err(|_| "Failed to acquire settings lock")?;
+
+    let settings = settings_guard.get_or_insert_with(Settings::default);
+    settings.ollama_model = model.clone();
+
+    // Save to disk
+    let config_path = CONFIG_PATH.read()
+        .map_err(|_| "Failed to acquire config path lock")?
+        .clone()
+        .ok_or("Settings not initialized")?;
+
+    settings.save(&config_path)?;
+
+    println!("Ollama model set to: {}", model);
     Ok(())
 }

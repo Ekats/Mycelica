@@ -1,6 +1,7 @@
-//! Anthropic Claude API client for AI-powered node processing
+//! AI client for node processing - supports Anthropic Claude and local Ollama
 //!
 //! Provides title, summary, and tag generation for conversation nodes.
+//! Can use either Anthropic API or local Ollama for inference.
 
 use serde::{Deserialize, Serialize};
 use crate::settings;
@@ -50,9 +51,120 @@ struct ContentBlock {
     text: String,
 }
 
-/// Check if AI features are available (API key is set)
+// ==================== Ollama API ====================
+
+/// Ollama API request format
+#[derive(Debug, Serialize)]
+struct OllamaRequest {
+    model: String,
+    prompt: String,
+    format: String,  // "json" for structured output
+    stream: bool,
+}
+
+/// Ollama API response format
+#[derive(Debug, Deserialize)]
+struct OllamaResponse {
+    response: String,
+    done: bool,
+}
+
+/// Ollama tags API response (list models)
+#[derive(Debug, Deserialize)]
+struct OllamaTagsResponse {
+    models: Vec<OllamaModel>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct OllamaModel {
+    pub name: String,
+    #[serde(default)]
+    pub size: u64,
+}
+
+/// Check if Ollama is available at localhost:11434
+pub async fn ollama_available() -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap_or_default();
+
+    client
+        .get("http://localhost:11434/api/tags")
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+/// Get list of available Ollama models
+pub async fn ollama_list_models() -> Result<Vec<OllamaModel>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("Failed to create client: {}", e))?;
+
+    let response = client
+        .get("http://localhost:11434/api/tags")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to connect to Ollama: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("Ollama API error: {}", response.status()));
+    }
+
+    let tags: OllamaTagsResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Ollama response: {}", e))?;
+
+    Ok(tags.models)
+}
+
+/// Generate text using Ollama (with JSON format)
+pub async fn ollama_generate(prompt: &str, model: &str) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))  // LLMs can be slow
+        .build()
+        .map_err(|e| format!("Failed to create client: {}", e))?;
+
+    let request = OllamaRequest {
+        model: model.to_string(),
+        prompt: prompt.to_string(),
+        format: "json".to_string(),
+        stream: false,
+    };
+
+    let response = client
+        .post("http://localhost:11434/api/generate")
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| format!("Ollama request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Ollama API error {}: {}", status, body));
+    }
+
+    let ollama_response: OllamaResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Ollama response: {}", e))?;
+
+    Ok(ollama_response.response)
+}
+
+// ==================== AI Availability ====================
+
+/// Check if AI features are available (API key is set OR Ollama backend selected)
 pub fn is_available() -> bool {
-    settings::has_api_key()
+    match settings::get_llm_backend().as_str() {
+        "ollama" => true,  // Ollama availability checked separately
+        _ => settings::has_api_key(),
+    }
 }
 
 /// Get the API key from settings (checks env var first, then stored setting)
@@ -60,36 +172,9 @@ fn get_api_key() -> Option<String> {
     settings::get_api_key()
 }
 
-/// Analyze a node's content to generate title, summary, and tags
-///
-/// Uses tiered processing:
-/// - HIDDEN items (debug, code, paste, trivial): Skip API, extract simple title
-/// - VISIBLE/SUPPORTING items: Full API analysis
-pub async fn analyze_node(raw_title: &str, content: &str) -> Result<AiAnalysisResult, String> {
-    // === Tiered processing: classify first to determine processing depth ===
-    let content_type = classify_content(content);
-
-    // HIDDEN tier: skip expensive API call, just extract title
-    if content_type.is_hidden() {
-        return Ok(extract_basic_metadata(raw_title, content, content_type));
-    }
-
-    // VISIBLE/SUPPORTING: proceed with full API analysis
-    let api_key = get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
-
-    // Truncate content for API efficiency (find safe UTF-8 boundary)
-    let content_preview = if content.len() > 3000 {
-        // Find a safe char boundary at or before 3000
-        let mut end = 3000;
-        while end > 0 && !content.is_char_boundary(end) {
-            end -= 1;
-        }
-        &content[..end]
-    } else {
-        content
-    };
-
-    let prompt = format!(
+/// Build the analysis prompt for a content preview
+fn build_analysis_prompt(content_preview: &str) -> String {
+    format!(
         r#"Analyze this conversation and provide JSON:
 
 CONTENT:
@@ -126,7 +211,70 @@ HIDDEN:
 
 JSON only: {{"content_type":"...","title":"...","summary":"...","tags":[...]}}"#,
         content_preview
-    );
+    )
+}
+
+/// Truncate content to a safe UTF-8 boundary
+fn truncate_content(content: &str, max_len: usize) -> &str {
+    if content.len() > max_len {
+        let mut end = max_len;
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        &content[..end]
+    } else {
+        content
+    }
+}
+
+/// Analyze a node's content to generate title, summary, and tags
+///
+/// Uses tiered processing:
+/// - HIDDEN items (debug, code, paste, trivial): Skip API, extract simple title
+/// - VISIBLE/SUPPORTING items: Full API analysis
+///
+/// Routes to Anthropic or Ollama based on settings::get_llm_backend()
+pub async fn analyze_node(raw_title: &str, content: &str) -> Result<AiAnalysisResult, String> {
+    // === Tiered processing: classify first to determine processing depth ===
+    let content_type = classify_content(content);
+
+    // HIDDEN tier: skip expensive API call, just extract title
+    if content_type.is_hidden() {
+        return Ok(extract_basic_metadata(raw_title, content, content_type));
+    }
+
+    // Route based on LLM backend setting
+    let backend = settings::get_llm_backend();
+    match backend.as_str() {
+        "ollama" => analyze_node_ollama(raw_title, content).await,
+        _ => analyze_node_anthropic(raw_title, content).await,
+    }
+}
+
+/// Analyze node using Ollama (local LLM)
+async fn analyze_node_ollama(raw_title: &str, content: &str) -> Result<AiAnalysisResult, String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+
+    let model = settings::get_ollama_model();
+
+    // Log model once per session
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        println!("[Ollama] Using model: {}", model);
+    }
+
+    let content_preview = truncate_content(content, 3000);
+    let prompt = build_analysis_prompt(content_preview);
+
+    let text = ollama_generate(&prompt, &model).await?;
+    parse_ai_response(&text, raw_title)
+}
+
+/// Analyze node using Anthropic Claude API
+async fn analyze_node_anthropic(raw_title: &str, content: &str) -> Result<AiAnalysisResult, String> {
+    let api_key = get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
+    let content_preview = truncate_content(content, 3000);
+    let prompt = build_analysis_prompt(content_preview);
 
     let request = AnthropicRequest {
         model: "claude-haiku-4-5-20251001".to_string(),

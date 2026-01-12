@@ -24,7 +24,7 @@ Run once. Database persists. **Skip if `.mycelica.db` exists.**
 ```bash
 # Install CLI globally
 cd src-tauri
-cargo install --path . --bin mycelica-cli
+cargo +nightly install --path . --bin mycelica-cli --features cuda --force
 cd ..
 
 # Create project database in repo root

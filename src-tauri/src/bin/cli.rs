@@ -11,8 +11,108 @@ use serde_json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::io::Write;
-use chrono::{Timelike, Utc};
+use chrono::{Timelike, Utc, Datelike, Local};
 use futures::{stream, StreamExt};
+
+// ============================================================================
+// Logging Infrastructure
+// ============================================================================
+
+use std::sync::Mutex;
+use std::fs::{self, File, OpenOptions};
+
+static LOG_FILE: Mutex<Option<File>> = Mutex::new(None);
+
+/// Initialize logging - creates log file and cleans old logs
+fn init_logging() -> Option<PathBuf> {
+    let log_dir = dirs::data_dir()
+        .map(|p| p.join("com.mycelica.app").join("logs"))
+        .unwrap_or_else(|| PathBuf::from("logs"));
+
+    if fs::create_dir_all(&log_dir).is_err() {
+        return None;
+    }
+
+    // Clean logs older than 7 days
+    if let Ok(entries) = fs::read_dir(&log_dir) {
+        let cutoff = Local::now() - chrono::Duration::days(7);
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("mycelica-") && name.ends_with(".log") {
+                    // Parse date from filename: mycelica-YYYY-MM-DD.log
+                    if let Some(date_str) = name.strip_prefix("mycelica-").and_then(|s| s.strip_suffix(".log")) {
+                        if let Ok(date) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                            if date < cutoff.date_naive() {
+                                let _ = fs::remove_file(&path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Create today's log file
+    let today = Local::now();
+    let log_filename = format!("mycelica-{:04}-{:02}-{:02}.log", today.year(), today.month(), today.day());
+    let log_path = log_dir.join(&log_filename);
+
+    if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+        *LOG_FILE.lock().unwrap() = Some(file);
+        Some(log_path)
+    } else {
+        None
+    }
+}
+
+/// Log to both terminal and file
+#[allow(unused)]
+fn log_both(msg: &str) {
+    let now = Local::now();
+    let timestamp = format!("[{:02}:{:02}:{:02}]", now.hour(), now.minute(), now.second());
+
+    // Print to terminal
+    println!("{}", msg);
+
+    // Write to log file
+    if let Ok(mut guard) = LOG_FILE.lock() {
+        if let Some(ref mut file) = *guard {
+            let _ = writeln!(file, "{} {}", timestamp, msg);
+        }
+    }
+}
+
+/// Log error to both terminal and file
+#[allow(unused)]
+fn elog_both(msg: &str) {
+    let now = Local::now();
+    let timestamp = format!("[{:02}:{:02}:{:02}]", now.hour(), now.minute(), now.second());
+
+    // Print to terminal
+    eprintln!("{}", msg);
+
+    // Write to log file
+    if let Ok(mut guard) = LOG_FILE.lock() {
+        if let Some(ref mut file) = *guard {
+            let _ = writeln!(file, "{} [ERROR] {}", timestamp, msg);
+        }
+    }
+}
+
+/// Macro for logging to both terminal and file
+macro_rules! log {
+    ($($arg:tt)*) => {
+        log_both(&format!($($arg)*))
+    };
+}
+
+/// Macro for error logging to both terminal and file
+macro_rules! elog {
+    ($($arg:tt)*) => {
+        elog_both(&format!($($arg)*))
+    };
+}
 
 // TUI imports
 use crossterm::{
@@ -801,10 +901,15 @@ enum CodeCommands {
 
 #[tokio::main]
 async fn main() {
+    // Initialize logging
+    if let Some(log_path) = init_logging() {
+        eprintln!("Logging to: {}", log_path.display());
+    }
+
     let cli = Cli::parse();
 
     if let Err(e) = run_cli(cli).await {
-        eprintln!("Error: {}", e);
+        elog!("Error: {}", e);
         std::process::exit(1);
     }
 }
@@ -1562,43 +1667,43 @@ async fn handle_node(cmd: NodeCommands, db: &Database, json: bool) -> Result<(),
 async fn handle_hierarchy(cmd: HierarchyCommands, db: &Database, json: bool, quiet: bool) -> Result<(), String> {
     match cmd {
         HierarchyCommands::Build => {
-            if !quiet { eprintln!("Building hierarchy..."); }
+            if !quiet { elog!("Building hierarchy..."); }
             hierarchy::build_hierarchy(db)?;
             if json {
-                println!(r#"{{"status":"ok"}}"#);
+                log!(r#"{{"status":"ok"}}"#);
             } else {
-                println!("Hierarchy built successfully");
+                log!("Hierarchy built successfully");
             }
         }
         HierarchyCommands::Rebuild => {
-            if !quiet { eprintln!("Rebuilding hierarchy (this may take a while)..."); }
+            if !quiet { elog!("Rebuilding hierarchy (this may take a while)..."); }
             db.delete_hierarchy_nodes().map_err(|e| e.to_string())?;
             hierarchy::build_hierarchy(db)?;
             if json {
-                println!(r#"{{"status":"ok"}}"#);
+                log!(r#"{{"status":"ok"}}"#);
             } else {
-                println!("Hierarchy rebuilt successfully");
+                log!("Hierarchy rebuilt successfully");
             }
         }
         HierarchyCommands::RebuildLite => {
-            if !quiet { eprintln!("Rebuilding hierarchy (lite, no AI)..."); }
+            if !quiet { elog!("Rebuilding hierarchy (lite, no AI)..."); }
             // Use clustering with lite mode
             let result = clustering::cluster_with_embeddings_lite(db).await?;
             if json {
-                println!(r#"{{"clusters_created":{},"items_assigned":{}}}"#,
+                log!(r#"{{"clusters_created":{},"items_assigned":{}}}"#,
                     result.clusters_created, result.items_assigned);
             } else {
-                println!("Created {} clusters, assigned {} items",
+                log!("Created {} clusters, assigned {} items",
                     result.clusters_created, result.items_assigned);
             }
         }
         HierarchyCommands::Flatten => {
-            if !quiet { eprintln!("Flattening single-child chains..."); }
+            if !quiet { elog!("Flattening single-child chains..."); }
             db.flatten_single_child_chains().map_err(|e| e.to_string())?;
             if json {
-                println!(r#"{{"status":"ok"}}"#);
+                log!(r#"{{"status":"ok"}}"#);
             } else {
-                println!("Flattened successfully");
+                log!("Flattened successfully");
             }
         }
         HierarchyCommands::Stats => {
@@ -1606,19 +1711,19 @@ async fn handle_hierarchy(cmd: HierarchyCommands, db: &Database, json: bool, qui
             let universe = db.get_universe().map_err(|e| e.to_string())?;
 
             if json {
-                println!(r#"{{"max_depth":{},"has_universe":{}}}"#, max_depth, universe.is_some());
+                log!(r#"{{"max_depth":{},"has_universe":{}}}"#, max_depth, universe.is_some());
             } else {
-                println!("Max depth: {}", max_depth);
+                log!("Max depth: {}", max_depth);
                 if let Some(u) = universe {
-                    println!("Universe:  {} ({} children)", u.title, u.child_count);
+                    log!("Universe:  {} ({} children)", u.title, u.child_count);
                 } else {
-                    println!("Universe:  None (run 'hierarchy build')");
+                    log!("Universe:  None (run 'hierarchy build')");
                 }
 
                 // Show counts per depth
                 for d in 0..=max_depth {
                     if let Ok(nodes) = db.get_nodes_at_depth(d) {
-                        println!("  Depth {}: {} nodes", d, nodes.len());
+                        log!("  Depth {}: {} nodes", d, nodes.len());
                     }
                 }
             }
@@ -1636,9 +1741,9 @@ async fn handle_hierarchy(cmd: HierarchyCommands, db: &Database, json: bool, qui
 
                 if old_parent == universe.id {
                     if json {
-                        println!(r#"{{"status":"already_correct","parent":"{}"}}"#, universe.id);
+                        log!(r#"{{"status":"already_correct","parent":"{}"}}"#, universe.id);
                     } else {
-                        println!("Recent Notes is already under Universe");
+                        log!("Recent Notes is already under Universe");
                     }
                 } else {
                     // Move Recent Notes to Universe at depth 1
@@ -1653,16 +1758,16 @@ async fn handle_hierarchy(cmd: HierarchyCommands, db: &Database, json: bool, qui
                     db.propagate_latest_dates().map_err(|e| e.to_string())?;
 
                     if json {
-                        println!(r#"{{"status":"fixed","old_parent":"{}","new_parent":"{}"}}"#, old_parent, universe.id);
+                        log!(r#"{{"status":"fixed","old_parent":"{}","new_parent":"{}"}}"#, old_parent, universe.id);
                     } else {
-                        println!("Moved Recent Notes from '{}' to Universe (depth 1)", old_parent);
+                        log!("Moved Recent Notes from '{}' to Universe (depth 1)", old_parent);
                     }
                 }
             } else {
                 if json {
-                    println!(r#"{{"status":"not_found"}}"#);
+                    log!(r#"{{"status":"not_found"}}"#);
                 } else {
-                    println!("Recent Notes container not found");
+                    log!("Recent Notes container not found");
                 }
             }
         }
@@ -1686,21 +1791,21 @@ async fn handle_process(cmd: ProcessCommands, db: &Database, json: bool, quiet: 
 
             if to_process.is_empty() {
                 if json {
-                    println!(r#"{{"processed":0,"message":"No unprocessed nodes"}}"#);
+                    log!(r#"{{"processed":0,"message":"No unprocessed nodes"}}"#);
                 } else {
-                    println!("No unprocessed nodes");
+                    log!("No unprocessed nodes");
                 }
                 return Ok(());
             }
 
             if !quiet {
-                eprintln!("Processing {} nodes...", to_process.len());
+                log!("Processing {} nodes...", to_process.len());
             }
 
             // Process nodes with 10 concurrent API calls
             const CONCURRENT_REQUESTS: usize = 10;
             if !quiet {
-                eprintln!("[Processing {} nodes with {} concurrent API calls]",
+                log!("[Processing {} nodes with {} concurrent API calls]",
                          to_process.len(), CONCURRENT_REQUESTS);
             }
 
@@ -1754,18 +1859,18 @@ async fn handle_process(cmd: ProcessCommands, db: &Database, json: bool, quiet: 
                     }
                     Err(e) => {
                         if !quiet {
-                            eprintln!("\nError processing {}: {}", &node.id[..8], e);
+                            elog!("\nError processing {}: {}", &node.id[..8], e);
                         }
                     }
                 }
             }
 
-            if !quiet { eprintln!(); }
+            if !quiet { log!(""); }
 
             if json {
-                println!(r#"{{"processed":{}}}"#, processed_count);
+                log!(r#"{{"processed":{}}}"#, processed_count);
             } else {
-                println!("Processed {} nodes", processed_count);
+                log!("Processed {} nodes", processed_count);
             }
         }
         ProcessCommands::Status => {
@@ -1774,17 +1879,17 @@ async fn handle_process(cmd: ProcessCommands, db: &Database, json: bool, quiet: 
             let items = stats.1;
 
             if json {
-                println!(r#"{{"unprocessed":{},"total":{}}}"#, unprocessed.len(), items);
+                log!(r#"{{"unprocessed":{},"total":{}}}"#, unprocessed.len(), items);
             } else {
-                println!("Unprocessed: {} / {} items", unprocessed.len(), items);
+                log!("Unprocessed: {} / {} items", unprocessed.len(), items);
             }
         }
         ProcessCommands::Reset => {
             db.reset_ai_processing().map_err(|e| e.to_string())?;
             if json {
-                println!(r#"{{"status":"ok"}}"#);
+                log!(r#"{{"status":"ok"}}"#);
             } else {
-                println!("AI processing reset");
+                log!("AI processing reset");
             }
         }
     }
@@ -1800,55 +1905,55 @@ async fn handle_cluster(cmd: ClusterCommands, db: &Database, json: bool, quiet: 
         ClusterCommands::Run { lite } => {
             if !quiet {
                 if lite {
-                    eprintln!("Running clustering (lite mode, no AI naming)...");
+                    elog!("Running clustering (lite mode, no AI naming)...");
                 } else {
-                    eprintln!("Running clustering...");
+                    elog!("Running clustering...");
                 }
             }
             let result = clustering::run_clustering(db, !lite).await?;
             if json {
-                println!(r#"{{"items_processed":{},"clusters_created":{},"items_assigned":{}}}"#,
+                log!(r#"{{"items_processed":{},"clusters_created":{},"items_assigned":{}}}"#,
                     result.items_processed, result.clusters_created, result.items_assigned);
             } else {
-                println!("Processed {} items, created {} clusters, assigned {} items",
+                log!("Processed {} items, created {} clusters, assigned {} items",
                     result.items_processed, result.clusters_created, result.items_assigned);
             }
         }
         ClusterCommands::Name => {
-            if !quiet { eprintln!("Naming clusters with AI..."); }
+            if !quiet { elog!("Naming clusters with AI..."); }
             let result = clustering::name_unnamed_clusters(db).await?;
             if json {
-                println!(r#"{{"clusters_named":{},"clusters_skipped":{}}}"#,
+                log!(r#"{{"clusters_named":{},"clusters_skipped":{}}}"#,
                     result.clusters_named, result.clusters_skipped);
             } else {
-                println!("Named {} clusters, skipped {}", result.clusters_named, result.clusters_skipped);
+                log!("Named {} clusters, skipped {}", result.clusters_named, result.clusters_skipped);
             }
         }
         ClusterCommands::All { lite } => {
             if !quiet {
                 if lite {
-                    eprintln!("Reclustering all items (lite mode, no AI)...");
+                    elog!("Reclustering all items (lite mode, no AI)...");
                 } else {
-                    eprintln!("Reclustering all items...");
+                    elog!("Reclustering all items...");
                 }
             }
             let result = clustering::recluster_all(db, !lite).await?;
             if json {
-                println!(r#"{{"items_processed":{},"clusters_created":{},"items_assigned":{}}}"#,
+                log!(r#"{{"items_processed":{},"clusters_created":{},"items_assigned":{}}}"#,
                     result.items_processed, result.clusters_created, result.items_assigned);
             } else {
-                println!("Processed {} items, created {} clusters, assigned {} items",
+                log!("Processed {} items, created {} clusters, assigned {} items",
                     result.items_processed, result.clusters_created, result.items_assigned);
             }
         }
         ClusterCommands::Fos => {
-            if !quiet { eprintln!("Clustering with FOS pre-grouping for papers..."); }
+            if !quiet { elog!("Clustering with FOS pre-grouping for papers..."); }
             let result = clustering::cluster_with_fos_pregrouping(db).await?;
             if json {
-                println!(r#"{{"items_processed":{},"clusters_created":{},"items_assigned":{},"edges_created":{}}}"#,
+                log!(r#"{{"items_processed":{},"clusters_created":{},"items_assigned":{},"edges_created":{}}}"#,
                     result.items_processed, result.clusters_created, result.items_assigned, result.edges_created);
             } else {
-                println!("Processed {} items, created {} clusters, assigned {} items, {} edges",
+                log!("Processed {} items, created {} clusters, assigned {} items, {} edges",
                     result.items_processed, result.clusters_created, result.items_assigned, result.edges_created);
             }
         }
@@ -1858,29 +1963,29 @@ async fn handle_cluster(cmd: ClusterCommands, db: &Database, json: bool, quiet: 
             let items = db.get_items().map_err(|e| e.to_string())?;
             let clustered: Vec<_> = items.iter().filter(|n| n.cluster_id.is_some()).collect();
             if json {
-                println!(r#"{{"status":"info","clustered_items":{},"message":"Use GUI to reset clustering"}}"#, clustered.len());
+                log!(r#"{{"status":"info","clustered_items":{},"message":"Use GUI to reset clustering"}}"#, clustered.len());
             } else {
-                println!("{} items have cluster assignments", clustered.len());
-                println!("Use 'hierarchy rebuild' to recluster from scratch");
+                log!("{} items have cluster assignments", clustered.len());
+                log!("Use 'hierarchy rebuild' to recluster from scratch");
             }
         }
         ClusterCommands::Thresholds { primary, secondary } => {
             if primary.is_some() || secondary.is_some() {
                 settings::set_clustering_thresholds(primary, secondary)?;
                 if json {
-                    println!(r#"{{"status":"ok"}}"#);
+                    log!(r#"{{"status":"ok"}}"#);
                 } else {
-                    println!("Thresholds updated");
+                    log!("Thresholds updated");
                 }
             } else {
                 let (p, s) = settings::get_clustering_thresholds();
                 if json {
-                    println!(r#"{{"primary":{},"secondary":{}}}"#,
+                    log!(r#"{{"primary":{},"secondary":{}}}"#,
                         p.map(|v| v.to_string()).unwrap_or("null".to_string()),
                         s.map(|v| v.to_string()).unwrap_or("null".to_string()));
                 } else {
-                    println!("Primary:   {}", p.map(|v| format!("{:.2}", v)).unwrap_or("default (0.75)".to_string()));
-                    println!("Secondary: {}", s.map(|v| format!("{:.2}", v)).unwrap_or("default (0.60)".to_string()));
+                    log!("Primary:   {}", p.map(|v| format!("{:.2}", v)).unwrap_or("default (0.75)".to_string()));
+                    log!("Secondary: {}", s.map(|v| format!("{:.2}", v)).unwrap_or("default (0.60)".to_string()));
                 }
             }
         }
@@ -2445,19 +2550,19 @@ fn handle_config(cmd: ConfigCommands, json: bool) -> Result<(), String> {
 async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: bool) -> Result<(), String> {
     use std::io::{Write, BufRead};
 
-    println!("=== Mycelica Setup ===\n");
+    log!("=== Mycelica Setup ===\n");
 
     // Show current database
-    println!("Database: {}\n", db.get_path());
+    log!("Database: {}\n", db.get_path());
 
     // Check and prompt for API keys
     let has_openai = settings::has_openai_api_key();
     let has_anthropic = settings::has_api_key();
 
-    println!("API Keys:");
-    println!("  OpenAI:    {}", if has_openai { "configured" } else { "not set" });
-    println!("  Anthropic: {}", if has_anthropic { "configured" } else { "not set" });
-    println!();
+    log!("API Keys:");
+    log!("  OpenAI:    {}", if has_openai { "configured" } else { "not set" });
+    log!("  Anthropic: {}", if has_anthropic { "configured" } else { "not set" });
+    log!("");
 
     // Prompt for OpenAI key if not set (required for embeddings)
     if !has_openai {
@@ -2469,9 +2574,9 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
         let key = key.trim().to_string();
         if !key.is_empty() {
             settings::set_openai_api_key(key)?;
-            println!("  OpenAI key saved.\n");
+            log!("  OpenAI key saved.\n");
         } else {
-            println!("  Skipped.\n");
+            log!("  Skipped.\n");
         }
     }
 
@@ -2485,9 +2590,9 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
         let key = key.trim().to_string();
         if !key.is_empty() {
             settings::set_api_key(key)?;
-            println!("  Anthropic key saved.\n");
+            log!("  Anthropic key saved.\n");
         } else {
-            println!("  Skipped.\n");
+            log!("  Skipped.\n");
         }
     }
 
@@ -2504,14 +2609,14 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
         db.get_node_embedding(&n.id).ok().flatten().is_some()
     }).count();
 
-    println!("Database Stats:");
-    println!("  Items:      {} ({} papers, {} other)", total, papers, non_papers);
-    println!("  Processed:  {} / {} (papers skip AI processing)", non_paper_processed, non_papers);
-    println!("  Embeddings: {} / {}", with_embeddings, total);
-    println!();
+    log!("Database Stats:");
+    log!("  Items:      {} ({} papers, {} other)", total, papers, non_papers);
+    log!("  Processed:  {} / {} (papers skip AI processing)", non_paper_processed, non_papers);
+    log!("  Embeddings: {} / {}", with_embeddings, total);
+    log!("");
 
     if skip_pipeline {
-        println!("Setup complete. (Pipeline skipped)");
+        log!("Setup complete. (Pipeline skipped)");
         return Ok(());
     }
 
@@ -2521,7 +2626,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
     let needs_embeddings = with_embeddings < total;
 
     if !needs_processing && !needs_embeddings {
-        println!("All items are processed and have embeddings. Nothing to do!");
+        log!("All items are processed and have embeddings. Nothing to do!");
         return Ok(());
     }
 
@@ -2533,20 +2638,20 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
     let run_pipeline = input.trim().is_empty() || input.trim().to_lowercase().starts_with('y');
 
     if !run_pipeline {
-        println!("Setup complete. Run 'mycelica-cli process run' later to process items.");
+        log!("Setup complete. Run 'mycelica-cli process run' later to process items.");
         return Ok(());
     }
 
-    println!();
-    println!("═══════════════════════════════════════════════════════════");
-    println!("Starting Mycelica Pipeline");
-    println!("═══════════════════════════════════════════════════════════");
+    log!("");
+    log!("═══════════════════════════════════════════════════════════");
+    log!("Starting Mycelica Pipeline");
+    log!("═══════════════════════════════════════════════════════════");
 
     // Step 0: Pattern Classification (FREE, identifies hidden items to skip)
-    println!();
-    println!("▶ STEP 0/5: Pattern Classification");
-    println!("───────────────────────────────────────────────────────────");
-    println!("  Classifying items using pattern matching (FREE)...");
+    log!("");
+    log!("▶ STEP 0/5: Pattern Classification");
+    log!("───────────────────────────────────────────────────────────");
+    log!("  Classifying items using pattern matching (FREE)...");
 
     let classified = classification::classify_all_items(db)?;
 
@@ -2562,15 +2667,15 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
         .filter(|n| !n.is_processed)
         .count();
 
-    println!("  ✓ Classified {} items", classified);
+    log!("  ✓ Classified {} items", classified);
     if hidden_count > 0 {
-        println!("  → {} items classified as hidden (will skip AI processing)", hidden_count);
+        log!("  → {} items classified as hidden (will skip AI processing)", hidden_count);
     }
 
     // Step 1: AI Processing + Embeddings
-    println!();
-    println!("▶ STEP 1/5: AI Processing + Embeddings");
-    println!("───────────────────────────────────────────────────────────");
+    log!("");
+    log!("▶ STEP 1/5: AI Processing + Embeddings");
+    log!("───────────────────────────────────────────────────────────");
 
     // 1a: AI process non-paper, non-code, non-hidden items
     // Papers have metadata from OpenAIRE, code items use their signature as title
@@ -2588,7 +2693,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
         .collect();
 
     if !unprocessed_non_papers.is_empty() && settings::has_api_key() {
-        println!("[1a] AI Processing {} items...", unprocessed_non_papers.len());
+        log!("[1a] AI Processing {} items...", unprocessed_non_papers.len());
 
         let mut success_count = 0;
         let mut error_count = 0;
@@ -2597,7 +2702,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
         for (i, node) in unprocessed_non_papers.iter().enumerate() {
             if !quiet {
                 let title_preview: String = node.title.chars().take(50).collect();
-                println!("  [{}/{}] {}{}",
+                log!("  [{}/{}] {}{}",
                     i + 1,
                     unprocessed_non_papers.len(),
                     title_preview,
@@ -2623,24 +2728,24 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
                     }
 
                     if !quiet {
-                        println!("    → \"{}\" ({})", result.title, result.content_type);
+                        log!("    → \"{}\" ({})", result.title, result.content_type);
                     }
                     success_count += 1;
                 }
                 Err(e) => {
                     if !quiet {
-                        eprintln!("    ✗ Error: {}", e);
+                        elog!("    ✗ Error: {}", e);
                     }
                     error_count += 1;
                 }
             }
         }
         let elapsed = step_start.elapsed().as_secs_f64();
-        println!("  ✓ Processed {} items in {:.1}s ({} errors)", success_count, elapsed, error_count);
+        log!("  ✓ Processed {} items in {:.1}s ({} errors)", success_count, elapsed, error_count);
     } else if !unprocessed_non_papers.is_empty() {
-        println!("[1a] AI Processing... ⊘ SKIPPED (no Anthropic API key)");
+        log!("[1a] AI Processing... ⊘ SKIPPED (no Anthropic API key)");
     } else {
-        println!("[1a] AI Processing... ✓ already complete");
+        log!("[1a] AI Processing... ✓ already complete");
     }
 
     // 1b: Generate embeddings for papers (they have metadata but need embeddings)
@@ -2650,14 +2755,14 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
         .collect();
 
     if !papers_needing_embeddings.is_empty() && settings::has_openai_api_key() {
-        println!("[1b] Embedding {} papers...", papers_needing_embeddings.len());
+        log!("[1b] Embedding {} papers...", papers_needing_embeddings.len());
 
         let mut success_count = 0;
         let step_start = std::time::Instant::now();
 
         for (i, node) in papers_needing_embeddings.iter().enumerate() {
             if !quiet && (i % 10 == 0 || i == papers_needing_embeddings.len() - 1) {
-                println!("  [{}/{}] {}", i + 1, papers_needing_embeddings.len(),
+                log!("  [{}/{}] {}", i + 1, papers_needing_embeddings.len(),
                     node.title.chars().take(50).collect::<String>());
             }
 
@@ -2672,11 +2777,11 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
             }
         }
         let elapsed = step_start.elapsed().as_secs_f64();
-        println!("  ✓ Embedded {} papers in {:.1}s", success_count, elapsed);
+        log!("  ✓ Embedded {} papers in {:.1}s", success_count, elapsed);
     } else if !papers_needing_embeddings.is_empty() {
-        println!("[1b] Paper embeddings... ⊘ SKIPPED (no OpenAI API key)");
+        log!("[1b] Paper embeddings... ⊘ SKIPPED (no OpenAI API key)");
     } else if papers > 0 {
-        println!("[1b] Paper embeddings... ✓ already complete");
+        log!("[1b] Paper embeddings... ✓ already complete");
     }
 
     // 1c: Generate embeddings for code items (skip AI, just embeddings)
@@ -2686,14 +2791,14 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
         .collect();
 
     if !code_needing_embeddings.is_empty() {
-        println!("[1c] Embedding {} code items (skipping AI)...", code_needing_embeddings.len());
+        log!("[1c] Embedding {} code items (skipping AI)...", code_needing_embeddings.len());
 
         let mut success_count = 0;
         let step_start = std::time::Instant::now();
 
         for (i, node) in code_needing_embeddings.iter().enumerate() {
             if !quiet && (i % 25 == 0 || i == code_needing_embeddings.len() - 1) {
-                println!("  [{}/{}] {}", i + 1, code_needing_embeddings.len(),
+                log!("  [{}/{}] {}", i + 1, code_needing_embeddings.len(),
                     node.title.chars().take(50).collect::<String>());
             }
 
@@ -2710,99 +2815,99 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
             }
         }
         let elapsed = step_start.elapsed().as_secs_f64();
-        println!("  ✓ Embedded {} code items in {:.1}s", success_count, elapsed);
+        log!("  ✓ Embedded {} code items in {:.1}s", success_count, elapsed);
     } else {
         let code_count = items.iter()
             .filter(|n| n.content_type.as_ref().map(|ct| ct.starts_with("code_")).unwrap_or(false))
             .count();
         if code_count > 0 {
-            println!("[1c] Code embeddings... ✓ already complete");
+            log!("[1c] Code embeddings... ✓ already complete");
         }
     }
 
     // Step 2: Clustering & Hierarchy
     // Note: hierarchy::build_full_hierarchy has its own verbose logging via emit_log()
-    println!();
-    println!("▶ STEP 2/5: Clustering & Hierarchy");
-    println!("───────────────────────────────────────────────────────────");
+    log!("");
+    log!("▶ STEP 2/5: Clustering & Hierarchy");
+    log!("───────────────────────────────────────────────────────────");
 
     // If FOS flag is set, run full FOS pipeline: FOS grouping → clustering → hierarchy
     if use_fos {
-        println!("Running FOS (Field of Science) pipeline...");
-        println!();
+        log!("Running FOS (Field of Science) pipeline...");
+        log!("");
 
         // Step 2a: Create FOS parent nodes
-        println!("  [2a] Creating FOS parent nodes...");
+        log!("  [2a] Creating FOS parent nodes...");
         match clustering::cluster_with_fos_pregrouping(db).await {
             Ok(result) => {
-                println!("  ✓ FOS grouping: {} papers → {} FOS categories",
+                log!("  ✓ FOS grouping: {} papers → {} FOS categories",
                     result.items_assigned, result.clusters_created);
             }
             Err(e) => {
-                eprintln!("  ✗ FOS pre-grouping failed: {}", e);
+                elog!("  ✗ FOS pre-grouping failed: {}", e);
             }
         }
 
         // Step 2b: Run clustering within each FOS group (assigns cluster_id)
-        println!("  [2b] Clustering within FOS groups...");
+        log!("  [2b] Clustering within FOS groups...");
         match clustering::run_clustering(db, true).await {
             Ok(result) => {
-                println!("  ✓ Clustered: {} items → {} clusters",
+                log!("  ✓ Clustered: {} items → {} clusters",
                     result.items_assigned, result.clusters_created);
             }
             Err(e) => {
-                eprintln!("  ✗ Clustering failed: {}", e);
+                elog!("  ✗ Clustering failed: {}", e);
             }
         }
 
         // Step 2c: Build full hierarchy with recursive AI grouping
-        println!("  [2c] Building hierarchy with AI grouping...");
-        println!();
+        log!("  [2c] Building hierarchy with AI grouping...");
+        log!("");
         match hierarchy::build_full_hierarchy(db, false, None).await {
             Ok(result) => {
-                println!();
-                println!("  ✓ Hierarchy complete: {} levels, {} items organized",
+                log!("");
+                log!("  ✓ Hierarchy complete: {} levels, {} items organized",
                     result.hierarchy_result.max_depth, result.hierarchy_result.items_organized);
             }
             Err(e) => {
-                eprintln!("  ✗ Hierarchy build failed: {}", e);
+                elog!("  ✗ Hierarchy build failed: {}", e);
             }
         }
 
         // Step 2d: Precompute FOS edges for fast view loading
-        println!("  [2d] Precomputing FOS edge sets...");
+        log!("  [2d] Precomputing FOS edge sets...");
         match db.precompute_fos_edges() {
-            Ok(count) => println!("  ✓ FOS edges: {} edges precomputed", count),
-            Err(e) => eprintln!("  ✗ FOS edge precomputation failed: {}", e),
+            Ok(count) => log!("  ✓ FOS edges: {} edges precomputed", count),
+            Err(e) => elog!("  ✗ FOS edge precomputation failed: {}", e),
         }
     } else {
         // Non-FOS path: Use full 7-step hierarchy build with recursive AI grouping
-        println!("Running full hierarchy build (7 steps)...");
-        println!();
+        log!("Running full hierarchy build (7 steps)...");
+        log!("");
         match hierarchy::build_full_hierarchy(db, true, None).await {
             Ok(result) => {
-                println!();
-                println!("✓ Hierarchy complete: {} levels, {} items organized",
+                log!("");
+                log!("✓ Hierarchy complete: {} levels, {} items organized",
                     result.hierarchy_result.max_depth, result.hierarchy_result.items_organized);
             }
             Err(e) => {
-                eprintln!("✗ Hierarchy build failed: {}", e);
+                elog!("✗ Hierarchy build failed: {}", e);
             }
         }
     }
 
     // Step 3: Code edges (only if code nodes exist)
     // Note: Category embeddings handled by Hierarchy Step 6/7
-    println!();
-    println!("▶ STEP 3/5: Code Analysis");
-    println!("───────────────────────────────────────────────────────────");
+    log!("");
+    log!("▶ STEP 3/5: Code Analysis");
+    log!("───────────────────────────────────────────────────────────");
 
     let code_functions: Vec<_> = items.iter()
         .filter(|n| n.content_type.as_deref() == Some("code_function"))
         .collect();
 
     if !code_functions.is_empty() {
-        println!("Analyzing {} code functions for call relationships...", code_functions.len());
+        log!("Analyzing {} code functions for call relationships...", code_functions.len());
         // Run analyze_code_edges inline (simplified version)
         use std::collections::{HashMap, HashSet};
 
@@ -2863,40 +2968,40 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
             }
         }
 
-        println!("  Indexed {} function names", name_to_id.len());
-        println!("  Found {} existing call edges", existing_edges.len());
+        log!("  Indexed {} function names", name_to_id.len());
+        log!("  Found {} existing call edges", existing_edges.len());
 
         if edges_created > 0 {
-            println!("✓ Created {} new call edges", edges_created);
+            log!("✓ Created {} new call edges", edges_created);
         } else {
-            println!("✓ No new edges needed (already analyzed or no calls found)");
+            log!("✓ No new edges needed (already analyzed or no calls found)");
         }
     } else {
-        println!("⊘ SKIPPED (no code_function nodes found)");
-        println!("  Run 'mycelica-cli import code <path>' to import code first");
+        log!("⊘ SKIPPED (no code_function nodes found)");
+        log!("  Run 'mycelica-cli import code <path>' to import code first");
     }
 
     // Step 4: Flatten hierarchy (remove empty intermediate levels)
-    println!();
-    println!("▶ STEP 4/5: Flatten Hierarchy");
-    println!("───────────────────────────────────────────────────────────");
+    log!("");
+    log!("▶ STEP 4/5: Flatten Hierarchy");
+    log!("───────────────────────────────────────────────────────────");
     match db.flatten_empty_levels() {
         Ok(removed) => {
             if removed > 0 {
-                println!("✓ Flattened: removed {} empty intermediate levels", removed);
+                log!("✓ Flattened: removed {} empty intermediate levels", removed);
             } else {
-                println!("✓ Hierarchy already flat (no empty levels)");
+                log!("✓ Hierarchy already flat (no empty levels)");
             }
         }
         Err(e) => {
-            eprintln!("✗ Flatten failed: {}", e);
+            elog!("✗ Flatten failed: {}", e);
         }
     }
 
-    println!();
-    println!("═══════════════════════════════════════════════════════════");
-    println!("✓ Setup Complete!");
-    println!("═══════════════════════════════════════════════════════════");
+    log!("");
+    log!("═══════════════════════════════════════════════════════════");
+    log!("✓ Setup Complete!");
+    log!("═══════════════════════════════════════════════════════════");
     Ok(())
 }
 
@@ -3384,7 +3489,9 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
             }
             // Reset cluster assignments for all items
             db.clear_item_parents().map_err(|e| e.to_string())?;
-            println!("✓ Reset clustering (cleared item parents)");
+            // Reset needs_clustering flag so items get re-clustered
+            let count = db.mark_all_items_need_clustering().map_err(|e| e.to_string())?;
+            println!("✓ Reset clustering for {} items (cleared parents, cluster_id, cluster_label, needs_clustering=1)", count);
         }
 
         MaintenanceCommands::ResetPrivacy { force } => {

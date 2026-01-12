@@ -162,3 +162,55 @@ pub fn get_show_tips() -> bool {
 pub fn set_show_tips(enabled: bool) -> Result<(), String> {
     settings::set_show_tips(enabled)
 }
+
+// ==================== LLM Backend (Ollama) ====================
+
+/// Ollama status response
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OllamaStatus {
+    pub available: bool,
+    pub models: Vec<String>,
+}
+
+/// Check if Ollama is available and list models
+#[tauri::command]
+pub async fn check_ollama_status() -> OllamaStatus {
+    use crate::ai_client;
+
+    let available = ai_client::ollama_available().await;
+    let models = if available {
+        ai_client::ollama_list_models()
+            .await
+            .map(|m| m.into_iter().map(|model| model.name).collect())
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    OllamaStatus { available, models }
+}
+
+/// Get current LLM backend ("anthropic" or "ollama")
+#[tauri::command]
+pub fn get_llm_backend() -> String {
+    settings::get_llm_backend()
+}
+
+/// Set LLM backend ("anthropic" or "ollama")
+#[tauri::command]
+pub fn set_llm_backend(backend: String) -> Result<(), String> {
+    settings::set_llm_backend(backend)
+}
+
+/// Get current Ollama model name
+#[tauri::command]
+pub fn get_ollama_model() -> String {
+    settings::get_ollama_model()
+}
+
+/// Set Ollama model name
+#[tauri::command]
+pub fn set_ollama_model(model: String) -> Result<(), String> {
+    settings::set_ollama_model(model)
+}
