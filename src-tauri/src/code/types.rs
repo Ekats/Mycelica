@@ -34,13 +34,17 @@ pub struct CodeItem {
 }
 
 impl CodeItem {
-    /// Generate a stable ID for this code item based on file path, name, and type
+    /// Generate a stable ID for this code item based on file path, name, and type.
+    /// Path is normalized to prevent duplicates from different path formats.
     pub fn generate_id(&self) -> String {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
-        self.file_path.hash(&mut hasher);
+        // Normalize path before hashing to prevent duplicates from:
+        // ./src/foo.rs, src/foo.rs, /abs/path/src/foo.rs
+        let normalized_path = normalize_path(&self.file_path);
+        normalized_path.hash(&mut hasher);
         self.name.hash(&mut hasher);
         self.item_type.hash(&mut hasher);
         // Include impl_for for impl blocks to differentiate impls for different types
@@ -94,6 +98,7 @@ pub struct CodeItemMetadata {
 /// Result of a code import operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeImportResult {
+    // Rust-specific
     pub functions: usize,
     pub structs: usize,
     pub enums: usize,
@@ -102,6 +107,12 @@ pub struct CodeImportResult {
     pub modules: usize,
     pub macros: usize,
     pub docs: usize,
+    // TypeScript/JavaScript
+    pub classes: usize,
+    pub interfaces: usize,
+    pub types: usize,
+    pub consts: usize,
+    // Common
     pub files_processed: usize,
     pub files_skipped: usize,
     pub edges_created: usize,
@@ -120,6 +131,10 @@ impl Default for CodeImportResult {
             modules: 0,
             macros: 0,
             docs: 0,
+            classes: 0,
+            interfaces: 0,
+            types: 0,
+            consts: 0,
             files_processed: 0,
             files_skipped: 0,
             edges_created: 0,
@@ -131,7 +146,9 @@ impl Default for CodeImportResult {
 
 impl CodeImportResult {
     pub fn total_items(&self) -> usize {
-        self.functions + self.structs + self.enums + self.traits + self.impls + self.modules + self.macros + self.docs
+        self.functions + self.structs + self.enums + self.traits + self.impls
+            + self.modules + self.macros + self.docs
+            + self.classes + self.interfaces + self.types + self.consts
     }
 
     /// Increment counter based on item type
@@ -145,7 +162,101 @@ impl CodeImportResult {
             "module" => self.modules += 1,
             "macro" => self.macros += 1,
             "doc" => self.docs += 1,
+            "class" => self.classes += 1,
+            "interface" => self.interfaces += 1,
+            "type" => self.types += 1,
+            "const" => self.consts += 1,
             _ => {}
         }
+    }
+}
+
+/// Normalize a file path for consistent ID generation.
+/// Converts any path format to a canonical relative path:
+/// - `/abs/path/to/repo/src/foo.rs` → `src/foo.rs`
+/// - `./src/foo.rs` → `src/foo.rs`
+/// - `src/foo.rs` → `src/foo.rs`
+///
+/// This ensures the same file always generates the same ID regardless
+/// of how the import path was specified.
+pub fn normalize_path(path: &str) -> String {
+    use std::path::Path;
+
+    let path = Path::new(path);
+
+    // Try to get canonical path, fall back to original
+    let path_str = if let Ok(canonical) = path.canonicalize() {
+        canonical.to_string_lossy().to_string()
+    } else {
+        path.to_string_lossy().to_string()
+    };
+
+    // Find common repo markers and extract relative path
+    // Look for patterns like: /path/to/repo/src-tauri/... or /path/to/repo/src/...
+    let markers = ["src-tauri/", "/src/", "src/"];
+    for marker in markers {
+        if let Some(idx) = path_str.find(marker) {
+            // Include the marker in the result for src-tauri, exclude leading slash for /src/
+            let start = if marker == "/src/" { idx + 1 } else { idx };
+            return path_str[start..].to_string();
+        }
+    }
+
+    // If no marker found, strip leading ./ and any absolute path prefix
+    let stripped = path_str
+        .trim_start_matches("./")
+        .trim_start_matches('/');
+
+    // If it looks like an absolute path with home dir, try to extract relative part
+    if let Some(idx) = stripped.find("/Repos/") {
+        if let Some(end_idx) = stripped[idx + 7..].find('/') {
+            // Skip past /Repos/RepoName/
+            return stripped[idx + 7 + end_idx + 1..].to_string();
+        }
+    }
+
+    stripped.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_path_relative() {
+        // Relative paths with ./
+        assert_eq!(normalize_path("./src-tauri/src/main.rs"), "src-tauri/src/main.rs");
+        assert_eq!(normalize_path("./src/App.tsx"), "src/App.tsx");
+    }
+
+    #[test]
+    fn test_normalize_path_no_prefix() {
+        // Relative paths without ./
+        assert_eq!(normalize_path("src-tauri/src/main.rs"), "src-tauri/src/main.rs");
+        assert_eq!(normalize_path("src/App.tsx"), "src/App.tsx");
+    }
+
+    #[test]
+    fn test_normalize_path_absolute() {
+        // Absolute paths should extract relative portion
+        let abs = "/home/user/Repos/Mycelica/src-tauri/src/main.rs";
+        assert_eq!(normalize_path(abs), "src-tauri/src/main.rs");
+
+        let abs2 = "/home/user/Repos/Mycelica/src/App.tsx";
+        assert_eq!(normalize_path(abs2), "src/App.tsx");
+    }
+
+    #[test]
+    fn test_normalize_path_consistency() {
+        // All these should normalize to the same value
+        let paths = [
+            "./src-tauri/src/main.rs",
+            "src-tauri/src/main.rs",
+            "/home/user/Repos/Mycelica/src-tauri/src/main.rs",
+        ];
+
+        let normalized: Vec<_> = paths.iter().map(|p| normalize_path(p)).collect();
+        assert!(normalized.iter().all(|p| p == &normalized[0]),
+            "All paths should normalize to same value: {:?}", normalized);
     }
 }

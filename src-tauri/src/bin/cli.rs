@@ -270,6 +270,9 @@ enum Commands {
         /// Use FOS (Field of Science) pre-grouping for papers before clustering
         #[arg(long)]
         fos: bool,
+        /// Include code items in AI processing (generate summaries)
+        #[arg(long)]
+        include_code: bool,
     },
     /// Recent nodes
     Recent {
@@ -799,6 +802,15 @@ enum MaintenanceCommands {
     PrecomputeFosEdges,
     /// Index edges by parent for fast per-view loading
     IndexEdges,
+    /// Merge small sibling categories by embedding similarity
+    MergeSmallCategories {
+        /// Cosine similarity threshold for clustering (0.0-1.0)
+        #[arg(long, default_value = "0.7")]
+        threshold: f32,
+        /// Maximum children for a category to be considered "small"
+        #[arg(long, default_value = "3")]
+        max_size: i32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -948,7 +960,7 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Privacy { cmd } => handle_privacy(cmd, &db, cli.json, cli.quiet).await,
         Commands::Paper { cmd } => handle_paper(cmd, &db, cli.json).await,
         Commands::Config { cmd } => handle_config(cmd, cli.json),
-        Commands::Setup { skip_pipeline, fos } => handle_setup(&db, skip_pipeline, fos, cli.quiet).await,
+        Commands::Setup { skip_pipeline, fos, include_code } => handle_setup(&db, skip_pipeline, fos, include_code, cli.quiet).await,
         Commands::Recent { cmd } => handle_recent(cmd, &db, cli.json),
         Commands::Pinned { cmd } => handle_pinned(cmd, &db, cli.json),
         Commands::Nav { cmd } => handle_nav(cmd, &db, cli.json).await,
@@ -1458,6 +1470,11 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
                 if result.modules > 0 { log!("  Modules: {}", result.modules); }
                 if result.macros > 0 { log!("  Macros: {}", result.macros); }
                 if result.docs > 0 { log!("  Docs: {}", result.docs); }
+                // TypeScript/JavaScript
+                if result.classes > 0 { log!("  Classes: {}", result.classes); }
+                if result.interfaces > 0 { log!("  Interfaces: {}", result.interfaces); }
+                if result.types > 0 { log!("  Types: {}", result.types); }
+                if result.consts > 0 { log!("  Consts: {}", result.consts); }
                 log!("  Edges created: {}", result.edges_created);
                 if result.doc_edges > 0 { log!("  Doc→code edges: {}", result.doc_edges); }
                 if update {
@@ -2547,7 +2564,7 @@ fn handle_config(cmd: ConfigCommands, json: bool) -> Result<(), String> {
 // Setup Command
 // ============================================================================
 
-async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: bool) -> Result<(), String> {
+async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include_code: bool, quiet: bool) -> Result<(), String> {
     use std::io::{Write, BufRead};
 
     log!("=== Mycelica Setup ===\n");
@@ -2677,14 +2694,19 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
     log!("▶ STEP 1/5: AI Processing + Embeddings");
     log!("───────────────────────────────────────────────────────────");
 
-    // 1a: AI process non-paper, non-code, non-hidden items
-    // Papers have metadata from OpenAIRE, code items use their signature as title
+    // 1a: AI process non-paper, non-hidden items
+    // Papers have metadata from OpenAIRE
+    // Code items included only if --include-code flag is set
     // Hidden items (debug, code, paste, trivial) skip AI processing
     let unprocessed_non_papers: Vec<_> = items.iter()
         .filter(|n| !n.is_processed)
         .filter(|n| n.content_type.as_deref() != Some("paper"))
         .filter(|n| n.content_type.as_deref() != Some("bookmark"))
-        .filter(|n| !n.content_type.as_ref().map(|ct| ct.starts_with("code_")).unwrap_or(false))
+        .filter(|n| {
+            let is_code = n.content_type.as_ref().map(|ct| ct.starts_with("code_")).unwrap_or(false);
+            // Include code items only if flag is set
+            !is_code || include_code
+        })
         // Skip hidden items (already classified by pattern matching in Step 0)
         .filter(|n| !n.content_type.as_ref()
             .and_then(|ct| classification::ContentType::from_str(ct))
@@ -2711,14 +2733,23 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
             }
 
             let content = node.content.as_deref().unwrap_or(&node.title);
+            let is_code_item = node.content_type.as_ref().map(|ct| ct.starts_with("code_")).unwrap_or(false);
+
             match mycelica_lib::ai_client::analyze_node(&node.title, content).await {
                 Ok(result) => {
+                    // For code items, preserve the original code_* content_type
+                    let final_content_type = if is_code_item {
+                        node.content_type.as_deref().unwrap_or(&result.content_type)
+                    } else {
+                        &result.content_type
+                    };
+
                     db.update_node_ai(
                         &node.id,
                         &result.title,
                         &result.summary,
                         &serde_json::to_string(&result.tags).unwrap_or_default(),
-                        &result.content_type,
+                        final_content_type,
                     ).ok();
 
                     // Generate embedding for the node
@@ -2728,7 +2759,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, quiet: 
                     }
 
                     if !quiet {
-                        log!("    → \"{}\" ({})", result.title, result.content_type);
+                        log!("    → \"{}\" ({})", result.title, final_content_type);
                     }
                     success_count += 1;
                 }
@@ -3329,7 +3360,7 @@ async fn handle_nav(cmd: NavCommands, db: &Database, json: bool) -> Result<(), S
                             } else {
                                 title.clone()
                             };
-                            println!("{}  {} 📄 {} ({})", prefix, item_prefix, display_title, &id[..12]);
+                            println!("{}  {} 📄 {} ({})", prefix, item_prefix, display_title, id);
                         }
                     }
 
@@ -3585,6 +3616,17 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
             log!("Indexing edges by parent for fast per-view loading...");
             let count = db.update_edge_parents().map_err(|e| e.to_string())?;
             log!("Indexed {} edges", count);
+        }
+
+        MaintenanceCommands::MergeSmallCategories { threshold, max_size } => {
+            log!("Merging small sibling categories (threshold={:.2}, max_size={})...", threshold, max_size);
+            let result = hierarchy::merge_small_categories(db, None, threshold, max_size).await
+                .map_err(|e| e.to_string())?;
+            log!("Merge complete:");
+            log!("  Categories merged: {}", result.categories_merged);
+            log!("  Children reparented: {}", result.children_reparented);
+            log!("  Categories renamed: {}", result.categories_renamed);
+            log!("  Levels processed: {}", result.levels_processed);
         }
     }
     Ok(())

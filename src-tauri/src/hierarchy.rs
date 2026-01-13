@@ -2986,3 +2986,328 @@ pub fn propagate_privacy_scores(db: &Database, app: Option<&tauri::AppHandle>) -
     emit_log(app, "info", &format!("✓ Privacy propagated to {} categories", categories_updated));
     Ok(categories_updated)
 }
+
+// ==================== Small Category Merging ====================
+
+/// Result of the merge_small_categories operation
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeCategoriesResult {
+    /// Number of categories merged (deleted after reparenting)
+    pub categories_merged: usize,
+    /// Number of children reparented
+    pub children_reparented: usize,
+    /// Number of survivor categories renamed
+    pub categories_renamed: usize,
+    /// Levels processed (bottom-up)
+    pub levels_processed: i32,
+}
+
+/// Merge small sibling categories that are semantically similar.
+///
+/// Post-hierarchy pass that consolidates fragmented categories:
+/// 1. Works bottom-up (deepest levels first) so merges cascade properly
+/// 2. For each parent, finds category children with ≤max_size children
+/// 3. Clusters these small siblings by embedding similarity (threshold)
+/// 4. Merges similar ones: reparent grandchildren to survivor, delete empty categories
+/// 5. Uses AI to rename survivor based on combined children
+///
+/// Parameters:
+/// - `threshold`: Cosine similarity threshold for clustering (default 0.7)
+/// - `max_size`: Maximum children for a category to be considered "small" (default 3)
+pub async fn merge_small_categories(
+    db: &Database,
+    app: Option<&AppHandle>,
+    threshold: f32,
+    max_size: i32,
+) -> Result<MergeCategoriesResult, String> {
+    emit_log(app, "info", &format!(
+        "Starting small category merge (threshold={:.2}, max_size={})",
+        threshold, max_size
+    ));
+
+    let protected_ids = db.get_protected_node_ids();
+    let max_depth = db.get_max_depth().map_err(|e| e.to_string())?;
+
+    let mut total_merged = 0usize;
+    let mut total_reparented = 0usize;
+    let mut total_renamed = 0usize;
+    let mut levels_processed = 0i32;
+
+    // Work bottom-up: start from deepest category level (max_depth - 1) down to depth 1
+    // Items are at max_depth, categories start one level above
+    // Don't process depth 0 (Universe)
+    for depth in (1..max_depth).rev() {
+        levels_processed += 1;
+        let nodes_at_depth = db.get_nodes_at_depth(depth).map_err(|e| e.to_string())?;
+
+        // Group nodes by parent_id to find siblings
+        let mut siblings_by_parent: HashMap<String, Vec<Node>> = HashMap::new();
+        for node in nodes_at_depth {
+            // Skip items, protected nodes, and nodes without parents
+            if node.is_item || protected_ids.contains(&node.id) {
+                continue;
+            }
+            if let Some(parent_id) = &node.parent_id {
+                siblings_by_parent.entry(parent_id.clone()).or_default().push(node);
+            }
+        }
+
+        // Process each group of siblings
+        for (parent_id, siblings) in siblings_by_parent {
+            // Find "small" categories (≤max_size children)
+            let small_cats: Vec<&Node> = siblings.iter()
+                .filter(|n| n.child_count <= max_size && !protected_ids.contains(&n.id))
+                .collect();
+
+            if small_cats.len() < 2 {
+                // Need at least 2 small siblings to potentially merge
+                continue;
+            }
+
+            emit_log(app, "debug", &format!(
+                "Found {} small categories under parent {} at depth {}",
+                small_cats.len(), parent_id, depth
+            ));
+
+            // Get embeddings for small categories
+            let embeddings: Vec<(String, Vec<f32>)> = small_cats.iter()
+                .filter_map(|cat| {
+                    db.get_node_embedding(&cat.id).ok().flatten()
+                        .map(|emb| (cat.id.clone(), emb))
+                })
+                .collect();
+
+            if embeddings.len() < 2 {
+                emit_log(app, "debug", "Not enough embeddings for clustering");
+                continue;
+            }
+
+            // Cluster by embedding similarity using simple single-linkage
+            let clusters = cluster_by_similarity(&embeddings, threshold);
+
+            // Process each cluster of similar categories
+            for cluster in clusters {
+                if cluster.len() < 2 {
+                    continue; // Need at least 2 to merge
+                }
+
+                // Find cluster members in small_cats
+                let cluster_cats: Vec<&Node> = cluster.iter()
+                    .filter_map(|id| small_cats.iter().find(|c| &c.id == id).copied())
+                    .collect();
+
+                if cluster_cats.len() < 2 {
+                    continue;
+                }
+
+                // Choose survivor: the one with most children, or first if tied
+                let survivor = cluster_cats.iter()
+                    .max_by_key(|c| c.child_count)
+                    .unwrap();
+
+                let to_merge: Vec<&&Node> = cluster_cats.iter()
+                    .filter(|c| c.id != survivor.id)
+                    .collect();
+
+                if to_merge.is_empty() {
+                    continue;
+                }
+
+                emit_log(app, "info", &format!(
+                    "Merging {} categories into '{}' ({})",
+                    to_merge.len(), survivor.title, survivor.id
+                ));
+
+                // Reparent grandchildren from merged categories to survivor
+                let mut children_moved = 0;
+                for cat in &to_merge {
+                    let grandchildren = db.get_children(&cat.id).map_err(|e| e.to_string())?;
+                    for grandchild in &grandchildren {
+                        db.update_parent(&grandchild.id, &survivor.id).map_err(|e| e.to_string())?;
+                        children_moved += 1;
+                    }
+                }
+
+                total_reparented += children_moved;
+                emit_log(app, "debug", &format!("Reparented {} children to survivor", children_moved));
+
+                // Delete the now-empty merged categories
+                for cat in &to_merge {
+                    db.delete_node(&cat.id).map_err(|e| e.to_string())?;
+                    total_merged += 1;
+                }
+
+                // Update survivor's child_count
+                let new_children = db.get_children(&survivor.id).map_err(|e| e.to_string())?;
+                db.update_child_count(&survivor.id, new_children.len() as i32)
+                    .map_err(|e| e.to_string())?;
+
+                // Rename survivor using AI based on combined children
+                if let Ok(Some(new_name)) = generate_merged_category_name(db, &survivor.id, app).await {
+                    if new_name != survivor.title {
+                        // Update title, cluster_label, and ai_title
+                        if let Ok(mut updated_node) = db.get_node(&survivor.id) {
+                            if let Some(ref mut node) = updated_node {
+                                node.title = new_name.clone();
+                                node.cluster_label = Some(new_name.clone());
+                                node.ai_title = Some(new_name.clone());
+                                if let Err(e) = db.update_node(node) {
+                                    emit_log(app, "warn", &format!("Failed to rename survivor: {}", e));
+                                } else {
+                                    emit_log(app, "info", &format!("Renamed survivor to '{}'", new_name));
+                                    total_renamed += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Recompute centroid for survivor
+                compute_and_store_centroid(db, &survivor.id);
+            }
+        }
+
+        emit_log(app, "debug", &format!("Completed depth {} processing", depth));
+    }
+
+    // Update parent child counts after all merges
+    if let Err(e) = db.fix_all_child_counts() {
+        emit_log(app, "warn", &format!("Failed to fix child counts: {}", e));
+    }
+
+    emit_log(app, "info", &format!(
+        "Merge complete: {} categories merged, {} children reparented, {} renamed across {} levels",
+        total_merged, total_reparented, total_renamed, levels_processed
+    ));
+
+    Ok(MergeCategoriesResult {
+        categories_merged: total_merged,
+        children_reparented: total_reparented,
+        categories_renamed: total_renamed,
+        levels_processed,
+    })
+}
+
+/// Cluster node IDs by embedding similarity using single-linkage clustering.
+/// Returns groups of similar IDs (each group has similarity >= threshold with at least one other member).
+fn cluster_by_similarity(embeddings: &[(String, Vec<f32>)], threshold: f32) -> Vec<Vec<String>> {
+    let n = embeddings.len();
+    if n < 2 {
+        return vec![];
+    }
+
+    // Union-Find data structure for clustering
+    let mut parent: Vec<usize> = (0..n).collect();
+
+    fn find(parent: &mut [usize], i: usize) -> usize {
+        if parent[i] != i {
+            parent[i] = find(parent, parent[i]);
+        }
+        parent[i]
+    }
+
+    fn union(parent: &mut [usize], i: usize, j: usize) {
+        let pi = find(parent, i);
+        let pj = find(parent, j);
+        if pi != pj {
+            parent[pi] = pj;
+        }
+    }
+
+    // Compare all pairs and union similar ones
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let sim = cosine_similarity(&embeddings[i].1, &embeddings[j].1);
+            if sim >= threshold {
+                union(&mut parent, i, j);
+            }
+        }
+    }
+
+    // Group by root
+    let mut clusters: HashMap<usize, Vec<String>> = HashMap::new();
+    for i in 0..n {
+        let root = find(&mut parent, i);
+        clusters.entry(root).or_default().push(embeddings[i].0.clone());
+    }
+
+    // Return only clusters with 2+ members
+    clusters.into_values()
+        .filter(|c| c.len() >= 2)
+        .collect()
+}
+
+/// Generate a new name for a merged category based on its combined children.
+/// Uses AI to create a meaningful name that encompasses all children.
+async fn generate_merged_category_name(
+    db: &Database,
+    category_id: &str,
+    app: Option<&AppHandle>,
+) -> Result<Option<String>, String> {
+    let children = db.get_children(category_id).map_err(|e| e.to_string())?;
+    if children.is_empty() {
+        return Ok(None);
+    }
+
+    // Get parent context for better naming
+    let category = db.get_node(category_id).map_err(|e| e.to_string())?;
+    let parent_context = if let Some(ref cat) = category {
+        if let Some(ref parent_id) = cat.parent_id {
+            db.get_node(parent_id).ok().flatten()
+                .map(|p| p.cluster_label.or(Some(p.title)).unwrap_or_default())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Use AI naming for merged categories
+    emit_log(app, "info", &format!(
+        "Using AI to name merged category with {} children", children.len()
+    ));
+
+    let topics: Vec<ai_client::TopicInfo> = children.iter()
+        .map(|c| ai_client::TopicInfo {
+            id: c.id.clone(),
+            label: c.ai_title.clone()
+                .or_else(|| c.cluster_label.clone())
+                .unwrap_or_else(|| c.title.clone()),
+            item_count: c.child_count.max(1),
+        })
+        .collect();
+
+    let context = ai_client::GroupingContext {
+        parent_name: parent_context.unwrap_or_else(|| "Knowledge".to_string()),
+        parent_description: None,
+        hierarchy_path: vec![],
+        current_depth: category.as_ref().map(|c| c.depth).unwrap_or(1),
+        sibling_names: vec![],
+        forbidden_names: vec![],
+        mandatory_clusters: vec![],
+    };
+
+    // Ask AI to suggest just ONE category name for these children
+    match timeout(
+        Duration::from_secs(30),
+        ai_client::group_topics_into_categories(&topics, &context, Some(1))
+    ).await {
+        Ok(Ok(groupings)) if !groupings.is_empty() => {
+            let name = groupings[0].name.clone();
+            if !is_garbage_name(&name) {
+                return Ok(Some(name));
+            }
+        }
+        Ok(Err(e)) => {
+            emit_log(app, "warn", &format!("AI naming failed: {}", e));
+        }
+        Err(_) => {
+            emit_log(app, "warn", "AI naming timed out");
+        }
+        _ => {}
+    }
+
+    // AI failed - no name
+    Ok(None)
+}

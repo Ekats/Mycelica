@@ -2,10 +2,12 @@
 //!
 //! Supports:
 //! - Rust (.rs) - parsed with `syn` crate
-//! - TypeScript/TSX (.ts, .tsx) - TODO: tree-sitter
+//! - TypeScript/TSX (.ts, .tsx) - parsed with tree-sitter
+//! - JavaScript/JSX (.js, .jsx) - parsed with tree-sitter
 //! - Markdown (.md) - documentation files
 
 pub mod rust_parser;
+pub mod ts_parser;
 pub mod types;
 
 use std::collections::HashSet;
@@ -23,6 +25,7 @@ pub use types::{CodeImportResult, CodeItem};
 pub enum Language {
     Rust,
     TypeScript,
+    JavaScript,
     Markdown,
 }
 
@@ -32,6 +35,7 @@ impl Language {
         match ext.to_lowercase().as_str() {
             "rs" => Some(Language::Rust),
             "ts" | "tsx" => Some(Language::TypeScript),
+            "js" | "jsx" | "mjs" | "cjs" => Some(Language::JavaScript),
             "md" => Some(Language::Markdown),
             _ => None,
         }
@@ -42,6 +46,7 @@ impl Language {
         match self {
             Language::Rust => &["rs"],
             Language::TypeScript => &["ts", "tsx"],
+            Language::JavaScript => &["js", "jsx", "mjs", "cjs"],
             Language::Markdown => &["md"],
         }
     }
@@ -51,6 +56,7 @@ impl Language {
         match s.to_lowercase().as_str() {
             "rust" | "rs" => Some(Language::Rust),
             "typescript" | "ts" | "tsx" => Some(Language::TypeScript),
+            "javascript" | "js" | "jsx" => Some(Language::JavaScript),
             "markdown" | "md" => Some(Language::Markdown),
             _ => None,
         }
@@ -112,6 +118,7 @@ pub fn import_code(
 
 /// Collect all files to process from a path.
 /// Uses the `ignore` crate to respect .gitignore files automatically.
+/// Skips nested git repositories (directories with their own .git folder).
 fn collect_files(
     path: &Path,
     lang_filter: Option<Language>,
@@ -122,6 +129,9 @@ fn collect_files(
         return Err(format!("Path does not exist: {}", path.display()));
     }
 
+    // Get the root path to identify nested repos
+    let root_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
     // Build walker that respects .gitignore
     let walker = WalkBuilder::new(path)
         .hidden(false)         // Don't skip hidden files (let .gitignore handle it)
@@ -129,6 +139,18 @@ fn collect_files(
         .git_global(true)      // Respect global gitignore
         .git_exclude(true)     // Respect .git/info/exclude
         .require_git(false)    // Work even if not a git repo
+        .filter_entry(move |entry| {
+            // Skip nested git repositories (directories with their own .git)
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                let canonical = entry_path.canonicalize().unwrap_or_else(|_| entry_path.to_path_buf());
+                // If this directory has .git and is NOT the root, skip it
+                if canonical != root_path && entry_path.join(".git").exists() {
+                    return false;
+                }
+            }
+            true
+        })
         .build();
 
     for entry in walker {
@@ -186,40 +208,54 @@ fn process_file(
     existing_ids: &HashSet<String>,
     result: &mut CodeImportResult,
 ) -> Result<(), String> {
-    match language {
-        Language::Markdown => {
-            // Handle markdown as a single doc node
-            return process_markdown_file(db, path, existing_ids, result);
-        }
-        Language::TypeScript => {
-            return Err("TypeScript parsing not yet implemented".to_string());
-        }
-        Language::Rust => {}
+    // Handle markdown separately (single doc node, not code items)
+    if language == Language::Markdown {
+        return process_markdown_file(db, path, existing_ids, result);
     }
 
-    // Parse Rust code items
-    let items = rust_parser::parse_rust_file(path)?;
+    // Parse code items based on language
+    let items = match language {
+        Language::Rust => rust_parser::parse_rust_file(path)?,
+        Language::TypeScript | Language::JavaScript => ts_parser::parse_ts_file(path)?,
+        Language::Markdown => unreachable!(), // Handled above
+    };
 
     // Create module node for the file itself
     let file_module_id = create_file_module_node(db, path, &language)?;
     result.modules += 1;
 
+    // Track IDs we've seen in this import to catch duplicates within same run
+    let mut seen_ids: HashSet<String> = HashSet::new();
+
     // Create nodes for each item
     for item in items {
         let node_id = item.generate_id();
 
-        // Skip if already exists
-        if existing_ids.contains(&node_id) {
+        // Skip if already exists in DB or seen in this import
+        if existing_ids.contains(&node_id) || seen_ids.contains(&node_id) {
             continue;
         }
 
-        // Create node
-        create_code_node(db, &item, &node_id)?;
-        result.increment(&item.item_type);
+        // Create node (handle UNIQUE constraint gracefully)
+        match create_code_node(db, &item, &node_id) {
+            Ok(()) => {
+                seen_ids.insert(node_id.clone());
+                result.increment(&item.item_type);
 
-        // Create DefinedIn edge: item -> file module
-        create_defined_in_edge(db, &node_id, &file_module_id)?;
-        result.edges_created += 1;
+                // Create DefinedIn edge: item -> file module
+                if let Err(e) = create_defined_in_edge(db, &node_id, &file_module_id) {
+                    // Edge might exist already, not fatal
+                    eprintln!("[Code] Warning: {}", e);
+                } else {
+                    result.edges_created += 1;
+                }
+            }
+            Err(e) if e.contains("UNIQUE constraint") => {
+                // Duplicate ID - skip silently (item already exists)
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     Ok(())
@@ -241,9 +277,10 @@ fn process_markdown_file(
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
 
-    // Generate stable ID based on file path
+    // Generate stable ID based on normalized file path
+    let normalized_path = types::normalize_path(&file_path_str);
     let mut hasher = DefaultHasher::new();
-    file_path_str.hash(&mut hasher);
+    normalized_path.hash(&mut hasher);
     "doc".hash(&mut hasher);
     let node_id = format!("code-{:016x}", hasher.finish());
 
@@ -337,9 +374,10 @@ fn create_file_module_node(db: &Database, path: &Path, language: &Language) -> R
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
 
-    // Generate stable ID
+    // Generate stable ID using normalized path
+    let normalized_path = types::normalize_path(&file_path);
     let mut hasher = DefaultHasher::new();
-    file_path.hash(&mut hasher);
+    normalized_path.hash(&mut hasher);
     "module".hash(&mut hasher);
     let node_id = format!("code-{:016x}", hasher.finish());
 
@@ -352,6 +390,7 @@ fn create_file_module_node(db: &Database, path: &Path, language: &Language) -> R
     let source = match language {
         Language::Rust => "code-rust",
         Language::TypeScript => "code-typescript",
+        Language::JavaScript => "code-javascript",
         Language::Markdown => "code-markdown",
     };
 
@@ -488,6 +527,7 @@ fn detect_language_from_path(path: &str) -> &'static str {
         .map(|ext| match ext {
             "rs" => "rust",
             "ts" | "tsx" => "typescript",
+            "js" | "jsx" | "mjs" | "cjs" => "javascript",
             "md" => "markdown",
             _ => "unknown",
         })
@@ -497,6 +537,7 @@ fn detect_language_from_path(path: &str) -> &'static str {
 /// Get an emoji for a code item type.
 fn emoji_for_item_type(item_type: &str) -> String {
     match item_type {
+        // Rust
         "function" => "🔧",
         "struct" => "📦",
         "enum" => "🔢",
@@ -505,6 +546,11 @@ fn emoji_for_item_type(item_type: &str) -> String {
         "module" => "📁",
         "macro" => "🔮",
         "doc" => "📖",
+        // TypeScript/JavaScript
+        "class" => "🏛️",
+        "interface" => "📋",
+        "type" => "🏷️",
+        "const" => "📌",
         _ => "📝",
     }
     .to_string()
