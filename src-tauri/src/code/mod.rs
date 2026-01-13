@@ -4,8 +4,13 @@
 //! - Rust (.rs) - parsed with `syn` crate
 //! - TypeScript/TSX (.ts, .tsx) - parsed with tree-sitter
 //! - JavaScript/JSX (.js, .jsx) - parsed with tree-sitter
+//! - Python (.py) - parsed with tree-sitter
+//! - C (.c, .h) - parsed with tree-sitter
 //! - Markdown (.md) - documentation files
+//! - reStructuredText (.rst) - documentation files
 
+pub mod c_parser;
+pub mod python_parser;
 pub mod rust_parser;
 pub mod ts_parser;
 pub mod types;
@@ -26,7 +31,10 @@ pub enum Language {
     Rust,
     TypeScript,
     JavaScript,
+    Python,
+    C,
     Markdown,
+    Rst,
 }
 
 impl Language {
@@ -36,7 +44,10 @@ impl Language {
             "rs" => Some(Language::Rust),
             "ts" | "tsx" => Some(Language::TypeScript),
             "js" | "jsx" | "mjs" | "cjs" => Some(Language::JavaScript),
+            "py" | "pyi" => Some(Language::Python),
+            "c" | "h" => Some(Language::C),
             "md" => Some(Language::Markdown),
+            "rst" => Some(Language::Rst),
             _ => None,
         }
     }
@@ -47,7 +58,10 @@ impl Language {
             Language::Rust => &["rs"],
             Language::TypeScript => &["ts", "tsx"],
             Language::JavaScript => &["js", "jsx", "mjs", "cjs"],
+            Language::Python => &["py", "pyi"],
+            Language::C => &["c", "h"],
             Language::Markdown => &["md"],
+            Language::Rst => &["rst"],
         }
     }
 
@@ -57,7 +71,10 @@ impl Language {
             "rust" | "rs" => Some(Language::Rust),
             "typescript" | "ts" | "tsx" => Some(Language::TypeScript),
             "javascript" | "js" | "jsx" => Some(Language::JavaScript),
+            "python" | "py" => Some(Language::Python),
+            "c" | "h" => Some(Language::C),
             "markdown" | "md" => Some(Language::Markdown),
+            "rst" | "restructuredtext" => Some(Language::Rst),
             _ => None,
         }
     }
@@ -208,16 +225,18 @@ fn process_file(
     existing_ids: &HashSet<String>,
     result: &mut CodeImportResult,
 ) -> Result<(), String> {
-    // Handle markdown separately (single doc node, not code items)
-    if language == Language::Markdown {
-        return process_markdown_file(db, path, existing_ids, result);
+    // Handle documentation files separately (single doc node, not code items)
+    if language == Language::Markdown || language == Language::Rst {
+        return process_doc_file(db, path, language, existing_ids, result);
     }
 
     // Parse code items based on language
     let items = match language {
         Language::Rust => rust_parser::parse_rust_file(path)?,
         Language::TypeScript | Language::JavaScript => ts_parser::parse_ts_file(path)?,
-        Language::Markdown => unreachable!(), // Handled above
+        Language::Python => python_parser::parse_py_file(path)?,
+        Language::C => c_parser::parse_c_file(path)?,
+        Language::Markdown | Language::Rst => unreachable!(), // Handled above
     };
 
     // Create module node for the file itself
@@ -261,10 +280,11 @@ fn process_file(
     Ok(())
 }
 
-/// Process a markdown file as a documentation node.
-fn process_markdown_file(
+/// Process a documentation file (Markdown or RST) as a documentation node.
+fn process_doc_file(
     db: &Database,
     path: &Path,
+    language: Language,
     existing_ids: &HashSet<String>,
     result: &mut CodeImportResult,
 ) -> Result<(), String> {
@@ -293,21 +313,30 @@ fn process_markdown_file(
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
 
-    // Extract title: first H1 heading or filename
-    let title = extract_markdown_title(&content)
-        .unwrap_or_else(|| {
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(file_name)
-                .to_string()
-        });
+    // Extract title based on language
+    let title = match language {
+        Language::Markdown => extract_markdown_title(&content),
+        Language::Rst => extract_rst_title(&content),
+        _ => None,
+    }.unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(file_name)
+            .to_string()
+    });
 
     let now = chrono::Utc::now().timestamp_millis();
+
+    let (source_str, lang_str) = match language {
+        Language::Markdown => ("code-markdown", "code-markdown"),
+        Language::Rst => ("code-rst", "code-rst"),
+        _ => ("code-doc", "code-doc"),
+    };
 
     // Create metadata JSON (same format as code nodes)
     let metadata = serde_json::json!({
         "file_path": file_path_str,
-        "language": "code-markdown"
+        "language": lang_str
     });
 
     let node = Node {
@@ -338,7 +367,7 @@ fn process_markdown_file(
         latest_child_date: None,
         is_private: None,
         privacy_reason: None,
-        source: Some("code-markdown".to_string()),
+        source: Some(source_str.to_string()),
         pdf_available: None,
         content_type: Some("code_doc".to_string()),
         associated_idea_id: None,
@@ -347,8 +376,8 @@ fn process_markdown_file(
 
     db.insert_node(&node)
         .map_err(|e| format!("Failed to insert doc node: {}", e))?;
-
     result.docs += 1;
+
     Ok(())
 }
 
@@ -360,6 +389,61 @@ fn extract_markdown_title(content: &str) -> Option<String> {
             return Some(trimmed[2..].trim().to_string());
         }
     }
+    None
+}
+
+/// Extract title from RST: first heading with underline
+/// RST headings are a line of text followed by a line of = - ~ ^ " etc.
+fn extract_rst_title(content: &str) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let underline_chars = ['=', '-', '`', ':', '\'', '"', '~', '^', '_', '*', '+', '#', '<', '>'];
+
+    for i in 0..lines.len().saturating_sub(1) {
+        let line = lines[i].trim();
+        let next_line = lines[i + 1].trim();
+
+        // Skip empty lines and directives
+        if line.is_empty() || line.starts_with("..") {
+            continue;
+        }
+
+        // Check if next line is an underline (all same char, at least 3 chars)
+        if next_line.len() >= 3 {
+            let first_char = next_line.chars().next().unwrap();
+            if underline_chars.contains(&first_char)
+                && next_line.chars().all(|c| c == first_char)
+                && next_line.len() >= line.len()
+            {
+                return Some(line.to_string());
+            }
+        }
+    }
+
+    // Also check for overline + title + underline pattern
+    for i in 1..lines.len().saturating_sub(1) {
+        let prev_line = lines[i - 1].trim();
+        let line = lines[i].trim();
+        let next_line = lines[i + 1].trim();
+
+        if line.is_empty() || line.starts_with("..") {
+            continue;
+        }
+
+        // Check if both prev and next are matching underlines
+        if prev_line.len() >= 3 && next_line.len() >= 3 {
+            let prev_char = prev_line.chars().next().unwrap();
+            let next_char = next_line.chars().next().unwrap();
+
+            if underline_chars.contains(&prev_char)
+                && prev_char == next_char
+                && prev_line.chars().all(|c| c == prev_char)
+                && next_line.chars().all(|c| c == next_char)
+            {
+                return Some(line.to_string());
+            }
+        }
+    }
+
     None
 }
 
@@ -391,7 +475,10 @@ fn create_file_module_node(db: &Database, path: &Path, language: &Language) -> R
         Language::Rust => "code-rust",
         Language::TypeScript => "code-typescript",
         Language::JavaScript => "code-javascript",
+        Language::Python => "code-python",
+        Language::C => "code-c",
         Language::Markdown => "code-markdown",
+        Language::Rst => "code-rst",
     };
 
     let node = Node {
@@ -528,7 +615,10 @@ fn detect_language_from_path(path: &str) -> &'static str {
             "rs" => "rust",
             "ts" | "tsx" => "typescript",
             "js" | "jsx" | "mjs" | "cjs" => "javascript",
+            "py" | "pyi" => "python",
+            "c" | "h" => "c",
             "md" => "markdown",
+            "rst" => "rst",
             _ => "unknown",
         })
         .unwrap_or("unknown")
@@ -798,8 +888,42 @@ mod tests {
         assert_eq!(Language::from_extension("rs"), Some(Language::Rust));
         assert_eq!(Language::from_extension("ts"), Some(Language::TypeScript));
         assert_eq!(Language::from_extension("tsx"), Some(Language::TypeScript));
+        assert_eq!(Language::from_extension("py"), Some(Language::Python));
+        assert_eq!(Language::from_extension("c"), Some(Language::C));
+        assert_eq!(Language::from_extension("h"), Some(Language::C));
         assert_eq!(Language::from_extension("md"), Some(Language::Markdown));
-        assert_eq!(Language::from_extension("py"), None);
+        assert_eq!(Language::from_extension("rst"), Some(Language::Rst));
+        assert_eq!(Language::from_extension("cpp"), None);
+    }
+
+    #[test]
+    fn test_extract_rst_title() {
+        // Simple underline style
+        assert_eq!(
+            extract_rst_title("My Title\n========\n\nContent here"),
+            Some("My Title".to_string())
+        );
+
+        // Dashes underline
+        assert_eq!(
+            extract_rst_title("Another Title\n-------------\n"),
+            Some("Another Title".to_string())
+        );
+
+        // Overline + underline style
+        assert_eq!(
+            extract_rst_title("==========\nBig Title\n==========\n"),
+            Some("Big Title".to_string())
+        );
+
+        // No title
+        assert_eq!(extract_rst_title("Just some text\nwithout underlines"), None);
+
+        // Skip directives
+        assert_eq!(
+            extract_rst_title(".. note::\n\nReal Title\n==========\n"),
+            Some("Real Title".to_string())
+        );
     }
 
     #[test]
