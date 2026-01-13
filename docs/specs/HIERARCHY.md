@@ -60,7 +60,7 @@ The hierarchy enforces tiered limits on children per level:
 | 5+ | 150 | Coherent mega-clusters only |
 
 ```rust
-// From hierarchy.rs:165-172
+// From hierarchy.rs:156-164
 fn max_children_for_depth(depth: i32) -> usize {
     match depth {
         0 | 1 => 10,   // Universe + L1: strict navigation
@@ -71,6 +71,31 @@ fn max_children_for_depth(depth: i32) -> usize {
     }
 }
 ```
+
+### Safety Limits
+
+**MAX_HIERARCHY_DEPTH = 15** — Prevents runaway recursion during intermediate node creation. If grouping would exceed this depth, the operation stops and logs a warning.
+
+```rust
+// From hierarchy.rs:1358
+const MAX_HIERARCHY_DEPTH: i32 = 15;
+```
+
+### Garbage Name Filtering
+
+AI-generated category names are filtered against a list of meaningless terms. A name is rejected if >50% of its words match garbage terms (substring matching).
+
+```rust
+// From hierarchy.rs:201-206
+const GARBAGE_NAMES: &[&str] = &[
+    "empty", "cluster", "misc", "other", "general", "various",
+    "uncategorized", "miscellaneous", "group", "collection",
+    "related", "topics", "items", "content", "stuff", "things",
+    "mixed", "assorted", "combined", "merged", "grouped", "sorted",
+];
+```
+
+When a garbage name is detected, the system falls back to keyword-based naming or skips the grouping.
 
 ### Threshold-Based Level Creation
 
@@ -282,6 +307,27 @@ If item count changes significantly:
   └── Re-run clustering from scratch
 ```
 
+### Step 5: Privacy Propagation
+
+After hierarchy is built, privacy scores propagate bottom-up from items to categories.
+
+**Algorithm (from hierarchy.rs:2947-2988):**
+1. Start from deepest level (one above items)
+2. Work upward toward Universe
+3. For each category: `privacy = min(children's privacy scores)`
+4. Most restrictive score wins (0.0 = private, 1.0 = public)
+
+```
+Items at depth 5:
+  Item A (privacy: 0.8)
+  Item B (privacy: 0.3)  ← most restrictive
+  Item C (privacy: 0.9)
+    ↓
+Parent category gets privacy: 0.3
+```
+
+**Protected nodes:** Project umbrellas (`project-*`) and Personal category (`category-personal`) stay at depth 1 and are excluded from uber-category grouping.
+
 ---
 
 ## UI View States
@@ -339,4 +385,4 @@ Middle levels are just scaffolding to make navigation manageable. Small collecti
 
 ---
 
-*Last updated: 2026-01-08*
+*Last updated: 2026-01-13*

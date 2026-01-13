@@ -67,9 +67,10 @@ mycelica-cli import keep <ZIP_FILE>
 mycelica-cli import openaire <QUERY> [--max-results N]
 mycelica-cli import openaire "machine learning" --max-results 100
 
-# Import source code (Rust, TypeScript, Markdown)
+# Import source code (Rust, TypeScript, JavaScript, Python, C, Markdown, RST)
 mycelica-cli import code <PATH>              # Import codebase
-mycelica-cli import code src/ --update       # Update after edits (re-index)
+mycelica-cli import code src/ --update       # Incremental update (delete + reimport + embeddings + edges)
+mycelica-cli import code . --language rust   # Filter by language
 ```
 
 ### node - Node Operations
@@ -110,9 +111,12 @@ mycelica-cli cluster status        # Show clustering statistics
 ### embeddings - Embedding Operations
 
 ```bash
-mycelica-cli embeddings regenerate [--local]  # Regenerate all embeddings
-mycelica-cli embeddings clear                 # Clear all embeddings
 mycelica-cli embeddings status                # Show embedding statistics
+mycelica-cli embeddings regenerate            # Regenerate all embeddings
+mycelica-cli embeddings clear                 # Clear all embeddings
+mycelica-cli embeddings local                 # Show local embeddings status
+mycelica-cli embeddings local on              # Enable local embeddings (default)
+mycelica-cli embeddings local off             # Disable local embeddings
 ```
 
 ### privacy - Privacy Operations
@@ -189,7 +193,9 @@ mycelica-cli maintenance fix-counts        # Fix child counts
 mycelica-cli maintenance fix-depths        # Fix node depths
 mycelica-cli maintenance prune-edges       # Prune dead edges
 mycelica-cli maintenance precompute-fos-edges  # Precompute FOS edge sets
-mycelica-cli maintenance index-edges       # Index edges by parent
+mycelica-cli maintenance index-edges          # Index edges by parent
+mycelica-cli maintenance merge-small-categories  # Merge small siblings by embedding similarity
+mycelica-cli maintenance repair-code-tags <PATH>  # Restore file_path metadata to code nodes
 ```
 
 ### export - Data Export
@@ -346,4 +352,4 @@ CLI operations can be cancelled with Ctrl+C. This is different from GUI which us
 
 ---
 
-*Last updated: 2026-01-10*
+*Last updated: 2026-01-13*

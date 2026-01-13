@@ -17,17 +17,17 @@ All backend operations exposed via `invoke()`. Frontend calls these through `@ta
 | [Clustering](#clustering) | 4 commands |
 | [AI Processing](#ai-processing) | 5 commands |
 | [Content Classification](#content-classification) | 3 commands |
-| [Rebuild Lite](#rebuild-lite) | 4 commands |
+| [Rebuild Lite](#rebuild-lite) | 5 commands |
 | [Import](#import) | 8 commands |
 | [Paper Operations](#paper-operations) | 9 commands |
 | [Quick Access](#quick-access-sidebar) | 5 commands |
 | [Semantic Similarity](#semantic-similarity) | 3 commands |
 | [Privacy](#privacy) | 10 commands |
-| [Settings & State](#settings--state) | 27 commands |
+| [Settings & State](#settings--state) | 32 commands |
 | [Database Management](#database-management) | 11 commands |
 | [Cancellation](#cancellation) | 4 commands |
 
-**Total: ~120+ commands**
+**Total: ~130+ commands**
 
 > See also: [CLI.md](../CLI.md) for command-line interface reference
 
@@ -668,6 +668,19 @@ const counts = await invoke<SupportingCounts>('get_supporting_counts', { parentI
 
 Fast hierarchy refresh without full AI processing.
 
+### preclassify_items
+Pre-classify items before full processing.
+
+```rust
+fn preclassify_items(state: State<AppState>) -> Result<usize, String>
+```
+
+```typescript
+const classified = await invoke<number>('preclassify_items');
+```
+
+---
+
 ### reclassify_pattern
 Pattern-based content type classification.
 
@@ -837,7 +850,7 @@ fn get_imported_paper_count(state: State<AppState>) -> Result<usize, String>
 ---
 
 ### import_code
-Import source code from a directory. Parses Rust, TypeScript, and Markdown files. Respects .gitignore.
+Import source code from a directory. Parses Rust, TypeScript, JavaScript, Python, C, Markdown, and RST files. Respects .gitignore.
 
 ```rust
 fn import_code(
@@ -1476,6 +1489,53 @@ fn set_show_tips(enabled: bool) -> Result<(), String>
 
 ---
 
+### get_llm_backend / set_llm_backend
+Get/set LLM backend for AI processing (Claude vs Ollama).
+
+```rust
+fn get_llm_backend() -> String  // "anthropic" or "ollama"
+fn set_llm_backend(backend: String) -> Result<(), String>
+```
+
+```typescript
+const backend = await invoke<string>('get_llm_backend');
+await invoke('set_llm_backend', { backend: 'ollama' });
+```
+
+---
+
+### check_ollama_status
+Check if Ollama is running and list available models.
+
+```rust
+async fn check_ollama_status() -> OllamaStatus
+```
+
+```typescript
+interface OllamaStatus {
+  available: boolean;
+  models: string[];
+}
+const status = await invoke<OllamaStatus>('check_ollama_status');
+```
+
+---
+
+### get_ollama_model / set_ollama_model
+Get/set the Ollama model for AI processing.
+
+```rust
+fn get_ollama_model() -> String
+fn set_ollama_model(model: String) -> Result<(), String>
+```
+
+```typescript
+const model = await invoke<string>('get_ollama_model');
+await invoke('set_ollama_model', { model: 'qwen2.5:7b' });
+```
+
+---
+
 ## Database Management
 
 ### get_db_path
@@ -1729,4 +1789,4 @@ try {
 
 ---
 
-*Last updated: 2026-01-10*
+*Last updated: 2026-01-13*
