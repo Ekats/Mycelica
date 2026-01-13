@@ -2,6 +2,57 @@
 
 All notable changes to Mycelica will be documented in this file.
 
+## [0.8.1] - 2026-01-13
+
+### Added
+- **LLM Backend Toggle**: Settings → API Keys now has Claude/Ollama toggle
+  - Shows Ollama model input and running status when Ollama selected
+  - Note: Only affects AI Processing; hierarchy build still uses Claude
+- **Call edges in Similar Nodes**: Shows "calls" / "called by" labels instead of percentages
+  - Works in both graph details panel and leaf view similar nodes
+  - Group headers show edge type when all items share the same type
+
+### Changed
+- **Unified color system**: Single `getHeatColor()` source of truth for all value-based colors
+  - Removed duplicate `getDateColor`, `getEdgeColor` functions
+  - Simplified gradient: Red → Yellow → Cyan (removed blue step)
+  - Fixed inconsistent 100% colors (removed hardcoded green)
+
+### Fixed
+- Similar nodes panel: All 100% entries now display same color
+
+---
+
+## [0.8.0] - 2026-01-12
+
+### Added
+- **Multi-language code import**: Full parsing support for Python, C, TypeScript, and RST
+  - `import code <path>` now handles `.py`, `.c`, `.h`, `.ts`, `.tsx`, `.rst` files
+  - Extracts functions, classes, structs, methods with proper signatures
+  - RST parser extracts documentation sections and code blocks
+- **Ollama backend**: Local LLM alternative to Claude for AI processing
+  - `config set-backend ollama` / `config set-backend anthropic`
+  - `config set-ollama-model <model>` (default: qwen2.5:7b)
+  - `check_ollama_status` command to verify Ollama is running
+- **CUDA embeddings**: GPU-accelerated local embeddings via candle
+  - Build with `cargo +nightly build --features cuda`
+  - Separate CPU and CUDA binaries in releases
+- **Call graph analysis**: `analyze code-edges` extracts function call relationships
+  - Creates `Calls` edges between functions
+  - Supports cross-file call detection
+- **CLI file logging**: All CLI output now logged to `~/.local/share/com.mycelica.app/logs/`
+- **Maintenance repair-code-tags**: Repairs corrupted code node metadata without re-running AI
+
+### Changed
+- Code nodes skip AI title generation (keep function signatures as titles)
+- Embeddings generated for all code items for similarity search
+
+### Fixed
+- Code node tags preserved during AI processing (was overwriting file_path metadata)
+- Cluster nodes filtered from similar nodes (can't open in leaf view)
+
+---
+
 ## [0.7.4] - 2026-01-10
 
 ### Added

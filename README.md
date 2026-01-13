@@ -44,16 +44,20 @@ Mycelica shows structure you can navigate, plus connections that cross category 
 - **AI-Powered Analysis** — Claude generates titles, summaries, tags, and emojis for imported content
 - **Smart Clustering** — Multi-method clustering (AI + TF-IDF fallback) organizes items into semantic topics
 - **Dynamic Hierarchy** — Auto-creates navigable structure with 8-15 children per level
-- **Semantic Connections** — OpenAI embeddings create "Related" edges between similar content:
+- **Semantic Connections** — Local embeddings (all-MiniLM-L6-v2) create "Related" edges between similar content:
   ```
   "Rust async debugging"    ←─ 0.89 ─→  "Tokio runtime errors"
   "Consciousness research"  ←─ 0.76 ─→  "Philosophy of mind"
   ```
+- **Code Import** — Import source code with function/class extraction and call graph analysis:
+  - Supports Rust, Python, TypeScript, C/C++, RST documentation
+  - `Calls` edges show function call relationships
+  - Semantic search across your codebase
 - **Leaf Reader** — Full-screen reader for conversations (chat bubbles) and notes (markdown)
 - **Privacy Filtering** — Showcase/normal modes for safe database exports
-- **Import** — Claude conversations, Markdown files, OpenAIRE papers, Google Keep
+- **Import** — Claude conversations, Markdown files, OpenAIRE papers, Google Keep, source code
 - **OpenAIRE Integration** — Query EU Open Research Graph with country/field/year filters, optional PDF download
-- **CLI & TUI** — 18 command categories, interactive terminal UI, BibTeX/JSON/Markdown/DOT export
+- **CLI & TUI** — 20 command categories, interactive terminal UI, BibTeX/JSON/Markdown/DOT export
 - **Local-First** — SQLite database stays on your machine
 
 ---
@@ -69,7 +73,8 @@ Download from [Releases](https://github.com/Ekats/Mycelica/releases):
 | `.deb` | `sudo dpkg -i Mycelica_*.deb` |
 | `.rpm` | `sudo rpm -i Mycelica-*.rpm` |
 | `.AppImage` | `chmod +x Mycelica_*.AppImage && ./Mycelica_*.AppImage` |
-| `.tar.gz` | `tar -xzf Mycelica_*.tar.gz && ./mycelica` |
+| `.tar.gz` (CPU) | `tar -xzf mycelica-cli-*.tar.gz` — CLI only |
+| `.tar.gz` (CUDA) | `tar -xzf mycelica-cli-cuda-*.tar.gz` — CLI with GPU acceleration |
 
 ### Build from Source
 
@@ -83,14 +88,16 @@ npm run tauri dev    # Development
 npm run tauri build  # Production
 ```
 
-### API Keys
+### API Keys & LLM Backend
 
 Set via **Settings panel** or environment variables:
 
 | Key | Required | Purpose |
 |-----|----------|---------|
-| `ANTHROPIC_API_KEY` | Yes | AI analysis, clustering, privacy scanning |
-| `OPENAI_API_KEY` | No | Semantic embeddings for similarity edges |
+| `ANTHROPIC_API_KEY` | Yes* | AI analysis, clustering, hierarchy build |
+
+*Or use **Ollama** as a local alternative for AI processing (Settings → API Keys → toggle Claude/Ollama).
+Embeddings are always local (all-MiniLM-L6-v2) — no OpenAI key needed.
 
 ---
 
@@ -102,7 +109,13 @@ Mycelica includes a headless CLI for scripting, automation, and server use.
 
 ```bash
 cd src-tauri
+
+# CPU build (default)
 cargo build --release --bin mycelica-cli
+
+# CUDA build (GPU-accelerated embeddings, requires nightly)
+cargo +nightly build --release --bin mycelica-cli --features cuda
+
 # Binary at: target/release/mycelica-cli
 ```
 
@@ -153,6 +166,8 @@ mycelica-cli [OPTIONS] <COMMAND>
 | `nav` | Graph navigation |
 | `maintenance` | Database maintenance |
 | `completions` | Shell completions |
+| `analyze` | Code analysis (call graph) |
+| `code` | Code operations (show source) |
 
 </details>
 
@@ -165,6 +180,7 @@ mycelica-cli [OPTIONS] <COMMAND>
 | `import claude <file>` | Import Claude JSON |
 | `import markdown <path>` | Import Markdown |
 | `import keep <zip>` | Import Google Keep |
+| `import code <path>` | Import source code (Rust, Python, TS, C) |
 
 </details>
 
@@ -318,11 +334,12 @@ Universe (root)
 
 ### Processing Pipeline
 
-1. **Import** — Claude conversations, Markdown, OpenAIRE papers, or Google Keep
-2. **AI Analysis** — Generate titles, summaries, tags, emojis
+1. **Import** — Claude conversations, Markdown, OpenAIRE papers, Google Keep, or source code
+2. **AI Analysis** — Generate titles, summaries, tags (code items skip this, keep function signatures)
 3. **Clustering** — Group items into semantic topics
 4. **Hierarchy Build** — Create navigable structure (8-15 children per level)
 5. **Embeddings** — Generate vectors for semantic similarity edges
+6. **Call Graph** — Extract function call relationships (code only)
 
 ---
 
@@ -345,9 +362,11 @@ mycelica/
 │   └── src/
 │       ├── commands/       # Tauri command handlers
 │       ├── db/             # SQLite layer
-│       ├── ai_client.rs    # Anthropic integration
+│       ├── code/           # Source code parsers (Rust, Python, TS, C)
+│       ├── ai_client.rs    # Anthropic/Ollama integration
 │       ├── hierarchy.rs    # Hierarchy algorithms
-│       └── clustering.rs   # Topic clustering
+│       ├── clustering.rs   # Topic clustering
+│       └── local_embeddings.rs  # all-MiniLM-L6-v2
 
 
 ```
