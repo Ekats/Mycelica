@@ -896,6 +896,8 @@ enum AnalyzeCommands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Create "Documents" edges from docs to code they reference
+    DocEdges,
 }
 
 #[derive(Subcommand)]
@@ -3892,6 +3894,9 @@ async fn handle_analyze(cmd: AnalyzeCommands, db: &Database, json: bool, quiet: 
         AnalyzeCommands::CodeEdges { path, dry_run } => {
             analyze_code_edges(db, path.as_deref(), dry_run, json, quiet)?;
         }
+        AnalyzeCommands::DocEdges => {
+            analyze_doc_edges(db, json, quiet)?;
+        }
     }
     Ok(())
 }
@@ -4037,23 +4042,253 @@ fn analyze_code_edges(
     Ok(())
 }
 
-/// Extract function name from a title like "pub fn foo_bar(...)" or "fn baz<T>(...)"
-fn extract_function_name(title: &str) -> Option<String> {
-    // Look for "fn name" pattern
-    let fn_idx = title.find("fn ")?;
-    let after_fn = &title[fn_idx + 3..];
+/// Analyze docs and create "Documents" edges to code they reference.
+/// Scans doc content for backtick references and function call patterns.
+fn analyze_doc_edges(db: &Database, json: bool, quiet: bool) -> Result<(), String> {
+    use std::collections::{HashMap, HashSet};
+    use mycelica_lib::db::{Edge, EdgeType};
+    use regex::Regex;
 
-    // Find the end of the function name (first non-identifier char)
-    let name_end = after_fn
-        .find(|c: char| !c.is_alphanumeric() && c != '_')
-        .unwrap_or(after_fn.len());
+    let all_nodes = db.get_items().map_err(|e| e.to_string())?;
 
-    let name = &after_fn[..name_end];
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
+    // Build name→id map for code items (functions, structs, classes, macros)
+    let mut name_to_id: HashMap<String, String> = HashMap::new();
+    for item in &all_nodes {
+        let content_type = item.content_type.as_deref().unwrap_or("");
+        if let Some(name) = extract_code_name_for_docs(&item.title, content_type) {
+            name_to_id.insert(name, item.id.clone());
+        }
     }
+
+    if !quiet {
+        eprintln!("[DocEdges] Built index of {} code names", name_to_id.len());
+    }
+
+    // Get doc nodes
+    let doc_nodes: Vec<_> = all_nodes
+        .iter()
+        .filter(|n| n.content_type.as_deref() == Some("code_doc"))
+        .collect();
+
+    if !quiet {
+        eprintln!("[DocEdges] Found {} docs to analyze", doc_nodes.len());
+    }
+
+    // Get existing Documents edges
+    let existing_edges: HashSet<(String, String)> = db
+        .get_all_edges()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e.edge_type == EdgeType::Documents)
+        .map(|e| (e.source, e.target))
+        .collect();
+
+    let backtick_re = Regex::new(r"`([^`]+)`").unwrap();
+    let fn_call_re = Regex::new(r"\b([a-z_][a-z0-9_]*)\s*\(").unwrap();
+    let type_re = Regex::new(r"\b([A-Z][a-zA-Z0-9]+)\b").unwrap();
+
+    let skip_keywords: HashSet<&str> = ["if", "for", "while", "match", "return", "let", "const",
+        "fn", "def", "class", "struct", "enum", "type", "impl", "trait", "pub", "async",
+        "e", "g", "i", "s", "t", "a", "eg", "ie", "etc", "vs", "or", "and"].into_iter().collect();
+
+    let skip_types: HashSet<&str> = ["The", "This", "That", "These", "Those", "When", "What",
+        "How", "Why", "Where", "Which", "See", "For", "From", "With", "Into", "After", "Before",
+        "JSON", "API", "SQL", "PDF", "URL", "CSS", "HTML", "HTTP", "HTTPS", "UTF", "ASCII",
+        "CLI", "TUI", "GUI", "README", "TODO", "FIXME", "NOTE", "OK", "NULL", "TRUE", "FALSE"].into_iter().collect();
+
+    let mut edges_created = 0;
+
+    for doc in &doc_nodes {
+        let content = match &doc.content {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let mut seen_in_doc: HashSet<String> = HashSet::new();
+
+        let mut try_create_edge = |name: String| {
+            if seen_in_doc.contains(&name) { return; }
+            if let Some(code_id) = name_to_id.get(&name) {
+                if existing_edges.contains(&(doc.id.clone(), code_id.clone())) {
+                    seen_in_doc.insert(name);
+                    return;
+                }
+                let edge = Edge {
+                    id: format!("edge-doc-{}-{}", &doc.id[..8.min(doc.id.len())], &code_id[..8.min(code_id.len())]),
+                    source: doc.id.clone(),
+                    target: code_id.clone(),
+                    edge_type: EdgeType::Documents,
+                    label: None,
+                    weight: Some(1.0),
+                    edge_source: Some("doc-analysis".to_string()),
+                    evidence_id: None,
+                    confidence: Some(0.9),
+                    created_at: chrono::Utc::now().timestamp_millis(),
+                };
+                if db.insert_edge(&edge).is_ok() {
+                    edges_created += 1;
+                }
+                seen_in_doc.insert(name);
+            }
+        };
+
+        // Backtick references
+        for cap in backtick_re.captures_iter(content) {
+            for name in extract_backtick_names(&cap[1]) {
+                try_create_edge(name);
+            }
+        }
+
+        // Function call patterns
+        for cap in fn_call_re.captures_iter(content) {
+            let name = cap[1].to_string();
+            if !skip_keywords.contains(name.as_str()) && (name.len() > 3 || name.contains('_')) {
+                try_create_edge(name);
+            }
+        }
+
+        // Type names
+        for cap in type_re.captures_iter(content) {
+            let name = cap[1].to_string();
+            if !skip_types.contains(name.as_str()) {
+                try_create_edge(name);
+            }
+        }
+    }
+
+    if json {
+        println!(r#"{{"docs_analyzed":{},"edges_created":{}}}"#, doc_nodes.len(), edges_created);
+    } else {
+        println!("Analyzed {} docs", doc_nodes.len());
+        println!("Created {} new Documents edges", edges_created);
+    }
+
+    Ok(())
+}
+
+/// Extract code name from title for doc→code edge matching.
+/// Filters out single-character names to avoid false positives.
+fn extract_code_name_for_docs(title: &str, content_type: &str) -> Option<String> {
+    match content_type {
+        "code_function" => {
+            // Rust: fn name
+            if let Some(fn_idx) = title.find("fn ") {
+                let after = &title[fn_idx + 3..];
+                let end = after.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(after.len());
+                let name = &after[..end];
+                if name.len() >= 2 { return Some(name.to_string()); }
+            }
+            // Python: def name
+            if let Some(def_idx) = title.find("def ") {
+                let after = &title[def_idx + 4..];
+                let end = after.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(after.len());
+                let name = &after[..end];
+                if name.len() >= 2 { return Some(name.to_string()); }
+            }
+            // C: last identifier before (
+            if let Some(paren_idx) = title.find('(') {
+                let before = title[..paren_idx].trim_end();
+                let start = before.rfind(|c: char| !c.is_alphanumeric() && c != '_').map(|i| i + 1).unwrap_or(0);
+                let name = &before[start..];
+                let skip = ["void", "int", "char", "float", "double", "long", "short", "unsigned", "signed", "const", "static", "inline"];
+                if name.len() >= 2 && !skip.contains(&name) { return Some(name.to_string()); }
+            }
+            None
+        }
+        "code_struct" => {
+            if let Some(caps) = regex::Regex::new(r"(?:pub\s+)?(?:typedef\s+)?struct\s+([a-zA-Z_][a-zA-Z0-9_]*)").ok()?.captures(title) {
+                return Some(caps[1].to_string());
+            }
+            None
+        }
+        "code_enum" => {
+            if let Some(caps) = regex::Regex::new(r"(?:pub\s+)?(?:typedef\s+)?enum\s+([a-zA-Z_][a-zA-Z0-9_]*)").ok()?.captures(title) {
+                return Some(caps[1].to_string());
+            }
+            None
+        }
+        "code_class" => {
+            if let Some(caps) = regex::Regex::new(r"class\s+([a-zA-Z_][a-zA-Z0-9_]*)").ok()?.captures(title) {
+                return Some(caps[1].to_string());
+            }
+            None
+        }
+        "code_macro" => {
+            if let Some(caps) = regex::Regex::new(r"#define\s+([a-zA-Z_][a-zA-Z0-9_]*)").ok()?.captures(title) {
+                return Some(caps[1].to_string());
+            }
+            None
+        }
+        "code_trait" => {
+            if let Some(caps) = regex::Regex::new(r"(?:pub\s+)?trait\s+([a-zA-Z_][a-zA-Z0-9_]*)").ok()?.captures(title) {
+                return Some(caps[1].to_string());
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Extract identifiers from backtick content.
+/// Filters out single-character names to avoid false positives.
+fn extract_backtick_names(content: &str) -> Vec<String> {
+    let content = content.split('(').next().unwrap_or(content);
+    content
+        .split(|c| c == ':' || c == '.')
+        .filter(|s| s.len() >= 2) // Skip single-char names
+        .filter(|s| s.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false))
+        .filter(|s| s.chars().all(|c| c.is_alphanumeric() || c == '_'))
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Extract function name from a title. Supports Rust, Python, and C patterns.
+fn extract_function_name(title: &str) -> Option<String> {
+    // Rust: "fn name" or "pub fn name" or "async fn name"
+    if let Some(fn_idx) = title.find("fn ") {
+        let after_fn = &title[fn_idx + 3..];
+        let name_end = after_fn
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(after_fn.len());
+        let name = &after_fn[..name_end];
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+
+    // Python: "def name(" or "async def name("
+    if let Some(def_idx) = title.find("def ") {
+        let after_def = &title[def_idx + 4..];
+        let name_end = after_def
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(after_def.len());
+        let name = &after_def[..name_end];
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+
+    // C: "type name(" - look for identifier followed by (
+    // Common C patterns: "void foo(", "int bar(", "PyObject *func(", "static void baz("
+    // Strategy: find last identifier before first '('
+    if let Some(paren_idx) = title.find('(') {
+        let before_paren = title[..paren_idx].trim_end();
+        // Find the function name (last word before paren)
+        let name_start = before_paren
+            .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let name = &before_paren[name_start..];
+        // Skip if it looks like a keyword or type
+        let skip_words = ["if", "for", "while", "switch", "return", "sizeof", "typeof",
+                          "void", "int", "char", "float", "double", "long", "short",
+                          "unsigned", "signed", "const", "static", "inline", "struct", "enum"];
+        if !name.is_empty() && !skip_words.contains(&name) {
+            return Some(name.to_string());
+        }
+    }
+
+    None
 }
 
 /// Find function names that appear to be called in the given code content.

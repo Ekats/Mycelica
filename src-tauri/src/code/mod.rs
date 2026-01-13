@@ -855,24 +855,53 @@ fn extract_backtick_identifiers(content: &str) -> Vec<String> {
 }
 
 /// Extract code item name from title based on content_type.
+/// Supports Rust, Python, and C patterns.
 fn extract_code_name(title: &str, content_type: &str) -> Option<String> {
     match content_type {
         "code_function" => {
-            // Title format: "fn name(...)" or "pub fn name(...)" or "pub async fn name(...)"
-            let re = regex::Regex::new(r"(?:pub\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+([a-zA-Z_][a-zA-Z0-9_]*)").ok()?;
-            re.captures(title).map(|c| c[1].to_string())
+            // Rust: "fn name(...)" or "pub fn name(...)" or "pub async fn name(...)"
+            if let Some(caps) = regex::Regex::new(r"(?:pub\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+([a-zA-Z_][a-zA-Z0-9_]*)").ok()?.captures(title) {
+                return Some(caps[1].to_string());
+            }
+            // Python: "def name(" or "async def name("
+            if let Some(caps) = regex::Regex::new(r"(?:async\s+)?def\s+([a-zA-Z_][a-zA-Z0-9_]*)").ok()?.captures(title) {
+                return Some(caps[1].to_string());
+            }
+            // C: "type name(" where type is void/int/char/bool/size_t/etc or pointer (*) or _t suffix
+            // Match: "void foo(", "int bar(", "PyObject func(", "char *str(", "size_t len("
+            if let Some(caps) = regex::Regex::new(r"^(?:static\s+)?(?:inline\s+)?(?:const\s+)?(?:unsigned\s+)?(?:signed\s+)?(?:long\s+)?(?:short\s+)?(?:void|int|char|bool|float|double|size_t|ssize_t|uint\d*_t|int\d*_t|[A-Z][a-zA-Z0-9_]*|\w+\s*\*+)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(").ok()?.captures(title) {
+                return Some(caps[1].to_string());
+            }
+            None
         }
         "code_struct" => {
-            // Title format: "struct Name" or "pub struct Name"
-            let re = regex::Regex::new(r"(?:pub\s+)?struct\s+([a-zA-Z_][a-zA-Z0-9_]*)").ok()?;
-            re.captures(title).map(|c| c[1].to_string())
+            // Rust: "struct Name" or "pub struct Name"
+            if let Some(caps) = regex::Regex::new(r"(?:pub\s+)?struct\s+([a-zA-Z_][a-zA-Z0-9_]*)").ok()?.captures(title) {
+                return Some(caps[1].to_string());
+            }
+            // C: "typedef struct { ... } Name" or "struct name"
+            if let Some(caps) = regex::Regex::new(r"(?:typedef\s+)?struct\s+([a-zA-Z_][a-zA-Z0-9_]*)").ok()?.captures(title) {
+                return Some(caps[1].to_string());
+            }
+            None
         }
         "code_enum" => {
-            let re = regex::Regex::new(r"(?:pub\s+)?enum\s+([a-zA-Z_][a-zA-Z0-9_]*)").ok()?;
+            // Rust/C: "enum Name" or "pub enum Name"
+            let re = regex::Regex::new(r"(?:pub\s+)?(?:typedef\s+)?enum\s+([a-zA-Z_][a-zA-Z0-9_]*)").ok()?;
             re.captures(title).map(|c| c[1].to_string())
         }
         "code_trait" => {
             let re = regex::Regex::new(r"(?:pub\s+)?trait\s+([a-zA-Z_][a-zA-Z0-9_]*)").ok()?;
+            re.captures(title).map(|c| c[1].to_string())
+        }
+        "code_class" => {
+            // Python: "class Name" or "class Name(Base)"
+            let re = regex::Regex::new(r"class\s+([a-zA-Z_][a-zA-Z0-9_]*)").ok()?;
+            re.captures(title).map(|c| c[1].to_string())
+        }
+        "code_macro" => {
+            // C: "#define NAME" or "#define NAME("
+            let re = regex::Regex::new(r"#define\s+([a-zA-Z_][a-zA-Z0-9_]*)").ok()?;
             re.captures(title).map(|c| c[1].to_string())
         }
         _ => None,
