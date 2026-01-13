@@ -119,6 +119,11 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const [savingOpenaireKey, setSavingOpenaireKey] = useState(false);
   const [openaireKeyError, setOpenaireKeyError] = useState<string | null>(null);
 
+  // LLM Backend (anthropic or ollama)
+  const [llmBackend, setLlmBackend] = useState<'anthropic' | 'ollama'>('anthropic');
+  const [ollamaModel, setOllamaModel] = useState('qwen2.5:7b');
+  const [ollamaStatus, setOllamaStatus] = useState<'unknown' | 'running' | 'stopped'>('unknown');
+
   // Database stats and path
   const [dbStats, setDbStats] = useState<DbStats | null>(null);
   const [dbPath, setDbPath] = useState<string>('');
@@ -234,6 +239,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
       loadApiKeyStatus();
       loadOpenaiKeyStatus();
       loadOpenaireKeyStatus();
+      loadLlmBackend();
       loadDbStats();
       loadDbPath();
       loadProcessingStats();
@@ -273,6 +279,37 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
       setOpenaireKeyStatus(maskedKey);
     } catch (err) {
       console.error('Failed to load OpenAIRE API key status:', err);
+    }
+  };
+
+  const loadLlmBackend = async () => {
+    try {
+      const backend = await invoke<string>('get_llm_backend');
+      setLlmBackend(backend as 'anthropic' | 'ollama');
+      const model = await invoke<string>('get_ollama_model');
+      setOllamaModel(model);
+      const status = await invoke<{ running: boolean }>('check_ollama_status');
+      setOllamaStatus(status.running ? 'running' : 'stopped');
+    } catch (err) {
+      console.error('Failed to load LLM backend:', err);
+    }
+  };
+
+  const handleSetLlmBackend = async (backend: 'anthropic' | 'ollama') => {
+    try {
+      await invoke('set_llm_backend', { backend });
+      setLlmBackend(backend);
+    } catch (err) {
+      console.error('Failed to set LLM backend:', err);
+    }
+  };
+
+  const handleSetOllamaModel = async (model: string) => {
+    try {
+      await invoke('set_ollama_model', { model });
+      setOllamaModel(model);
+    } catch (err) {
+      console.error('Failed to set Ollama model:', err);
     }
   };
 
@@ -2061,6 +2098,56 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
               <div className="flex items-center gap-2 mb-4">
                 <Key className="w-5 h-5 text-amber-400" />
                 <h3 className="text-lg font-medium text-white">API Keys</h3>
+              </div>
+
+              {/* LLM Backend Toggle */}
+              <div className="bg-gray-900/50 rounded-lg p-4 mb-3">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-sm font-medium text-gray-200">AI Processing Backend</span>
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() => handleSetLlmBackend('anthropic')}
+                      className={`px-3 py-1 rounded-l text-xs font-medium transition-colors ${
+                        llmBackend === 'anthropic'
+                          ? 'bg-purple-600 text-white'
+                          : 'bg-gray-700 text-gray-400 hover:text-gray-200'
+                      }`}
+                    >
+                      Claude
+                    </button>
+                    <button
+                      onClick={() => handleSetLlmBackend('ollama')}
+                      className={`px-3 py-1 rounded-r text-xs font-medium transition-colors ${
+                        llmBackend === 'ollama'
+                          ? 'bg-orange-600 text-white'
+                          : 'bg-gray-700 text-gray-400 hover:text-gray-200'
+                      }`}
+                    >
+                      Ollama
+                    </button>
+                  </div>
+                </div>
+                {llmBackend === 'ollama' && (
+                  <div className="mt-3">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs text-gray-400">Ollama Model</span>
+                      <span className={`text-xs ${ollamaStatus === 'running' ? 'text-green-400' : 'text-red-400'}`}>
+                        {ollamaStatus === 'running' ? '● Running' : '● Not running'}
+                      </span>
+                    </div>
+                    <input
+                      type="text"
+                      value={ollamaModel}
+                      onChange={(e) => setOllamaModel(e.target.value)}
+                      onBlur={() => handleSetOllamaModel(ollamaModel)}
+                      placeholder="qwen2.5:7b"
+                      className="w-full px-3 py-1.5 bg-gray-800 border border-gray-700 rounded text-sm text-white placeholder-gray-500 focus:border-orange-500/50 focus:ring-1 focus:ring-orange-500/20 focus:outline-none"
+                    />
+                  </div>
+                )}
+                <p className="mt-2 text-xs text-gray-500">
+                  Affects AI Processing (summaries, tags). Hierarchy build still uses Claude.
+                </p>
               </div>
 
               {/* Anthropic API Key */}
