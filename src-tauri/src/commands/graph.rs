@@ -517,24 +517,31 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
 
         match ai_client::analyze_node(&node.title, content).await {
             Ok(result) => {
-                let tags_json = serde_json::to_string(&result.tags).unwrap_or_default();
-
-                // Preserve code_* content_types (from code import), use AI classification for others
-                let final_content_type = if node.content_type
+                // Preserve code_* content_types AND tags (from code import)
+                // Code nodes have file_path metadata in tags that must not be overwritten
+                let is_code_node = node.content_type
                     .as_ref()
                     .map(|ct| ct.starts_with("code_"))
-                    .unwrap_or(false)
-                {
+                    .unwrap_or(false);
+
+                let final_content_type = if is_code_node {
                     node.content_type.clone().unwrap_or_default()
                 } else {
                     result.content_type.clone()
+                };
+
+                // For code nodes, keep original tags (file_path metadata); for others, use AI tags
+                let final_tags = if is_code_node {
+                    node.tags.clone().unwrap_or_default()
+                } else {
+                    serde_json::to_string(&result.tags).unwrap_or_default()
                 };
 
                 if let Err(e) = db.update_node_ai(
                     &node.id,
                     &result.title,
                     &result.summary,
-                    &tags_json,
+                    &final_tags,
                     &final_content_type,
                 ) {
                     let err_msg = format!("DB save failed: {}", e);
@@ -1324,7 +1331,7 @@ pub fn clear_recent(state: State<AppState>, node_id: String) -> Result<(), Strin
 
 // ==================== Semantic Similarity Commands ====================
 
-/// Similar node result with similarity score
+/// Similar node result with similarity score or edge relationship
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SimilarNode {
@@ -1333,6 +1340,9 @@ pub struct SimilarNode {
     pub emoji: Option<String>,
     pub summary: Option<String>,
     pub similarity: f32,
+    /// Edge type if this is an edge-based relationship (e.g., "calls", "called_by", "documents")
+    /// None for embedding-based similarity
+    pub edge_type: Option<String>,
 }
 
 /// Find nodes semantically similar to a given node
@@ -1385,16 +1395,71 @@ pub fn get_similar_nodes(
             .collect::<Vec<_>>()
     };
 
-    // Fetch full node data for results
+    // Fetch full node data for results (only items, not categories/clusters)
     let mut results: Vec<SimilarNode> = Vec::new();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // First, add edge-based relationships (calls, documents) - these come first
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+    if let Ok(edges) = db.get_edges_for_node(&node_id) {
+        for edge in edges {
+            let (related_id, edge_label) = if edge.source == node_id {
+                // Outgoing edge: this node -> target
+                let label = match edge.edge_type.as_str() {
+                    "calls" => "calls",
+                    "documents" => "documents",
+                    _ => continue, // Skip other edge types for now
+                };
+                (edge.target, label)
+            } else {
+                // Incoming edge: source -> this node
+                let label = match edge.edge_type.as_str() {
+                    "calls" => "called by",
+                    "documents" => "documented by",
+                    _ => continue,
+                };
+                (edge.source, label)
+            };
+
+            if seen_ids.contains(&related_id) {
+                continue;
+            }
+
+            if let Ok(Some(node)) = db.get_node(&related_id) {
+                if !node.is_item {
+                    continue;
+                }
+                seen_ids.insert(related_id.clone());
+                results.push(SimilarNode {
+                    id: node.id,
+                    title: node.ai_title.unwrap_or(node.title),
+                    emoji: node.emoji,
+                    summary: node.summary,
+                    similarity: 1.0, // Edge relationships are "100%" related
+                    edge_type: Some(edge_label.to_string()),
+                });
+            }
+        }
+    }
+    drop(db);
+
+    // Then add embedding-based similar nodes
     for (id, sim_score) in similar {
+        if seen_ids.contains(&id) {
+            continue; // Skip if already added via edge
+        }
         if let Ok(Some(node)) = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_node(&id) {
+            // Skip non-item nodes (categories, clusters) - they shouldn't open in leaf view
+            if !node.is_item {
+                continue;
+            }
             results.push(SimilarNode {
                 id: node.id,
                 title: node.ai_title.unwrap_or(node.title),
                 emoji: node.emoji,
                 summary: node.summary,
                 similarity: sim_score,
+                edge_type: None,
             });
         }
     }

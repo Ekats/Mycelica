@@ -3,6 +3,7 @@ import React, { useRef, useEffect, useState } from 'react';
 import * as d3 from 'd3';
 import type { Node } from '../../types/graph';
 import { generateClusterColor, getDirectConnectionColor, getChainConnectionColor, getStructuralDepth, getMutedClusterColor } from '../../utils/nodeColors';
+import { getDateColor, getEdgeColor } from '../../utils/similarityColor';
 
 // =============================================================================
 // TYPES
@@ -102,32 +103,8 @@ const getNodeOpacity = (
   return 0.7;
 };
 
-// Get date-based color (red=old, cyan=new)
-const getDateColor = (timestamp: number, minDate: number, maxDate: number): string => {
-  const range = maxDate - minDate || 1;
-  const t = (timestamp - minDate) / range;
-  let hue: number;
-  if (t < 0.5) {
-    hue = t * 2 * 60; // red → yellow
-  } else {
-    hue = 210 - (t - 0.5) * 2 * 30; // blue → cyan
-  }
-  return `hsl(${hue}, 75%, 65%)`;
-};
-
 // Nice font for card text
 const CARD_FONT = "'Inter', 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif";
-
-// Get edge color based on normalized weight
-const getEdgeColor = (normalized: number): string => {
-  let hue: number;
-  if (normalized < 0.5) {
-    hue = normalized * 2 * 60; // red → yellow
-  } else {
-    hue = 210 - (normalized - 0.5) * 2 * 30; // blue → cyan
-  }
-  return `hsl(${hue}, 80%, 50%)`;
-};
 
 // Get all 4 side centers of a node
 const getSideCenters = (center: { x: number; y: number }, width: number, height: number) => {

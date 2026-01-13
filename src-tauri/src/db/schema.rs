@@ -1461,6 +1461,16 @@ impl Database {
         Ok(())
     }
 
+    /// Update only the tags field for a node (used for repairing code node metadata)
+    pub fn update_node_tags(&self, node_id: &str, tags: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE nodes SET tags = ?2 WHERE id = ?1",
+            params![node_id, tags],
+        )?;
+        Ok(())
+    }
+
     // Get items that haven't been processed by AI yet
     pub fn get_unprocessed_nodes(&self) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();

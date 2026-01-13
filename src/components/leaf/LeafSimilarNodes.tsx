@@ -9,6 +9,7 @@ interface SimilarNode {
   emoji: string | null;
   summary: string | null;
   similarity: number;
+  edgeType: string | null;  // "calls", "called by", "documents", etc.
 }
 
 interface HistoryEntry {
@@ -135,10 +136,10 @@ export function LeafSimilarNodes({ nodeId, nodeTitle, nodeEmoji, onNavigate }: L
                 )}
               </div>
               <span
-                className="text-xs shrink-0 font-medium"
-                style={{ color: getSimilarityColor(node.similarity) }}
+                className={`text-xs shrink-0 font-medium ${node.edgeType ? 'text-blue-400' : ''}`}
+                style={node.edgeType ? undefined : { color: getSimilarityColor(node.similarity) }}
               >
-                {Math.round(node.similarity * 100)}%
+                {node.edgeType || `${Math.round(node.similarity * 100)}%`}
               </span>
             </button>
           ))}

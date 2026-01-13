@@ -2,7 +2,7 @@ import { memo, useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { Pin, PinOff, Lock, LockOpen, GitBranch, GitMerge, MoreHorizontal } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import type { Node, Edge } from '../../types/graph';
-import { getSimilarityColor } from '../../utils/similarityColor';
+import { getSimilarityColor, getHeatColor } from '../../utils/similarityColor';
 
 interface SimilarNode {
   id: string;
@@ -10,6 +10,7 @@ interface SimilarNode {
   emoji: string | null;
   summary: string | null;
   similarity: number;
+  edgeType: string | null;  // "calls", "called by", "documents", etc.
 }
 
 // Hierarchical group of similar nodes
@@ -214,14 +215,7 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
     const timestamp = toMs(dateValue);
     const dateRange = viewMaxDate - viewMinDate || 1;
     const t = Math.max(0, Math.min(1, (timestamp - viewMinDate) / dateRange));
-
-    let hue: number;
-    if (t < 0.5) {
-      hue = t * 2 * 60; // red → yellow
-    } else {
-      hue = 210 - (t - 0.5) * 2 * 30; // blue → cyan
-    }
-    return `hsl(${hue}, 75%, 65%)`;
+    return getHeatColor(t);
   }, [viewMinDate, viewMaxDate]);
 
   // Helper to count all descendants
@@ -397,6 +391,11 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
     const groupIsInside = isDescendant(group.id, sourceId);
     const displaySimilarity = groupIsInside ? 1.0 : group.avgSimilarity;
 
+    // Check if all items in this group have the same edge type
+    const allItems = getAllDescendantItems(group);
+    const edgeTypes = new Set(allItems.map(item => item.edgeType).filter(Boolean));
+    const groupEdgeType = edgeTypes.size === 1 ? Array.from(edgeTypes)[0] : null;
+
     return (
       <div key={path} style={{ marginLeft: indentLevel * 12 }}>
         {/* Group header */}
@@ -412,10 +411,10 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
             <span className="text-xs text-gray-500">({totalItems})</span>
           </span>
           <span
-            className="text-xs shrink-0 font-medium"
-            style={{ color: groupIsInside ? '#4ade80' : getSimilarityColor(displaySimilarity) }}
+            className={`text-xs shrink-0 font-medium ${groupEdgeType ? 'text-blue-400' : ''}`}
+            style={groupEdgeType ? undefined : { color: getSimilarityColor(displaySimilarity) }}
           >
-            {(displaySimilarity * 100).toFixed(0)}%
+            {groupEdgeType || `${(displaySimilarity * 100).toFixed(0)}%`}
           </span>
         </button>
 
@@ -457,10 +456,10 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
                     <span className="truncate">{item.title}</span>
                   </span>
                   <span
-                    className="text-xs shrink-0 font-medium"
-                    style={{ color: isInside ? '#4ade80' : getSimilarityColor(displaySimilarity) }}
+                    className={`text-xs shrink-0 font-medium ${item.edgeType ? 'text-blue-400' : ''}`}
+                    style={item.edgeType ? undefined : { color: getSimilarityColor(displaySimilarity) }}
                   >
-                    {(displaySimilarity * 100).toFixed(0)}%
+                    {item.edgeType || `${(displaySimilarity * 100).toFixed(0)}%`}
                   </span>
                 </button>
               );
@@ -469,7 +468,7 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
         )}
       </div>
     );
-  }, [expandedGroups, toggleGroup, nodes, onJumpToNode, devLog, countAllDescendants, similarNodesMap, isDescendant]);
+  }, [expandedGroups, toggleGroup, nodes, onJumpToNode, devLog, countAllDescendants, similarNodesMap, isDescendant, getAllDescendantItems]);
 
   // Recursive render for hierarchy inside node - shows clear groupings
   const renderHierarchyNode = useCallback((node: Node, sourceId: string, depth: number) => {

@@ -2,6 +2,8 @@
  * Shared color utilities for graph nodes and connections
  */
 
+import { getHeatColor } from './similarityColor';
+
 // Type for node data in rendering context
 export interface RenderNode {
   id: string;
@@ -17,19 +19,11 @@ export const generateClusterColor = (clusterId: number): string => {
 };
 
 /**
- * Direct connection color: red -> yellow -> blue -> cyan
- * Skips green for colorblind accessibility
+ * Direct connection color: uses shared heat color formula
+ * Darker than default for better visibility on graph nodes
  */
 export const getDirectConnectionColor = (weight: number): string => {
-  let hue: number;
-  if (weight < 0.5) {
-    // First half: red (0) -> yellow (60)
-    hue = weight * 2 * 60;
-  } else {
-    // Second half: blue (210) -> cyan (180)
-    hue = 210 - (weight - 0.5) * 2 * 30;
-  }
-  return `hsl(${hue}, 80%, 40%)`; // Match edge saturation (80%), slightly darker
+  return getHeatColor(weight, 80, 40); // Darker for graph visibility
 };
 
 /**

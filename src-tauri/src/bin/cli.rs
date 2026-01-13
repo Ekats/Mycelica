@@ -811,6 +811,15 @@ enum MaintenanceCommands {
         #[arg(long, default_value = "3")]
         max_size: i32,
     },
+    /// Repair code node tags (restore file_path metadata from source files)
+    RepairCodeTags {
+        /// Path to source code directory
+        #[arg(default_value = ".")]
+        path: String,
+        /// Show what would be repaired without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3630,6 +3639,10 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
             log!("  Categories renamed: {}", result.categories_renamed);
             log!("  Levels processed: {}", result.levels_processed);
         }
+
+        MaintenanceCommands::RepairCodeTags { path, dry_run } => {
+            repair_code_tags(db, &path, dry_run)?;
+        }
     }
     Ok(())
 }
@@ -4037,6 +4050,120 @@ fn analyze_code_edges(
         } else {
             println!("Created {} new Calls edges", edges_created);
         }
+    }
+
+    Ok(())
+}
+
+/// Repair code node tags by restoring file_path metadata from source files.
+/// This fixes nodes where AI processing overwrote the file location metadata.
+fn repair_code_tags(db: &Database, path: &str, dry_run: bool) -> Result<(), String> {
+    use std::collections::HashMap;
+    use std::path::Path;
+    use mycelica_lib::code::{self, Language, CodeItem};
+
+    log!("Scanning source files in: {}", path);
+    if dry_run {
+        log!("(dry-run mode - no changes will be made)");
+    }
+
+    let path = Path::new(path);
+
+    // Collect all code files
+    let files = code::collect_code_files(path, None)
+        .map_err(|e| format!("Failed to collect files: {}", e))?;
+
+    log!("Found {} source files to scan", files.len());
+
+    // Build a map of node_id -> correct metadata JSON
+    let mut id_to_metadata: HashMap<String, String> = HashMap::new();
+
+    for file_path in &files {
+        let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let language = match Language::from_extension(ext) {
+            Some(lang) => lang,
+            None => continue,
+        };
+
+        // Skip doc files - they don't have the broken tags issue
+        if language == Language::Markdown || language == Language::Rst {
+            continue;
+        }
+
+        // Parse the file to get code items
+        let items: Vec<CodeItem> = match language {
+            Language::Rust => code::rust_parser::parse_rust_file(file_path)
+                .unwrap_or_default(),
+            Language::TypeScript | Language::JavaScript => code::ts_parser::parse_ts_file(file_path)
+                .unwrap_or_default(),
+            Language::Python => code::python_parser::parse_py_file(file_path)
+                .unwrap_or_default(),
+            Language::C => code::c_parser::parse_c_file(file_path)
+                .unwrap_or_default(),
+            _ => continue,
+        };
+
+        for item in items {
+            let node_id = item.generate_id();
+            let metadata = item.metadata_json();
+            id_to_metadata.insert(node_id, metadata);
+        }
+    }
+
+    log!("Parsed {} code items from source files", id_to_metadata.len());
+
+    // Get all code nodes from database
+    let all_nodes = db.get_items().map_err(|e| e.to_string())?;
+    let code_nodes: Vec<_> = all_nodes
+        .into_iter()
+        .filter(|n| n.content_type.as_deref().map(|ct| ct.starts_with("code_")).unwrap_or(false))
+        .filter(|n| n.id.starts_with("code-"))
+        .collect();
+
+    log!("Found {} code nodes in database", code_nodes.len());
+
+    let mut repaired = 0;
+    let mut already_ok = 0;
+    let mut not_found = 0;
+
+    for node in code_nodes {
+        // Check if we have metadata for this node
+        let correct_metadata = match id_to_metadata.get(&node.id) {
+            Some(m) => m,
+            None => {
+                not_found += 1;
+                continue;
+            }
+        };
+
+        // Check if current tags are broken (array format instead of object)
+        let current_tags = node.tags.as_deref().unwrap_or("[]");
+        let is_broken = current_tags.trim_start().starts_with('[');
+
+        if !is_broken {
+            already_ok += 1;
+            continue;
+        }
+
+        // Repair the tags
+        if dry_run {
+            log!("Would repair: {} -> {}", node.id, &correct_metadata[..correct_metadata.len().min(60)]);
+        } else {
+            db.update_node_tags(&node.id, correct_metadata)
+                .map_err(|e| format!("Failed to update {}: {}", node.id, e))?;
+        }
+        repaired += 1;
+    }
+
+    log!("");
+    log!("Repair complete:");
+    log!("  Repaired: {}", repaired);
+    log!("  Already OK: {}", already_ok);
+    log!("  Not found in source: {}", not_found);
+
+    if dry_run && repaired > 0 {
+        log!("");
+        log!("Run without --dry-run to apply changes");
     }
 
     Ok(())
