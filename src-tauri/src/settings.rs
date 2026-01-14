@@ -477,6 +477,29 @@ pub fn set_protect_recent_notes(protected: bool) -> Result<(), String> {
 /// The fixed ID for the Recent Notes container
 pub const RECENT_NOTES_CONTAINER_ID: &str = "container-recent-notes";
 
+/// The fixed ID for the Holerabbit sessions container
+pub const HOLERABBIT_CONTAINER_ID: &str = "holerabbit-sessions";
+
+// ==================== Code Import Containers ====================
+
+/// Container IDs for code imports by language
+pub const RUST_IMPORT_CONTAINER_ID: &str = "import-rust";
+pub const TYPESCRIPT_IMPORT_CONTAINER_ID: &str = "import-typescript";
+pub const JAVASCRIPT_IMPORT_CONTAINER_ID: &str = "import-javascript";
+pub const PYTHON_IMPORT_CONTAINER_ID: &str = "import-python";
+pub const C_IMPORT_CONTAINER_ID: &str = "import-c";
+pub const DOCS_IMPORT_CONTAINER_ID: &str = "import-docs";
+
+/// All import container IDs for protection during hierarchy rebuilds
+pub const IMPORT_CONTAINER_IDS: &[&str] = &[
+    RUST_IMPORT_CONTAINER_ID,
+    TYPESCRIPT_IMPORT_CONTAINER_ID,
+    JAVASCRIPT_IMPORT_CONTAINER_ID,
+    PYTHON_IMPORT_CONTAINER_ID,
+    C_IMPORT_CONTAINER_ID,
+    DOCS_IMPORT_CONTAINER_ID,
+];
+
 // ==================== Local Embeddings ====================
 
 /// Check if local embeddings are enabled (default: true)

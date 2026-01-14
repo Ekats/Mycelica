@@ -633,7 +633,7 @@ impl Database {
         false
     }
 
-    /// Get all protected node IDs (Recent Notes and descendants)
+    /// Get all protected node IDs (Recent Notes, Holerabbit, Import containers, and their descendants)
     /// Returns empty set if protection is disabled
     /// Uses a single recursive CTE query for O(1) database calls instead of O(n) traversals
     pub fn get_protected_node_ids(&self) -> std::collections::HashSet<String> {
@@ -645,30 +645,46 @@ impl Database {
             return protected;
         }
 
-        let container_id = settings::RECENT_NOTES_CONTAINER_ID;
+        // Build list of all protected container IDs
+        let mut container_ids: Vec<&str> = vec![
+            settings::RECENT_NOTES_CONTAINER_ID,
+            settings::HOLERABBIT_CONTAINER_ID,
+        ];
+        container_ids.extend(settings::IMPORT_CONTAINER_IDS.iter().copied());
 
-        // Single recursive CTE query to get all descendants in one DB call
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn.prepare(
+        // Build WHERE clause with all container IDs
+        let placeholders: Vec<String> = (1..=container_ids.len()).map(|i| format!("?{}", i)).collect();
+        let where_clause = placeholders.join(" OR id = ");
+
+        let query = format!(
             "WITH RECURSIVE descendants AS (
-                SELECT id FROM nodes WHERE id = ?1
+                SELECT id FROM nodes WHERE id = {}
                 UNION ALL
                 SELECT n.id FROM nodes n
                 JOIN descendants d ON n.parent_id = d.id
             )
-            SELECT id FROM descendants"
-        ) {
+            SELECT id FROM descendants",
+            where_clause
+        );
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(&query) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("Failed to prepare protected nodes query: {}", e);
-                // Fallback: just return the container ID
-                protected.insert(container_id.to_string());
+                // Fallback: return all container IDs
+                for id in &container_ids {
+                    protected.insert(id.to_string());
+                }
                 return protected;
             }
         };
 
+        // Convert to rusqlite params
+        let params: Vec<&dyn rusqlite::ToSql> = container_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
         let ids: Vec<String> = stmt
-            .query_map(params![container_id], |row| row.get(0))
+            .query_map(params.as_slice(), |row| row.get(0))
             .ok()
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default();
@@ -718,28 +734,15 @@ impl Database {
     /// Standard SELECT columns for nodes (excludes embedding - use dedicated functions)
     const NODE_COLUMNS: &'static str = "id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date, is_private, privacy_reason, source, pdf_available, content_type, associated_idea_id, privacy";
 
-    /// Get nodes for graph view (only VISIBLE tier + unclassified)
-    /// SUPPORTING (investigation, discussion, reference, creative) and
-    /// HIDDEN (debug, code, paste, trivial) are lazy-loaded in leaf view
-    /// If include_hidden is true, includes all items regardless of content_type
-    pub fn get_all_nodes(&self, include_hidden: bool) -> Result<Vec<Node>> {
+    /// Get all nodes for graph view - no content_type filtering
+    /// All nodes are always shown; filtering is handled by frontend if needed
+    /// The include_hidden parameter is kept for API compatibility but ignored
+    pub fn get_all_nodes(&self, _include_hidden: bool) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
-        let query = if include_hidden {
-            format!(
-                "SELECT {} FROM nodes ORDER BY created_at DESC",
-                Self::NODE_COLUMNS
-            )
-        } else {
-            format!(
-                "SELECT {} FROM nodes
-                 WHERE content_type IS NULL
-                    OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper', 'bookmark')
-                    OR content_type LIKE 'code_%'
-                 ORDER BY created_at DESC",
-                Self::NODE_COLUMNS
-            )
-        };
-        let mut stmt = conn.prepare(&query)?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes ORDER BY created_at DESC",
+            Self::NODE_COLUMNS
+        ))?;
 
         let nodes = stmt.query_map([], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
         Ok(nodes)
@@ -2624,14 +2627,11 @@ impl Database {
     }
 
     /// Get all nodes that have embeddings (for similarity search)
-    /// Returns (node_id, embedding) pairs
-    /// Only returns VISIBLE tier items for similar node suggestions
+    /// Returns (node_id, embedding) pairs - no content_type filtering
     pub fn get_nodes_with_embeddings(&self) -> Result<Vec<(String, Vec<f32>)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, embedding FROM nodes
-             WHERE embedding IS NOT NULL
-               AND (content_type IS NULL OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper', 'bookmark') OR content_type LIKE 'code_%')"
+            "SELECT id, embedding FROM nodes WHERE embedding IS NOT NULL"
         )?;
 
         let results = stmt.query_map([], |row| {

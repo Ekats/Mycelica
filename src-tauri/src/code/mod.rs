@@ -80,6 +80,77 @@ impl Language {
     }
 }
 
+/// Get or create the import container for a language.
+/// Returns the container ID.
+fn get_or_create_import_container(db: &Database, language: &Language) -> String {
+    use crate::settings;
+
+    let (container_id, title, emoji) = match language {
+        Language::Rust => (settings::RUST_IMPORT_CONTAINER_ID, "Rust Code", "🦀"),
+        Language::TypeScript => (settings::TYPESCRIPT_IMPORT_CONTAINER_ID, "TypeScript Code", "📘"),
+        Language::JavaScript => (settings::JAVASCRIPT_IMPORT_CONTAINER_ID, "JavaScript Code", "📒"),
+        Language::Python => (settings::PYTHON_IMPORT_CONTAINER_ID, "Python Code", "🐍"),
+        Language::C => (settings::C_IMPORT_CONTAINER_ID, "C Code", "⚙️"),
+        Language::Markdown | Language::Rst => (settings::DOCS_IMPORT_CONTAINER_ID, "Documentation", "📄"),
+    };
+
+    // Check if container exists
+    if db.get_node(container_id).ok().flatten().is_some() {
+        return container_id.to_string();
+    }
+
+    // Get Universe as parent
+    let universe_id = db.get_universe()
+        .ok()
+        .flatten()
+        .map(|u| u.id)
+        .unwrap_or_default();
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let node = Node {
+        id: container_id.to_string(),
+        node_type: NodeType::Cluster,
+        title: title.to_string(),
+        url: None,
+        content: Some(format!("Imported {} files", title.to_lowercase())),
+        position: Position { x: 0.0, y: 0.0 },
+        created_at: now,
+        updated_at: now,
+        cluster_id: None,
+        cluster_label: Some(title.to_string()),
+        ai_title: Some(title.to_string()),
+        summary: Some(format!("Container for imported {} files", title.to_lowercase())),
+        tags: None,
+        emoji: Some(emoji.to_string()),
+        is_processed: true,
+        depth: 1,  // Direct child of Universe
+        is_item: false,
+        is_universe: false,
+        parent_id: if universe_id.is_empty() { None } else { Some(universe_id) },
+        child_count: 0,
+        conversation_id: None,
+        sequence_index: None,
+        is_pinned: false,
+        last_accessed_at: None,
+        latest_child_date: None,
+        is_private: None,
+        privacy_reason: None,
+        source: Some("code-import".to_string()),
+        pdf_available: None,
+        content_type: Some("import-container".to_string()),
+        associated_idea_id: None,
+        privacy: Some(1.0),  // Code is public
+    };
+
+    if let Err(e) = db.insert_node(&node) {
+        eprintln!("[Code] Failed to create import container {}: {}", container_id, e);
+    } else {
+        println!("[Code] Created import container: {}", title);
+    }
+
+    container_id.to_string()
+}
+
 /// Import source code from a path into the database.
 ///
 /// # Arguments
@@ -470,6 +541,9 @@ fn create_file_module_node(db: &Database, path: &Path, language: &Language) -> R
         return Ok(node_id);
     }
 
+    // Get or create the import container for this language
+    let container_id = get_or_create_import_container(db, language);
+
     let now = chrono::Utc::now().timestamp_millis();
     let source = match language {
         Language::Rust => "code-rust",
@@ -492,10 +566,10 @@ fn create_file_module_node(db: &Database, path: &Path, language: &Language) -> R
         updated_at: now,
         cluster_id: None,
         cluster_label: None,
-        depth: 2,
+        depth: 2,  // Container is depth 1, file modules are depth 2
         is_item: false, // File modules are containers, not leaf items
         is_universe: false,
-        parent_id: None,
+        parent_id: Some(container_id),
         child_count: 0,
         ai_title: None,
         summary: None,

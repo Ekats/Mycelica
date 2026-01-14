@@ -1114,6 +1114,24 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
   // Build breadcrumb display: Universe + navigation path + current level
   const currentLevelInfo = getLevelName(currentDepth, maxDepth);
 
+  // Compute current view's direct child count for overcrowded warning
+  const currentViewChildCount = useMemo(() => {
+    if (nodes.size === 0) return 0;
+    const allNodes = Array.from(nodes.values());
+    const universeNode = allNodes.find(n => n.isUniverse);
+
+    if (currentParentId) {
+      return allNodes.filter(n => n.parentId === currentParentId).length;
+    }
+    if (universeNode) {
+      return allNodes.filter(n => n.parentId === universeNode.id).length;
+    }
+    return allNodes.filter(n => n.depth === currentDepth).length;
+  }, [nodes, currentParentId, currentDepth]);
+
+  const OVERCROWDED_THRESHOLD = 100;
+  const isOvercrowded = currentViewChildCount > OVERCROWDED_THRESHOLD;
+
   // ==========================================================================
   // LAYOUT COMPUTATION - Compute positioned nodes and edges for GraphCanvas
   // ==========================================================================
@@ -1401,6 +1419,16 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
           );
         })()}
       </div>
+
+      {/* Overcrowded view warning */}
+      {isOvercrowded && (
+        <div className="absolute top-20 left-4 bg-amber-900/90 backdrop-blur-sm rounded-lg px-3 py-2 z-10 border border-amber-600/50 flex items-center gap-2 max-w-md">
+          <AlertTriangle size={16} className="text-amber-400 flex-shrink-0" />
+          <span className="text-sm text-amber-200">
+            This view has {currentViewChildCount} items. Consider organizing into subcategories.
+          </span>
+        </div>
+      )}
 
       {/* Similar nodes panel - memoized for performance */}
       {showPanels && showDetails && (

@@ -142,7 +142,7 @@ pub async fn run_clustering(db: &Database, use_ai: bool) -> Result<ClusteringRes
 
     let skipped_protected = protected_ids.len();
     if skipped_protected > 0 {
-        println!("[Clustering] Skipping {} protected items (Recent Notes)", skipped_protected);
+        println!("[Clustering] Skipping {} protected items (Recent Notes, Holerabbit)", skipped_protected);
     }
 
     // Filter out non-visible items - only cluster VISIBLE tier (insight, exploration, synthesis, question, planning)
@@ -159,6 +159,8 @@ pub async fn run_clustering(db: &Database, use_ai: bool) -> Result<ClusteringRes
                 Some("investigation") | Some("discussion") | Some("reference") | Some("creative") => false,
                 // HIDDEN tier - exclude from clustering
                 Some("code") | Some("debug") | Some("paste") | Some("trivial") => false,
+                // SPECIAL containers - exclude from clustering
+                Some("session") => false,
                 _ => true,  // Include any unknown types (backwards compat)
             }
         })

@@ -5,6 +5,7 @@
 
 use crate::db::{Database, Edge, EdgeType, Node, NodeType, Position};
 use crate::local_embeddings;
+use crate::settings::HOLERABBIT_CONTAINER_ID;
 use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -13,11 +14,24 @@ use tiny_http::Response;
 
 // ==================== Initialization ====================
 
-/// Initialize holerabbit on startup - pause all live sessions
-/// (only one live session allowed, and it should be controlled by the extension)
+/// Initialize holerabbit on startup:
+/// 1. Create Holerabbit container node if missing
+/// 2. Reparent orphan sessions under the container
+/// 3. Pause all live sessions
 pub fn init(db: &Database) {
+    // Ensure container exists
+    let container_id = get_or_create_container(db);
+
     if let Ok(sessions) = db.get_nodes_by_content_type("session") {
-        for s in sessions {
+        for s in &sessions {
+            // Reparent orphan sessions
+            if s.parent_id.is_none() || s.parent_id.as_deref() != Some(container_id.as_str()) {
+                if let Err(e) = db.update_node_parent(&s.id, &container_id) {
+                    eprintln!("[Holerabbit] Failed to reparent session {}: {}", s.id, e);
+                }
+            }
+
+            // Pause live sessions
             let tags_str = s.tags.clone().unwrap_or_default();
             if let Ok(mut tags) = serde_json::from_str::<serde_json::Value>(&tags_str) {
                 if tags["status"].as_str() == Some("live") {
@@ -30,7 +44,69 @@ pub fn init(db: &Database) {
                 }
             }
         }
+
+        // Update container child count
+        let _ = db.update_child_count(&container_id, sessions.len() as i32);
     }
+}
+
+/// Get or create the Holerabbit container node (under Universe)
+fn get_or_create_container(db: &Database) -> String {
+    // Check if container exists
+    if let Ok(Some(_)) = db.get_node(HOLERABBIT_CONTAINER_ID) {
+        return HOLERABBIT_CONTAINER_ID.to_string();
+    }
+
+    // Get Universe as parent
+    let universe_id = db.get_universe()
+        .ok()
+        .flatten()
+        .map(|u| u.id)
+        .unwrap_or_default();
+
+    let now = Utc::now().timestamp_millis();
+    let node = Node {
+        id: HOLERABBIT_CONTAINER_ID.to_string(),
+        node_type: NodeType::Cluster,
+        title: "Holerabbit".to_string(),
+        url: None,
+        content: None,
+        position: Position { x: 0.0, y: 0.0 },
+        created_at: now,
+        updated_at: now,
+        cluster_id: None,
+        cluster_label: None,
+        ai_title: Some("Browsing Sessions".to_string()),
+        summary: Some("Web browsing sessions tracked by Holerabbit extension".to_string()),
+        tags: None,
+        emoji: Some("🐇".to_string()),
+        is_processed: true,
+        depth: 1,
+        is_item: false,
+        is_universe: false,
+        parent_id: if universe_id.is_empty() { None } else { Some(universe_id) },
+        child_count: 0,
+        conversation_id: None,
+        sequence_index: None,
+        is_pinned: false,
+        last_accessed_at: Some(now),
+        latest_child_date: None,
+        is_private: None,
+        privacy_reason: None,
+        source: Some("holerabbit".to_string()),
+        pdf_available: Some(false),
+        content_type: Some("holerabbit_container".to_string()),
+        associated_idea_id: None,
+        privacy: None,
+    };
+
+    if let Err(e) = db.insert_node(&node) {
+        eprintln!("[Holerabbit] Failed to create container: {}", e);
+    } else {
+        println!("[Holerabbit] Created Holerabbit container node");
+    }
+
+    HOLERABBIT_CONTAINER_ID.to_string()
 }
 
 // ==================== Request/Response Types ====================
@@ -182,6 +258,7 @@ fn get_or_create_session(
     // Priority 3: Create new live session
     let session_id = format!("session-{}", timestamp);
     let now = Utc::now().timestamp_millis();
+    let container_id = get_or_create_container(db);
 
     let node = Node {
         id: session_id.clone(),
@@ -205,11 +282,11 @@ fn get_or_create_session(
             .to_string(),
         ),
         emoji: Some("🐇".to_string()),
-        is_processed: false,
-        depth: 0,
+        is_processed: true,
+        depth: 2,  // Container is depth 1, sessions are depth 2
         is_item: false,
         is_universe: false,
-        parent_id: None,
+        parent_id: Some(container_id),
         child_count: 0,
         conversation_id: None,
         sequence_index: None,
@@ -255,6 +332,7 @@ fn ensure_session_exists(
 
     // Create new session with the provided ID
     let now = Utc::now().timestamp_millis();
+    let container_id = get_or_create_container(db);
 
     let node = Node {
         id: session_id.to_string(),
@@ -278,11 +356,11 @@ fn ensure_session_exists(
             .to_string(),
         ),
         emoji: Some("🐇".to_string()),
-        is_processed: false,
-        depth: 0,
+        is_processed: true,
+        depth: 2,  // Container is depth 1, sessions are depth 2
         is_item: false,
         is_universe: false,
-        parent_id: None,
+        parent_id: Some(container_id),
         child_count: 0,
         conversation_id: None,
         sequence_index: None,
@@ -402,11 +480,11 @@ fn process_visit(db: &Database, req: &VisitRequest) -> Result<VisitResponse, Str
                 .to_string(),
             ),
             emoji: Some("🌐".to_string()),
-            is_processed: false,
-            depth: 0,
+            is_processed: true,
+            depth: 3,  // Container=1, Session=2, Visit=3
             is_item: true,
             is_universe: false,
-            parent_id: None,
+            parent_id: None,  // Linked to session via edges, not hierarchy
             child_count: 0,
             conversation_id: None,
             sequence_index: None,

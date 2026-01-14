@@ -603,9 +603,65 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
         println!("[Hierarchy] Created Notes container (protected)");
     }
 
+    // Step 9: Ensure Holerabbit container exists (for browsing sessions)
+    let holerabbit_container_id = crate::settings::HOLERABBIT_CONTAINER_ID;
+    if db.get_node(holerabbit_container_id).map_err(|e| e.to_string())?.is_none() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let holerabbit_node = Node {
+            id: holerabbit_container_id.to_string(),
+            node_type: NodeType::Cluster,
+            title: "Holerabbit".to_string(),
+            url: None,
+            content: None,
+            position: Position { x: 0.0, y: 0.0 },
+            created_at: now,
+            updated_at: now,
+            cluster_id: None,
+            cluster_label: Some("Holerabbit".to_string()),
+            ai_title: Some("Holerabbit".to_string()),
+            summary: Some("Browser session tracking".to_string()),
+            tags: None,
+            emoji: Some("🐰".to_string()),
+            is_processed: true,
+            depth: topic_depth,
+            is_item: false,
+            is_universe: false,
+            parent_id: Some(universe_id.clone()),
+            child_count: 0,
+            conversation_id: None,
+            sequence_index: None,
+            is_pinned: false,
+            last_accessed_at: None,
+            latest_child_date: None,
+            is_private: None,
+            privacy_reason: None,
+            source: None,
+            pdf_available: None,
+            content_type: None,
+            associated_idea_id: None,
+            privacy: Some(0.5),
+        };
+
+        db.insert_node(&holerabbit_node).map_err(|e| e.to_string())?;
+
+        // Update Universe child count to include Holerabbit
+        universe_child_count += 1;
+        db.update_child_count(&universe_id, universe_child_count)
+            .map_err(|e| e.to_string())?;
+
+        println!("[Hierarchy] Created Holerabbit container (protected)");
+    }
+
+    // Step 10: Ensure import containers exist (for code imports by language)
+    let import_containers_created = ensure_import_containers_exist(db, &universe_id, topic_depth, &mut universe_child_count)?;
+
     let total_items = item_count + private_count;
-    println!("Hierarchy complete: Universe -> {} topics + Personal + Notes -> {} items",
-             topics_created, total_items);
+    println!("Hierarchy complete: Universe -> {} topics + Personal + Notes + Holerabbit + {} import containers -> {} items",
+             topics_created, import_containers_created, total_items);
 
     // Update edge parent columns for fast per-view lookups
     if let Ok(count) = db.update_edge_parents() {
@@ -618,6 +674,83 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
         items_organized: total_items,
         max_depth: item_depth,
     })
+}
+
+/// Ensure all import containers exist (created if missing)
+/// Returns the number of containers created
+fn ensure_import_containers_exist(
+    db: &Database,
+    universe_id: &str,
+    depth: i32,
+    universe_child_count: &mut i32,
+) -> Result<i32, String> {
+    use crate::settings;
+
+    let containers = [
+        (settings::RUST_IMPORT_CONTAINER_ID, "Rust Code", "🦀"),
+        (settings::TYPESCRIPT_IMPORT_CONTAINER_ID, "TypeScript Code", "📘"),
+        (settings::JAVASCRIPT_IMPORT_CONTAINER_ID, "JavaScript Code", "📒"),
+        (settings::PYTHON_IMPORT_CONTAINER_ID, "Python Code", "🐍"),
+        (settings::C_IMPORT_CONTAINER_ID, "C Code", "⚙️"),
+        (settings::DOCS_IMPORT_CONTAINER_ID, "Documentation", "📄"),
+    ];
+
+    let mut created = 0;
+
+    for (id, title, emoji) in containers {
+        if db.get_node(id).map_err(|e| e.to_string())?.is_some() {
+            continue;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let node = Node {
+            id: id.to_string(),
+            node_type: NodeType::Cluster,
+            title: title.to_string(),
+            url: None,
+            content: Some(format!("Imported {} files", title.to_lowercase())),
+            position: Position { x: 0.0, y: 0.0 },
+            created_at: now,
+            updated_at: now,
+            cluster_id: None,
+            cluster_label: Some(title.to_string()),
+            ai_title: Some(title.to_string()),
+            summary: Some(format!("Container for imported {} files", title.to_lowercase())),
+            tags: None,
+            emoji: Some(emoji.to_string()),
+            is_processed: true,
+            depth,
+            is_item: false,
+            is_universe: false,
+            parent_id: Some(universe_id.to_string()),
+            child_count: 0,
+            conversation_id: None,
+            sequence_index: None,
+            is_pinned: false,
+            last_accessed_at: None,
+            latest_child_date: None,
+            is_private: None,
+            privacy_reason: None,
+            source: Some("code-import".to_string()),
+            pdf_available: None,
+            content_type: Some("import-container".to_string()),
+            associated_idea_id: None,
+            privacy: Some(1.0),
+        };
+
+        db.insert_node(&node).map_err(|e| e.to_string())?;
+        *universe_child_count += 1;
+        db.update_child_count(universe_id, *universe_child_count)
+            .map_err(|e| e.to_string())?;
+        created += 1;
+        println!("[Hierarchy] Created import container: {} (protected)", title);
+    }
+
+    Ok(created)
 }
 
 /// Build hierarchy while preserving existing top-level parent nodes (e.g., FOS categories)
@@ -1403,19 +1536,26 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
     // Track created category IDs to update their child_count after reparenting
     let mut created_category_ids: Vec<String> = Vec::new();
 
-    // Recent Notes container should never be reparented
+    // Protected containers should never be reparented
     let recent_notes_id = crate::settings::RECENT_NOTES_CONTAINER_ID;
+    let holerabbit_id = crate::settings::HOLERABBIT_CONTAINER_ID;
+    let import_container_ids: std::collections::HashSet<&str> =
+        crate::settings::IMPORT_CONTAINER_IDS.iter().copied().collect();
 
     for (idx, grouping) in groupings.iter().enumerate() {
         // Find ALL child nodes matching this grouping's labels
         // Deduplicate by node ID to handle duplicate labels in AI response
-        // Exclude Recent Notes container from reparenting
+        // Exclude protected containers from reparenting
         let mut seen_ids = std::collections::HashSet::new();
         let matching_children: Vec<&Node> = grouping.children
             .iter()
             .flat_map(|label| label_to_children.get(label).cloned().unwrap_or_default())
             .filter(|node| seen_ids.insert(node.id.clone()))
-            .filter(|node| node.id != recent_notes_id)  // Never reparent Recent Notes
+            .filter(|node| {
+                node.id != recent_notes_id
+                    && node.id != holerabbit_id
+                    && !import_container_ids.contains(node.id.as_str())
+            })
             .collect();
 
         if matching_children.is_empty() {
