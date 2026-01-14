@@ -107,6 +107,8 @@ Do not proceed without updating the index. Deletes old nodes, reimports, regener
 | Code import | `src-tauri/src/code/mod.rs` |
 | AI client | `src-tauri/src/ai_client.rs` |
 | Local embeddings | `src-tauri/src/local_embeddings.rs` |
+| HTTP server | `src-tauri/src/http_server.rs` |
+| Browser sessions | `src-tauri/src/holerabbit.rs` |
 
 ---
 
@@ -117,6 +119,9 @@ Do not proceed without updating the index. Deletes old nodes, reimports, regener
 | `Calls` | Function calls function | `analyze code-edges` |
 | `DefinedIn` | Code item in file/module | `import code` |
 | `Documents` | Markdown doc references code | `import code` |
+| `Clicked` | Followed a link | Holerabbit extension |
+| `Backtracked` | Returned to previous page | Holerabbit extension |
+| `SessionItem` | Node belongs to session | Holerabbit extension |
 
 Other edge types exist (`UsesType`, `Implements`, `Tests`) but aren't auto-generated yet.
 

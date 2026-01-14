@@ -176,6 +176,9 @@ Edges are loaded per-view using `get_edges_for_view(parent_id)`:
 | `related` | Semantic similarity |
 | `contains` | Parent-child containment |
 | `belongs_to` | Multi-path category membership |
+| `clicked` | Navigation: followed a link (Holerabbit) |
+| `backtracked` | Navigation: returned to previous page (Holerabbit) |
+| `session_item` | Node belongs to browsing session (Holerabbit) |
 
 ---
 

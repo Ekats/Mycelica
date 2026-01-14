@@ -2,6 +2,32 @@
 
 All notable changes to Mycelica will be documented in this file.
 
+## [0.8.2] - 2026-01-14
+
+### Added
+- **Holerabbit browser extension backend**: Full session tracking for Firefox extension
+  - `POST /holerabbit/visit` - Record page visits with navigation edges
+  - `GET /holerabbit/sessions` - List all browsing sessions
+  - `GET /holerabbit/session/{id}` - Session detail with items and edges
+  - `GET /holerabbit/live` - Query current live session
+  - Session controls: pause/resume/rename/merge/delete
+  - Single live session enforcement (resume auto-pauses others)
+  - `init()` pauses all sessions on startup
+- **Sessions panel in sidebar**: View and manage browsing sessions
+  - Real-time updates via Tauri events (no polling)
+  - Inline rename with edit button
+  - Delete with confirmation
+  - Pause/resume controls
+- **New edge types**: `Clicked`, `Backtracked`, `SessionItem` for navigation tracking
+- **New node types**: `web` (pages) and `session` (containers)
+
+### Technical
+- `holerabbit.rs` module (~1100 lines) for session management
+- HTTP server emits `holerabbit:visit` event for real-time UI updates
+- `SessionsPanel.tsx` (~470 lines) with Tauri event listener
+
+---
+
 ## [0.8.1] - 2026-01-13
 
 ### Added

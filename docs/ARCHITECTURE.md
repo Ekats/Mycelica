@@ -322,7 +322,16 @@ See `docs/specs/COMMANDS.md` for full API reference.
 
 **format_abstract.rs** - Paper abstract formatting with section headers
 
-**http_server.rs** - HTTP server for browser extension integration
+**http_server.rs** - HTTP server for browser extension integration (localhost:9876)
+- Routes for `/capture`, `/search`, `/status`
+- Holerabbit routes for session management
+- Emits `holerabbit:visit` event for real-time UI updates
+
+**holerabbit.rs** - Browser extension backend for tracking web visits
+- Session management (pause/resume/rename/merge/delete)
+- Single live session enforcement
+- Web page nodes with clicked/backtracked navigation edges
+- `init()` pauses all sessions on startup
 
 **code/types.rs** - Code parsing type definitions
 
@@ -409,6 +418,8 @@ src/
 │   │   ├── LeafSimilarNodes.tsx
 │   │   ├── PaperViewer.tsx     # PDF paper viewer
 │   │   └── SupportingItemsPanel.tsx
+│   ├── sessions/
+│   │   └── SessionsPanel.tsx   # Browsing sessions (Holerabbit)
 │   ├── sidebar/Sidebar.tsx
 │   ├── settings/
 │   │   ├── SettingsPanel.tsx
@@ -450,7 +461,8 @@ src-tauri/src/
 ├── import.rs                   # Data import
 ├── openaire.rs                 # OpenAIRE paper import
 ├── format_abstract.rs          # Paper abstract formatting
-├── http_server.rs              # HTTP server for browser extension
+├── http_server.rs              # HTTP server for browser extension (port 9876)
+├── holerabbit.rs               # Browser session tracking
 ├── settings.rs                 # Config persistence
 ├── tags.rs                     # Persistent tag system
 └── utils.rs                    # Shared utilities
@@ -486,6 +498,9 @@ listen('hierarchy-log', handler);     // Hierarchy building logs
 listen('privacy-progress', handler);  // Privacy scanning progress
 listen('embedding-progress', handler); // Embedding generation
 listen('reclassify-progress', handler); // Reclassification progress
+
+// Browser extension
+listen('holerabbit:visit', handler);  // New web visit received
 ```
 
 ---
