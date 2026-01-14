@@ -1,12 +1,13 @@
 import { useState, useEffect, useCallback, useDeferredValue, useMemo } from 'react';
-import { Search, X, ChevronRight, ChevronDown, Settings, Pin, Clock, PinOff, GripVertical } from 'lucide-react';
+import { Search, X, ChevronRight, ChevronDown, Settings, Pin, Clock, PinOff, GripVertical, Rabbit } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useGraphStore } from '../../stores/graphStore';
 import { getEmojiForNode, initLearnedMappings } from '../../utils/emojiMatcher';
+import { SessionsPanel } from '../sessions/SessionsPanel';
 import type { Node } from '../../types/graph';
 
-type SidebarTab = 'pinned' | 'search';
+type SidebarTab = 'pinned' | 'search' | 'sessions';
 
 const MIN_SIDEBAR_WIDTH = 200;
 const MAX_SIDEBAR_WIDTH = 400;
@@ -269,6 +270,18 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
             <Search className="w-3.5 h-3.5" />
             Search
           </button>
+          <button
+            onClick={() => setActiveTab('sessions')}
+            className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium transition-colors ${
+              activeTab === 'sessions'
+                ? 'bg-gray-700 text-white'
+                : 'text-gray-400 hover:text-gray-200'
+            }`}
+            title="Browsing Sessions"
+          >
+            <Rabbit className="w-3.5 h-3.5" />
+            Sessions
+          </button>
         </div>
       </div>
 
@@ -377,6 +390,11 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
               </div>
             )}
           </>
+        )}
+
+        {/* Sessions tab */}
+        {activeTab === 'sessions' && (
+          <SessionsPanel />
         )}
       </div>
 

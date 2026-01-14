@@ -52,6 +52,10 @@ pub enum EdgeType {
     Imports,    // module -> module it imports
     Tests,      // test function -> function it tests
     Documents,  // doc -> code item it documents (via backtick references)
+    // Holerabbit browsing relationships
+    Clicked,     // web page -> web page (followed link)
+    Backtracked, // web page -> web page (returned via back button)
+    SessionItem, // session -> web page (belongs to session)
 }
 
 impl EdgeType {
@@ -69,6 +73,9 @@ impl EdgeType {
             EdgeType::Imports => "imports",
             EdgeType::Tests => "tests",
             EdgeType::Documents => "documents",
+            EdgeType::Clicked => "clicked",
+            EdgeType::Backtracked => "backtracked",
+            EdgeType::SessionItem => "session_item",
         }
     }
 
@@ -86,6 +93,9 @@ impl EdgeType {
             "imports" => Some(EdgeType::Imports),
             "tests" => Some(EdgeType::Tests),
             "documents" => Some(EdgeType::Documents),
+            "clicked" => Some(EdgeType::Clicked),
+            "backtracked" => Some(EdgeType::Backtracked),
+            "session_item" => Some(EdgeType::SessionItem),
             _ => None,
         }
     }

@@ -856,7 +856,7 @@ impl Database {
     pub fn delete_edges_by_source_and_type(&self, source_id: &str, edge_type: &str) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         let deleted = conn.execute(
-            "DELETE FROM edges WHERE source = ?1 AND edge_type = ?2",
+            "DELETE FROM edges WHERE source_id = ?1 AND type = ?2",
             params![source_id, edge_type],
         )?;
         Ok(deleted)
@@ -1264,6 +1264,75 @@ impl Database {
     pub fn delete_edge(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM edges WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    // ==================== Holerabbit DB Functions ====================
+
+    /// Get all nodes with a specific content_type
+    pub fn get_nodes_by_content_type(&self, content_type: &str) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE content_type = ?1 ORDER BY created_at DESC",
+            Self::NODE_COLUMNS
+        ))?;
+        let nodes = stmt.query_map(params![content_type], Self::row_to_node)?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(nodes)
+    }
+
+    /// Count edges from a source with specific type
+    pub fn get_edge_count_by_source_and_type(&self, source_id: &str, edge_type: &str) -> Result<i32> {
+        let conn = self.conn.lock().unwrap();
+        let count: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM edges WHERE source_id = ?1 AND type = ?2",
+            params![source_id, edge_type],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Get edges from a source with specific type
+    pub fn get_edges_by_source_and_type(&self, source_id: &str, edge_type: &str) -> Result<Vec<Edge>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at
+             FROM edges WHERE source_id = ?1 AND type = ?2"
+        )?;
+        let edges = stmt.query_map(params![source_id, edge_type], |row| {
+            Ok(Edge {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                target: row.get(2)?,
+                edge_type: EdgeType::from_str(&row.get::<_, String>(3)?).unwrap_or(EdgeType::Related),
+                label: row.get(4)?,
+                weight: row.get(5)?,
+                edge_source: row.get(6)?,
+                evidence_id: row.get(7)?,
+                confidence: row.get(8)?,
+                created_at: row.get(9)?,
+            })
+        })?.collect::<Result<Vec<_>>>()?;
+        Ok(edges)
+    }
+
+    /// Delete edge by source, target, and type
+    pub fn delete_edge_by_endpoints(&self, source_id: &str, target_id: &str, edge_type: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM edges WHERE source_id = ?1 AND target_id = ?2 AND type = ?3",
+            params![source_id, target_id, edge_type],
+        )?;
+        Ok(())
+    }
+
+    /// Update node title
+    pub fn update_node_title(&self, node_id: &str, title: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE nodes SET title = ?2 WHERE id = ?1",
+            params![node_id, title],
+        )?;
         Ok(())
     }
 

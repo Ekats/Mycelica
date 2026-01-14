@@ -14,6 +14,7 @@ mod tags;
 pub mod openaire;
 mod format_abstract;
 pub mod code;
+mod holerabbit;
 
 use commands::{
     AppState,
@@ -170,7 +171,7 @@ pub fn run() {
             let db = Arc::new(db);
 
             // Start HTTP server for browser extension (localhost:9876)
-            http_server::start(db.clone());
+            http_server::start(db.clone(), app.handle().clone());
 
             // Use configurable cache TTL from settings
             let cache_ttl = settings::similarity_cache_ttl_secs();

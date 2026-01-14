@@ -4,18 +4,24 @@
 //! - POST /capture - Create bookmark node from web content
 //! - GET /search?q=<query> - Search nodes
 //! - GET /status - Check connection status
+//! - POST /holerabbit/visit - Record web page visit (Holerabbit extension)
 
 use crate::db::{Database, Node, NodeType, Position};
+use crate::holerabbit;
 use crate::local_embeddings;
 use std::io::Read;
 use std::sync::Arc;
+use tauri::{AppHandle, Emitter};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 const PORT: u16 = 9876;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Start the HTTP server in a background thread
-pub fn start(db: Arc<Database>) {
+pub fn start(db: Arc<Database>, app_handle: AppHandle) {
+    // Initialize holerabbit - pause all live sessions on startup
+    holerabbit::init(&db);
+
     std::thread::spawn(move || {
         let addr = format!("127.0.0.1:{}", PORT);
         let server = match Server::http(&addr) {
@@ -31,15 +37,16 @@ pub fn start(db: Arc<Database>) {
 
         for request in server.incoming_requests() {
             let db = db.clone();
+            let app = app_handle.clone();
             // Handle request in the same thread (tiny_http is single-threaded by default)
-            if let Err(e) = handle_request(request, &db) {
+            if let Err(e) = handle_request(request, &db, &app) {
                 eprintln!("[HTTP] Error handling request: {}", e);
             }
         }
     });
 }
 
-fn handle_request(mut request: Request, db: &Database) -> Result<(), String> {
+fn handle_request(mut request: Request, db: &Database, app: &AppHandle) -> Result<(), String> {
     let path = request.url().split('?').next().unwrap_or("");
     let method = request.method().clone();
 
@@ -64,8 +71,59 @@ fn handle_request(mut request: Request, db: &Database) -> Result<(), String> {
         (Method::Get, "/status") => {
             handle_status()
         }
+        // Holerabbit routes
+        (Method::Post, "/holerabbit/visit") => {
+            let mut body = String::new();
+            request.as_reader().read_to_string(&mut body)
+                .map_err(|e| format!("Failed to read body: {}", e))?;
+            let response = holerabbit::handle_visit(db, &body);
+            // Emit event to notify frontend of new visit
+            let _ = app.emit("holerabbit:visit", ());
+            response
+        }
+        (Method::Get, "/holerabbit/sessions") => {
+            holerabbit::handle_sessions(db)
+        }
+        (Method::Get, path) if path.starts_with("/holerabbit/session/") && !path.contains("/pause") && !path.contains("/resume") && !path.contains("/rename") && !path.contains("/merge") => {
+            let session_id = &path["/holerabbit/session/".len()..];
+            holerabbit::handle_session_detail(db, session_id)
+        }
+        // Session control endpoints
+        (Method::Post, path) if path.ends_with("/pause") && path.starts_with("/holerabbit/session/") => {
+            let session_id = &path["/holerabbit/session/".len()..path.len() - 6]; // strip /pause
+            holerabbit::handle_pause_session(db, session_id)
+        }
+        (Method::Post, path) if path.ends_with("/resume") && path.starts_with("/holerabbit/session/") => {
+            let session_id = &path["/holerabbit/session/".len()..path.len() - 7]; // strip /resume
+            holerabbit::handle_resume_session(db, session_id)
+        }
+        (Method::Post, path) if path.ends_with("/rename") && path.starts_with("/holerabbit/session/") => {
+            let session_id = path["/holerabbit/session/".len()..path.len() - 7].to_string(); // strip /rename
+            let mut body = String::new();
+            request.as_reader().read_to_string(&mut body)
+                .map_err(|e| format!("Failed to read body: {}", e))?;
+            holerabbit::handle_rename_session(db, &session_id, &body)
+        }
+        (Method::Post, path) if path.ends_with("/merge") && path.starts_with("/holerabbit/session/") => {
+            let session_id = path["/holerabbit/session/".len()..path.len() - 6].to_string(); // strip /merge
+            let mut body = String::new();
+            request.as_reader().read_to_string(&mut body)
+                .map_err(|e| format!("Failed to read body: {}", e))?;
+            holerabbit::handle_merge_sessions(db, &session_id, &body)
+        }
+        (Method::Delete, path) if path.starts_with("/holerabbit/session/") => {
+            // DELETE /holerabbit/session/{id} - delete session
+            let session_id = &path["/holerabbit/session/".len()..];
+            println!("[HTTP] DELETE session_id extracted: '{}'", session_id);
+            // Ensure it's just the ID (no sub-path like /pause)
+            if !session_id.is_empty() && !session_id.contains('/') {
+                holerabbit::handle_delete_session(db, session_id)
+            } else {
+                cors_response(json_response(404, r#"{"error":"Invalid session ID"}"#))
+            }
+        }
         _ => {
-            json_response(404, r#"{"error":"Not found"}"#)
+            cors_response(json_response(404, r#"{"error":"Not found"}"#))
         }
     };
 
@@ -233,7 +291,7 @@ fn cors_response(mut response: Response<std::io::Cursor<Vec<u8>>>) -> Response<s
         Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap()
     );
     response.add_header(
-        Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"GET, POST, OPTIONS"[..]).unwrap()
+        Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"GET, POST, DELETE, OPTIONS"[..]).unwrap()
     );
     response.add_header(
         Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type"[..]).unwrap()
