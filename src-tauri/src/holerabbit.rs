@@ -138,27 +138,18 @@ fn fetch_page(url: &str) -> Result<(String, String), String> {
 // ==================== Session Management ====================
 
 /// Get or create a session for the current visit
-/// If session_id is provided by extension, use it directly
-/// Otherwise fall back to gap-based detection for old extensions
+/// Priority: live session > extension's session_id > create new
 fn get_or_create_session(
     db: &Database,
     timestamp: i64,
-    gap_minutes: i64,
+    _gap_minutes: i64,
     explicit_session_id: Option<&str>,
 ) -> Result<(String, bool), String> {
-    // If extension provides session_id, use it directly
-    if let Some(sid) = explicit_session_id {
-        return ensure_session_exists(db, sid, timestamp);
-    }
-
-    // Fallback: gap-based detection for old extensions
-    let gap_ms = gap_minutes * 60 * 1000;
-
     let sessions = db
         .get_nodes_by_content_type("session")
         .map_err(|e| e.to_string())?;
 
-    // Find the single live session (there should be at most one)
+    // Priority 1: Use existing live session (set by app or extension)
     for s in &sessions {
         let tags_str = s.tags.clone().unwrap_or_default();
         if let Ok(tags) = serde_json::from_str::<serde_json::Value>(&tags_str) {
@@ -173,32 +164,28 @@ fn get_or_create_session(
         }
     }
 
-    // No live session - check for recent non-paused session within gap
-    for s in &sessions {
-        let tags_str = s.tags.clone().unwrap_or_default();
-        if let Ok(tags) = serde_json::from_str::<serde_json::Value>(&tags_str) {
-            let status = tags["status"].as_str().unwrap_or("archived");
-            let last_activity = tags["last_activity"].as_i64().unwrap_or(0);
-
-            if status != "paused" && timestamp - last_activity < gap_ms {
-                let mut tags = tags;
-                tags["last_activity"] = json!(timestamp);
-                tags["status"] = json!("live"); // Reactivate it
-                db.update_node_tags(&s.id, &tags.to_string())
-                    .map_err(|e| e.to_string())?;
-                println!("[Holerabbit] Reactivated session {} (was within gap)", &s.id);
-                return Ok((s.id.clone(), false));
-            }
+    // Priority 2: Use extension's session_id if provided (and set it live)
+    if let Some(sid) = explicit_session_id {
+        let (session_id, is_new) = ensure_session_exists(db, sid, timestamp)?;
+        // Set it live
+        if let Some(session) = db.get_node(&session_id).map_err(|e| e.to_string())? {
+            let mut tags: serde_json::Value =
+                serde_json::from_str(&session.tags.unwrap_or_default()).unwrap_or(json!({}));
+            tags["status"] = json!("live");
+            tags["last_activity"] = json!(timestamp);
+            db.update_node_tags(&session_id, &tags.to_string())
+                .map_err(|e| e.to_string())?;
         }
+        return Ok((session_id, is_new));
     }
 
-    // Create new session
+    // Priority 3: Create new live session
     let session_id = format!("session-{}", timestamp);
     let now = Utc::now().timestamp_millis();
 
     let node = Node {
         id: session_id.clone(),
-        node_type: NodeType::Cluster, // Sessions are containers like clusters
+        node_type: NodeType::Cluster,
         title: format!("Session {}", format_datetime(timestamp)),
         url: None,
         content: None,
@@ -220,7 +207,7 @@ fn get_or_create_session(
         emoji: Some("🐇".to_string()),
         is_processed: false,
         depth: 0,
-        is_item: false, // Sessions are containers, not items
+        is_item: false,
         is_universe: false,
         parent_id: None,
         child_count: 0,
@@ -592,6 +579,65 @@ pub struct SessionDetail {
 #[derive(Serialize)]
 pub struct SessionsResponse {
     pub sessions: Vec<SessionSummary>,
+}
+
+#[derive(Serialize)]
+pub struct LiveSessionResponse {
+    pub session: Option<SessionSummary>,
+}
+
+// ==================== GET /holerabbit/live ====================
+
+/// Handle GET /holerabbit/live - get current live session (if any)
+pub fn handle_live_session(db: &Database) -> Response<std::io::Cursor<Vec<u8>>> {
+    match get_live_session(db) {
+        Ok(session) => {
+            let response = LiveSessionResponse { session };
+            let json = serde_json::to_string(&response)
+                .unwrap_or_else(|_| r#"{"session":null}"#.to_string());
+            success_response(&json)
+        }
+        Err(e) => error_response(500, &e),
+    }
+}
+
+fn get_live_session(db: &Database) -> Result<Option<SessionSummary>, String> {
+    let sessions = db
+        .get_nodes_by_content_type("session")
+        .map_err(|e| e.to_string())?;
+
+    for s in sessions {
+        let tags_str = s.tags.clone().unwrap_or_default();
+        if let Ok(tags) = serde_json::from_str::<serde_json::Value>(&tags_str) {
+            if tags["status"].as_str() == Some("live") {
+                let entry_point = tags["entry_point"].as_str().map(String::from);
+                let entry_title = entry_point.as_ref().and_then(|id| {
+                    db.get_node(id)
+                        .ok()
+                        .flatten()
+                        .map(|n| n.ai_title.unwrap_or(n.title))
+                });
+
+                let item_count = db
+                    .get_edge_count_by_source_and_type(&s.id, "session_item")
+                    .unwrap_or(0);
+
+                return Ok(Some(SessionSummary {
+                    id: s.id,
+                    title: s.ai_title.unwrap_or(s.title),
+                    start_time: tags["start_time"].as_i64().unwrap_or(0),
+                    duration_ms: tags["last_activity"].as_i64().unwrap_or(0)
+                        - tags["start_time"].as_i64().unwrap_or(0),
+                    item_count,
+                    status: "live".to_string(),
+                    entry_point,
+                    entry_title,
+                }));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 // ==================== GET /holerabbit/sessions ====================

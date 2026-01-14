@@ -84,6 +84,9 @@ fn handle_request(mut request: Request, db: &Database, app: &AppHandle) -> Resul
         (Method::Get, "/holerabbit/sessions") => {
             holerabbit::handle_sessions(db)
         }
+        (Method::Get, "/holerabbit/live") => {
+            holerabbit::handle_live_session(db)
+        }
         (Method::Get, path) if path.starts_with("/holerabbit/session/") && !path.contains("/pause") && !path.contains("/resume") && !path.contains("/rename") && !path.contains("/merge") => {
             let session_id = &path["/holerabbit/session/".len()..];
             holerabbit::handle_session_detail(db, session_id)

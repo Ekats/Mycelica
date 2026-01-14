@@ -53,6 +53,10 @@ Mycelica shows structure you can navigate, plus connections that cross category 
   - Supports Rust, Python, TypeScript, C/C++, RST documentation
   - `Calls` edges show function call relationships
   - Semantic search across your codebase
+- **Browser Integration** — [Holerabbit Firefox extension](https://github.com/Ekats/Mycelica-Firefox) tracks browsing sessions:
+  - Automatic session grouping with navigation edges
+  - Pause/resume/rename sessions from app or extension
+  - Real-time sync between browser and Mycelica
 - **Leaf Reader** — Full-screen reader for conversations (chat bubbles) and notes (markdown)
 - **Privacy Filtering** — Showcase/normal modes for safe database exports
 - **Import** — Claude conversations, Markdown files, OpenAIRE papers, Google Keep, source code
@@ -307,11 +311,18 @@ mycelica-cli tui
 ┌──────────────▼──────────────────────────┐
 │   Rust Backend                          │
 │   Tauri 2 + Tokio + rusqlite            │
+│   HTTP server on localhost:9876         │
 └──────────────┬──────────────────────────┘
                │
 ┌──────────────▼──────────────────────────┐
 │   SQLite Database                       │
 │   Nodes + Edges + Embeddings + FTS5     │
+└─────────────────────────────────────────┘
+        ▲
+        │ HTTP (localhost:9876)
+┌───────┴─────────────────────────────────┐
+│   Holerabbit Firefox Extension          │
+│   Tracks browsing sessions              │
 └─────────────────────────────────────────┘
 ```
 
@@ -354,6 +365,7 @@ mycelica/
 │   │   ├── graph/          # D3 visualization
 │   │   ├── leaf/           # Content reader
 │   │   ├── sidebar/        # Quick access
+│   │   ├── sessions/       # Browsing sessions panel
 │   │   └── settings/       # Configuration
 │   ├── stores/             # Zustand state
 │   └── hooks/              # Data fetching
@@ -366,7 +378,9 @@ mycelica/
 │       ├── ai_client.rs    # Anthropic/Ollama integration
 │       ├── hierarchy.rs    # Hierarchy algorithms
 │       ├── clustering.rs   # Topic clustering
-│       └── local_embeddings.rs  # all-MiniLM-L6-v2
+│       ├── local_embeddings.rs  # all-MiniLM-L6-v2
+│       ├── http_server.rs  # Browser extension API (port 9876)
+│       └── holerabbit.rs   # Browsing session tracking
 
 
 ```
