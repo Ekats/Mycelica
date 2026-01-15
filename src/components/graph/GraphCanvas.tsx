@@ -438,9 +438,24 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
     // ==========================================================================
 
     // Calculate min/max dates for date coloring
-    const dates = graphNodes.map(n => n.createdAt);
-    const minDate = Math.min(...dates);
-    const maxDate = Math.max(...dates);
+    // Collect ALL dates that will actually be displayed (must match the fill conditions below)
+    const displayedDates: number[] = [];
+    graphNodes.forEach(n => {
+      if (n.childCount === 0 && n.createdAt > 0) {
+        // Leaf nodes show createdAt
+        displayedDates.push(n.createdAt);
+      }
+      if (n.childCount > 0 && n.latestChildDate && n.latestChildDate > 0) {
+        // Category nodes show latestChildDate
+        displayedDates.push(n.latestChildDate);
+      }
+    });
+    // Use actual range, or if all same/empty, use a 30-day window for visual variety
+    const minDate = displayedDates.length > 0 ? Math.min(...displayedDates) : Date.now() - 30 * 24 * 60 * 60 * 1000;
+    const maxDate = displayedDates.length > 0 ? Math.max(...displayedDates) : Date.now();
+    // If range is too small (< 1 hour), dates are effectively "same time" - all get middle color
+    const dateRange = maxDate - minDate;
+    const effectiveMinDate = dateRange < 3600000 ? maxDate - 3600000 : minDate;
 
     // Create card and dot groups
     const cardsGroup = container.append('g').attr('class', 'cards');
@@ -623,7 +638,7 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       .attr('x', 14).attr('y', NOTE_HEIGHT - 16)
       .attr('font-family', CARD_FONT)
       .attr('font-size', '17px')
-      .attr('fill', d => d.childCount > 0 ? 'rgba(255,255,255,0.7)' : getDateColor(d.createdAt, minDate, maxDate))
+      .attr('fill', d => d.childCount > 0 ? 'rgba(255,255,255,0.7)' : getDateColor(d.createdAt, effectiveMinDate, maxDate))
       .text(d => d.childCount > 0 ? `${d.childCount} items` : new Date(d.createdAt).toLocaleDateString());
 
     // Footer right text (latest date for groups)
@@ -633,7 +648,7 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       .attr('text-anchor', 'end')
       .attr('font-family', CARD_FONT)
       .attr('font-size', '17px')
-      .attr('fill', d => (d.childCount > 0 && d.latestChildDate) ? getDateColor(d.latestChildDate, minDate, maxDate) : 'transparent')
+      .attr('fill', d => (d.childCount > 0 && d.latestChildDate) ? getDateColor(d.latestChildDate, effectiveMinDate, maxDate) : 'transparent')
       .text(d => (d.childCount > 0 && d.latestChildDate) ? `Latest: ${new Date(d.latestChildDate).toLocaleDateString()}` : '');
 
     // === ITEM BADGES (semantic type indicators - only on leaf nodes) ===
