@@ -1114,23 +1114,8 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
   // Build breadcrumb display: Universe + navigation path + current level
   const currentLevelInfo = getLevelName(currentDepth, maxDepth);
 
-  // Compute current view's direct child count for overcrowded warning
-  const currentViewChildCount = useMemo(() => {
-    if (nodes.size === 0) return 0;
-    const allNodes = Array.from(nodes.values());
-    const universeNode = allNodes.find(n => n.isUniverse);
-
-    if (currentParentId) {
-      return allNodes.filter(n => n.parentId === currentParentId).length;
-    }
-    if (universeNode) {
-      return allNodes.filter(n => n.parentId === universeNode.id).length;
-    }
-    return allNodes.filter(n => n.depth === currentDepth).length;
-  }, [nodes, currentParentId, currentDepth]);
-
   const OVERCROWDED_THRESHOLD = 100;
-  const isOvercrowded = currentViewChildCount > OVERCROWDED_THRESHOLD;
+  const [overcrowdedNode, setOvercrowdedNode] = useState<Node | null>(null);
 
   // ==========================================================================
   // LAYOUT COMPUTATION - Compute positioned nodes and edges for GraphCanvas
@@ -1267,6 +1252,11 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
   }, []);
 
   const handleNavigateToNode = useCallback((node: Node) => {
+    // Warn if node has too many direct children
+    if (node.childCount > OVERCROWDED_THRESHOLD) {
+      setOvercrowdedNode(node);
+      return;
+    }
     navigateToNode(node);
   }, [navigateToNode]);
 
@@ -1420,13 +1410,38 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
         })()}
       </div>
 
-      {/* Overcrowded view warning */}
-      {isOvercrowded && (
-        <div className="absolute top-20 left-4 bg-amber-900/90 backdrop-blur-sm rounded-lg px-3 py-2 z-10 border border-amber-600/50 flex items-center gap-2 max-w-md">
-          <AlertTriangle size={16} className="text-amber-400 flex-shrink-0" />
-          <span className="text-sm text-amber-200">
-            This view has {currentViewChildCount} items. Consider organizing into subcategories.
-          </span>
+      {/* Overcrowded node warning popup */}
+      {overcrowdedNode && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50">
+          <div className="bg-gray-800 rounded-lg border border-gray-700 p-6 max-w-md shadow-xl">
+            <div className="flex items-start gap-3 mb-4">
+              <AlertTriangle size={24} className="text-amber-400 flex-shrink-0 mt-0.5" />
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-1">Large Category</h3>
+                <p className="text-gray-300 text-sm">
+                  "{overcrowdedNode.aiTitle || overcrowdedNode.title}" has {overcrowdedNode.childCount} direct children.
+                  Consider organizing into subcategories for better navigation.
+                </p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={() => setOvercrowdedNode(null)}
+                className="px-4 py-2 text-sm text-gray-400 hover:text-white transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  navigateToNode(overcrowdedNode);
+                  setOvercrowdedNode(null);
+                }}
+                className="px-4 py-2 text-sm bg-amber-600 hover:bg-amber-500 text-white rounded transition-colors"
+              >
+                Enter Anyway
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

@@ -5,6 +5,12 @@ import type { Node } from '../../types/graph';
 import { generateClusterColor, getDirectConnectionColor, getChainConnectionColor, getStructuralDepth, getMutedClusterColor } from '../../utils/nodeColors';
 import { getDateColor, getEdgeColor } from '../../utils/similarityColor';
 
+// Pre-rendered card images for performance (includes shadows, titlebar, synopsis area, footer)
+import cardItemPng from '../../assets/node-card-item.png';
+import cardCategory1Png from '../../assets/node-card-category-1.png';
+import cardCategory2Png from '../../assets/node-card-category-2.png';
+import cardCategory3Png from '../../assets/node-card-category-3.png';
+
 // =============================================================================
 // TYPES
 // =============================================================================
@@ -105,6 +111,74 @@ const getNodeOpacity = (
 
 // Nice font for card text
 const CARD_FONT = "'Inter', 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif";
+
+// Select card image based on structural depth (child count)
+// depth 0 = item (no children), depth 1 = 2-5 children, depth 2 = 6-15, depth 3+ = 16+
+const getCardImage = (childCount: number, isItem: boolean): { src: string; width: number; height: number } => {
+  const depth = getStructuralDepth(childCount, isItem);
+  if (depth >= 4) return { src: cardCategory3Png, width: 348, height: 348 };
+  if (depth >= 3) return { src: cardCategory2Png, width: 341, height: 341 };
+  if (depth >= 2) return { src: cardCategory1Png, width: 334, height: 334 };
+  return { src: cardItemPng, width: 324, height: 324 };
+};
+
+// =============================================================================
+// CANVAS COLORIZATION (multiply blend for accurate colors)
+// =============================================================================
+
+// Cache for loaded images
+const imageCache = new Map<string, HTMLImageElement>();
+
+// Cache for colorized image data URLs
+const colorizedCache = new Map<string, string>();
+
+// Load image and cache it
+const loadImage = (src: string): Promise<HTMLImageElement> => {
+  const cached = imageCache.get(src);
+  if (cached) return Promise.resolve(cached);
+
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      imageCache.set(src, img);
+      resolve(img);
+    };
+    img.onerror = reject;
+    img.src = src;
+  });
+};
+
+// Colorize a grayscale image using canvas multiply blend
+const colorizeImage = (img: HTMLImageElement, color: string): string => {
+  const cacheKey = `${img.src}:${color}`;
+  const cached = colorizedCache.get(cacheKey);
+  if (cached) return cached;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = img.width;
+  canvas.height = img.height;
+  const ctx = canvas.getContext('2d')!;
+
+  // Draw original grayscale image
+  ctx.drawImage(img, 0, 0);
+
+  // Apply color via multiply blend
+  ctx.globalCompositeOperation = 'multiply';
+  ctx.fillStyle = color;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Restore alpha channel from original image
+  ctx.globalCompositeOperation = 'destination-in';
+  ctx.drawImage(img, 0, 0);
+
+  const dataUrl = canvas.toDataURL('image/png');
+  colorizedCache.set(cacheKey, dataUrl);
+  return dataUrl;
+};
+
+// Preload all card images on module load
+const cardImageSrcs = [cardItemPng, cardCategory1Png, cardCategory2Png, cardCategory3Png];
+cardImageSrcs.forEach(src => loadImage(src));
 
 // Get all 4 side centers of a node
 const getSideCenters = (center: { x: number; y: number }, width: number, height: number) => {
@@ -382,91 +456,41 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
         `translate(${d.x * initialPositionScale}, ${d.y * initialPositionScale}) scale(${initialCardScale}) translate(${-NOTE_WIDTH/2}, ${-NOTE_HEIGHT/2})`
       );
 
-    // === TOPIC SHADOWS (render order = z-order, first = bottom) ===
+    // === CARD BACKGROUND (pre-rendered PNG with canvas multiply colorization) ===
+    // Single <image> replaces ~15 rect elements per node
+    // Helper to get colorized image URL (uses canvas multiply blend)
+    const getColorizedImageUrl = (d: GraphNode): string => {
+      const cardInfo = getCardImage(d.childCount, d.isItem);
+      const color = getNodeColor(d, activeNodeId, connectionMap);
+      const cachedImg = imageCache.get(cardInfo.src);
+      if (cachedImg) {
+        return colorizeImage(cachedImg, color);
+      }
+      // Fallback to original if not loaded yet
+      return cardInfo.src;
+    };
 
-    // Violet shadow FIRST (ALL topics) - offset = 7 * depth
-    cardGroups.filter(d => getStructuralDepth(d.childCount, d.isItem) >= 1)
-      .append('rect')
-      .attr('class', 'shadow-violet')
-      .attr('x', d => 7 * getStructuralDepth(d.childCount, d.isItem))
-      .attr('y', d => 7 * getStructuralDepth(d.childCount, d.isItem))
-      .attr('width', NOTE_WIDTH)
-      .attr('height', NOTE_HEIGHT)
-      .attr('rx', 6)
-      .attr('fill', '#5b21b6')
-      .attr('stroke', d => d.id === activeNodeId ? '#fbbf24' : 'rgba(255,255,255,0.2)')
-      .attr('stroke-width', d => d.id === activeNodeId ? 2 : 1);
+    cardGroups.append('image')
+      .attr('class', 'card-bg-image')
+      .attr('href', d => getColorizedImageUrl(d))
+      .attr('width', d => getCardImage(d.childCount, d.isItem).width)
+      .attr('height', d => getCardImage(d.childCount, d.isItem).height)
+      .attr('x', d => -(getCardImage(d.childCount, d.isItem).width - NOTE_WIDTH) / 2)
+      .attr('y', d => -(getCardImage(d.childCount, d.isItem).height - NOTE_HEIGHT) / 2)
+      .attr('data-node-id', d => d.id);  // For updates
 
-    // Cluster shadow 3 - for 16+ children
-    cardGroups.filter(d => getStructuralDepth(d.childCount, d.isItem) >= 4)
-      .append('rect')
-      .attr('class', 'shadow-cluster')
-      .attr('x', 21).attr('y', 21)
-      .attr('width', NOTE_WIDTH).attr('height', NOTE_HEIGHT)
-      .attr('rx', 6)
-      .attr('fill', d => {
-        const base = d.renderClusterId >= 0 ? generateClusterColor(d.renderClusterId) : '#374151';
-        return d3.color(base)?.darker(1.8)?.toString() || '#2a2a2a';
-      })
-      .attr('stroke', d => d.id === activeNodeId ? '#fbbf24' : 'rgba(255,255,255,0.15)')
-      .attr('stroke-width', d => d.id === activeNodeId ? 2 : 1);
-
-    // Cluster shadow 2 - for 6+ children
-    cardGroups.filter(d => getStructuralDepth(d.childCount, d.isItem) >= 3)
-      .append('rect')
-      .attr('class', 'shadow-cluster')
-      .attr('x', 14).attr('y', 14)
-      .attr('width', NOTE_WIDTH).attr('height', NOTE_HEIGHT)
-      .attr('rx', 6)
-      .attr('fill', d => {
-        const base = d.renderClusterId >= 0 ? generateClusterColor(d.renderClusterId) : '#374151';
-        return d3.color(base)?.darker(1.4)?.toString() || '#333333';
-      })
-      .attr('stroke', d => d.id === activeNodeId ? '#fbbf24' : 'rgba(255,255,255,0.15)')
-      .attr('stroke-width', d => d.id === activeNodeId ? 2 : 1);
-
-    // Cluster shadow 1 - for 2+ children
-    cardGroups.filter(d => getStructuralDepth(d.childCount, d.isItem) >= 2)
-      .append('rect')
-      .attr('class', 'shadow-cluster')
-      .attr('x', 7).attr('y', 7)
-      .attr('width', NOTE_WIDTH).attr('height', NOTE_HEIGHT)
-      .attr('rx', 6)
-      .attr('fill', d => {
-        const base = d.renderClusterId >= 0 ? generateClusterColor(d.renderClusterId) : '#374151';
-        return d3.color(base)?.darker(1.0)?.toString() || '#3d3d3d';
-      })
-      .attr('stroke', d => d.id === activeNodeId ? '#fbbf24' : 'rgba(255,255,255,0.15)')
-      .attr('stroke-width', d => d.id === activeNodeId ? 2 : 1);
-
-    // === ITEM SHADOW ===
-    cardGroups.filter(d => getStructuralDepth(d.childCount, d.isItem) === 0)
-      .append('rect')
-      .attr('x', 2).attr('y', 2)
-      .attr('width', NOTE_WIDTH).attr('height', NOTE_HEIGHT)
-      .attr('rx', 6)
-      .attr('fill', 'rgba(0,0,0,0.3)');
-
-    // Card background
+    // Selection highlight (stroke overlay) - created for ALL nodes, visibility toggled
     cardGroups.append('rect')
-      .attr('class', 'card-bg')
+      .attr('class', 'selection-highlight')
       .attr('width', NOTE_WIDTH).attr('height', NOTE_HEIGHT)
       .attr('rx', 6)
-      .attr('fill', d => getNodeColor(d, activeNodeId, connectionMap))
-      .attr('stroke', d => d.id === activeNodeId ? '#fbbf24' : 'rgba(255,255,255,0.15)')
-      .attr('stroke-width', d => d.id === activeNodeId ? 2 : 1);
+      .attr('fill', 'none')
+      .attr('stroke', '#fbbf24')
+      .attr('stroke-width', 3)
+      .style('display', d => d.id === activeNodeId ? null : 'none');
 
     // Apply opacity to entire card group
     cardGroups.style('opacity', d => getNodeOpacity(d, activeNodeId, connectionMap, edgeConnectedIds));
-
-    // Titlebar - darker area at top
-    cardGroups.append('rect')
-      .attr('width', NOTE_WIDTH).attr('height', 80)
-      .attr('rx', 6)
-      .attr('fill', 'rgba(0,0,0,0.4)');
-    cardGroups.append('rect')
-      .attr('y', 70).attr('width', NOTE_WIDTH).attr('height', 10)
-      .attr('fill', 'rgba(0,0,0,0.4)');
 
     // Virtual DOM: Track node indices for limiting detailed content
     const nodeIndexMap = new Map(graphNodes.map((n, i) => [n.id, i]));
@@ -531,13 +555,8 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       });
     });
 
-    // Synopsis area background
+    // Synopsis height for text layout (background baked into PNG)
     const synopsisHeight = NOTE_HEIGHT - 148;
-    cardGroups.append('rect')
-      .attr('class', 'synopsis-bg')
-      .attr('x', 0).attr('y', 80)
-      .attr('width', NOTE_WIDTH).attr('height', synopsisHeight)
-      .attr('fill', 'rgba(0,0,0,0.2)');
 
     // Synopsis - SVG text (only for first N nodes - virtual DOM optimization)
     const synopsisGroups = cardGroups
@@ -597,14 +616,7 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       }
     });
 
-    // Footer background
-    cardGroups.append('rect')
-      .attr('class', 'footer-bg')
-      .attr('x', 8).attr('y', NOTE_HEIGHT - 34)
-      .attr('width', NOTE_WIDTH - 16).attr('height', 26)
-      .attr('rx', 4).attr('ry', 4)
-      .attr('fill', 'rgba(0, 0, 0, 0.5)');
-
+    // Footer text (background baked into PNG)
     // Footer left text
     cardGroups.append('text')
       .attr('class', 'footer-left')
@@ -624,57 +636,22 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       .attr('fill', d => (d.childCount > 0 && d.latestChildDate) ? getDateColor(d.latestChildDate, minDate, maxDate) : 'transparent')
       .text(d => (d.childCount > 0 && d.latestChildDate) ? `Latest: ${new Date(d.latestChildDate).toLocaleDateString()}` : '');
 
-    // Open/Enter button (shown when selected, if showTips enabled)
-    const OPEN_BTN_WIDTH = 80;
-    const OPEN_BTN_HEIGHT = 28;
-    const openBtnGroups = cardGroups.append('g')
-      .attr('class', 'open-btn')
-      .attr('transform', `translate(${NOTE_WIDTH / 2 - OPEN_BTN_WIDTH / 2}, ${NOTE_HEIGHT - 68})`)
-      .style('opacity', 0) // Hidden by default
-      .style('pointer-events', 'none') // Disabled when hidden
-      .style('cursor', 'pointer');
-
-    openBtnGroups.append('rect')
-      .attr('width', OPEN_BTN_WIDTH)
-      .attr('height', OPEN_BTN_HEIGHT)
-      .attr('rx', 6)
-      .attr('fill', '#d97706');
-
-    openBtnGroups.append('text')
-      .attr('x', OPEN_BTN_WIDTH / 2)
-      .attr('y', OPEN_BTN_HEIGHT / 2 + 5)
-      .attr('text-anchor', 'middle')
-      .attr('font-family', CARD_FONT)
-      .attr('font-size', '14px')
-      .attr('font-weight', '600')
-      .attr('fill', 'white')
-      .text(d => d.isItem ? 'Open' : (d.childCount > 0 ? 'Enter' : ''));
-
-    openBtnGroups.on('click', function(event, d) {
-      event.stopPropagation();
-      if (d.isItem) {
-        onOpenLeaf(d.id);
-      } else if (d.childCount > 0) {
-        onSelectNode(null);
-        onNavigateToNode(d);
-      }
-    });
-
-    // Item type badge (NOTE or PAPER)
+    // === ITEM BADGES (semantic type indicators - only on leaf nodes) ===
     const itemBadges = cardGroups.filter(d => d.isItem && d.childCount === 0);
-
-    const getBadgeText = (d: GraphNode) => d.contentType === 'paper' ? 'PAPER' : 'NOTE';
     const BADGE_WIDTH = 72;
     const PDF_BADGE_WIDTH = 46;
     const BADGE_GAP = 6;
 
-    // Main badge (NOTE or PAPER) - always centered
+    // Main badge (NOTE or PAPER) - centered in footer
     itemBadges.append('rect')
+      .attr('class', 'item-badge-bg')
       .attr('x', NOTE_WIDTH / 2 - BADGE_WIDTH / 2).attr('y', NOTE_HEIGHT - 34)
       .attr('width', BADGE_WIDTH).attr('height', 26)
       .attr('rx', 4)
       .attr('fill', d => d.contentType === 'paper' ? '#b45309' : '#5b21b6');
+
     itemBadges.append('text')
+      .attr('class', 'item-badge-text')
       .attr('x', NOTE_WIDTH / 2).attr('y', NOTE_HEIGHT - 15)
       .attr('text-anchor', 'middle')
       .attr('font-family', CARD_FONT)
@@ -682,31 +659,33 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       .attr('font-weight', '700')
       .attr('letter-spacing', '1.5px')
       .attr('fill', '#ffffff')
-      .text(d => getBadgeText(d));
+      .text(d => d.contentType === 'paper' ? 'PAPER' : 'NOTE');
 
-    // PDF badge (lighter blue, to the right, clickable) - only for papers with PDF
+    // PDF badge (clickable, only for papers with PDF)
     const pdfBadgeGroups = itemBadges.filter(d => d.contentType === 'paper' && d.pdfAvailable)
       .append('g')
       .attr('class', 'pdf-badge')
       .attr('cursor', 'pointer')
       .on('click', (event, d) => {
-        event.stopPropagation();  // Don't trigger card click
+        event.stopPropagation();
         onOpenLeaf(d.id, 'pdf');
       })
       .on('mouseenter', function(event) {
-        event.stopPropagation();  // Don't trigger card hover tooltip
-        setHoveredNode(null);     // Clear any existing tooltip
-        d3.select(this).select('rect').attr('fill', '#1e6fd9');  // Lighter on hover
+        event.stopPropagation();
+        setHoveredNode(null);
+        d3.select(this).select('rect').attr('fill', '#1e6fd9');
       })
       .on('mouseleave', function(event) {
         event.stopPropagation();
-        d3.select(this).select('rect').attr('fill', '#0a51a9');  // Back to normal
+        d3.select(this).select('rect').attr('fill', '#0a51a9');
       });
+
     pdfBadgeGroups.append('rect')
       .attr('x', NOTE_WIDTH / 2 + BADGE_WIDTH / 2 + BADGE_GAP).attr('y', NOTE_HEIGHT - 34)
       .attr('width', PDF_BADGE_WIDTH).attr('height', 26)
       .attr('rx', 4)
-      .attr('fill', '#0a51a9');  // Dark blue
+      .attr('fill', '#0a51a9');
+
     pdfBadgeGroups.append('text')
       .attr('x', NOTE_WIDTH / 2 + BADGE_WIDTH / 2 + BADGE_GAP + PDF_BADGE_WIDTH / 2).attr('y', NOTE_HEIGHT - 15)
       .attr('text-anchor', 'middle')
@@ -714,26 +693,8 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       .attr('font-size', '14px')
       .attr('font-weight', '700')
       .attr('fill', '#ffffff')
-      .attr('pointer-events', 'none')  // Let clicks pass through to parent group
+      .attr('pointer-events', 'none')
       .text('PDF');
-
-    // Menu button for items
-    const menuBtnGroups = cardGroups.filter(d => d.childCount === 0)
-      .append('g')
-      .attr('class', 'node-menu-btn')
-      .attr('cursor', 'pointer')
-      .attr('transform', `translate(${NOTE_WIDTH - 36}, ${NOTE_HEIGHT - 32})`);
-    menuBtnGroups.append('rect')
-      .attr('width', 28).attr('height', 22)
-      .attr('rx', 4)
-      .attr('fill', 'rgba(255,255,255,0.1)');
-    menuBtnGroups.append('text')
-      .attr('x', 14).attr('y', 16)
-      .attr('text-anchor', 'middle')
-      .attr('font-size', '16px')
-      .attr('font-weight', 'bold')
-      .attr('fill', 'rgba(255,255,255,0.6)')
-      .text('•••');
 
     // === DOT RENDERING (zoomed out view) ===
     const dotGroups = dotsGroup.selectAll('g.node-dot')
@@ -964,50 +925,37 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       }
     });
 
-    // Menu button handlers
-    menuBtnGroups
-      .on('click', function(event, d) {
-        event.stopPropagation();
-        const rect = (event.target as SVGElement).getBoundingClientRect();
-        onShowContextMenu(d.id, { x: rect.right + 10, y: rect.top });
-      })
-      .on('mouseenter', function() {
-        d3.select(this).select('rect').attr('fill', 'rgba(255,255,255,0.25)');
-        d3.select(this).select('text').attr('fill', 'rgba(255,255,255,0.9)');
-      })
-      .on('mouseleave', function() {
-        d3.select(this).select('rect').attr('fill', 'rgba(255,255,255,0.1)');
-        d3.select(this).select('text').attr('fill', 'rgba(255,255,255,0.6)');
-      });
-
     // ==========================================================================
     // HOVER HANDLERS
     // ==========================================================================
 
-    // Card hover - show tooltip and highlight
+    // Helper to get hover color (brighter version)
+    const getHoverColor = (d: GraphNode): string => {
+      const baseColor = d.renderClusterId >= 0 ? generateClusterColor(d.renderClusterId) : '#6b7280';
+      const c = d3.color(baseColor);
+      return c ? c.brighter(0.3).toString() : baseColor;
+    };
+
+    // Card hover - show tooltip and brighten
     cardGroups
       .on('mouseenter', function(_, d) {
         setHoveredNode(d);
-        // Highlight hovered card
-        d3.select(this).select('.card-bg')
-          .attr('fill', d.renderClusterId >= 0 ? generateClusterColor(d.renderClusterId) : '#4b5563');
+        // Brighten on hover using canvas colorization with brighter color
+        const hoverColor = getHoverColor(d);
+        const cardInfo = getCardImage(d.childCount, d.isItem);
+        const cachedImg = imageCache.get(cardInfo.src);
+        if (cachedImg) {
+          d3.select(this).select('.card-bg-image').attr('href', colorizeImage(cachedImg, hoverColor));
+        }
       })
       .on('mouseleave', function(_, d) {
         setHoveredNode(null);
         // Restore color based on selection state
-        const isSelected = d.id === activeNodeIdRef.current;
-        if (isSelected) {
-          d3.select(this).select('.card-bg')
-            .attr('fill', d.renderClusterId >= 0 ? generateClusterColor(d.renderClusterId) : '#4b5563');
-        } else {
-          const conn = connectionMapRef.current.get(d.id);
-          let color: string;
-          if (conn) {
-            color = conn.distance === 1 ? getDirectConnectionColor(conn.weight) : getChainConnectionColor(conn.distance);
-          } else {
-            color = getMutedClusterColor(d);
-          }
-          d3.select(this).select('.card-bg').attr('fill', color);
+        const color = getNodeColor(d, activeNodeIdRef.current, connectionMapRef.current);
+        const cardInfo = getCardImage(d.childCount, d.isItem);
+        const cachedImg = imageCache.get(cardInfo.src);
+        if (cachedImg) {
+          d3.select(this).select('.card-bg-image').attr('href', colorizeImage(cachedImg, color));
         }
       });
 
@@ -1314,58 +1262,28 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       return getNodeOpacity(data, activeNodeId, connectionMap, edgeConnectedIds);
     };
 
-    // Update card background colors with transition
-    svg.selectAll<SVGRectElement, GraphNode>('.card-bg')
-      .transition().duration(150)
-      .attr('fill', function(this: SVGRectElement) {
+    // Update card background colors via canvas multiply blend
+    svg.selectAll<SVGImageElement, GraphNode>('.card-bg-image')
+      .attr('href', function(this: SVGImageElement) {
         const parentEl = this.parentNode as Element;
-        if (!parentEl) return '#374151';
+        if (!parentEl) return '';
         const data = d3.select<Element, GraphNode>(parentEl).datum();
-        return getColorFromData(data);
-      })
-      .attr('stroke', function(this: SVGRectElement) {
-        const parentEl = this.parentNode as Element;
-        if (!parentEl) return 'rgba(255,255,255,0.15)';
-        const data = d3.select<Element, GraphNode>(parentEl).datum();
-        return data.id === activeNodeId ? '#fbbf24' : 'rgba(255,255,255,0.15)';
-      })
-      .attr('stroke-width', function(this: SVGRectElement) {
-        const parentEl = this.parentNode as Element;
-        if (!parentEl) return 1;
-        const data = d3.select<Element, GraphNode>(parentEl).datum();
-        return data.id === activeNodeId ? 2 : 1;
+        const cardInfo = getCardImage(data.childCount, data.isItem);
+        const color = getColorFromData(data);
+        const cachedImg = imageCache.get(cardInfo.src);
+        if (cachedImg) {
+          return colorizeImage(cachedImg, color);
+        }
+        return cardInfo.src;
       });
 
-    // Update shadow-violet strokes (main violet layer)
-    svg.selectAll<SVGRectElement, GraphNode>('.shadow-violet')
-      .transition().duration(150)
-      .attr('stroke', function(this: SVGRectElement) {
+    // Update selection highlight visibility
+    svg.selectAll<SVGRectElement, GraphNode>('.selection-highlight')
+      .style('display', function(this: SVGRectElement) {
         const parentEl = this.parentNode as Element;
-        if (!parentEl) return 'rgba(255,255,255,0.2)';
+        if (!parentEl) return 'none';
         const data = d3.select<Element, GraphNode>(parentEl).datum();
-        return data.id === activeNodeId ? '#fbbf24' : 'rgba(255,255,255,0.2)';
-      })
-      .attr('stroke-width', function(this: SVGRectElement) {
-        const parentEl = this.parentNode as Element;
-        if (!parentEl) return 1;
-        const data = d3.select<Element, GraphNode>(parentEl).datum();
-        return data.id === activeNodeId ? 2 : 1;
-      });
-
-    // Update shadow-cluster strokes (depth layers)
-    svg.selectAll<SVGRectElement, GraphNode>('.shadow-cluster')
-      .transition().duration(150)
-      .attr('stroke', function(this: SVGRectElement) {
-        const parentEl = this.parentNode as Element;
-        if (!parentEl) return 'rgba(255,255,255,0.15)';
-        const data = d3.select<Element, GraphNode>(parentEl).datum();
-        return data.id === activeNodeId ? '#fbbf24' : 'rgba(255,255,255,0.15)';
-      })
-      .attr('stroke-width', function(this: SVGRectElement) {
-        const parentEl = this.parentNode as Element;
-        if (!parentEl) return 1;
-        const data = d3.select<Element, GraphNode>(parentEl).datum();
-        return data.id === activeNodeId ? 2 : 1;
+        return data.id === activeNodeId ? null : 'none';
       });
 
     // Update card group opacity
@@ -1422,29 +1340,7 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
         });
     }
 
-    // Update Open/Enter button visibility based on selection
-    svg.selectAll<SVGGElement, GraphNode>('.open-btn')
-      .each(function(this: SVGGElement) {
-        const parentEl = this.parentNode as Element;
-        if (!parentEl) return;
-        const data = d3.select<Element, GraphNode>(parentEl).datum();
-        // Show if: tips enabled, node selected, and node has action (is item or has children)
-        const isVisible = showTips && data.id === activeNodeId && (data.isItem || data.childCount > 0);
-        // Set pointer-events immediately (not animated)
-        d3.select(this).style('pointer-events', isVisible ? 'auto' : 'none');
-      })
-      .transition().duration(150)
-      .style('opacity', function(this: SVGGElement) {
-        const parentEl = this.parentNode as Element;
-        if (!parentEl) return 0;
-        const data = d3.select<Element, GraphNode>(parentEl).datum();
-        if (showTips && data.id === activeNodeId && (data.isItem || data.childCount > 0)) {
-          return 1;
-        }
-        return 0;
-      });
-
-  }, [activeNodeId, connectionMap, graphNodes, edgeData, showTips]);
+  }, [activeNodeId, connectionMap, graphNodes, edgeData]);
 
   // ==========================================================================
   // RENDER

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="348" height="348" viewBox="0 0 348 348" xmlns="http://www.w3.org/2000/svg">
+  <!-- Category card with 3 shadow stacks (16+ children) -->
+
+  <!-- Violet base shadow -->
+  <rect x="28" y="28" width="320" height="320" rx="6" fill="#5b21b6"/>
+
+  <!-- Cluster shadow 3 -->
+  <rect x="21" y="21" width="320" height="320" rx="6" fill="#2a2a2a"/>
+
+  <!-- Cluster shadow 2 -->
+  <rect x="14" y="14" width="320" height="320" rx="6" fill="#333333"/>
+
+  <!-- Cluster shadow 1 -->
+  <rect x="7" y="7" width="320" height="320" rx="6" fill="#3d3d3d"/>
+
+  <!-- Main card background -->
+  <rect x="0" y="0" width="320" height="320" rx="6" fill="#4b5563"/>
+
+  <!-- Titlebar dark overlay -->
+  <rect x="0" y="0" width="320" height="80" rx="6" fill="rgba(0,0,0,0.4)"/>
+  <rect x="0" y="70" width="320" height="10" fill="rgba(0,0,0,0.4)"/>
+
+  <!-- Synopsis area -->
+  <rect x="0" y="80" width="320" height="172" fill="rgba(0,0,0,0.2)"/>
+
+  <!-- Footer area -->
+  <rect x="8" y="286" width="304" height="26" rx="4" fill="rgba(0,0,0,0.5)"/>
+</svg>

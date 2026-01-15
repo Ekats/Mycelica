@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="324" height="324" viewBox="0 0 324 324" xmlns="http://www.w3.org/2000/svg">
+  <!-- Item card (no children) - complete with all areas -->
+
+  <!-- Drop shadow -->
+  <rect x="4" y="4" width="320" height="320" rx="6" fill="rgba(0,0,0,0.3)"/>
+
+  <!-- Main card background -->
+  <rect x="0" y="0" width="320" height="320" rx="6" fill="#4b5563"/>
+
+  <!-- Titlebar dark overlay -->
+  <rect x="0" y="0" width="320" height="80" rx="6" fill="rgba(0,0,0,0.4)"/>
+  <rect x="0" y="70" width="320" height="10" fill="rgba(0,0,0,0.4)"/>
+
+  <!-- Synopsis area (slightly darker) -->
+  <rect x="0" y="80" width="320" height="172" fill="rgba(0,0,0,0.2)"/>
+
+  <!-- Footer area (darker) -->
+  <rect x="8" y="286" width="304" height="26" rx="4" fill="rgba(0,0,0,0.5)"/>
+</svg>
