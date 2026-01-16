@@ -8,7 +8,7 @@ pub mod settings;
 pub mod hierarchy;
 pub mod import;
 pub mod similarity;
-mod local_embeddings;
+pub mod local_embeddings;
 pub mod classification;
 mod tags;
 pub mod openaire;

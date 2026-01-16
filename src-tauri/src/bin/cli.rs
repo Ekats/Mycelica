@@ -496,6 +496,8 @@ enum HierarchyCommands {
     Stats,
     /// Fix Recent Notes position (move to Universe)
     FixRecentNotes,
+    /// Smart add orphan items by finding similar existing items
+    SmartAdd,
 }
 
 #[derive(Subcommand)]
@@ -1799,7 +1801,138 @@ async fn handle_hierarchy(cmd: HierarchyCommands, db: &Database, json: bool, qui
                 }
             }
         }
+        HierarchyCommands::SmartAdd => {
+            handle_smart_add(&db, json).await?;
+        }
     }
+    Ok(())
+}
+
+// ============================================================================
+// Smart Add
+// ============================================================================
+
+async fn handle_smart_add(db: &Database, json: bool) -> Result<(), String> {
+    use similarity::cosine_similarity;
+    use std::time::Instant;
+
+    let start = Instant::now();
+    const SIMILARITY_THRESHOLD: f32 = 0.3;
+
+    // Get all nodes
+    let all_nodes = db.get_all_nodes(true).map_err(|e| e.to_string())?;
+
+    // Get orphan items (is_item=true, parent_id=None)
+    let orphans: Vec<_> = all_nodes.iter()
+        .filter(|n| n.is_item && n.parent_id.is_none())
+        .cloned()
+        .collect();
+
+    if orphans.is_empty() {
+        if json {
+            log!(r#"{{"orphans":0,"matched":0,"embedded":0,"ms":0}}"#);
+        } else {
+            log!("No orphan items found");
+        }
+        return Ok(());
+    }
+
+    log!("Found {} orphan items", orphans.len());
+
+    // Get all items WITH parents (potential matches)
+    let items_with_parents: Vec<_> = all_nodes.iter()
+        .filter(|n| n.is_item && n.parent_id.is_some())
+        .collect();
+
+    log!("Found {} items with parents to match against", items_with_parents.len());
+
+    // Pre-fetch all embeddings
+    let all_embeddings = db.get_nodes_with_embeddings().map_err(|e| e.to_string())?;
+    let mut emb_map: std::collections::HashMap<_, _> = all_embeddings.into_iter().collect();
+
+    // Find orphans without embeddings and generate them
+    let orphans_needing_embeddings: Vec<_> = orphans.iter()
+        .filter(|o| !emb_map.contains_key(&o.id))
+        .collect();
+
+    let mut embedded = 0;
+    if !orphans_needing_embeddings.is_empty() {
+        log!("Generating embeddings for {} orphans...", orphans_needing_embeddings.len());
+
+        // Prepare texts for batch embedding
+        let texts: Vec<String> = orphans_needing_embeddings.iter()
+            .map(|o| {
+                let title = o.ai_title.as_ref().unwrap_or(&o.title);
+                let content = o.content.as_deref().unwrap_or("");
+                format!("{}\n{}", title, &content[..content.len().min(500)])
+            })
+            .collect();
+
+        // Generate embeddings in batch
+        if let Ok(embeddings) = mycelica_lib::local_embeddings::generate_batch(&texts.iter().map(|s| s.as_str()).collect::<Vec<_>>()) {
+            for (orphan, embedding) in orphans_needing_embeddings.iter().zip(embeddings.into_iter()) {
+                if db.update_node_embedding(&orphan.id, &embedding).is_ok() {
+                    emb_map.insert(orphan.id.clone(), embedding);
+                    embedded += 1;
+                }
+            }
+            log!("Generated {} embeddings", embedded);
+        }
+    }
+
+    let mut matched = 0;
+
+    for orphan in &orphans {
+        // Get orphan's embedding
+        let orphan_emb = match emb_map.get(&orphan.id) {
+            Some(e) => e,
+            None => {
+                log!("  [skip] '{}' - no embedding", orphan.title);
+                continue;
+            }
+        };
+
+        // Find most similar item that has a parent
+        let mut best: Option<(&str, &str, i32, f32)> = None; // (item_id, parent_id, depth, score)
+        for candidate in &items_with_parents {
+            if let Some(cand_emb) = emb_map.get(&candidate.id) {
+                let score = cosine_similarity(orphan_emb, cand_emb);
+                if score > SIMILARITY_THRESHOLD {
+                    if best.is_none() || score > best.unwrap().3 {
+                        best = Some((
+                            &candidate.id,
+                            candidate.parent_id.as_ref().unwrap(),
+                            candidate.depth,
+                            score,
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Place orphan as sibling of best match
+        if let Some((similar_id, parent_id, depth, score)) = best {
+            db.set_node_parent(&orphan.id, parent_id, depth).map_err(|e| e.to_string())?;
+            db.increment_child_count(parent_id).map_err(|e| e.to_string())?;
+            matched += 1;
+            log!("  '{}' -> '{}' (sim: {:.2} with '{}')",
+                orphan.ai_title.as_ref().unwrap_or(&orphan.title),
+                parent_id,
+                score,
+                similar_id);
+        } else {
+            log!("  [skip] '{}' - no similar item found (threshold: {})", orphan.title, SIMILARITY_THRESHOLD);
+        }
+    }
+
+    let elapsed = start.elapsed().as_millis() as u64;
+
+    if json {
+        log!(r#"{{"orphans":{},"matched":{},"embedded":{},"ms":{}}}"#, orphans.len(), matched, embedded, elapsed);
+    } else {
+        log!("Done: {}/{} orphans placed, {} embeddings generated in {}ms", matched, orphans.len(), embedded, elapsed);
+    }
+
     Ok(())
 }
 

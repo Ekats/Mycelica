@@ -162,5 +162,6 @@ Other edge types exist (`UsesType`, `Implements`, `Tests`) but aren't auto-gener
 | Browse files | `mycelica-cli nav folder src-tauri/src/` |
 | Update after edit | `mycelica-cli import code <file> --update` |
 | Rebuild call graph | `mycelica-cli analyze code-edges` |
+| Place orphan items | `mycelica-cli hierarchy smart-add` |
 | Stats | `mycelica-cli db stats` |
 | Interactive browser | `mycelica-cli tui` |
