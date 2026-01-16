@@ -132,36 +132,52 @@ function mapBackendEdge(e: BackendEdge): Edge {
   };
 }
 
+// Module-level flag to prevent double-loading from multiple useGraph() calls
+let isLoadingGraph = false;
+
 export function useGraph() {
   const { setNodes, setEdges, nodes, edges, showHidden } = useGraphStore();
   const [loaded, setLoaded] = useState(false);
   const [loadedParents, setLoadedParents] = useState<Set<string>>(new Set());
 
   const loadGraph = useCallback(async (includeHidden: boolean) => {
+    // Prevent concurrent loads from multiple useGraph() calls
+    if (isLoadingGraph) {
+      console.log('[PERF] loadGraph skipped - already loading');
+      return;
+    }
+    isLoadingGraph = true;
+
     try {
+      const start = performance.now();
       console.log(`Loading graph from backend (includeHidden=${includeHidden})...`);
 
-      // Only load nodes on startup - edges are loaded per-view for performance
+      // Load all nodes - needed for similar nodes, search, cross-graph jumps
+      const invokeStart = performance.now();
       const backendNodes = await invoke<BackendNode[]>('get_nodes', { includeHidden });
+      const invokeTime = performance.now() - invokeStart;
 
-      console.log(`Loaded ${backendNodes.length} nodes`);
-      if (backendNodes.length > 0) {
-        console.log('First node:', JSON.stringify(backendNodes[0], null, 2));
-      }
+      console.log(`[PERF] get_nodes invoke: ${invokeTime.toFixed(0)}ms (${backendNodes.length} nodes)`);
 
+      const mapStart = performance.now();
       const nodeMap = new Map<string, Node>();
       for (const n of backendNodes) {
         nodeMap.set(n.id, mapBackendNode(n));
       }
+      const mapTime = performance.now() - mapStart;
 
       setNodes(nodeMap);
       // Clear loaded parents cache when reloading with different visibility
       setLoadedParents(new Set());
-      // Don't load all edges - they'll be loaded per-view via loadEdgesForView
       setLoaded(true);
+
+      const totalTime = performance.now() - start;
+      console.log(`[PERF] loadGraph total: ${totalTime.toFixed(0)}ms (invoke: ${invokeTime.toFixed(0)}ms, map: ${mapTime.toFixed(0)}ms)`);
     } catch (error) {
       console.error('Failed to load graph:', error);
       setLoaded(true); // Mark as loaded even on error so UI doesn't hang
+    } finally {
+      isLoadingGraph = false;
     }
   }, [setNodes]);
 
@@ -199,9 +215,12 @@ export function useGraph() {
   }, [loadedParents]);
 
   // Load graph on mount and reload when showHidden changes
+  // Skip if nodes already loaded (prevents double-load from multiple useGraph() calls)
   useEffect(() => {
-    loadGraph(showHidden);
-  }, [loadGraph, showHidden]);
+    if (nodes.size === 0) {
+      loadGraph(showHidden);
+    }
+  }, [loadGraph, showHidden, nodes.size]);
 
   // Simple reload function that uses current showHidden value
   const reload = useCallback(() => {

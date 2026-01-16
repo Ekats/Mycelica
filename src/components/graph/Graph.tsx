@@ -1121,10 +1121,21 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
   // LAYOUT COMPUTATION - Compute positioned nodes and edges for GraphCanvas
   // ==========================================================================
   const { graphNodesComputed, edgeDataComputed } = useMemo(() => {
+    const layoutStart = performance.now();
     if (nodes.size === 0) return { graphNodesComputed: [], edgeDataComputed: [] };
 
     const allNodes = Array.from(nodes.values());
     const universeNode = allNodes.find(n => n.isUniverse);
+
+    // Build parent->children index ONCE for O(1) child lookups (vs O(n) filter)
+    const childrenIndex = new Map<string | undefined, Node[]>();
+    for (const node of allNodes) {
+      const parentKey = node.parentId ?? undefined;
+      if (!childrenIndex.has(parentKey)) {
+        childrenIndex.set(parentKey, []);
+      }
+      childrenIndex.get(parentKey)!.push(node);
+    }
 
     // Privacy filter helper
     const passesPrivacy = (n: Node): boolean => {
@@ -1132,23 +1143,21 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
       return n.isPrivate !== true;
     };
 
-    // Recursive check: does this node have any visible descendants?
+    // Recursive check using indexed children (O(k) instead of O(n) per call)
     const hasVisibleDescendants = (parentId: string): boolean => {
-      const children = allNodes.filter(n => n.parentId === parentId);
-      if (children.length === 0) return false; // No children = no visible descendants
+      const children = childrenIndex.get(parentId) || [];
+      if (children.length === 0) return false;
       return children.some(child => {
         if (child.isItem) {
-          // Items must pass privacy themselves
           return passesPrivacy(child);
         } else {
-          // Categories: recurse without checking category's own privacy
-          // (category privacy is derived from children, so we check the actual items)
           return hasVisibleDescendants(child.id);
         }
       });
     };
 
     // Filter nodes for current view
+    const filterStart = performance.now();
     const nodeArray = allNodes.filter(node => {
       if (hidePrivate) {
         if (node.isItem) {
@@ -1164,8 +1173,15 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
       if (currentDepth === 0 && universeNode) return node.parentId === universeNode.id;
       return node.depth === currentDepth && !node.parentId;
     });
+    const filterTime = performance.now() - filterStart;
 
-    if (nodeArray.length === 0) return { graphNodesComputed: [], edgeDataComputed: [] };
+    if (nodeArray.length === 0) {
+      const totalTime = performance.now() - layoutStart;
+      if (totalTime > 10) {
+        console.log(`[PERF] Layout computation: ${totalTime.toFixed(1)}ms (filter: ${filterTime.toFixed(1)}ms, ${allNodes.length} total -> 0 displayed)`);
+      }
+      return { graphNodesComputed: [], edgeDataComputed: [] };
+    }
 
     // Constants
     const noteWidth = 320, noteHeight = 320, nodeSpacing = 400;
@@ -1232,6 +1248,11 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
         edgeData.push({ source, target, type: edge.type, weight: edge.weight ?? 0.5 });
       }
     });
+
+    const totalTime = performance.now() - layoutStart;
+    if (totalTime > 10) { // Only log if > 10ms
+      console.log(`[PERF] Layout computation: ${totalTime.toFixed(1)}ms (filter: ${filterTime.toFixed(1)}ms, ${allNodes.length} total -> ${graphNodes.length} displayed)`);
+    }
 
     return { graphNodesComputed: graphNodes, edgeDataComputed: edgeData };
   }, [nodes, edges, width, height, currentDepth, currentParentId, hidePrivate, privacyThreshold, getNodeEmoji]);
