@@ -2850,7 +2850,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
 
     // Step 0: Pattern Classification (FREE, identifies hidden items to skip)
     log!("");
-    log!("▶ STEP 0/5: Pattern Classification");
+    log!("▶ STEP 0/6: Pattern Classification");
     log!("───────────────────────────────────────────────────────────");
     log!("  Classifying items using pattern matching (FREE)...");
 
@@ -2875,7 +2875,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
 
     // Step 1: AI Processing + Embeddings
     log!("");
-    log!("▶ STEP 1/5: AI Processing + Embeddings");
+    log!("▶ STEP 1/6: AI Processing + Embeddings");
     log!("───────────────────────────────────────────────────────────");
 
     // 1a: AI process non-paper, non-hidden items
@@ -3043,7 +3043,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
     // Step 2: Clustering & Hierarchy
     // Note: hierarchy::build_full_hierarchy has its own verbose logging via emit_log()
     log!("");
-    log!("▶ STEP 2/5: Clustering & Hierarchy");
+    log!("▶ STEP 2/6: Clustering & Hierarchy");
     log!("───────────────────────────────────────────────────────────");
 
     // If FOS flag is set, run full FOS pipeline: FOS grouping → clustering → hierarchy
@@ -3114,7 +3114,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
     // Step 3: Code edges (only if code nodes exist)
     // Note: Category embeddings handled by Hierarchy Step 6/7
     log!("");
-    log!("▶ STEP 3/5: Code Analysis");
+    log!("▶ STEP 3/6: Code Analysis");
     log!("───────────────────────────────────────────────────────────");
 
     let code_functions: Vec<_> = items.iter()
@@ -3198,7 +3198,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
 
     // Step 4: Flatten hierarchy (remove empty intermediate levels)
     log!("");
-    log!("▶ STEP 4/5: Flatten Hierarchy");
+    log!("▶ STEP 4/6: Flatten Hierarchy");
     log!("───────────────────────────────────────────────────────────");
     match db.flatten_empty_levels() {
         Ok(removed) => {
@@ -3211,6 +3211,42 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
         Err(e) => {
             elog!("✗ Flatten failed: {}", e);
         }
+    }
+
+    // Step 5: Build HNSW index for fast similarity search
+    log!("");
+    log!("▶ STEP 5/6: Build HNSW Index");
+    log!("───────────────────────────────────────────────────────────");
+    {
+        use mycelica_lib::commands::{HnswIndex, hnsw_index_path};
+
+        let embeddings = db.get_nodes_with_embeddings().map_err(|e| e.to_string())?;
+        if embeddings.is_empty() {
+            log!("⊘ SKIPPED (no embeddings found)");
+        } else {
+            log!("Building index for {} embeddings...", embeddings.len());
+            let start = std::time::Instant::now();
+
+            let mut index = HnswIndex::new();
+            index.build(&embeddings);
+
+            let db_path = PathBuf::from(db.get_path());
+            let index_path = hnsw_index_path(&db_path);
+            index.save(&index_path)?;
+
+            log!("✓ HNSW index built in {:.1}s → {}",
+                start.elapsed().as_secs_f64(),
+                index_path.display());
+        }
+    }
+
+    // Step 6: Index edges for fast view loading
+    log!("");
+    log!("▶ STEP 6/6: Index Edge Parents");
+    log!("───────────────────────────────────────────────────────────");
+    match db.update_edge_parents() {
+        Ok(count) => log!("✓ Indexed {} edges with parent IDs", count),
+        Err(e) => elog!("✗ Edge indexing failed: {}", e),
     }
 
     log!("");

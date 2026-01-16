@@ -179,6 +179,8 @@ pub fn run() {
             // Try to load pre-built HNSW index from disk
             let mut hnsw_index = commands::HnswIndex::new();
             let hnsw_path = commands::hnsw_index_path(&db_path);
+            let mut needs_background_build = false;
+
             if hnsw_path.exists() {
                 match hnsw_index.load(&hnsw_path) {
                     Ok(count) => println!("Loaded HNSW index with ~{} points", count),
@@ -186,7 +188,15 @@ pub fn run() {
                         eprintln!("Failed to load HNSW index: {}", e);
                         // Delete corrupted index file
                         let _ = std::fs::remove_file(&hnsw_path);
+                        needs_background_build = true;
                     }
+                }
+            } else {
+                // Check if we have embeddings but no index - if so, build in background
+                let embedding_count = db.count_nodes_with_embeddings().unwrap_or(0);
+                if embedding_count > 0 {
+                    println!("HNSW index missing but {} embeddings found, will build in background", embedding_count);
+                    needs_background_build = true;
                 }
             }
 
@@ -198,6 +208,53 @@ pub fn run() {
                 hnsw_index: std::sync::RwLock::new(hnsw_index),
                 openaire_cancel: std::sync::atomic::AtomicBool::new(false),
             });
+
+            // Background HNSW index build if needed
+            if needs_background_build {
+                let bg_app_handle = app.handle().clone();
+                let bg_db_path = db_path.clone();
+
+                std::thread::spawn(move || {
+                    println!("[HNSW] Background build starting...");
+                    let start = std::time::Instant::now();
+
+                    // Get state from app handle
+                    let state: tauri::State<'_, commands::AppState> = bg_app_handle.state();
+                    let db_arc = match state.db.read() {
+                        Ok(guard) => guard.clone(),
+                        Err(e) => {
+                            eprintln!("[HNSW] Failed to acquire DB lock: {}", e);
+                            return;
+                        }
+                    };
+
+                    // Load embeddings from DB
+                    match db_arc.get_nodes_with_embeddings() {
+                        Ok(embeddings) if !embeddings.is_empty() => {
+                            println!("[HNSW] Building index for {} embeddings...", embeddings.len());
+
+                            let mut index = commands::HnswIndex::new();
+                            index.build(&embeddings);
+
+                            // Save to disk
+                            let hnsw_path = commands::hnsw_index_path(&bg_db_path);
+                            if let Err(e) = index.save(&hnsw_path) {
+                                eprintln!("[HNSW] Failed to save index: {}", e);
+                                return;
+                            }
+
+                            // Update AppState
+                            if let Ok(mut hnsw_guard) = state.hnsw_index.write() {
+                                *hnsw_guard = index;
+                            }
+
+                            println!("[HNSW] Background build complete in {:.1}s", start.elapsed().as_secs_f64());
+                        }
+                        Ok(_) => println!("[HNSW] No embeddings to index"),
+                        Err(e) => eprintln!("[HNSW] Failed to load embeddings: {}", e),
+                    }
+                });
+            }
 
             // Set window title and handle HiDPI scaling
             // Note: On Wayland, title updates taskbar but not header bar (upstream GTK issue)
