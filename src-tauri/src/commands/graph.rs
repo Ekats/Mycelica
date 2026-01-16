@@ -48,15 +48,85 @@ impl SimilarityCache {
     }
 }
 
+/// In-memory cache for all embeddings - loaded once, avoids repeated SQLite reads
+/// ~80MB for 55k nodes × 384 floats × 4 bytes
+pub struct EmbeddingsCache {
+    embeddings: Option<HashMap<String, Vec<f32>>>,
+    loaded_at: Option<Instant>,
+}
+
+impl EmbeddingsCache {
+    pub fn new() -> Self {
+        Self {
+            embeddings: None,
+            loaded_at: None,
+        }
+    }
+
+    /// Check if cache is loaded
+    pub fn is_loaded(&self) -> bool {
+        self.embeddings.is_some()
+    }
+
+    /// Get all embeddings as Vec for similarity search
+    pub fn get_all(&self) -> Option<Vec<(String, Vec<f32>)>> {
+        self.embeddings.as_ref().map(|map| {
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        })
+    }
+
+    /// Get a single embedding
+    pub fn get(&self, node_id: &str) -> Option<&Vec<f32>> {
+        self.embeddings.as_ref()?.get(node_id)
+    }
+
+    /// Load all embeddings from database
+    pub fn load(&mut self, db: &Database) -> Result<usize, String> {
+        let start = Instant::now();
+        let all = db.get_nodes_with_embeddings().map_err(|e| e.to_string())?;
+        let count = all.len();
+        let map: HashMap<String, Vec<f32>> = all.into_iter().collect();
+        self.embeddings = Some(map);
+        self.loaded_at = Some(Instant::now());
+        println!("[PERF] EmbeddingsCache: loaded {} embeddings in {}ms", count, start.elapsed().as_millis());
+        Ok(count)
+    }
+
+    /// Invalidate cache (call when embeddings are added/updated/deleted)
+    pub fn invalidate(&mut self) {
+        self.embeddings = None;
+        self.loaded_at = None;
+        println!("[PERF] EmbeddingsCache: invalidated");
+    }
+
+    /// Update a single embedding in cache (avoids full reload)
+    pub fn update(&mut self, node_id: &str, embedding: Vec<f32>) {
+        if let Some(ref mut map) = self.embeddings {
+            map.insert(node_id.to_string(), embedding);
+        }
+    }
+
+    /// Remove a single embedding from cache
+    pub fn remove(&mut self, node_id: &str) {
+        if let Some(ref mut map) = self.embeddings {
+            map.remove(node_id);
+        }
+    }
+}
+
 pub struct AppState {
     pub db: RwLock<Arc<Database>>,
     pub similarity_cache: RwLock<SimilarityCache>,
+    pub embeddings_cache: RwLock<EmbeddingsCache>,
     pub openaire_cancel: std::sync::atomic::AtomicBool,
 }
 
 #[tauri::command]
 pub fn get_nodes(state: State<AppState>, include_hidden: Option<bool>) -> Result<Vec<Node>, String> {
-    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_all_nodes(include_hidden.unwrap_or(false)).map_err(|e| e.to_string())
+    let start = std::time::Instant::now();
+    let result = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_all_nodes(include_hidden.unwrap_or(false)).map_err(|e| e.to_string());
+    println!("[PERF] get_nodes: {}ms ({} nodes)", start.elapsed().as_millis(), result.as_ref().map(|v| v.len()).unwrap_or(0));
+    result
 }
 
 #[tauri::command]
@@ -263,7 +333,10 @@ pub fn get_edges_for_fos(state: State<AppState>, fos_id: String) -> Result<Vec<E
 
 #[tauri::command]
 pub fn get_edges_for_view(state: State<AppState>, parent_id: String) -> Result<Vec<Edge>, String> {
-    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_edges_for_view(&parent_id).map_err(|e| e.to_string())
+    let start = std::time::Instant::now();
+    let result = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_edges_for_view(&parent_id).map_err(|e| e.to_string());
+    println!("[PERF] get_edges_for_view({}): {}ms ({} edges)", parent_id, start.elapsed().as_millis(), result.as_ref().map(|v| v.len()).unwrap_or(0));
+    result
 }
 
 #[tauri::command]
@@ -634,6 +707,17 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
         remaining_secs: Some(0.0),
     });
 
+    // Invalidate embeddings cache if we processed any nodes (they got new embeddings)
+    if processed > 0 {
+        if let Ok(mut cache) = state.embeddings_cache.write() {
+            cache.invalidate();
+        }
+        // Also invalidate similarity cache since embeddings changed
+        if let Ok(mut cache) = state.similarity_cache.write() {
+            cache.invalidate();
+        }
+    }
+
     Ok(ProcessingResult {
         processed,
         failed,
@@ -797,7 +881,10 @@ pub fn get_children_flat(state: State<AppState>, parent_id: String) -> Result<Ve
 /// If include_hidden is true, also includes HIDDEN tier items
 #[tauri::command]
 pub fn get_graph_children(state: State<AppState>, parent_id: String, include_hidden: Option<bool>) -> Result<Vec<Node>, String> {
-    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_graph_children(&parent_id, include_hidden.unwrap_or(false)).map_err(|e| e.to_string())
+    let start = std::time::Instant::now();
+    let result = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_graph_children(&parent_id, include_hidden.unwrap_or(false)).map_err(|e| e.to_string());
+    println!("[PERF] get_graph_children({}): {}ms ({} children)", parent_id, start.elapsed().as_millis(), result.as_ref().map(|v| v.len()).unwrap_or(0));
+    result
 }
 
 /// Get supporting items (code/debug/paste) under a parent
@@ -1354,6 +1441,7 @@ pub fn get_similar_nodes(
     top_n: Option<usize>,
     min_similarity: Option<f32>,
 ) -> Result<Vec<SimilarNode>, String> {
+    let fn_start = std::time::Instant::now();
     let top_n = top_n.unwrap_or(10);
     let min_similarity = min_similarity.unwrap_or(0.0);
 
@@ -1361,29 +1449,56 @@ pub fn get_similar_nodes(
     let cached = state.similarity_cache.read().map_err(|e| format!("Cache lock error: {}", e))?.get(&node_id);
 
     let similar = if let Some(cached_results) = cached {
+        println!("[PERF] get_similar_nodes: cache HIT");
         // Use cached results, but filter and limit
         cached_results.into_iter()
             .filter(|(_, score)| *score >= min_similarity)
             .take(top_n)
             .collect::<Vec<_>>()
     } else {
-        // Get the target node's embedding - return empty if none (e.g., category nodes)
-        let target_embedding = match state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_node_embedding(&node_id) {
-            Ok(Some(emb)) => emb,
-            _ => return Ok(vec![]), // No embedding = no similar nodes, but not an error
-        };
+        println!("[PERF] get_similar_nodes: similarity cache MISS, computing...");
 
-        // Get all embeddings
-        let all_embeddings = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_nodes_with_embeddings()
-            .map_err(|e| e.to_string())?;
+        // Get all embeddings from cache (lazy-load on first access)
+        let emb_start = std::time::Instant::now();
+        let all_embeddings = {
+            // Check if embeddings cache needs loading
+            let needs_load = !state.embeddings_cache.read()
+                .map_err(|e| format!("Cache lock error: {}", e))?.is_loaded();
+
+            if needs_load {
+                // Load embeddings into cache (one-time cost)
+                let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+                state.embeddings_cache.write()
+                    .map_err(|e| format!("Cache lock error: {}", e))?
+                    .load(&db)?;
+            }
+
+            // Get from cache
+            state.embeddings_cache.read()
+                .map_err(|e| format!("Cache lock error: {}", e))?
+                .get_all()
+                .unwrap_or_default()
+        };
+        println!("[PERF] get_similar_nodes: get {} embeddings took {}ms (from cache)", all_embeddings.len(), emb_start.elapsed().as_millis());
 
         if all_embeddings.is_empty() {
             return Ok(vec![]);
         }
 
+        // Get the target node's embedding from cache
+        let target_embedding = {
+            let cache = state.embeddings_cache.read().map_err(|e| format!("Cache lock error: {}", e))?;
+            match cache.get(&node_id) {
+                Some(emb) => emb.clone(),
+                None => return Ok(vec![]), // No embedding = no similar nodes
+            }
+        };
+
         // Find similar nodes - get more than requested for caching
+        let sim_start = std::time::Instant::now();
         let max_cache_results = 50;
         let similar = similarity::find_similar(&target_embedding, &all_embeddings, &node_id, max_cache_results, 0.0);
+        println!("[PERF] get_similar_nodes: similarity calc took {}ms", sim_start.elapsed().as_millis());
 
         // Cache the full results
         state.similarity_cache.write().map_err(|e| format!("Cache lock error: {}", e))?.insert(node_id.clone(), similar.clone());
@@ -1464,6 +1579,7 @@ pub fn get_similar_nodes(
         }
     }
 
+    println!("[PERF] get_similar_nodes: total {}ms ({} results)", fn_start.elapsed().as_millis(), results.len());
     Ok(results)
 }
 
@@ -2192,6 +2308,15 @@ pub async fn regenerate_all_embeddings(
         status: format!("Complete! {} embeddings regenerated", success_count),
     });
 
+    // Invalidate embeddings cache so next similarity query reloads from DB
+    if let Ok(mut cache) = state.embeddings_cache.write() {
+        cache.invalidate();
+    }
+    // Also invalidate similarity cache since embeddings changed
+    if let Ok(mut cache) = state.similarity_cache.write() {
+        cache.invalidate();
+    }
+
     Ok(RegenerateResult {
         count: success_count,
         embedding_source: embedding_source.to_string(),
@@ -2646,6 +2771,13 @@ pub async fn smart_add_to_hierarchy(
 
     let elapsed = start.elapsed().as_millis() as u64;
     println!("[SmartAdd] Done: {}/{} orphans placed in {}ms", matched, orphans.len(), elapsed);
+
+    // Invalidate embeddings cache if we generated new embeddings
+    if !orphans_needing_embeddings.is_empty() {
+        if let Ok(mut cache) = state.embeddings_cache.write() {
+            cache.invalidate();
+        }
+    }
 
     Ok(SmartAddResult {
         orphans_found: orphans.len(),

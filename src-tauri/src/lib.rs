@@ -178,6 +178,7 @@ pub fn run() {
             app.manage(AppState {
                 db: std::sync::RwLock::new(db),
                 similarity_cache: std::sync::RwLock::new(commands::SimilarityCache::new(cache_ttl)),
+                embeddings_cache: std::sync::RwLock::new(commands::EmbeddingsCache::new()),
                 openaire_cancel: std::sync::atomic::AtomicBool::new(false),
             });
 
