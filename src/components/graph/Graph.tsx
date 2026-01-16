@@ -135,7 +135,7 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     showTips,
     setShowTips,
   } = useGraphStore();
-  const { loadEdgesForView, loadEdgesForFos } = useGraph();
+  const { loadEdgesForView } = useGraph();
   const [zoomLevel, setZoomLevel] = useState(1);
   const [devLogs, setDevLogs] = useState<DevConsoleLog[]>([]);
   const [showDevConsole, setShowDevConsole] = useState(false);
@@ -338,16 +338,10 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
   // Load edges for current view (O(1) indexed lookup instead of loading all 338k edges)
   useEffect(() => {
     if (currentParentId) {
-      // FOS views may have precomputed edges, try that first
-      if (currentParentId.startsWith('fos-')) {
-        loadEdgesForFos(currentParentId);
-      } else {
-        // Regular views use per-view indexed lookup
-        loadEdgesForView(currentParentId);
-      }
+      loadEdgesForView(currentParentId);
     }
     // Universe view (currentParentId = null) doesn't need edges - it shows top-level categories
-  }, [currentParentId, loadEdgesForView, loadEdgesForFos]);
+  }, [currentParentId, loadEdgesForView]);
 
   // Load pinned node IDs on mount
   useEffect(() => {

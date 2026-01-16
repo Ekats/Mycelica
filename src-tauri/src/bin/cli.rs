@@ -562,6 +562,8 @@ enum EmbeddingsCommands {
         #[arg(value_parser = ["on", "off"])]
         state: Option<String>,
     },
+    /// Build HNSW index for fast similarity search
+    BuildIndex,
 }
 
 #[derive(Subcommand)]
@@ -2230,6 +2232,44 @@ async fn handle_embeddings(cmd: EmbeddingsCommands, db: &Database, json: bool) -
                 } else {
                     println!("Local embeddings: {}", if current { "enabled" } else { "disabled" });
                 }
+            }
+        }
+        EmbeddingsCommands::BuildIndex => {
+            use mycelica_lib::commands::{HnswIndex, hnsw_index_path};
+
+            eprintln!("Building HNSW index for fast similarity search...");
+            eprintln!("This may take several minutes for large databases.");
+
+            // Get all embeddings
+            let embeddings = db.get_nodes_with_embeddings().map_err(|e| e.to_string())?;
+            let count = embeddings.len();
+
+            if count == 0 {
+                if json {
+                    println!(r#"{{"status":"error","message":"No embeddings found"}}"#);
+                } else {
+                    eprintln!("No embeddings found. Run 'mycelica-cli process nodes' first.");
+                }
+                return Ok(());
+            }
+
+            eprintln!("Found {} embeddings", count);
+
+            // Build index
+            let mut index = HnswIndex::new();
+            index.build(&embeddings);
+
+            // Save to disk
+            let db_path = PathBuf::from(db.get_path());
+            let index_path = hnsw_index_path(&db_path);
+            index.save(&index_path)?;
+
+            if json {
+                println!(r#"{{"status":"ok","embeddings":{},"path":"{}"}}"#,
+                    count, index_path.display());
+            } else {
+                println!("Built HNSW index with {} embeddings", count);
+                println!("Saved to: {:?}", index_path);
             }
         }
     }

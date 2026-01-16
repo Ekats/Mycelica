@@ -3,7 +3,6 @@ use crate::clustering::{self, ClusteringResult as ClusterResult};
 use crate::ai_client;
 use crate::hierarchy;
 use crate::import;
-use crate::similarity;
 use crate::settings;
 use tauri::{State, AppHandle, Emitter};
 use std::sync::Arc;
@@ -11,7 +10,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use serde::Serialize;
+use std::path::Path;
+use serde::{Serialize, Deserialize};
+use instant_distance::{Builder, HnswMap, Search};
+use instant_distance::Point as HnswPoint;
 
 use crate::utils::safe_truncate;
 
@@ -114,10 +116,175 @@ impl EmbeddingsCache {
     }
 }
 
+/// Embedding point wrapper for HNSW
+/// Implements distance as Euclidean (smaller = closer)
+#[derive(Clone, Serialize, Deserialize)]
+pub struct EmbeddingPoint(pub Vec<f32>);
+
+impl HnswPoint for EmbeddingPoint {
+    fn distance(&self, other: &Self) -> f32 {
+        // Euclidean distance (instant-distance expects smaller = closer)
+        // For normalized embeddings, this is equivalent to sqrt(2*(1 - cosine_sim))
+        self.0.iter()
+            .zip(other.0.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt()
+    }
+}
+
+/// HNSW index for fast approximate nearest neighbor search
+/// Provides O(log n) queries instead of O(n) brute-force
+/// Can be serialized to disk for fast loading on app startup
+pub struct HnswIndex {
+    index: Option<HnswMap<EmbeddingPoint, String>>,  // Point -> node_id
+    built_at: Option<Instant>,
+    node_count: usize,
+}
+
+impl HnswIndex {
+    pub fn new() -> Self {
+        Self {
+            index: None,
+            built_at: None,
+            node_count: 0,
+        }
+    }
+
+    pub fn is_built(&self) -> bool {
+        self.index.is_some()
+    }
+
+    /// Build index from embeddings
+    /// Uses tuned HNSW parameters for 50k+ vectors:
+    /// - ef_construction=100: build speed vs quality tradeoff
+    /// - ef_search=50: fast queries with good recall
+    pub fn build(&mut self, embeddings: &[(String, Vec<f32>)]) {
+        let start = Instant::now();
+        println!("[PERF] HnswIndex: starting build with {} points...", embeddings.len());
+
+        let points: Vec<EmbeddingPoint> = embeddings.iter()
+            .map(|(_, emb)| EmbeddingPoint(emb.clone()))
+            .collect();
+        let values: Vec<String> = embeddings.iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        // Use tuned parameters for large datasets
+        // ef_construction=100 (default is higher, causing slow builds)
+        // ef_search=50 (fast queries, ~95% recall)
+        self.index = Some(
+            Builder::default()
+                .ef_construction(100)
+                .ef_search(50)
+                .build(points, values)
+        );
+        self.built_at = Some(Instant::now());
+        self.node_count = embeddings.len();
+        println!("[PERF] HnswIndex: built with {} points in {}ms",
+            embeddings.len(), start.elapsed().as_millis());
+    }
+
+    /// Save index to disk for fast loading on next startup
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let Some(ref index) = self.index else {
+            return Err("No index to save".to_string());
+        };
+
+        let start = Instant::now();
+        let bytes = bincode::serialize(index)
+            .map_err(|e| format!("Failed to serialize HNSW index: {}", e))?;
+
+        std::fs::write(path, &bytes)
+            .map_err(|e| format!("Failed to write HNSW index to {:?}: {}", path, e))?;
+
+        println!("[PERF] HnswIndex: saved {} points ({} bytes) to {:?} in {}ms",
+            self.node_count, bytes.len(), path, start.elapsed().as_millis());
+        Ok(())
+    }
+
+    /// Load pre-built index from disk
+    pub fn load(&mut self, path: &Path) -> Result<usize, String> {
+        let start = Instant::now();
+
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("Failed to read HNSW index from {:?}: {}", path, e))?;
+
+        let index: HnswMap<EmbeddingPoint, String> = bincode::deserialize(&bytes)
+            .map_err(|e| format!("Failed to deserialize HNSW index: {}", e))?;
+
+        // HnswMap doesn't expose length, estimate from file size
+        // ~1.5KB per point for 384-dim embeddings + graph structure
+        let estimated_count = bytes.len() / 2000;
+
+        self.index = Some(index);
+        self.built_at = Some(Instant::now());
+        self.node_count = estimated_count;
+
+        println!("[PERF] HnswIndex: loaded from {:?} ({} bytes) in {}ms",
+            path, bytes.len(), start.elapsed().as_millis());
+        Ok(estimated_count)
+    }
+
+    /// Search for k nearest neighbors
+    /// Returns (node_id, similarity) pairs - converts Euclidean distance to cosine similarity
+    pub fn search(&self, query: &[f32], k: usize, exclude_id: &str) -> Vec<(String, f32)> {
+        let Some(ref index) = self.index else { return vec![]; };
+
+        let query_point = EmbeddingPoint(query.to_vec());
+        let mut search = Search::default();
+
+        // Get k+1 results to account for potential self-match
+        let results: Vec<_> = index.search(&query_point, &mut search)
+            .take(k + 1)
+            .filter(|item| item.value != exclude_id)
+            .take(k)
+            .map(|item| {
+                // Convert Euclidean distance to cosine similarity approximation
+                // For normalized vectors: cos_sim ≈ 1 - (dist^2 / 2)
+                let dist = item.distance;
+                let sim = 1.0 - (dist * dist / 2.0);
+                (item.value.clone(), sim.clamp(0.0, 1.0))
+            })
+            .collect();
+
+        results
+    }
+
+    pub fn invalidate(&mut self) {
+        self.index = None;
+        self.built_at = None;
+        self.node_count = 0;
+        println!("[PERF] HnswIndex: invalidated");
+    }
+}
+
+/// Get the HNSW index file path for a given database path
+/// e.g., /path/to/mycelica.db -> /path/to/mycelica-hnsw.bin
+pub fn hnsw_index_path(db_path: &Path) -> std::path::PathBuf {
+    let stem = db_path.file_stem().unwrap_or_default().to_string_lossy();
+    let parent = db_path.parent().unwrap_or(Path::new("."));
+    parent.join(format!("{}-hnsw.bin", stem))
+}
+
+/// Delete the HNSW index file if it exists
+pub fn delete_hnsw_index(db_path: &Path) {
+    let index_path = hnsw_index_path(db_path);
+    if index_path.exists() {
+        if let Err(e) = std::fs::remove_file(&index_path) {
+            eprintln!("[HNSW] Failed to delete index file {:?}: {}", index_path, e);
+        } else {
+            println!("[HNSW] Deleted stale index file {:?}", index_path);
+        }
+    }
+}
+
 pub struct AppState {
     pub db: RwLock<Arc<Database>>,
+    pub db_path: std::path::PathBuf,
     pub similarity_cache: RwLock<SimilarityCache>,
     pub embeddings_cache: RwLock<EmbeddingsCache>,
+    pub hnsw_index: RwLock<HnswIndex>,
     pub openaire_cancel: std::sync::atomic::AtomicBool,
 }
 
@@ -712,6 +879,12 @@ pub async fn process_nodes(app: AppHandle, state: State<'_, AppState>) -> Result
         if let Ok(mut cache) = state.embeddings_cache.write() {
             cache.invalidate();
         }
+        // Also invalidate HNSW index since embeddings changed
+        if let Ok(mut index) = state.hnsw_index.write() {
+            index.invalidate();
+        }
+        // Delete stale HNSW index file
+        delete_hnsw_index(&state.db_path);
         // Also invalidate similarity cache since embeddings changed
         if let Ok(mut cache) = state.similarity_cache.write() {
             cache.invalidate();
@@ -1458,32 +1631,39 @@ pub fn get_similar_nodes(
     } else {
         println!("[PERF] get_similar_nodes: similarity cache MISS, computing...");
 
-        // Get all embeddings from cache (lazy-load on first access)
+        // Ensure embeddings cache is loaded (lazy-load on first access)
         let emb_start = std::time::Instant::now();
-        let all_embeddings = {
-            // Check if embeddings cache needs loading
+        {
             let needs_load = !state.embeddings_cache.read()
                 .map_err(|e| format!("Cache lock error: {}", e))?.is_loaded();
 
             if needs_load {
-                // Load embeddings into cache (one-time cost)
                 let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
                 state.embeddings_cache.write()
                     .map_err(|e| format!("Cache lock error: {}", e))?
                     .load(&db)?;
             }
+        }
 
-            // Get from cache
-            state.embeddings_cache.read()
+        // Build HNSW index if not already built
+        let needs_build = !state.hnsw_index.read()
+            .map_err(|e| format!("HNSW lock error: {}", e))?.is_built();
+
+        if needs_build {
+            let all_embeddings = state.embeddings_cache.read()
                 .map_err(|e| format!("Cache lock error: {}", e))?
                 .get_all()
-                .unwrap_or_default()
-        };
-        println!("[PERF] get_similar_nodes: get {} embeddings took {}ms (from cache)", all_embeddings.len(), emb_start.elapsed().as_millis());
+                .unwrap_or_default();
 
-        if all_embeddings.is_empty() {
-            return Ok(vec![]);
+            if all_embeddings.is_empty() {
+                return Ok(vec![]);
+            }
+
+            state.hnsw_index.write()
+                .map_err(|e| format!("HNSW lock error: {}", e))?
+                .build(&all_embeddings);
         }
+        println!("[PERF] get_similar_nodes: embeddings/HNSW setup took {}ms", emb_start.elapsed().as_millis());
 
         // Get the target node's embedding from cache
         let target_embedding = {
@@ -1494,11 +1674,13 @@ pub fn get_similar_nodes(
             }
         };
 
-        // Find similar nodes - get more than requested for caching
+        // Query HNSW index for nearest neighbors
         let sim_start = std::time::Instant::now();
         let max_cache_results = 50;
-        let similar = similarity::find_similar(&target_embedding, &all_embeddings, &node_id, max_cache_results, 0.0);
-        println!("[PERF] get_similar_nodes: similarity calc took {}ms", sim_start.elapsed().as_millis());
+        let similar = state.hnsw_index.read()
+            .map_err(|e| format!("HNSW lock error: {}", e))?
+            .search(&target_embedding, max_cache_results, &node_id);
+        println!("[PERF] get_similar_nodes: HNSW search took {}ms", sim_start.elapsed().as_millis());
 
         // Cache the full results
         state.similarity_cache.write().map_err(|e| format!("Cache lock error: {}", e))?.insert(node_id.clone(), similar.clone());
@@ -2312,6 +2494,12 @@ pub async fn regenerate_all_embeddings(
     if let Ok(mut cache) = state.embeddings_cache.write() {
         cache.invalidate();
     }
+    // Also invalidate HNSW index since embeddings changed
+    if let Ok(mut index) = state.hnsw_index.write() {
+        index.invalidate();
+    }
+    // Delete stale HNSW index file
+    delete_hnsw_index(&state.db_path);
     // Also invalidate similarity cache since embeddings changed
     if let Ok(mut cache) = state.similarity_cache.write() {
         cache.invalidate();
@@ -2777,6 +2965,12 @@ pub async fn smart_add_to_hierarchy(
         if let Ok(mut cache) = state.embeddings_cache.write() {
             cache.invalidate();
         }
+        // Also invalidate HNSW index since embeddings changed
+        if let Ok(mut index) = state.hnsw_index.write() {
+            index.invalidate();
+        }
+        // Delete stale HNSW index file
+        delete_hnsw_index(&state.db_path);
     }
 
     Ok(SmartAddResult {

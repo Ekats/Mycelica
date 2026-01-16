@@ -1,5 +1,5 @@
 pub mod db;
-mod commands;
+pub mod commands;
 pub mod utils;
 mod http_server;
 pub mod clustering;
@@ -175,10 +175,27 @@ pub fn run() {
 
             // Use configurable cache TTL from settings
             let cache_ttl = settings::similarity_cache_ttl_secs();
+
+            // Try to load pre-built HNSW index from disk
+            let mut hnsw_index = commands::HnswIndex::new();
+            let hnsw_path = commands::hnsw_index_path(&db_path);
+            if hnsw_path.exists() {
+                match hnsw_index.load(&hnsw_path) {
+                    Ok(count) => println!("Loaded HNSW index with ~{} points", count),
+                    Err(e) => {
+                        eprintln!("Failed to load HNSW index: {}", e);
+                        // Delete corrupted index file
+                        let _ = std::fs::remove_file(&hnsw_path);
+                    }
+                }
+            }
+
             app.manage(AppState {
                 db: std::sync::RwLock::new(db),
+                db_path: db_path.clone(),
                 similarity_cache: std::sync::RwLock::new(commands::SimilarityCache::new(cache_ttl)),
                 embeddings_cache: std::sync::RwLock::new(commands::EmbeddingsCache::new()),
+                hnsw_index: std::sync::RwLock::new(hnsw_index),
                 openaire_cancel: std::sync::atomic::AtomicBool::new(false),
             });
 
