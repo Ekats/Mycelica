@@ -2,6 +2,31 @@
 
 All notable changes to Mycelica will be documented in this file.
 
+## [0.8.3] - 2026-01-16
+
+### Added
+- **HNSW similarity index**: O(log n) approximate nearest neighbor search replaces O(n) brute-force
+  - 50-100x speedup for similarity queries (~870ms → ~10ms)
+  - Index auto-built during `mycelica-cli setup` (Step 5/6)
+  - Background build on app startup if index missing
+  - Background build on database switch
+  - Saved to disk as `{db-name}-hnsw.bin` (~100MB for 55k embeddings)
+- **Edge parent indexing**: Added Step 6/6 to CLI setup for fast view-based edge loading
+- **HNSW status API**: `get_hnsw_status` command returns `{ isBuilt, isBuilding, nodeCount }`
+- **Building indicator**: Bottom-right UI shows spinner + message while HNSW index builds
+- **Loading screen**: Dark background with spinner on app startup (replaces white flash)
+
+### Changed
+- `get_similar_nodes` returns empty array if HNSW index not ready (no blocking)
+- Dev builds: Added `opt-level = 3` for `instant-distance` crate (faster dev testing)
+
+### Technical
+- `instant-distance` crate with `serde` + `serde-big-array` features for index serialization
+- `HnswIndex` struct with `building` AtomicBool to prevent concurrent builds
+- `HnswBuildingIndicator` React component polls status every 1s until built
+
+---
+
 ## [0.8.2] - 2026-01-14
 
 ### Added
