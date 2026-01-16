@@ -9,7 +9,7 @@ import type { Node, NodeType } from '../../types/graph';
 import { getEmojiForNode, initLearnedMappings } from '../../utils/emojiMatcher';
 import { generateClusterColor, getDirectConnectionColor, getChainConnectionColor, getStructuralDepth } from '../../utils/nodeColors';
 import { ChevronRight, AlertTriangle, X, Lock, LockOpen } from 'lucide-react';
-import { SimilarNodesPanel, SimilarNodesLoading } from './SimilarNodesPanel';
+import { SimilarNodesPanel, SimilarNodesLoading, HnswBuildingIndicator } from './SimilarNodesPanel';
 import { ComponentErrorBoundary } from '../ErrorBoundary';
 import { DevConsole, DevConsoleLog } from './DevConsole';
 import { GraphStatusBar } from './GraphStatusBar';
@@ -1493,6 +1493,9 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
 
       {/* Loading indicator for similar nodes */}
       <SimilarNodesLoading loadingSimilar={loadingSimilar} />
+
+      {/* HNSW index building indicator */}
+      <HnswBuildingIndicator />
 
       {/* Status bar, color legend, and help text */}
       <GraphStatusBar

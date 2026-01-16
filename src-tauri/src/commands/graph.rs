@@ -140,6 +140,7 @@ pub struct HnswIndex {
     index: Option<HnswMap<EmbeddingPoint, String>>,  // Point -> node_id
     built_at: Option<Instant>,
     node_count: usize,
+    building: std::sync::atomic::AtomicBool,  // true if background build in progress
 }
 
 impl HnswIndex {
@@ -148,6 +149,7 @@ impl HnswIndex {
             index: None,
             built_at: None,
             node_count: 0,
+            building: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -155,11 +157,24 @@ impl HnswIndex {
         self.index.is_some()
     }
 
+    pub fn is_building(&self) -> bool {
+        self.building.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_building(&self, value: bool) {
+        self.building.store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn count(&self) -> usize {
+        self.node_count
+    }
+
     /// Build index from embeddings
     /// Uses tuned HNSW parameters for 50k+ vectors:
     /// - ef_construction=100: build speed vs quality tradeoff
     /// - ef_search=50: fast queries with good recall
     pub fn build(&mut self, embeddings: &[(String, Vec<f32>)]) {
+        self.set_building(true);
         let start = Instant::now();
         println!("[PERF] HnswIndex: starting build with {} points...", embeddings.len());
 
@@ -181,6 +196,7 @@ impl HnswIndex {
         );
         self.built_at = Some(Instant::now());
         self.node_count = embeddings.len();
+        self.set_building(false);
         println!("[PERF] HnswIndex: built with {} points in {}ms",
             embeddings.len(), start.elapsed().as_millis());
     }
@@ -1645,23 +1661,14 @@ pub fn get_similar_nodes(
             }
         }
 
-        // Build HNSW index if not already built
-        let needs_build = !state.hnsw_index.read()
+        // Check if HNSW index is ready (built by background thread or CLI)
+        let hnsw_ready = state.hnsw_index.read()
             .map_err(|e| format!("HNSW lock error: {}", e))?.is_built();
 
-        if needs_build {
-            let all_embeddings = state.embeddings_cache.read()
-                .map_err(|e| format!("Cache lock error: {}", e))?
-                .get_all()
-                .unwrap_or_default();
-
-            if all_embeddings.is_empty() {
-                return Ok(vec![]);
-            }
-
-            state.hnsw_index.write()
-                .map_err(|e| format!("HNSW lock error: {}", e))?
-                .build(&all_embeddings);
+        if !hnsw_ready {
+            // Index not ready yet - return empty, background build will complete soon
+            println!("[PERF] get_similar_nodes: HNSW index not ready, returning empty");
+            return Ok(vec![]);
         }
         println!("[PERF] get_similar_nodes: embeddings/HNSW setup took {}ms", emb_start.elapsed().as_millis());
 
@@ -1772,6 +1779,24 @@ pub struct EmbeddingStatus {
     pub nodes_with_embeddings: i32,
     pub total_items: usize,
     pub openai_available: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HnswStatus {
+    pub is_built: bool,
+    pub is_building: bool,
+    pub node_count: usize,
+}
+
+#[tauri::command]
+pub fn get_hnsw_status(state: State<AppState>) -> Result<HnswStatus, String> {
+    let hnsw = state.hnsw_index.read().map_err(|e| format!("HNSW lock error: {}", e))?;
+    Ok(HnswStatus {
+        is_built: hnsw.is_built(),
+        is_building: hnsw.is_building(),
+        node_count: hnsw.count(),
+    })
 }
 
 #[tauri::command]
@@ -2214,9 +2239,84 @@ pub fn switch_database(app: AppHandle, state: State<AppState>, db_path: String) 
         new_db.get_stats().map_err(|e| e.to_string())?;
 
     // Hot-swap the database connection
+    let new_db = Arc::new(new_db);
     {
         let mut db_guard = state.db.write().map_err(|e| format!("DB lock error: {}", e))?;
-        *db_guard = Arc::new(new_db);
+        *db_guard = new_db.clone();
+    }
+
+    // Load or build HNSW index for the new database
+    {
+        let hnsw_path = hnsw_index_path(&path);
+        let mut needs_background_build = false;
+
+        // Clear current index first
+        if let Ok(mut hnsw_guard) = state.hnsw_index.write() {
+            hnsw_guard.invalidate();
+
+            // Try to load existing index
+            if hnsw_path.exists() {
+                match hnsw_guard.load(&hnsw_path) {
+                    Ok(count) => println!("[switch_database] Loaded HNSW index with ~{} points", count),
+                    Err(e) => {
+                        eprintln!("[switch_database] Failed to load HNSW index: {}", e);
+                        let _ = std::fs::remove_file(&hnsw_path);
+                        needs_background_build = true;
+                    }
+                }
+            } else {
+                // Check if embeddings exist
+                let embedding_count = new_db.count_nodes_with_embeddings().unwrap_or(0);
+                if embedding_count > 0 {
+                    println!("[switch_database] HNSW index missing but {} embeddings found", embedding_count);
+                    needs_background_build = true;
+                }
+            }
+        }
+
+        // Spawn background build if needed
+        if needs_background_build {
+            let bg_app = app.clone();
+            let bg_path = path.clone();
+
+            std::thread::spawn(move || {
+                println!("[HNSW] Background build starting...");
+                let start = std::time::Instant::now();
+
+                // Get state from app handle
+                let state: tauri::State<'_, AppState> = bg_app.state();
+                let db_arc = match state.db.read() {
+                    Ok(guard) => guard.clone(),
+                    Err(e) => {
+                        eprintln!("[HNSW] Failed to acquire DB lock: {}", e);
+                        return;
+                    }
+                };
+
+                match db_arc.get_nodes_with_embeddings() {
+                    Ok(embeddings) if !embeddings.is_empty() => {
+                        println!("[HNSW] Building index for {} embeddings...", embeddings.len());
+
+                        let mut index = HnswIndex::new();
+                        index.build(&embeddings);
+
+                        let hnsw_path = hnsw_index_path(&bg_path);
+                        if let Err(e) = index.save(&hnsw_path) {
+                            eprintln!("[HNSW] Failed to save index: {}", e);
+                            return;
+                        }
+
+                        if let Ok(mut guard) = state.hnsw_index.write() {
+                            *guard = index;
+                        }
+
+                        println!("[HNSW] Background build complete in {:.1}s", start.elapsed().as_secs_f64());
+                    }
+                    Ok(_) => println!("[HNSW] No embeddings to index"),
+                    Err(e) => eprintln!("[HNSW] Failed to load embeddings: {}", e),
+                }
+            });
+        }
     }
 
     // Update window title to show new database path

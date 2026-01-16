@@ -858,6 +858,46 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
   );
 });
 
+// HNSW building indicator component
+export const HnswBuildingIndicator = memo(function HnswBuildingIndicator() {
+  const [hnswStatus, setHnswStatus] = useState<{ isBuilt: boolean; isBuilding: boolean } | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    const checkStatus = async () => {
+      try {
+        const status = await invoke<{ isBuilt: boolean; isBuilding: boolean; nodeCount: number }>('get_hnsw_status');
+        if (mounted) setHnswStatus(status);
+      } catch (e) {
+        console.error('Failed to get HNSW status:', e);
+      }
+    };
+
+    // Check immediately and poll while building
+    checkStatus();
+    const interval = setInterval(checkStatus, 1000);
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
+  }, []);
+
+  // Show nothing if built or status unknown
+  if (!hnswStatus || hnswStatus.isBuilt) return null;
+
+  return (
+    <div className="absolute bottom-16 right-4 bg-gray-800/95 backdrop-blur-sm text-white rounded-lg shadow-xl border border-gray-700 z-30 px-4 py-3 max-w-xs">
+      <div className="flex items-center gap-2">
+        <div className="animate-spin w-4 h-4 border-2 border-amber-400 border-t-transparent rounded-full" />
+        <div>
+          <div className="text-sm text-amber-400 font-medium">Building similarity index...</div>
+          <div className="text-xs text-gray-400">This may take a few minutes for large databases.</div>
+        </div>
+      </div>
+    </div>
+  );
+});
+
 // Loading indicator component (also memoized)
 export const SimilarNodesLoading = memo(function SimilarNodesLoading({
   loadingSimilar

@@ -51,7 +51,7 @@ use commands::{
     // Quick access commands (Sidebar)
     set_node_pinned, touch_node, get_pinned_nodes, get_recent_nodes, clear_recent,
     // Semantic similarity commands
-    get_similar_nodes, get_embedding_status,
+    get_similar_nodes, get_embedding_status, get_hnsw_status,
     // OpenAI API key commands
     get_openai_api_key_status, save_openai_api_key, clear_openai_api_key,
     // OpenAIRE API key commands
@@ -397,6 +397,7 @@ pub fn run() {
             // Semantic similarity
             get_similar_nodes,
             get_embedding_status,
+            get_hnsw_status,
             // OpenAI API key
             get_openai_api_key_status,
             save_openai_api_key,

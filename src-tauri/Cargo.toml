@@ -99,6 +99,8 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.gemm-f32]
 opt-level = 3
+[profile.dev.package.instant-distance]
+opt-level = 3
 
 [[bin]]
 name = "batch_import"
