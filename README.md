@@ -14,7 +14,7 @@ https://github.com/user-attachments/assets/149d3241-1b93-4269-94c2-10edb9153db3
 
 1. Download [latest release](https://github.com/Ekats/Mycelica/releases)
 2. Grab [`mycelica-consciousness-demo.db`](https://github.com/Ekats/Mycelica/releases/tag/v0.8.3db) (450 MB)
-3. Open Mycelica → Settings → Open database
+3. Open Mycelica → Settings → Info → Open database
 4. Navigate (first launch builds similarity index ~40s, then instant)
 
 Imported from OpenAIRE — consciousness research spanning neuroscience, philosophy of mind, clinical applications, and meditation studies.
