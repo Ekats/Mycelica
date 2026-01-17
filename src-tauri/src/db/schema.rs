@@ -2835,6 +2835,46 @@ impl Database {
         Ok(deleted)
     }
 
+    /// Delete all edges where node is source or target
+    pub fn delete_edges_for_node(&self, node_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM edges WHERE source_id = ?1 OR target_id = ?1",
+            params![node_id],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Clear parent_id references to a node (set to NULL)
+    /// Used before deleting a node to avoid foreign key violations
+    pub fn clear_parent_references(&self, node_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE nodes SET parent_id = NULL WHERE parent_id = ?1",
+            params![node_id],
+        )?;
+        Ok(updated)
+    }
+
+    /// Delete fos_edges entries for a node (as fos_id) and for edges referencing this node
+    /// Required before deleting edges/node because fos_edges FK lacks CASCADE
+    pub fn delete_fos_edges_for_node(&self, node_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        // First: delete fos_edges where the edge references this node
+        let deleted1 = conn.execute(
+            "DELETE FROM fos_edges WHERE edge_id IN (
+                SELECT id FROM edges WHERE source_id = ?1 OR target_id = ?1
+            )",
+            params![node_id],
+        )?;
+        // Second: delete fos_edges where fos_id = this node
+        let deleted2 = conn.execute(
+            "DELETE FROM fos_edges WHERE fos_id = ?1",
+            params![node_id],
+        )?;
+        Ok(deleted1 + deleted2)
+    }
+
     /// Delete empty items (items with no meaningful content/raw data)
     pub fn delete_empty_items(&self) -> Result<usize> {
         let conn = self.conn.lock().unwrap();

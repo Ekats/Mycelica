@@ -10,19 +10,16 @@ https://github.com/user-attachments/assets/149d3241-1b93-4269-94c2-10edb9153db3
 
 ## Try It Now
 
-**5,236 research papers. 25,703 semantic connections. Zero setup.**
+**53,167 research papers. 170,824 semantic connections. Zero setup.**
 
 1. Download [latest release](https://github.com/Ekats/Mycelica/releases)
-2. Grab `mycelica-somatic-neuroscience-trimmed.db` (88 MB)
+2. Grab [`mycelica-consciousness-demo.db`](https://github.com/Ekats/Mycelica/releases/tag/v0.8.3db) (450 MB)
 3. Open Mycelica → Settings → Open database
-4. Navigate
+4. Navigate (first launch builds similarity index ~40s, then instant)
 
-Imported from OpenAIRE using:
-```
-(peripheral neuroplasticity) OR (somatic mutation accumulation) OR (interoception) OR (DNA repair aging)
-```
+Imported from OpenAIRE — consciousness research spanning neuroscience, philosophy of mind, clinical applications, and meditation studies.
 
-From raw papers to 7-level hierarchy with 25,703 semantic edges in 33 minutes. No manual categorization. Structure emerged from embeddings.
+8-level hierarchy with 170k semantic edges. No manual categorization. Structure emerged from embeddings.
 
 ![Graph visualization](https://github.com/user-attachments/assets/695f699f-9902-4d50-a8bb-13371818c96d)
 
@@ -44,7 +41,10 @@ Mycelica shows structure you can navigate, plus connections that cross category 
 - **AI-Powered Analysis** — Claude generates titles, summaries, tags, and emojis for imported content
 - **Smart Clustering** — Multi-method clustering (AI + TF-IDF fallback) organizes items into semantic topics
 - **Dynamic Hierarchy** — Auto-creates navigable structure with 8-15 children per level
-- **Semantic Connections** — Local embeddings (all-MiniLM-L6-v2) create "Related" edges between similar content:
+- **Instant Similarity Search** — HNSW index enables O(log n) nearest neighbor lookup:
+  - 50-100x faster than brute-force (~10ms vs ~870ms for 50k nodes)
+  - Index auto-builds on first launch, saved to disk for instant subsequent loads
+  - Local embeddings (all-MiniLM-L6-v2) create "Related" edges:
   ```
   "Rust async debugging"    ←─ 0.89 ─→  "Tokio runtime errors"
   "Consciousness research"  ←─ 0.76 ─→  "Philosophy of mind"
@@ -79,6 +79,7 @@ Download from [Releases](https://github.com/Ekats/Mycelica/releases):
 | `.AppImage` | `chmod +x Mycelica_*.AppImage && ./Mycelica_*.AppImage` |
 | `.tar.gz` (CPU) | `tar -xzf mycelica-cli-*.tar.gz` — CLI only |
 | `.tar.gz` (CUDA) | `tar -xzf mycelica-cli-cuda-*.tar.gz` — CLI with GPU acceleration |
+| **Arch Linux** | `yay -S mycelica-bin` — prebuilt, or `yay -S mycelica` — build from source |
 
 ### Build from Source
 
@@ -350,7 +351,8 @@ Universe (root)
 3. **Clustering** — Group items into semantic topics
 4. **Hierarchy Build** — Create navigable structure (8-15 children per level)
 5. **Embeddings** — Generate vectors for semantic similarity edges
-6. **Call Graph** — Extract function call relationships (code only)
+6. **HNSW Index** — Build approximate nearest neighbor index for instant similarity queries
+7. **Call Graph** — Extract function call relationships (code only)
 
 ---
 

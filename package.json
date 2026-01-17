@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:build": "tauri build || true && npm run appimage",
+    "appimage": "cd src-tauri/target/release/bundle/appimage/Mycelica.AppDir && cp -n Mycelica.png mycelica.png; cd .. && appimagetool Mycelica.AppDir Mycelica_${npm_package_version}_amd64.AppImage"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

@@ -3272,8 +3272,21 @@ pub async fn merge_small_categories(
                 total_reparented += children_moved;
                 emit_log(app, "debug", &format!("Reparented {} children to survivor", children_moved));
 
-                // Delete the now-empty merged categories
+                // Delete edges and then the now-empty merged categories
                 for cat in &to_merge {
+                    // First: reparent any remaining children to survivor (safety net)
+                    let remaining_children = db.get_children(&cat.id).map_err(|e| e.to_string())?;
+                    for child in &remaining_children {
+                        db.update_parent(&child.id, &survivor.id).map_err(|e| e.to_string())?;
+                        emit_log(app, "debug", &format!("Safety reparent: {} -> {}", child.id, survivor.id));
+                    }
+                    // Second: clear any orphaned parent_id references
+                    db.clear_parent_references(&cat.id).map_err(|e| e.to_string())?;
+                    // Third: delete fos_edges FIRST (FK lacks CASCADE, references both nodes and edges)
+                    db.delete_fos_edges_for_node(&cat.id).map_err(|e| e.to_string())?;
+                    // Fourth: delete all edges referencing this node
+                    db.delete_edges_for_node(&cat.id).map_err(|e| e.to_string())?;
+                    // Finally: delete the node
                     db.delete_node(&cat.id).map_err(|e| e.to_string())?;
                     total_merged += 1;
                 }
