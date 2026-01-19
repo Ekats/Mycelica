@@ -76,9 +76,7 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
 }: SimilarNodesPanelProps) {
   // Local state for expand/collapse - tracks expanded group paths
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
-  const [collapsedSimilar, setCollapsedSimilar] = useState<Set<string>>(() =>
-    new Set(Array.from(similarNodesMap.keys())) // Collapsed by default
-  );
+  const [collapsedSimilar, setCollapsedSimilar] = useState<Set<string>>(new Set()); // Expanded by default
   const [collapsedHierarchy, setCollapsedHierarchy] = useState<Set<string>>(() =>
     new Set(Array.from(similarNodesMap.keys())) // Collapsed by default
   );
@@ -90,6 +88,22 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
   const [associations, setAssociations] = useState<Map<string, Edge[]>>(new Map());
   const [collapsedAssociations, setCollapsedAssociations] = useState<Set<string>>(new Set());
   const fetchedAssociationsRef = useRef<Set<string>>(new Set());
+
+  // Ensure new nodes start with Hierarchy collapsed
+  useEffect(() => {
+    const nodeIds = Array.from(similarNodesMap.keys());
+    setCollapsedHierarchy(prev => {
+      const next = new Set(prev);
+      let changed = false;
+      for (const nodeId of nodeIds) {
+        if (!next.has(nodeId)) {
+          next.add(nodeId);
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [similarNodesMap]);
 
   // Fetch associations for items when they're selected
   useEffect(() => {
@@ -664,6 +678,33 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
                     )}
                   </div>
                 </div>
+                {/* Go to parent button */}
+                {sourceNode?.parentId && (
+                  <button
+                    onClick={async () => {
+                      let parentNode = nodes.get(sourceNode.parentId!);
+                      if (!parentNode) {
+                        // Fetch parent if not loaded
+                        try {
+                          parentNode = await invoke<Node>('get_node', { nodeId: sourceNode.parentId });
+                        } catch (e) {
+                          devLog('warn', `Failed to fetch parent: ${e}`);
+                          return;
+                        }
+                      }
+                      if (parentNode) {
+                        onJumpToNode(parentNode, sourceNode);
+                        devLog('info', `Navigating to parent: ${parentNode.aiTitle || parentNode.title}`);
+                      }
+                    }}
+                    className="w-full mb-2 px-3 py-1.5 text-left text-xs bg-gray-700/30 hover:bg-gray-700/50 text-gray-400 hover:text-amber-400 rounded border border-gray-700/50 flex items-center gap-2 transition-colors"
+                  >
+                    <span>↑</span>
+                    <span className="truncate">
+                      {nodes.get(sourceNode.parentId)?.emoji || '📁'} {nodes.get(sourceNode.parentId)?.aiTitle || nodes.get(sourceNode.parentId)?.title || 'Parent'}
+                    </span>
+                  </button>
+                )}
                 {/* Metadata */}
                 {sourceNode && (
                   <div className="text-xs text-gray-400 mb-2 flex items-center gap-2 flex-wrap">
@@ -712,7 +753,44 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
                 )}
               </div>
 
-              {/* Hierarchy section - only for nodes with children */}
+              {/* Similar nodes header - clickable to collapse (expanded by default) */}
+              <button
+                onClick={() => setCollapsedSimilar(prev => {
+                  const next = new Set(prev);
+                  if (next.has(sourceId)) {
+                    next.delete(sourceId);
+                  } else {
+                    next.add(sourceId);
+                  }
+                  return next;
+                })}
+                className="w-full px-3 py-1.5 bg-gray-700/20 text-xs text-gray-400 border-t border-gray-700/50 flex items-center justify-between hover:bg-gray-700/40 transition-colors"
+              >
+                <span className="flex items-center gap-1">
+                  <span>{collapsedSimilar.has(sourceId) ? '▶' : '▼'}</span>
+                  <span>↔ Similar ({similarNodes.length})</span>
+                </span>
+              </button>
+
+              {/* Hierarchical similar nodes - collapsible */}
+              {!collapsedSimilar.has(sourceId) && (
+                <div className="py-1">
+                  {buildHierarchy(similarNodes)
+                    .sort((a, b) => {
+                      // Sort descendants (100%) to top, then by avgSimilarity
+                      const aIsInside = isDescendant(a.id, sourceId);
+                      const bIsInside = isDescendant(b.id, sourceId);
+                      if (aIsInside && !bIsInside) return -1;
+                      if (!aIsInside && bIsInside) return 1;
+                      return b.avgSimilarity - a.avgSimilarity;
+                    })
+                    .map((group) =>
+                      renderGroup(group, sourceNode, sourceId, `${sourceId}/${group.id}`, 0)
+                    )}
+                </div>
+              )}
+
+              {/* Hierarchy section - only for nodes with children (collapsed by default) */}
               {sourceNode && sourceNode.childCount > 0 && (
                 <>
                   <button
@@ -795,43 +873,6 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
                     </div>
                   )}
                 </>
-              )}
-
-              {/* Similar nodes header - clickable to collapse (collapsed by default) */}
-              <button
-                onClick={() => setCollapsedSimilar(prev => {
-                  const next = new Set(prev);
-                  if (next.has(sourceId)) {
-                    next.delete(sourceId);
-                  } else {
-                    next.add(sourceId);
-                  }
-                  return next;
-                })}
-                className="w-full px-3 py-1.5 bg-gray-700/20 text-xs text-gray-400 border-t border-gray-700/50 flex items-center justify-between hover:bg-gray-700/40 transition-colors"
-              >
-                <span className="flex items-center gap-1">
-                  <span>{collapsedSimilar.has(sourceId) ? '▶' : '▼'}</span>
-                  <span>↔ Similar ({similarNodes.length})</span>
-                </span>
-              </button>
-
-              {/* Hierarchical similar nodes - collapsible */}
-              {!collapsedSimilar.has(sourceId) && (
-                <div className="py-1">
-                  {buildHierarchy(similarNodes)
-                    .sort((a, b) => {
-                      // Sort descendants (100%) to top, then by avgSimilarity
-                      const aIsInside = isDescendant(a.id, sourceId);
-                      const bIsInside = isDescendant(b.id, sourceId);
-                      if (aIsInside && !bIsInside) return -1;
-                      if (!aIsInside && bIsInside) return 1;
-                      return b.avgSimilarity - a.avgSimilarity;
-                    })
-                    .map((group) =>
-                      renderGroup(group, sourceNode, sourceId, `${sourceId}/${group.id}`, 0)
-                    )}
-                </div>
               )}
             </div>
           );

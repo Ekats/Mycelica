@@ -56,6 +56,8 @@ pub enum EdgeType {
     Clicked,     // web page -> web page (followed link)
     Backtracked, // web page -> web page (returned via back button)
     SessionItem, // session -> web page (belongs to session)
+    // Category relationships
+    Sibling,     // category -> category (sibling relationship based on paper cross-edges)
 }
 
 impl EdgeType {
@@ -76,6 +78,7 @@ impl EdgeType {
             EdgeType::Clicked => "clicked",
             EdgeType::Backtracked => "backtracked",
             EdgeType::SessionItem => "session_item",
+            EdgeType::Sibling => "sibling",
         }
     }
 
@@ -96,6 +99,7 @@ impl EdgeType {
             "clicked" => Some(EdgeType::Clicked),
             "backtracked" => Some(EdgeType::Backtracked),
             "session_item" => Some(EdgeType::SessionItem),
+            "sibling" => Some(EdgeType::Sibling),
             _ => None,
         }
     }

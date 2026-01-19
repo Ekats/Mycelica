@@ -1,4 +1,5 @@
 use rusqlite::{Connection, Result, params, OptionalExtension};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use super::models::{Node, Edge, NodeType, EdgeType, Position, Tag, Paper};
@@ -865,6 +866,16 @@ impl Database {
         Ok(deleted)
     }
 
+    /// Delete all edges of a specific type
+    pub fn delete_edges_by_type(&self, edge_type: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM edges WHERE type = ?1",
+            params![edge_type],
+        )?;
+        Ok(deleted)
+    }
+
     // Privacy operations - sets both legacy is_private AND new privacy score
     pub fn update_node_privacy(&self, node_id: &str, is_private: bool, reason: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -1262,6 +1273,118 @@ impl Database {
         })?.collect::<Result<Vec<_>>>()?;
 
         Ok(edges)
+    }
+
+    /// Get edges for multiple nodes in a single bulk query
+    /// Returns (source_id, target_id, weight) tuples for edges where either endpoint is in node_ids
+    /// Much more efficient than calling get_edges_for_node repeatedly
+    pub fn get_edges_for_nodes_bulk(&self, node_ids: &[&str]) -> Result<Vec<(String, String, f64)>> {
+        if node_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let conn = self.conn.lock().unwrap();
+
+        // Build IN clause
+        let placeholders: Vec<&str> = node_ids.iter().map(|_| "?").collect();
+        let in_clause = placeholders.join(",");
+
+        let query = format!(
+            "SELECT source_id, target_id, weight FROM edges
+             WHERE source_id IN ({}) OR target_id IN ({})",
+            in_clause, in_clause
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+
+        // Build params (need to bind twice for both IN clauses)
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        for id in node_ids {
+            params.push(id);
+        }
+        for id in node_ids {
+            params.push(id);
+        }
+
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<f64>>(2)?.unwrap_or(1.0),
+            ))
+        })?;
+
+        rows.collect()
+    }
+
+    /// Count cross-edges between all pairs of topics in one efficient query
+    /// Returns HashMap<(topic_a_id, topic_b_id), count> with canonical ordering (a < b)
+    ///
+    /// A cross-edge is an edge where one endpoint is a child of topic A and the other
+    /// is a child of topic B. This is used for grouping topics by connectivity.
+    pub fn count_all_cross_edges(&self, topic_ids: &[&str]) -> Result<HashMap<(String, String), usize>> {
+        if topic_ids.len() < 2 {
+            return Ok(HashMap::new());
+        }
+
+        let conn = self.conn.lock().unwrap();
+
+        // Step 1: Get paper IDs for each topic (direct children that are items)
+        let mut topic_papers: HashMap<String, Vec<String>> = HashMap::new();
+        for &topic_id in topic_ids {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM nodes WHERE parent_id = ?1 AND is_item = 1"
+            )?;
+            let papers: Vec<String> = stmt.query_map([topic_id], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            topic_papers.insert(topic_id.to_string(), papers);
+        }
+
+        // Step 2: Build paper -> topic lookup
+        let mut paper_to_topic: HashMap<String, String> = HashMap::new();
+        for (topic_id, papers) in &topic_papers {
+            for paper_id in papers {
+                paper_to_topic.insert(paper_id.clone(), topic_id.clone());
+            }
+        }
+
+        if paper_to_topic.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Step 3: Get all edges involving these papers
+        let all_paper_ids: Vec<&str> = paper_to_topic.keys().map(|s| s.as_str()).collect();
+        let edges = self.get_edges_for_nodes_bulk(&all_paper_ids)?;
+
+        // Step 4: Count cross-edges between topic pairs
+        let mut cross_edge_counts: HashMap<(String, String), usize> = HashMap::new();
+
+        for (source, target, _weight) in edges {
+            let source_topic = paper_to_topic.get(&source);
+            let target_topic = paper_to_topic.get(&target);
+
+            if let (Some(topic_a), Some(topic_b)) = (source_topic, target_topic) {
+                // Only count if papers are in DIFFERENT topics
+                if topic_a != topic_b {
+                    // Canonical ordering: smaller ID first
+                    let key = if topic_a < topic_b {
+                        (topic_a.clone(), topic_b.clone())
+                    } else {
+                        (topic_b.clone(), topic_a.clone())
+                    };
+                    *cross_edge_counts.entry(key).or_default() += 1;
+                }
+            }
+        }
+
+        // Edges are stored once but we counted from both directions in get_edges_for_nodes_bulk
+        // Divide by 2 to get actual count
+        for count in cross_edge_counts.values_mut() {
+            *count /= 2;
+        }
+
+        Ok(cross_edge_counts)
     }
 
     pub fn delete_edge(&self, id: &str) -> Result<()> {

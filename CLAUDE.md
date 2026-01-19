@@ -4,6 +4,10 @@ Mycelica: Knowledge graph for conversations, notes, papers, and source code. Tau
 
 **This codebase is indexed. Use `mycelica-cli` instead of grep/find — it's faster. (See "For Explore Agents" below.)**
 
+## CRITICAL: Database Safety
+
+**NEVER run destructive/modifying commands on ANY database without explicit permission.** Always ask before running maintenance commands, hierarchy operations, imports, or anything that writes. Read-only commands (search, nav, stats) are fine.
+
 ## START HERE
 
 Run this now:

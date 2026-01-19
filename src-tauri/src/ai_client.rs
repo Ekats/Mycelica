@@ -124,6 +124,16 @@ pub async fn ollama_list_models() -> Result<Vec<OllamaModel>, String> {
 
 /// Generate text using Ollama (with JSON format)
 pub async fn ollama_generate(prompt: &str, model: &str) -> Result<String, String> {
+    ollama_generate_internal(prompt, model, Some("json")).await
+}
+
+/// Generate plain text using Ollama (no JSON formatting)
+pub async fn ollama_generate_text(prompt: &str, model: &str) -> Result<String, String> {
+    ollama_generate_internal(prompt, model, None).await
+}
+
+/// Internal Ollama generation with optional format
+async fn ollama_generate_internal(prompt: &str, model: &str, format: Option<&str>) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))  // LLMs can be slow
         .build()
@@ -132,7 +142,7 @@ pub async fn ollama_generate(prompt: &str, model: &str) -> Result<String, String
     let request = OllamaRequest {
         model: model.to_string(),
         prompt: prompt.to_string(),
-        format: "json".to_string(),
+        format: format.unwrap_or("").to_string(),
         stream: false,
     };
 
@@ -610,16 +620,47 @@ pub struct MultiClusterAssignment {
 
 // ==================== Cluster Naming ====================
 
-/// Name clusters using AI (single call for all clusters)
+/// Name clusters using AI
+/// Prefers Ollama (free) if available, falls back to Anthropic
 /// Takes cluster IDs with sample member titles, returns cluster ID -> name mappings
 pub async fn name_clusters(
     clusters: &[(i32, Vec<String>)],  // (cluster_id, member_titles)
 ) -> Result<Vec<(i32, String)>, String> {
-    let api_key = get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
-
     if clusters.is_empty() {
         return Ok(vec![]);
     }
+
+    // Prefer Ollama (free) if available
+    if ollama_available().await {
+        return name_clusters_ollama(clusters).await;
+    }
+
+    // Fall back to Anthropic batch API
+    name_clusters_anthropic(clusters).await
+}
+
+/// Name clusters one-by-one using Ollama (simpler prompts work better for local models)
+async fn name_clusters_ollama(
+    clusters: &[(i32, Vec<String>)],
+) -> Result<Vec<(i32, String)>, String> {
+    let mut results = Vec::new();
+
+    for (id, titles) in clusters {
+        let name = match name_cluster_from_samples(titles, &[]).await {
+            Ok(n) => n,
+            Err(_) => format!("Cluster {}", id), // Fallback
+        };
+        results.push((*id, name));
+    }
+
+    Ok(results)
+}
+
+/// Name clusters using Anthropic batch API (more efficient for many clusters)
+async fn name_clusters_anthropic(
+    clusters: &[(i32, Vec<String>)],
+) -> Result<Vec<(i32, String)>, String> {
+    let api_key = get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
 
     // Build prompt with cluster samples
     let clusters_section: String = clusters
@@ -742,52 +783,104 @@ fn parse_cluster_names_response(
     }
 }
 
-/// Ask AI to name a cluster based on sample item titles (for embedding clustering)
-pub async fn name_cluster_from_samples(
-    titles: &[String],
-    forbidden_names: &[String],
-) -> Result<String, String> {
-    let api_key = get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
-
-    if titles.is_empty() {
-        return Err("No titles provided".into());
-    }
-
-    let forbidden_str = if forbidden_names.is_empty() {
-        "None".to_string()
-    } else {
-        forbidden_names.iter().take(20).cloned().collect::<Vec<_>>().join(", ")
-    };
-
+/// Build the cluster naming prompt (works for both Ollama and Anthropic)
+fn build_cluster_naming_prompt(titles: &[String]) -> String {
     let titles_list = titles.iter()
         .take(12)
         .map(|t| format!("- {}", t.chars().take(80).collect::<String>()))
         .collect::<Vec<_>>()
         .join("\n");
 
-    let prompt = format!(
-        r#"These items belong to the same semantic cluster. Generate a 2-4 word category name.
+    format!(
+        r#"Name this cluster of papers in 2-8 words.
 
-Items:
+Papers:
 {titles_list}
 
-Forbidden names (already used): {forbidden_str}
+Examples of good names:
+- "Consciousness Theories"
+- "Neural Processing Models"
+- "Visual Perception Studies"
 
-RULES:
-1. Be specific and descriptive (e.g., "Rust Development", "Game Physics", "API Design")
-2. Avoid generic names like "General", "Various", "Miscellaneous", "Items"
-3. Focus on the common theme across items
-4. Respond with ONLY the category name, nothing else"#,
-        titles_list = titles_list,
-        forbidden_str = forbidden_str
-    );
+Category name:"#,
+        titles_list = titles_list
+    )
+}
+
+/// Ask AI to name a cluster based on sample item titles
+/// Prefers Ollama (free) if available, falls back to Anthropic
+/// Retries if name matches forbidden_names (up to 2 attempts)
+pub async fn name_cluster_from_samples(
+    titles: &[String],
+    forbidden_names: &[String],
+) -> Result<String, String> {
+    if titles.is_empty() {
+        return Err("No titles provided".into());
+    }
+
+    let prompt = build_cluster_naming_prompt(titles);
+
+    // Prefer Ollama (free) if available, otherwise use Anthropic
+    let use_ollama = ollama_available().await;
+
+    // Try up to 2 times if we hit a forbidden name
+    for attempt in 0..2 {
+        let name = if use_ollama {
+            name_cluster_ollama(&prompt).await?
+        } else {
+            name_cluster_anthropic(&prompt).await?
+        };
+
+        // Validate length
+        if name.len() < 2 || name.len() > 60 {
+            if attempt == 0 {
+                continue; // Retry once
+            }
+            return Err(format!("Invalid name length: {} chars", name.len()));
+        }
+
+        // Check forbidden names (case-insensitive)
+        let name_lower = name.to_lowercase();
+        let is_forbidden = forbidden_names.iter()
+            .any(|f| f.to_lowercase() == name_lower);
+
+        if !is_forbidden {
+            return Ok(name);
+        }
+        // Forbidden - retry
+    }
+
+    Err("Failed to generate unique name after retries".into())
+}
+
+/// Name cluster using Ollama (local LLM)
+async fn name_cluster_ollama(prompt: &str) -> Result<String, String> {
+    let model = settings::get_ollama_model();
+    let response = ollama_generate_text(prompt, &model).await?;
+
+    // Clean up response - take first line, trim quotes
+    let name = response
+        .lines()
+        .next()
+        .unwrap_or(&response)
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
+
+    Ok(name)
+}
+
+/// Name cluster using Anthropic API
+async fn name_cluster_anthropic(prompt: &str) -> Result<String, String> {
+    let api_key = get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
 
     let request = AnthropicRequest {
         model: "claude-haiku-4-5-20251001".to_string(),
-        max_tokens: 50,
+        max_tokens: 30,
         messages: vec![Message {
             role: "user".to_string(),
-            content: prompt,
+            content: prompt.to_string(),
         }],
     };
 
@@ -823,11 +916,6 @@ RULES:
         .first()
         .map(|c| c.text.trim().to_string())
         .unwrap_or_default();
-
-    // Validate
-    if name.len() < 3 || name.len() > 50 {
-        return Err(format!("Invalid name length: {} chars", name.len()));
-    }
 
     Ok(name)
 }
@@ -2485,6 +2573,55 @@ pub fn embeddings_available() -> bool {
 
 /// Generate an embedding for text.
 /// Uses local embeddings (384-dim) if enabled, otherwise OpenAI (1536-dim).
+/// Simple Claude API call for arbitrary prompts (used by hierarchy coherence refinement)
+/// Returns the raw text response from Claude Haiku
+#[allow(dead_code)]
+pub async fn call_claude_simple(prompt: &str) -> Result<String, String> {
+    let api_key = get_api_key().ok_or("ANTHROPIC_API_KEY not set")?;
+
+    let request = AnthropicRequest {
+        model: "claude-haiku-4-5-20251001".to_string(),
+        max_tokens: 2000,
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: prompt.to_string(),
+        }],
+    };
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("API error {}: {}", status, body));
+    }
+
+    let api_response: AnthropicResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    // Track token usage
+    if let Some(usage) = &api_response.usage {
+        let _ = settings::add_anthropic_tokens(usage.input_tokens, usage.output_tokens);
+    }
+
+    api_response
+        .content
+        .first()
+        .map(|c| c.text.clone())
+        .ok_or_else(|| "No content in response".to_string())
+}
+
 pub async fn generate_embedding(text: &str) -> Result<Vec<f32>, String> {
     // Route to local embeddings if enabled
     if settings::use_local_embeddings() {

@@ -824,6 +824,43 @@ enum MaintenanceCommands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Refine hierarchy by splitting incoherent and merging similar categories
+    RefineCoherence {
+        /// Coherence threshold (0.0-1.0). Categories below this get split.
+        #[arg(long, default_value = "0.45")]
+        coherence_threshold: f32,
+
+        /// Merge threshold (0.0-1.0). Sibling categories above this get auto-merged.
+        #[arg(long, default_value = "0.65")]
+        merge_threshold: f32,
+
+        /// Only analyze, don't make changes
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Refine hierarchy using graph edges (papers move to connected subcategories)
+    RefineGraph {
+        /// Merge threshold (0.0-1.0). Sibling categories above this get merged.
+        #[arg(long, default_value = "0.65")]
+        merge_threshold: f32,
+
+        /// Minimum papers to form a new subcategory from connected component
+        #[arg(long, default_value = "3")]
+        min_component: usize,
+
+        /// Only analyze, don't make changes
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Analyze coherence and sibling similarity distributions by depth
+    DiagnoseCoherence {
+        /// Maximum depth to analyze
+        #[arg(long, default_value = "7")]
+        max_depth: i32,
+        /// Sample size per depth for coherence analysis
+        #[arg(long, default_value = "50")]
+        sample_size: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3852,7 +3889,193 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
         MaintenanceCommands::RepairCodeTags { path, dry_run } => {
             repair_code_tags(db, &path, dry_run)?;
         }
+
+        MaintenanceCommands::RefineCoherence { coherence_threshold, merge_threshold, dry_run } => {
+            log!("Refining hierarchy coherence (coh={:.2}, merge={:.2}, dry_run={})...",
+                coherence_threshold, merge_threshold, dry_run);
+
+            let config = hierarchy::RefineConfig {
+                coherence_threshold,
+                merge_threshold,
+                dry_run,
+            };
+
+            let result = hierarchy::refine_hierarchy_coherence(db, None, config).await
+                .map_err(|e| format!("Refinement failed: {}", e))?;
+
+            log!("Refinement complete:");
+            log!("  {} categories analyzed", result.categories_analyzed);
+            log!("  {} incoherent found", result.incoherent_found);
+            log!("  {} children relocated", result.children_relocated);
+            log!("  {} categories merged", result.categories_merged);
+            log!("  {} iterations", result.iterations);
+        }
+
+        MaintenanceCommands::RefineGraph { merge_threshold, min_component, dry_run } => {
+            log!("Refining hierarchy by graph (merge={:.2}, min_component={}, dry_run={})...",
+                merge_threshold, min_component, dry_run);
+
+            let config = hierarchy::RefineGraphConfig {
+                merge_threshold,
+                min_component_size: min_component,
+                dry_run,
+            };
+
+            let result = hierarchy::refine_hierarchy_by_graph(db, None, config).await
+                .map_err(|e| format!("Refinement failed: {}", e))?;
+
+            log!("Refinement complete:");
+            log!("  {} categories analyzed", result.categories_analyzed);
+            log!("  {} papers moved", result.papers_moved);
+            log!("  {} subcategories created", result.subcategories_created);
+            log!("  {} categories merged", result.categories_merged);
+            log!("  {} iterations", result.iterations);
+        }
+
+        MaintenanceCommands::DiagnoseCoherence { max_depth, sample_size } => {
+            diagnose_coherence(db, max_depth, sample_size)?;
+        }
     }
+    Ok(())
+}
+
+/// Compute percentiles from a sorted slice
+fn percentiles(sorted: &[f32]) -> (f32, f32, f32, f32, f32, f32) {
+    if sorted.is_empty() {
+        return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    let n = sorted.len();
+    let min = sorted[0];
+    let max = sorted[n - 1];
+    let p25 = sorted[n / 4];
+    let p50 = sorted[n / 2];
+    let p75 = sorted[3 * n / 4];
+    let p90 = sorted[9 * n / 10];
+    (min, p25, p50, p75, p90, max)
+}
+
+/// Diagnose coherence and sibling similarity distributions by depth
+fn diagnose_coherence(db: &Database, max_depth: i32, sample_size: usize) -> Result<(), String> {
+    use similarity::cosine_similarity;
+    use rand::seq::SliceRandom;
+
+    log!("\n=== COHERENCE & SIMILARITY DIAGNOSTIC ===\n");
+
+    let mut coherence_stats: Vec<(i32, usize, f32, f32, f32, f32, f32, f32)> = Vec::new();
+    let mut sibling_stats: Vec<(i32, usize, f32, f32, f32, f32, f32, f32)> = Vec::new();
+
+    for depth in 0..=max_depth {
+        let nodes = db.get_nodes_at_depth(depth).map_err(|e| e.to_string())?;
+        let categories: Vec<_> = nodes.iter().filter(|n| !n.is_item).collect();
+
+        if categories.is_empty() {
+            continue;
+        }
+
+        // === COHERENCE ANALYSIS ===
+        // Sample categories at this depth
+        let mut rng = rand::thread_rng();
+        let mut sampled: Vec<_> = categories.clone();
+        sampled.shuffle(&mut rng);
+        sampled.truncate(sample_size);
+
+        let mut coherence_scores: Vec<f32> = Vec::new();
+        for cat in &sampled {
+            let children = db.get_children(&cat.id).map_err(|e| e.to_string())?;
+            if children.len() < 2 {
+                continue;
+            }
+
+            // Get centroid
+            let centroid = match db.get_node_embedding(&cat.id).map_err(|e| e.to_string())? {
+                Some(c) => c,
+                None => continue,
+            };
+
+            // Compute mean similarity to centroid
+            let mut total_sim = 0.0f32;
+            let mut count = 0usize;
+            for child in &children {
+                if let Some(emb) = db.get_node_embedding(&child.id).map_err(|e| e.to_string())? {
+                    total_sim += cosine_similarity(&centroid, &emb);
+                    count += 1;
+                }
+            }
+
+            if count >= 2 {
+                coherence_scores.push(total_sim / count as f32);
+            }
+        }
+
+        coherence_scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let (min, p25, p50, p75, p90, max) = percentiles(&coherence_scores);
+        coherence_stats.push((depth, coherence_scores.len(), min, p25, p50, p75, p90, max));
+
+        // === SIBLING SIMILARITY ANALYSIS ===
+        // Group categories by parent
+        let mut by_parent: std::collections::HashMap<String, Vec<&Node>> = std::collections::HashMap::new();
+        for cat in &categories {
+            if let Some(ref pid) = cat.parent_id {
+                by_parent.entry(pid.clone()).or_default().push(*cat);
+            }
+        }
+
+        let mut sibling_sims: Vec<f32> = Vec::new();
+        for siblings in by_parent.values() {
+            if siblings.len() < 2 {
+                continue;
+            }
+
+            // Get embeddings
+            let embeddings: Vec<(String, Vec<f32>)> = siblings.iter()
+                .filter_map(|s| db.get_node_embedding(&s.id).ok().flatten()
+                    .map(|emb| (s.id.clone(), emb)))
+                .collect();
+
+            // Compute pairwise similarities
+            for i in 0..embeddings.len() {
+                for j in (i + 1)..embeddings.len() {
+                    let sim = cosine_similarity(&embeddings[i].1, &embeddings[j].1);
+                    sibling_sims.push(sim);
+                }
+            }
+        }
+
+        sibling_sims.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let (min, p25, p50, p75, p90, max) = percentiles(&sibling_sims);
+        sibling_stats.push((depth, sibling_sims.len(), min, p25, p50, p75, p90, max));
+    }
+
+    // Print coherence table
+    log!("COHERENCE BY DEPTH (mean child-to-centroid similarity)");
+    log!("Higher = tighter cluster, Lower = scattered children\n");
+    log!("{:>5} {:>8} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6}",
+         "Depth", "Samples", "Min", "P25", "P50", "P75", "P90", "Max");
+    log!("{}", "-".repeat(60));
+    for (depth, n, min, p25, p50, p75, p90, max) in &coherence_stats {
+        log!("{:>5} {:>8} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3}",
+             depth, n, min, p25, p50, p75, p90, max);
+    }
+
+    log!("\n\nSIBLING SIMILARITY BY DEPTH (pairwise centroid similarity)");
+    log!("Higher = siblings are similar (merge candidates), Lower = distinct\n");
+    log!("{:>5} {:>8} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6}",
+         "Depth", "Pairs", "Min", "P25", "P50", "P75", "P90", "Max");
+    log!("{}", "-".repeat(60));
+    for (depth, n, min, p25, p50, p75, p90, max) in &sibling_stats {
+        log!("{:>5} {:>8} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3}",
+             depth, n, min, p25, p50, p75, p90, max);
+    }
+
+    log!("\n\nSUGGESTED THRESHOLDS:");
+    // Find natural boundaries
+    if let Some((_, _, _, _, p50_coh, _, _, _)) = coherence_stats.iter().find(|(d, _, _, _, _, _, _, _)| *d == 2) {
+        log!("  Coherence threshold: {:.2} (based on depth-2 median)", p50_coh);
+    }
+    if let Some((_, _, _, _, _, _, p90_sib, _)) = sibling_stats.iter().find(|(d, _, _, _, _, _, _, _)| *d == 2) {
+        log!("  Merge threshold: {:.2} (based on depth-2 P90 sibling sim)", p90_sib);
+    }
+
     Ok(())
 }
 
@@ -4696,9 +4919,23 @@ async fn handle_code(cmd: CodeCommands, db: &Database, db_path: &PathBuf) -> Res
             let node = db.get_node(&id).map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("Node not found: {}", id))?;
 
+            // Check if this is a code node
+            let is_code_node = node.content_type.as_ref()
+                .map(|ct| ct.starts_with("code_"))
+                .unwrap_or(false);
+
+            if !is_code_node {
+                return Err(format!(
+                    "Node '{}' is not a code node (content_type: {:?}). Use 'node get {}' instead.",
+                    node.title,
+                    node.content_type,
+                    id
+                ));
+            }
+
             // Parse tags JSON to get file_path, line_start, line_end
             let tags = node.tags.as_ref()
-                .ok_or("Node has no tags metadata")?;
+                .ok_or("Code node has no tags metadata (missing file_path/line info)")?;
 
             #[derive(serde::Deserialize)]
             struct CodeMetadata {
@@ -4707,8 +4944,19 @@ async fn handle_code(cmd: CodeCommands, db: &Database, db_path: &PathBuf) -> Res
                 line_end: usize,
             }
 
+            // Check if tags looks like an array (regular tags) vs object (code metadata)
+            let trimmed = tags.trim();
+            if trimmed.starts_with('[') {
+                return Err(format!(
+                    "Code node '{}' has regular tags instead of source location metadata.\n\
+                     This node was likely imported without --update or from a different source.\n\
+                     Re-import with: mycelica-cli import code <file-or-directory> --update",
+                    node.title
+                ));
+            }
+
             let metadata: CodeMetadata = serde_json::from_str(tags)
-                .map_err(|e| format!("Failed to parse tags JSON: {}. Tags: {}", e, tags))?;
+                .map_err(|e| format!("Failed to parse code metadata: {}.\nTags: {}", e, tags))?;
 
             // Resolve file path - if relative, resolve from database directory
             let file_path = PathBuf::from(&metadata.file_path);

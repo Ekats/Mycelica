@@ -1369,7 +1369,7 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
                             const jumpFromEmoji = jumpFromNode ? getNodeEmoji(jumpFromNode) : crumb.jumpFromEmoji;
                             return jumpFromEmoji && <span className="mr-1">{jumpFromEmoji}</span>;
                           })()}
-                          {crumb.jumpFromTitle}
+                          {crumb.jumpFromTitle && crumb.jumpFromTitle.length > 15 ? crumb.jumpFromTitle.slice(0, 13) + '…' : crumb.jumpFromTitle}
                         </button>
                       </>
                     )}
@@ -1385,7 +1385,7 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
                     title={hierarchyTooltip}
                   >
                     {crumbEmoji && <span>{crumbEmoji}</span>}
-                    {crumb.title}{toSuperscript(crumb.depth)}
+                    {crumb.title.length > 20 ? crumb.title.slice(0, 18) + '…' : crumb.title}{toSuperscript(crumb.depth)}
                   </span>
                 ) : (
                   // Ancestor: clickable
@@ -1399,16 +1399,32 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
                       devLog('info', `Navigated to "${crumb.title}" (depth ${crumb.depth})`);
                     }}
                     className={`flex items-center gap-1 px-2 py-1 rounded transition-colors hover:bg-gray-700 cursor-pointer ${isJump ? 'text-blue-300' : 'text-gray-300'}`}
+                    title={hierarchyTooltip}
                   >
                     <span className="text-sm font-medium">
                       {crumbEmoji && <span className="mr-1">{crumbEmoji}</span>}
-                      {crumb.title}{toSuperscript(crumb.depth)}
+                      {crumb.title.length > 20 ? crumb.title.slice(0, 18) + '…' : crumb.title}{toSuperscript(crumb.depth)}
                     </span>
                   </button>
                 )}
               </div>
             );
           })}
+
+          {/* Go up one level button */}
+          {breadcrumbs.length > 0 && (
+            <button
+              onClick={() => {
+                setActiveNode(null);
+                navigateBack();
+                devLog('info', 'Navigated up one level');
+              }}
+              className="ml-2 px-2 py-1 rounded text-gray-400 hover:text-amber-400 hover:bg-gray-700 transition-colors"
+              title="Go up one level"
+            >
+              ↑
+            </button>
+          )}
         </div>
 
         {/* Subtitle with current node's summary */}

@@ -10,7 +10,7 @@
 //! Key insight: Start with natural clusters, then organize them into a
 //! navigable tree. Both directions meeting in the middle.
 
-use crate::db::{Database, Node, NodeType, Position};
+use crate::db::{Database, Edge, EdgeType, Node, NodeType, Position};
 use crate::ai_client::{self, TopicInfo};
 use crate::settings;
 use crate::commands::is_rebuild_cancelled;
@@ -195,6 +195,1136 @@ fn is_coherent_for_deep_split(children: &[Node]) -> bool {
     }
 
     false // Diverse cluster_ids = incoherent noise
+}
+
+// ==================== Coherence-Based Hierarchy Refinement ====================
+
+/// Compute intra-category coherence: how tight are children around their centroid?
+/// Returns mean similarity of children to centroid (0.0 = scattered, 1.0 = tight cluster)
+/// O(n) complexity - NOT O(n^2) pairwise comparison
+fn compute_category_coherence(db: &Database, category_id: &str) -> Result<Option<f32>, String> {
+    let children = db.get_children(category_id).map_err(|e| e.to_string())?;
+    if children.len() < 2 {
+        return Ok(Some(1.0)); // Single child trivially coherent
+    }
+
+    // Get centroid embedding (categories have pre-computed centroids)
+    let centroid = match db.get_node_embedding(category_id).map_err(|e| e.to_string())? {
+        Some(c) => c,
+        None => return Ok(None), // No centroid = can't compute
+    };
+
+    // Measure each child's similarity to centroid (O(n), not O(n^2))
+    let mut total_sim = 0.0f32;
+    let mut count = 0usize;
+
+    for child in &children {
+        if let Some(child_emb) = db.get_node_embedding(&child.id).map_err(|e| e.to_string())? {
+            total_sim += cosine_similarity(&centroid, &child_emb);
+            count += 1;
+        }
+    }
+
+    if count < 2 {
+        return Ok(None);
+    }
+
+    // Coherence = mean similarity to centroid
+    // Tight cluster = all children close to centroid = high coherence
+    Ok(Some(total_sim / count as f32))
+}
+
+/// Find sibling categories that should be merged (sim >= threshold)
+fn find_mergeable_siblings(
+    db: &Database,
+    parent_id: &str,
+    threshold: f32,
+) -> Result<Vec<(String, String, f32)>, String> {
+    let siblings = db.get_children(parent_id).map_err(|e| e.to_string())?;
+    let categories: Vec<&Node> = siblings.iter().filter(|n| !n.is_item).collect();
+
+    if categories.len() < 2 {
+        return Ok(vec![]);
+    }
+
+    let embeddings: Vec<(String, Vec<f32>)> = categories.iter()
+        .filter_map(|c| db.get_node_embedding(&c.id).ok().flatten()
+            .map(|emb| (c.id.clone(), emb)))
+        .collect();
+
+    let mut candidates = Vec::new();
+    let n = embeddings.len();
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let sim = cosine_similarity(&embeddings[i].1, &embeddings[j].1);
+            if sim >= threshold {
+                candidates.push((embeddings[i].0.clone(), embeddings[j].0.clone(), sim));
+            }
+        }
+    }
+
+    // Sort by similarity descending
+    candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(candidates)
+}
+
+// ==================== Graph-Based Hierarchy Refinement ====================
+
+/// In-memory edge graph built from bulk DB query
+/// Maps node_id -> Vec<(neighbor_id, weight)>
+type EdgeGraph = HashMap<String, Vec<(String, f32)>>;
+
+/// Build edge graph for a set of node IDs using bulk query
+/// Much faster than per-node queries: O(1) DB call instead of O(N)
+fn build_edge_graph_bulk(
+    db: &Database,
+    node_ids: &HashSet<String>,
+) -> Result<EdgeGraph, String> {
+    if node_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    // Convert to Vec<&str> for the DB method
+    let ids_vec: Vec<&str> = node_ids.iter().map(|s| s.as_str()).collect();
+
+    // Bulk fetch all edges involving these nodes
+    let edges = db.get_edges_for_nodes_bulk(&ids_vec).map_err(|e| e.to_string())?;
+
+    // Build graph - only include edges where BOTH endpoints are in our set
+    let mut graph: EdgeGraph = HashMap::new();
+    for id in node_ids {
+        graph.insert(id.clone(), Vec::new());
+    }
+
+    for (source, target, weight) in edges {
+        let w = weight as f32;
+
+        // Only add edge if both endpoints are in our set (internal edges only)
+        if node_ids.contains(&source) && node_ids.contains(&target) {
+            graph.get_mut(&source).unwrap().push((target.clone(), w));
+            graph.get_mut(&target).unwrap().push((source.clone(), w));
+        }
+    }
+
+    Ok(graph)
+}
+
+/// Build adjacency list for papers (only edges between papers in set)
+fn build_paper_adjacency(
+    edge_graph: &EdgeGraph,
+    paper_ids: &HashSet<String>,
+) -> HashMap<String, Vec<String>> {
+    let mut graph: HashMap<String, Vec<String>> = HashMap::new();
+
+    for paper_id in paper_ids {
+        let neighbors: Vec<String> = edge_graph
+            .get(paper_id)
+            .map(|edges| {
+                edges.iter()
+                    .filter(|(neighbor, _)| paper_ids.contains(neighbor))
+                    .map(|(neighbor, _)| neighbor.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        graph.insert(paper_id.clone(), neighbors);
+    }
+
+    graph
+}
+
+/// Find connected components in a paper graph using union-find
+fn find_connected_components(
+    graph: &HashMap<String, Vec<String>>,
+) -> Vec<Vec<String>> {
+    let ids: Vec<&String> = graph.keys().collect();
+    let id_to_idx: HashMap<&String, usize> = ids.iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i))
+        .collect();
+
+    // Union-find parent array
+    let mut parent: Vec<usize> = (0..ids.len()).collect();
+
+    fn find(parent: &mut [usize], i: usize) -> usize {
+        if parent[i] != i {
+            parent[i] = find(parent, parent[i]);
+        }
+        parent[i]
+    }
+
+    fn union(parent: &mut [usize], i: usize, j: usize) {
+        let pi = find(parent, i);
+        let pj = find(parent, j);
+        if pi != pj {
+            parent[pi] = pj;
+        }
+    }
+
+    // Union connected papers
+    for (paper_id, neighbors) in graph {
+        let i = id_to_idx[paper_id];
+        for neighbor_id in neighbors {
+            let j = id_to_idx[neighbor_id];
+            union(&mut parent, i, j);
+        }
+    }
+
+    // Group by root
+    let mut components: HashMap<usize, Vec<String>> = HashMap::new();
+    for (i, paper_id) in ids.iter().enumerate() {
+        let root = find(&mut parent, i);
+        components.entry(root).or_default().push((*paper_id).clone());
+    }
+
+    components.into_values().collect()
+}
+
+// ==================== Topic-Level Graph Functions (for uber-category grouping) ====================
+
+/// Build affinity graph between topics based on cross-edges between their papers
+/// Returns adjacency list: topic_id -> Vec<connected_topic_id>
+fn build_topic_affinity_graph(
+    db: &Database,
+    topic_ids: &[String],
+    min_cross_edges: usize,
+) -> Result<HashMap<String, Vec<String>>, String> {
+    if topic_ids.len() < 2 {
+        return Ok(HashMap::new());
+    }
+
+    // Get cross-edge counts for all topic pairs
+    let topic_refs: Vec<&str> = topic_ids.iter().map(|s| s.as_str()).collect();
+    let cross_edges = db.count_all_cross_edges(&topic_refs).map_err(|e| e.to_string())?;
+
+    // Build adjacency list
+    let mut graph: HashMap<String, Vec<String>> = HashMap::new();
+    for topic_id in topic_ids {
+        graph.insert(topic_id.clone(), Vec::new());
+    }
+
+    for ((topic_a, topic_b), count) in cross_edges {
+        if count >= min_cross_edges {
+            graph.get_mut(&topic_a).unwrap().push(topic_b.clone());
+            graph.get_mut(&topic_b).unwrap().push(topic_a.clone());
+        }
+    }
+
+    Ok(graph)
+}
+
+/// Group topics by edge connectivity
+/// Returns Vec of groups, where each group is a Vec of topic IDs that should form an uber-category
+fn group_topics_by_edges(
+    db: &Database,
+    topic_ids: &[String],
+    min_cross_edges: usize,
+) -> Result<Vec<Vec<String>>, String> {
+    if topic_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    if topic_ids.len() == 1 {
+        return Ok(vec![topic_ids.to_vec()]);
+    }
+
+    // Build topic affinity graph
+    let graph = build_topic_affinity_graph(db, topic_ids, min_cross_edges)?;
+
+    // Find connected components using existing function
+    let components = find_connected_components(&graph);
+
+    Ok(components)
+}
+
+// ==================== Recursive Grouping by Paper Connectivity ====================
+
+/// Collect all paper IDs under a category (recursively through subcategories)
+fn collect_papers_recursively(db: &Database, category_id: &str) -> Result<Vec<String>, String> {
+    let mut papers = Vec::new();
+    let mut stack = vec![category_id.to_string()];
+
+    while let Some(node_id) = stack.pop() {
+        let children = db.get_children(&node_id).map_err(|e| e.to_string())?;
+        for child in children {
+            if child.is_item {
+                papers.push(child.id);
+            } else {
+                stack.push(child.id);
+            }
+        }
+    }
+
+    Ok(papers)
+}
+
+/// For each topic, determine which connected component most of its papers belong to
+/// Returns: topic_id -> component_index (0-based)
+fn map_topics_to_components(
+    db: &Database,
+    topic_ids: &[String],
+    min_component_size: usize,
+) -> Result<(HashMap<String, usize>, Vec<Vec<String>>), String> {
+    // Collect all papers from all topics
+    let mut topic_papers: HashMap<String, Vec<String>> = HashMap::new();
+    let mut all_papers: HashSet<String> = HashSet::new();
+
+    for topic_id in topic_ids {
+        let papers = collect_papers_recursively(db, topic_id)?;
+        for paper in &papers {
+            all_papers.insert(paper.clone());
+        }
+        topic_papers.insert(topic_id.clone(), papers);
+    }
+
+    if all_papers.is_empty() {
+        return Ok((HashMap::new(), vec![]));
+    }
+
+    // Build edge graph among all papers
+    let edge_graph = build_edge_graph_bulk(db, &all_papers)?;
+    let adjacency = build_paper_adjacency(&edge_graph, &all_papers);
+
+    // Find connected components among papers
+    let components = find_connected_components(&adjacency);
+
+    // Create paper -> component_index mapping
+    let mut paper_to_component: HashMap<String, usize> = HashMap::new();
+    for (idx, component) in components.iter().enumerate() {
+        for paper_id in component {
+            paper_to_component.insert(paper_id.clone(), idx);
+        }
+    }
+
+    // For each topic, count papers in each component and assign to majority
+    let mut topic_to_component: HashMap<String, usize> = HashMap::new();
+
+    for topic_id in topic_ids {
+        let papers = topic_papers.get(topic_id).unwrap();
+        if papers.is_empty() {
+            continue;
+        }
+
+        // Count papers per component
+        let mut component_counts: HashMap<usize, usize> = HashMap::new();
+        for paper_id in papers {
+            if let Some(&comp_idx) = paper_to_component.get(paper_id) {
+                *component_counts.entry(comp_idx).or_insert(0) += 1;
+            }
+        }
+
+        // Assign to majority component
+        if let Some((&majority_comp, _)) = component_counts.iter().max_by_key(|(_, count)| *count) {
+            topic_to_component.insert(topic_id.clone(), majority_comp);
+        }
+    }
+
+    // Filter to significant components (with >= min_component_size papers)
+    let significant_components: Vec<Vec<String>> = components.into_iter()
+        .filter(|c| c.len() >= min_component_size)
+        .collect();
+
+    Ok((topic_to_component, significant_components))
+}
+
+/// Group topics by edge connectivity of their papers
+/// Returns Vec of groups, where each group is topics that should stay together
+fn group_topics_by_paper_connectivity(
+    db: &Database,
+    topic_ids: &[String],
+    min_group_size: usize,
+    min_component_size: usize,
+) -> Result<Vec<Vec<String>>, String> {
+    if topic_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    if topic_ids.len() == 1 {
+        return Ok(vec![topic_ids.to_vec()]);
+    }
+
+    // Map topics to their dominant component
+    let (topic_to_component, significant_components) =
+        map_topics_to_components(db, topic_ids, min_component_size)?;
+
+    if significant_components.is_empty() {
+        // No significant components - all papers are isolated or in tiny groups
+        return Ok(vec![]);
+    }
+
+    // Invert mapping: component_index -> Vec<topic_id>
+    let mut component_to_topics: HashMap<usize, Vec<String>> = HashMap::new();
+    for (topic_id, comp_idx) in &topic_to_component {
+        component_to_topics.entry(*comp_idx).or_default().push(topic_id.clone());
+    }
+
+    // Filter to groups with >= min_group_size topics
+    let groups: Vec<Vec<String>> = component_to_topics.into_values()
+        .filter(|topics| topics.len() >= min_group_size)
+        .collect();
+
+    // Check if too many topics would be singletons (>50%)
+    let grouped_count: usize = groups.iter().map(|g| g.len()).sum();
+    if grouped_count < topic_ids.len() / 2 {
+        // Too sparse - most topics would be orphaned
+        return Ok(vec![]);
+    }
+
+    Ok(groups)
+}
+
+// ==================== Category Edges from Paper Cross-Counts ====================
+
+/// Create edges between sibling categories based on paper cross-edge counts.
+/// Weight reflects fraction of smaller category's papers with cross-connections.
+///
+/// For each pair of sibling categories (same parent), creates one edge with weight
+/// calculated as: raw_cross_edges / min(papers_in_a, papers_in_b), capped at 1.0.
+pub fn create_category_edges_from_cross_counts(
+    db: &Database,
+    app: Option<&AppHandle>,
+) -> Result<usize, String> {
+    // Delete existing sibling edges
+    db.delete_edges_by_type("sibling").map_err(|e| e.to_string())?;
+
+    let mut created = 0;
+
+    // Get all non-item nodes (categories)
+    let all_nodes = db.get_all_nodes(false).map_err(|e| e.to_string())?;
+    let categories: Vec<&Node> = all_nodes.iter().filter(|n| !n.is_item).collect();
+
+    // Group by parent_id to find siblings
+    let mut siblings_map: HashMap<String, Vec<&Node>> = HashMap::new();
+    for cat in &categories {
+        if let Some(parent_id) = &cat.parent_id {
+            siblings_map.entry(parent_id.clone()).or_default().push(cat);
+        }
+    }
+
+    // Process each sibling group
+    for (parent_id, siblings) in &siblings_map {
+        if siblings.len() < 2 {
+            continue;
+        }
+
+        // Collect papers for each sibling (recursively)
+        let mut sibling_papers: HashMap<String, Vec<String>> = HashMap::new();
+        for sibling in siblings {
+            let papers = collect_papers_recursively(db, &sibling.id)?;
+            sibling_papers.insert(sibling.id.clone(), papers);
+        }
+
+        // Build paper -> sibling mapping
+        let mut paper_to_sibling: HashMap<String, String> = HashMap::new();
+        for (sibling_id, papers) in &sibling_papers {
+            for paper_id in papers {
+                paper_to_sibling.insert(paper_id.clone(), sibling_id.clone());
+            }
+        }
+
+        if paper_to_sibling.is_empty() {
+            continue;
+        }
+
+        // Get all edges involving these papers
+        let all_paper_ids: Vec<&str> = paper_to_sibling.keys().map(|s| s.as_str()).collect();
+        let edges = db.get_edges_for_nodes_bulk(&all_paper_ids).map_err(|e| e.to_string())?;
+
+        // Count cross-edges between sibling pairs
+        let mut cross_edge_counts: HashMap<(String, String), usize> = HashMap::new();
+        for (source, target, _weight) in &edges {
+            let source_sibling = paper_to_sibling.get(source);
+            let target_sibling = paper_to_sibling.get(target);
+
+            if let (Some(sib_a), Some(sib_b)) = (source_sibling, target_sibling) {
+                if sib_a != sib_b {
+                    // Canonical ordering
+                    let key = if sib_a < sib_b {
+                        (sib_a.clone(), sib_b.clone())
+                    } else {
+                        (sib_b.clone(), sib_a.clone())
+                    };
+                    *cross_edge_counts.entry(key).or_default() += 1;
+                }
+            }
+        }
+
+        // Divide by 2 (edges counted from both directions in bulk query)
+        for count in cross_edge_counts.values_mut() {
+            *count /= 2;
+        }
+
+        // Create edges for all sibling pairs
+        for i in 0..siblings.len() {
+            for j in (i + 1)..siblings.len() {
+                let sib_a = &siblings[i];
+                let sib_b = &siblings[j];
+
+                // Canonical ordering for lookup
+                let key = if sib_a.id < sib_b.id {
+                    (sib_a.id.clone(), sib_b.id.clone())
+                } else {
+                    (sib_b.id.clone(), sib_a.id.clone())
+                };
+
+                let raw_count = cross_edge_counts.get(&key).copied().unwrap_or(0);
+
+                // Normalize by smaller category size
+                let size_a = sibling_papers.get(&sib_a.id).map(|v| v.len()).unwrap_or(0);
+                let size_b = sibling_papers.get(&sib_b.id).map(|v| v.len()).unwrap_or(0);
+                let min_size = size_a.min(size_b).max(1);
+                let weight = (raw_count as f64 / min_size as f64).min(1.0);
+
+                // Insert edge (always, even if weight is 0)
+                let edge_id = format!("sibling-{}-{}", sib_a.id, sib_b.id);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64;
+                db.insert_edge(&Edge {
+                    id: edge_id,
+                    source: sib_a.id.clone(),
+                    target: sib_b.id.clone(),
+                    edge_type: EdgeType::Sibling,
+                    label: None,
+                    weight: Some(weight),
+                    edge_source: Some("ai".to_string()),
+                    evidence_id: None,
+                    confidence: None,
+                    created_at: now,
+                }).map_err(|e| e.to_string())?;
+
+                created += 1;
+            }
+        }
+    }
+
+    emit_log(app, "info", &format!("Created {} sibling edges from paper cross-counts", created));
+    Ok(created)
+}
+
+/// Result of splitting a leaf category by connectivity
+#[derive(Debug, Default)]
+struct SplitResult {
+    pub papers_moved: usize,
+    pub subcategories_created: usize,
+    pub did_split: bool,
+}
+
+/// Split a leaf category (all children are papers) by edge connectivity.
+/// If papers form multiple disconnected components, create subcategories for each.
+///
+/// Only splits if at least 2 components have >= min_component_size papers.
+/// Papers in smaller components stay in the parent (acceptable orphans).
+async fn split_leaf_category_by_connectivity(
+    db: &Database,
+    category_id: &str,
+    min_component_size: usize,
+    app: Option<&AppHandle>,
+) -> Result<SplitResult, String> {
+    let mut result = SplitResult::default();
+
+    let children = db.get_children(category_id).map_err(|e| e.to_string())?;
+
+    // Must be a leaf category (all children are papers)
+    let all_papers = children.iter().all(|c| c.is_item);
+    if !all_papers || children.is_empty() {
+        return Ok(result);
+    }
+
+    // Need enough papers to potentially split
+    if children.len() < min_component_size * 2 {
+        return Ok(result);
+    }
+
+    // Build edge graph among papers
+    let paper_ids: HashSet<String> = children.iter().map(|c| c.id.clone()).collect();
+    let edge_graph = build_edge_graph_bulk(db, &paper_ids)?;
+    let paper_adjacency = build_paper_adjacency(&edge_graph, &paper_ids);
+    let components = find_connected_components(&paper_adjacency);
+
+    // Count qualifying components (>= min_component_size)
+    let qualifying_components: Vec<&Vec<String>> = components.iter()
+        .filter(|c| c.len() >= min_component_size)
+        .collect();
+
+    // Only split if there are at least 2 qualifying components
+    if qualifying_components.len() < 2 {
+        return Ok(result);
+    }
+
+    let category = db.get_node(category_id).map_err(|e| e.to_string())?
+        .ok_or("Category not found")?;
+    let category_name = category.ai_title.as_deref().unwrap_or(&category.title);
+
+    emit_log(app, "info", &format!(
+        "  Splitting '{}': {} papers -> {} components",
+        category_name, children.len(), qualifying_components.len()
+    ));
+
+    let new_depth = category.depth + 1;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap().as_millis();
+
+    // Collect existing sibling names to avoid duplicates
+    let parent_id = category.parent_id.as_deref().unwrap_or("");
+    let siblings = db.get_children(parent_id).map_err(|e| e.to_string())?;
+    let existing_names: Vec<String> = siblings.iter()
+        .filter_map(|s| s.ai_title.clone())
+        .collect();
+
+    for (idx, component) in qualifying_components.iter().enumerate() {
+        // Get paper nodes for naming
+        let component_papers: Vec<Node> = component.iter()
+            .filter_map(|id| db.get_node(id).ok().flatten())
+            .collect();
+
+        // Name the new subcategory
+        let refs: Vec<&Node> = component_papers.iter().collect();
+        let name = name_cluster_from_items(&refs, &existing_names, app).await
+            .unwrap_or_else(|_| format!("{} - Group {}", category_name, idx + 1));
+
+        let sub_id = format!("{}-split-{}-{}", category_id, timestamp, idx);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap().as_secs() as i64;
+
+        // Create subcategory
+        db.insert_node(&Node {
+            id: sub_id.clone(),
+            node_type: NodeType::Cluster,
+            title: name.clone(),
+            url: None,
+            content: None,
+            position: Position { x: 0.0, y: 0.0 },
+            created_at: now,
+            updated_at: now,
+            cluster_id: None,
+            cluster_label: None,
+            depth: new_depth,
+            is_item: false,
+            is_universe: false,
+            parent_id: Some(category_id.to_string()),
+            child_count: component.len() as i32,
+            ai_title: Some(name.clone()),
+            summary: None,
+            tags: None,
+            emoji: None,
+            is_processed: false,
+            conversation_id: None,
+            sequence_index: None,
+            is_pinned: false,
+            last_accessed_at: None,
+            latest_child_date: None,
+            is_private: None,
+            privacy_reason: None,
+            source: None,
+            pdf_available: None,
+            content_type: None,
+            associated_idea_id: None,
+            privacy: None,
+        }).map_err(|e| e.to_string())?;
+
+        // Move papers into new subcategory
+        for paper_id in *component {
+            db.update_parent(paper_id, &sub_id).map_err(|e| e.to_string())?;
+            db.set_node_depth(paper_id, new_depth + 1).map_err(|e| e.to_string())?;
+            result.papers_moved += 1;
+        }
+
+        compute_and_store_centroid(db, &sub_id);
+        result.subcategories_created += 1;
+
+        emit_log(app, "info", &format!(
+            "    Created '{}' with {} papers", name, component.len()
+        ));
+    }
+
+    // Update parent's child count (now has subcategories + orphan papers)
+    let new_child_count = db.get_children(category_id).map_err(|e| e.to_string())?.len();
+    db.update_child_count(category_id, new_child_count as i32).map_err(|e| e.to_string())?;
+    compute_and_store_centroid(db, category_id);
+
+    result.did_split = true;
+    Ok(result)
+}
+
+/// Result struct for graph-based refinement
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefineGraphResult {
+    pub categories_analyzed: usize,
+    pub papers_moved: usize,
+    pub subcategories_created: usize,
+    pub categories_merged: usize,
+    pub iterations: usize,
+}
+
+const MAX_REFINE_GRAPH_ITERATIONS: usize = 5;
+
+/// Configuration for graph-based refinement
+pub struct RefineGraphConfig {
+    pub merge_threshold: f32,
+    pub min_component_size: usize,  // Min papers to form new subcategory
+    pub dry_run: bool,
+}
+
+impl Default for RefineGraphConfig {
+    fn default() -> Self {
+        Self {
+            merge_threshold: DEFAULT_MERGE_THRESHOLD,
+            min_component_size: 3,
+            dry_run: false,
+        }
+    }
+}
+
+/// Helper: merge cat_b into cat_a (reparent children, delete cat_b)
+/// Simplified version without logging (used by graph-based refinement)
+fn merge_category_into_silent(db: &Database, survivor_id: &str, to_delete_id: &str) -> Result<(), String> {
+    let children = db.get_children(to_delete_id).map_err(|e| e.to_string())?;
+    for child in &children {
+        db.update_parent(&child.id, survivor_id).map_err(|e| e.to_string())?;
+    }
+
+    // Delete in FK order
+    db.delete_fos_edges_for_node(to_delete_id).map_err(|e| e.to_string())?;
+    db.delete_edges_for_node(to_delete_id).map_err(|e| e.to_string())?;
+    db.delete_node(to_delete_id).map_err(|e| e.to_string())?;
+
+    // Update survivor
+    let new_count = db.get_children(survivor_id).map_err(|e| e.to_string())?.len();
+    db.update_child_count(survivor_id, new_count as i32).map_err(|e| e.to_string())?;
+    compute_and_store_centroid(db, survivor_id);
+
+    Ok(())
+}
+
+/// Main graph-based refinement function
+pub async fn refine_hierarchy_by_graph(
+    db: &Database,
+    app: Option<&AppHandle>,
+    config: RefineGraphConfig,
+) -> Result<RefineGraphResult, String> {
+    emit_log(app, "info", "Starting graph-based hierarchy refinement...");
+
+    let protected = db.get_protected_node_ids();
+    let mut result = RefineGraphResult {
+        categories_analyzed: 0,
+        papers_moved: 0,
+        subcategories_created: 0,
+        categories_merged: 0,
+        iterations: 0,
+    };
+
+    loop {
+        result.iterations += 1;
+        if result.iterations > MAX_REFINE_GRAPH_ITERATIONS {
+            emit_log(app, "warn", &format!("Hit max iterations ({})", MAX_REFINE_GRAPH_ITERATIONS));
+            break;
+        }
+
+        let mut changes = 0;
+        let max_depth = db.get_max_depth().map_err(|e| e.to_string())?;
+
+        // Phase A: Top-down merge similar sibling categories (keep existing logic)
+        emit_log(app, "info", &format!("  Iteration {} Phase A: Merging similar categories", result.iterations));
+
+        for depth in 0..max_depth {
+            let parents = db.get_nodes_at_depth(depth).map_err(|e| e.to_string())?;
+
+            for parent in parents {
+                if parent.is_item || protected.contains(&parent.id) {
+                    continue;
+                }
+
+                let candidates = find_mergeable_siblings(db, &parent.id, config.merge_threshold)?;
+
+                for (cat_a, cat_b, sim) in &candidates {
+                    // Check both nodes still exist
+                    let node_a = match db.get_node(cat_a).map_err(|e| e.to_string())? {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    let node_b = match db.get_node(cat_b).map_err(|e| e.to_string())? {
+                        Some(n) => n,
+                        None => continue,
+                    };
+
+                    // Survivor = category with more children
+                    let (survivor_id, to_delete_id) = if node_b.child_count > node_a.child_count {
+                        (cat_b.as_str(), cat_a.as_str())
+                    } else {
+                        (cat_a.as_str(), cat_b.as_str())
+                    };
+
+                    emit_log(app, "debug", &format!("  Merging: sim={:.3}", sim));
+
+                    if !config.dry_run {
+                        merge_category_into_silent(db, survivor_id, to_delete_id)?;
+                        result.categories_merged += 1;
+                        changes += 1;
+                    }
+                }
+            }
+        }
+
+        // Phase B: Split leaf categories by edge connectivity
+        // Categories whose papers aren't connected should be split
+        emit_log(app, "info", &format!("  Iteration {} Phase B: Splitting by connectivity", result.iterations));
+
+        // Work bottom-up so we process leaves first
+        for depth in (1..=max_depth).rev() {
+            let nodes = db.get_nodes_at_depth(depth).map_err(|e| e.to_string())?;
+
+            for node in nodes {
+                if node.is_item || protected.contains(&node.id) {
+                    continue;
+                }
+
+                // Check if node still exists (may have been modified)
+                if db.get_node(&node.id).map_err(|e| e.to_string())?.is_none() {
+                    continue;
+                }
+
+                result.categories_analyzed += 1;
+
+                // Try to split leaf categories by connectivity
+                if !config.dry_run {
+                    let split = split_leaf_category_by_connectivity(
+                        db, &node.id, config.min_component_size, app
+                    ).await?;
+
+                    if split.did_split {
+                        result.papers_moved += split.papers_moved;
+                        result.subcategories_created += split.subcategories_created;
+                        changes += split.subcategories_created;
+                    }
+                }
+            }
+        }
+
+        if changes == 0 {
+            emit_log(app, "info", &format!("Converged after {} iterations", result.iterations));
+            break;
+        }
+    }
+
+    // Index edges for the reorganized hierarchy
+    emit_log(app, "info", "  Indexing edge parents...");
+    let indexed = db.update_edge_parents().map_err(|e| e.to_string())?;
+    emit_log(app, "info", &format!("  Indexed {} edges", indexed));
+
+    Ok(result)
+}
+
+/// Relocate misplaced children from an incoherent category to better-fitting sibling categories.
+/// Returns number of moves executed.
+fn relocate_from_incoherent_category(
+    db: &Database,
+    category_id: &str,
+    app: Option<&AppHandle>,
+) -> Result<usize, String> {
+    let category = db.get_node(category_id).map_err(|e| e.to_string())?
+        .ok_or("Category not found")?;
+
+    let children = db.get_children(category_id).map_err(|e| e.to_string())?;
+    if children.is_empty() {
+        return Ok(0);
+    }
+
+    // Get current category's centroid
+    let current_centroid = match db.get_node_embedding(category_id).map_err(|e| e.to_string())? {
+        Some(c) => c,
+        None => return Ok(0),  // No centroid, can't compare
+    };
+
+    // Build sibling-only centroid map
+    let parent_id = match &category.parent_id {
+        Some(id) => id.clone(),
+        None => return Ok(0),
+    };
+    let siblings = db.get_children(&parent_id).map_err(|e| e.to_string())?;
+    let sibling_centroids: HashMap<String, Vec<f32>> = siblings.iter()
+        .filter(|s| !s.is_item && s.id != category.id)
+        .filter_map(|s| db.get_node_embedding(&s.id).ok().flatten()
+            .map(|emb| (s.id.clone(), emb)))
+        .collect();
+    if sibling_centroids.is_empty() {
+        return Ok(0);
+    }
+
+    // Collect moves: (child_id, new_parent_id)
+    let mut moves: Vec<(String, String)> = Vec::new();
+
+    // Analyze each child
+    for child in &children {
+        if !child.is_item {
+            continue;
+        }
+        let child_emb = match db.get_node_embedding(&child.id).map_err(|e| e.to_string())? {
+            Some(e) => e,
+            None => continue,
+        };
+
+        // Similarity to current parent
+        let current_sim = cosine_similarity(&child_emb, &current_centroid);
+
+        // Find best alternative
+        let mut best_id: Option<String> = None;
+        let mut best_sim = current_sim;
+
+        for (other_id, centroid) in sibling_centroids.iter() {
+            if other_id == &child.id {
+                continue;
+            }
+
+            let sim = cosine_similarity(&child_emb, centroid);
+            if sim > best_sim + 0.05 {
+                best_sim = sim;
+                best_id = Some(other_id.clone());
+            }
+        }
+
+        if let Some(new_parent_id) = best_id {
+            moves.push((child.id.clone(), new_parent_id));
+        }
+    }
+
+    if moves.is_empty() {
+        return Ok(0);
+    }
+
+    emit_log(app, "info", &format!(
+        "  Relocating {} children from '{}'",
+        moves.len(),
+        category.ai_title.as_deref().unwrap_or(&category.title)
+    ));
+
+    // Track affected parents
+    let mut affected_parents: HashSet<String> = HashSet::new();
+    affected_parents.insert(category_id.to_string());
+
+    // Execute all moves
+    for (child_id, new_parent_id) in &moves {
+        db.update_parent(child_id, new_parent_id).map_err(|e| e.to_string())?;
+
+        if let Some(new_parent) = db.get_node(new_parent_id).map_err(|e| e.to_string())? {
+            db.set_node_depth(child_id, new_parent.depth + 1).map_err(|e| e.to_string())?;
+        }
+
+        affected_parents.insert(new_parent_id.clone());
+    }
+
+    // Update counts and centroids for all affected parents
+    for parent_id in &affected_parents {
+        compute_and_store_centroid(db, parent_id);
+        let actual_count = db.get_children(parent_id).map_err(|e| e.to_string())?.len() as i32;
+        db.update_child_count(parent_id, actual_count).map_err(|e| e.to_string())?;
+    }
+
+    // Delete source category if now empty
+    let remaining = db.get_children(category_id).map_err(|e| e.to_string())?.len();
+    if remaining == 0 {
+        emit_log(app, "debug", &format!(
+            "    Deleting empty category '{}'",
+            category.ai_title.as_deref().unwrap_or(&category.title)
+        ));
+        db.delete_fos_edges_for_node(category_id).map_err(|e| e.to_string())?;
+        db.delete_edges_for_node(category_id).map_err(|e| e.to_string())?;
+        db.delete_node(category_id).map_err(|e| e.to_string())?;
+    }
+
+    Ok(moves.len())
+}
+
+/// Result struct for refinement
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefineCoherenceResult {
+    pub categories_analyzed: usize,
+    pub incoherent_found: usize,
+    pub children_relocated: usize,
+    pub categories_merged: usize,
+    pub iterations: usize,
+}
+
+// Default thresholds (used when not specified via CLI)
+const DEFAULT_COHERENCE_THRESHOLD: f32 = 0.45;
+const DEFAULT_MERGE_THRESHOLD: f32 = 0.65;
+const MAX_REFINE_ITERATIONS: usize = 10;
+
+/// Configuration for coherence refinement
+pub struct RefineConfig {
+    pub coherence_threshold: f32,  // Below = split category
+    pub merge_threshold: f32,      // Above = auto-merge
+    pub dry_run: bool,
+}
+
+impl Default for RefineConfig {
+    fn default() -> Self {
+        Self {
+            coherence_threshold: DEFAULT_COHERENCE_THRESHOLD,
+            merge_threshold: DEFAULT_MERGE_THRESHOLD,
+            dry_run: false,
+        }
+    }
+}
+
+/// Helper: merge cat_b into cat_a (reparent children, delete cat_b)
+fn merge_category_into(db: &Database, survivor_id: &str, to_delete_id: &str, app: Option<&AppHandle>) -> Result<(), String> {
+    let survivor = db.get_node(survivor_id).map_err(|e| e.to_string())?
+        .ok_or("Survivor category not found")?;
+    let to_delete = db.get_node(to_delete_id).map_err(|e| e.to_string())?
+        .ok_or("Category to delete not found")?;
+
+    emit_log(app, "info", &format!(
+        "    Merging '{}' into '{}'",
+        to_delete.ai_title.as_deref().unwrap_or(&to_delete.title),
+        survivor.ai_title.as_deref().unwrap_or(&survivor.title)
+    ));
+
+    let children = db.get_children(to_delete_id).map_err(|e| e.to_string())?;
+    for child in &children {
+        db.update_parent(&child.id, survivor_id).map_err(|e| e.to_string())?;
+    }
+
+    // Delete in FK order: fos_edges -> edges -> node
+    db.delete_fos_edges_for_node(to_delete_id).map_err(|e| e.to_string())?;
+    db.delete_edges_for_node(to_delete_id).map_err(|e| e.to_string())?;
+    db.delete_node(to_delete_id).map_err(|e| e.to_string())?;
+
+    // Update survivor
+    let new_count = db.get_children(survivor_id).map_err(|e| e.to_string())?.len();
+    db.update_child_count(survivor_id, new_count as i32).map_err(|e| e.to_string())?;
+    compute_and_store_centroid(db, survivor_id);
+
+    Ok(())
+}
+
+/// Main refinement function - iterates until stable
+pub async fn refine_hierarchy_coherence(
+    db: &Database,
+    app: Option<&AppHandle>,
+    config: RefineConfig,
+) -> Result<RefineCoherenceResult, String> {
+    emit_log(app, "info", "Starting coherence-based refinement...");
+
+    let protected = db.get_protected_node_ids();
+    let mut analyzed = 0usize;
+    let mut incoherent = 0usize;
+    let mut relocated = 0usize;
+    let mut merged = 0usize;
+    let mut iterations = 0;
+
+    loop {
+        iterations += 1;
+        if iterations > MAX_REFINE_ITERATIONS {
+            emit_log(app, "warn", &format!("Hit max iterations ({})", MAX_REFINE_ITERATIONS));
+            break;
+        }
+
+        let mut changes = 0;
+        let max_depth = db.get_max_depth().map_err(|e| e.to_string())?;
+
+        // Phase A: Top-down merge similar siblings first (consolidate before splitting)
+        emit_log(app, "debug", &format!("Iteration {} - Phase A: merging similar siblings", iterations));
+
+        for depth in 0..max_depth {
+            let parents = db.get_nodes_at_depth(depth).map_err(|e| e.to_string())?;
+
+            for parent in parents {
+                if parent.is_item || protected.contains(&parent.id) {
+                    continue;
+                }
+
+                let candidates = find_mergeable_siblings(db, &parent.id, config.merge_threshold)?;
+
+                for (cat_a, cat_b, sim) in &candidates {
+                    let node_a = match db.get_node(cat_a).map_err(|e| e.to_string())? {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    let node_b = match db.get_node(cat_b).map_err(|e| e.to_string())? {
+                        Some(n) => n,
+                        None => continue,
+                    };
+
+                    // Survivor = category with more children (or first if equal)
+                    let (survivor_id, to_delete_id) = if node_b.child_count > node_a.child_count {
+                        (cat_b.as_str(), cat_a.as_str())
+                    } else {
+                        (cat_a.as_str(), cat_b.as_str())
+                    };
+
+                    emit_log(app, "info", &format!("  Merging: sim={:.3}", sim));
+
+                    if !config.dry_run {
+                        merge_category_into(db, survivor_id, to_delete_id, app)?;
+                        merged += 1;
+                        changes += 1;
+                    }
+                }
+            }
+        }
+
+        // Phase B: Relocate misplaced children from incoherent categories
+        emit_log(app, "debug", &format!("Iteration {} - Phase B: relocating misplaced children", iterations));
+
+        // Bottom-up: check each category for coherence (depth >= 2 only)
+        // Skip top-layer categories to preserve hierarchy structure
+        for depth in (2..max_depth).rev() {
+            let nodes = db.get_nodes_at_depth(depth).map_err(|e| e.to_string())?;
+
+            for node in nodes {
+                if node.is_item || protected.contains(&node.id) {
+                    continue;
+                }
+
+                // Check if node still exists (may have been deleted)
+                if db.get_node(&node.id).map_err(|e| e.to_string())?.is_none() {
+                    continue;
+                }
+
+                analyzed += 1;
+
+                if let Some(coherence) = compute_category_coherence(db, &node.id)? {
+                    if coherence < config.coherence_threshold {
+                        incoherent += 1;
+                        emit_log(app, "debug", &format!(
+                            "Incoherent: '{}' (coh={:.3})",
+                            node.ai_title.as_deref().unwrap_or(&node.title), coherence
+                        ));
+
+                        if !config.dry_run {
+                            let moves = relocate_from_incoherent_category(
+                                db, &node.id, app
+                            )?;
+
+                            if moves > 0 {
+                                relocated += moves;
+                                changes += moves;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if changes == 0 {
+            emit_log(app, "info", &format!("Converged after {} iterations", iterations));
+            break;
+        }
+    }
+
+    Ok(RefineCoherenceResult {
+        categories_analyzed: analyzed,
+        incoherent_found: incoherent,
+        children_relocated: relocated,
+        categories_merged: merged,
+        iterations,
+    })
 }
 
 /// Names that indicate AI couldn't produce a meaningful grouping
@@ -1433,27 +2563,114 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
              context.parent_name, context.current_depth,
              hierarchy_path, sibling_names.len(), forbidden_names.len(), context.mandatory_clusters.len()));
 
-    // Get AI to group topics - use batching for large datasets
-    // Both paths have 120s timeout to prevent hanging
-    let groupings = if topics.len() > BATCH_THRESHOLD {
-        emit_log(app, "info", &format!("Large dataset ({} topics) - using batch processing", topics.len()));
-        group_topics_in_batches(&topics, &context, app, max_groups).await?
-    } else {
-        match timeout(
-            Duration::from_secs(120),
-            ai_client::group_topics_into_categories(&topics, &context, Some(max_groups))
-        ).await {
-            Ok(Ok(g)) => g,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                emit_log(app, "error", &format!("AI grouping timed out for {} after 120s", parent_id));
-                return Ok(false); // Signal failure, will be added to failed_nodes
+    // === Edge-based grouping (API-free for structural decisions) ===
+    // Group topics by connectivity of their papers - topics whose papers share edges stay together
+    let child_ids: Vec<String> = children.iter().map(|c| c.id.clone()).collect();
+    let min_group_size = 2;  // At least 2 topics to form a group
+    let min_component_size = 3;  // At least 3 papers to count as significant component
+
+    let edge_groups = group_topics_by_paper_connectivity(db, &child_ids, min_group_size, min_component_size)?;
+
+    let groupings = if edge_groups.len() >= 2 {
+        // Log compact summary: group sizes and first topic in each
+        let group_summary: String = edge_groups.iter()
+            .take(5)
+            .map(|g| format!("{}t", g.len()))
+            .collect::<Vec<_>>()
+            .join("/");
+        let extra = if edge_groups.len() > 5 { format!("/+{}", edge_groups.len() - 5) } else { String::new() };
+        emit_log(app, "info", &format!("  Edge grouping: {} children → {} groups ({}{})",
+            child_ids.len(), edge_groups.len(), group_summary, extra));
+
+        // Convert edge groups to CategoryGrouping format
+        let mut groupings: Vec<ai_client::CategoryGrouping> = Vec::new();
+
+        // Build id -> node lookup
+        let id_to_node: HashMap<&str, &Node> = children.iter()
+            .map(|n| (n.id.as_str(), n))
+            .collect();
+
+        for group in &edge_groups {
+            // Get nodes in this group
+            let group_nodes: Vec<&Node> = group.iter()
+                .filter_map(|id| id_to_node.get(id.as_str()).copied())
+                .collect();
+
+            if group_nodes.is_empty() {
+                continue;
             }
+
+            // Collect papers from all topics in this group for naming
+            let mut all_papers: Vec<Node> = Vec::new();
+            for topic_id in group {
+                if let Ok(topic_children) = db.get_children(topic_id) {
+                    for child in topic_children {
+                        if child.is_item {
+                            all_papers.push(child);
+                        }
+                    }
+                }
+            }
+
+            // Name the group using AI (only AI call - for naming, not structure)
+            let paper_refs: Vec<&Node> = all_papers.iter().collect();
+            let group_name = name_cluster_from_items(&paper_refs, &forbidden_names, app).await
+                .unwrap_or_else(|_| format!("Group {}", groupings.len() + 1));
+
+            // Get labels for topics in this group (for matching later)
+            let topic_labels: Vec<String> = group_nodes.iter()
+                .map(|node| {
+                    if node.is_item {
+                        node.ai_title.clone()
+                            .or_else(|| node.cluster_label.clone())
+                            .unwrap_or_else(|| node.title.clone())
+                    } else {
+                        node.cluster_label.clone()
+                            .or_else(|| node.ai_title.clone())
+                            .unwrap_or_else(|| node.title.clone())
+                    }
+                })
+                .collect();
+
+            groupings.push(ai_client::CategoryGrouping {
+                name: group_name,
+                description: None,
+                children: topic_labels,
+            });
+        }
+
+        // Log created group names (truncated)
+        let names: String = groupings.iter()
+            .take(4)
+            .map(|g| {
+                let name = &g.name;
+                if name.len() > 20 { format!("{}...", &name[..17]) } else { name.clone() }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let extra = if groupings.len() > 4 { format!(", +{}", groupings.len() - 4) } else { String::new() };
+        emit_log(app, "info", &format!("  Named: {}{}", names, extra));
+
+        groupings
+    } else {
+        // All topics are connected (one component) or edge data too sparse
+        let reason = if edge_groups.len() == 1 { "all connected" } else { "edges too sparse" };
+        emit_log(app, "info", &format!("  Edge grouping: {} children → {} groups ({}) - skip",
+            child_ids.len(), edge_groups.len(), reason));
+
+        // Fall back to embedding-based clustering for items, or skip for categories
+        let non_item_count = children.iter().filter(|c| !c.is_item).count();
+        if non_item_count == 0 {
+            emit_log(app, "info", "  Fallback: embedding clustering for items");
+            return cluster_items_by_embedding(db, parent_id, &children, app).await;
+        } else {
+            return Ok(false);
         }
     };
 
     if groupings.is_empty() {
-        return Err("AI returned no groupings".to_string());
+        emit_log(app, "info", "No valid groupings produced");
+        return Ok(false);
     }
 
     // Filter out garbage category names (indicates AI couldn't produce meaningful groups)
@@ -2297,6 +3514,34 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
         Err(e) => emit_log(app, "warn", &format!("Tag bootstrap failed (non-fatal): {}", e)),
     }
 
+    // Create semantic edges BEFORE hierarchy building (needed for edge-based grouping)
+    let semantic_edges_created = if db.get_nodes_with_embeddings().map(|v| v.len()).unwrap_or(0) > 1 {
+        emit_log(app, "info", "");
+        emit_log(app, "info", "Creating semantic edges from embeddings (for edge-based grouping)...");
+
+        // Delete old semantic edges first
+        if let Ok(deleted) = db.delete_semantic_edges() {
+            if deleted > 0 {
+                emit_log(app, "info", &format!("  Cleared {} old semantic edges", deleted));
+            }
+        }
+
+        // Create new edges: min 50% similarity, max 5 edges per node
+        match db.create_semantic_edges(0.5, 5) {
+            Ok(created) => {
+                emit_log(app, "info", &format!("✓ Created {} semantic edges", created));
+                created
+            }
+            Err(e) => {
+                emit_log(app, "warn", &format!("Failed to create semantic edges: {}", e));
+                0
+            }
+        }
+    } else {
+        emit_log(app, "info", "Skipping semantic edges (no embeddings yet)");
+        0
+    };
+
     // Step 3: Build initial hierarchy
     emit_log(app, "info", "");
     emit_log(app, "info", "▶ Phase 3: Building initial hierarchy structure");
@@ -2337,168 +3582,25 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
             .unwrap_or(false)
     });
 
-    let mut project_umbrellas_created = 0;
-
-    if is_code_only {
-        // Step 4: Skip for code-only databases
-        emit_log(app, "info", "");
-        emit_log(app, "info", "▶ Phase 4: Skipped (code-only database, no project detection needed)");
-        emit_log(app, "info", "───────────────────────────────────────────────────────────");
-        emit_progress(app, AiProgressEvent {
-            current: 4,
-            total: 7,
-            node_title: "Phase 4: Skipped".to_string(),
-            new_title: "Code-only database".to_string(),
-            emoji: Some("⏭️".to_string()),
-            status: "processing".to_string(),
-            error_message: None,
-            elapsed_secs: Some(total_start.elapsed().as_secs_f64()),
-            estimate_secs: None,
-            remaining_secs: None,
-        });
-    } else {
-        // Step 4: Detect and create project umbrellas
-        emit_log(app, "info", "");
-        emit_log(app, "info", "▶ Phase 4: Creating project umbrella categories");
-        emit_log(app, "info", "───────────────────────────────────────────────────────────");
-        emit_progress(app, AiProgressEvent {
-            current: 4,
-            total: 7,
-            node_title: "Phase 4: Project detection".to_string(),
-            new_title: "Detecting major projects...".to_string(),
-            emoji: Some("📦".to_string()),
-            status: "processing".to_string(),
-            error_message: None,
-            elapsed_secs: Some(total_start.elapsed().as_secs_f64()),
-            estimate_secs: None,
-            remaining_secs: None,
-        });
-        emit_log(app, "info", "Collecting capitalized words from titles...");
-
-        // Step 1: Collect ALL capitalized words (very loose, 5+ occurrences)
-        let candidates = ai_client::collect_capitalized_words(db);
-
-    if candidates.is_empty() {
-        emit_log(app, "info", "No capitalized words found (need 5+ occurrences)");
-    } else {
-        emit_log(app, "info", &format!("Found {} capitalized words, asking AI to detect projects...", candidates.len()));
-
-        // Show top 10 candidates
-        for candidate in candidates.iter().take(10) {
-            emit_log(app, "info", &format!("  {} ({} occurrences)", candidate.word, candidate.count));
-        }
-        if candidates.len() > 10 {
-            emit_log(app, "info", &format!("  ... and {} more", candidates.len() - 10));
-        }
-
-        // Step 2: AI detects which are actual user projects
-        let major_projects = ai_client::detect_projects_with_ai(db, candidates).await;
-
-        if major_projects.is_empty() {
-            emit_log(app, "info", "AI detected no user projects");
-        } else {
-            emit_log(app, "info", &format!("AI detected {} user projects:", major_projects.len()));
-            for project in &major_projects {
-                emit_log(app, "info", &format!("  ✓ {} ({} items, {:.1}%)", project.name, project.item_count, project.percentage));
-            }
-
-        // Get universe node
-        let universe = db.get_universe().map_err(|e| e.to_string())?
-            .ok_or("No universe node found")?;
-
-        for project in &major_projects {
-            // Find parent topics of items containing this project name
-            let mut topic_ids_to_move: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-            for item_id in &project.item_ids {
-                if let Ok(Some(item)) = db.get_node(item_id) {
-                    if let Some(parent_id) = &item.parent_id {
-                        // Only move topics (non-items) that are direct children of universe
-                        if let Ok(Some(parent)) = db.get_node(parent_id) {
-                            if !parent.is_item && parent.parent_id.as_ref() == Some(&universe.id) {
-                                topic_ids_to_move.insert(parent_id.clone());
-                            }
-                        }
-                    }
-                }
-            }
-
-            if topic_ids_to_move.is_empty() {
-                emit_log(app, "info", &format!("  Skipping '{}': no eligible topics to move", project.name));
-                continue;
-            }
-
-            // Create project umbrella node under universe
-            let umbrella_id = format!("project-{}", project.name.to_lowercase().replace(' ', "-"));
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64;
-            let umbrella = crate::db::Node {
-                id: umbrella_id.clone(),
-                node_type: crate::db::NodeType::Thought,
-                title: project.name.clone(),
-                url: None,
-                content: None,
-                position: crate::db::Position { x: 0.0, y: 0.0 },
-                created_at: now,
-                updated_at: now,
-                cluster_id: None,
-                cluster_label: Some(project.name.clone()),
-                depth: 1,
-                is_item: false,
-                is_universe: false,
-                parent_id: Some(universe.id.clone()),
-                child_count: topic_ids_to_move.len() as i32,
-                ai_title: Some(project.name.clone()),
-                summary: Some(format!("Project umbrella for {} ({} items)", project.name, project.item_count)),
-                tags: None,
-                emoji: Some("📦".to_string()),
-                is_processed: true,
-                conversation_id: None,
-                sequence_index: None,
-                is_pinned: false,
-                last_accessed_at: None,
-                latest_child_date: None,
-                is_private: None,
-                privacy_reason: None,
-                source: None,
-                pdf_available: None,
-                content_type: None,
-                associated_idea_id: None,
-                privacy: None,
-            };
-
-            // Insert umbrella node
-            if let Err(e) = db.insert_node(&umbrella) {
-                emit_log(app, "warn", &format!("  Failed to create umbrella for '{}': {}", project.name, e));
-                continue;
-            }
-
-            // Reparent topics under the umbrella
-            let mut moved_count = 0;
-            for topic_id in &topic_ids_to_move {
-                if let Err(e) = db.update_node_parent(topic_id, &umbrella_id) {
-                    emit_log(app, "warn", &format!("    Failed to move topic {}: {}", topic_id, e));
-                } else {
-                    // Update depth of moved topic and its subtree
-                    if let Err(e) = db.increment_subtree_depth_by(topic_id, 1) {
-                        emit_log(app, "warn", &format!("    Failed to update depth for {}: {}", topic_id, e));
-                    }
-                    moved_count += 1;
-                }
-            }
-
-            emit_log(app, "info", &format!("  ✓ Created '{}' umbrella with {} topics", project.name, moved_count));
-            project_umbrellas_created += 1;
-        }
-        } // end inner else (AI validated projects)
-    } // end outer else (candidate_projects not empty)
-
-    if project_umbrellas_created > 0 {
-        emit_log(app, "info", &format!("✓ Created {} project umbrella categories", project_umbrellas_created));
-    }
-    } // end else (not code-only)
+    // Phase 4: Project detection - DISABLED
+    // Edge-based grouping handles organization better than keyword-based project detection.
+    // The detect_projects_with_ai call was also Anthropic-only.
+    let _is_code_only = is_code_only; // suppress unused warning
+    emit_log(app, "info", "");
+    emit_log(app, "info", "▶ Phase 4: Skipped (project detection disabled, using edge-based grouping)");
+    emit_log(app, "info", "───────────────────────────────────────────────────────────");
+    emit_progress(app, AiProgressEvent {
+        current: 4,
+        total: 7,
+        node_title: "Phase 4: Skipped".to_string(),
+        new_title: "Using edge-based grouping".to_string(),
+        emoji: Some("⏭️".to_string()),
+        status: "processing".to_string(),
+        error_message: None,
+        elapsed_secs: Some(total_start.elapsed().as_secs_f64()),
+        estimate_secs: None,
+        remaining_secs: None,
+    });
 
     // Step 4.5: Consolidate Universe into uber-categories if it has too many direct children
     let universe = db.get_universe().map_err(|e| e.to_string())?
@@ -2513,9 +3615,9 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
         emit_log(app, "info", "───────────────────────────────────────────────────────────");
 
         // Build TopicInfo for uber-category grouping
-        // IMPORTANT: Filter out project-* and category-personal nodes - they should stay at depth 1
+        // Filter out category-personal - it should stay at depth 1
         let categories: Vec<ai_client::TopicInfo> = universe_children.iter()
-            .filter(|c| !c.id.starts_with("project-") && c.id != "category-personal")
+            .filter(|c| c.id != "category-personal")
             .map(|c| ai_client::TopicInfo {
                 id: c.id.clone(),
                 label: c.cluster_label.clone()
@@ -2525,127 +3627,130 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
             })
             .collect();
 
-        // Get persistent tag anchors for uber-category hints
-        let tag_anchors = crate::tags::get_tag_anchors(db);
-        if !tag_anchors.is_empty() {
-            emit_log(app, "info", &format!("  Using {} persistent tags as category anchors", tag_anchors.len()));
-        }
+        // Edge-based uber-category grouping: topics group by cross-edges between their papers
+        let topic_ids: Vec<String> = categories.iter().map(|c| c.id.clone()).collect();
+        let min_cross_edges = 5; // Minimum edges between topics to consider them connected
 
-        // Pre-fetch embeddings for similarity-sorted batching
-        let embeddings_map: std::collections::HashMap<String, Vec<f32>> = categories
-            .iter()
-            .filter_map(|c| {
-                db.get_node_embedding(&c.id)
-                    .ok()
-                    .flatten()
-                    .map(|emb| (c.id.clone(), emb))
-            })
-            .collect();
-        emit_log(app, "info", &format!("  Fetched {}/{} topic embeddings for similarity sorting", embeddings_map.len(), categories.len()));
+        emit_log(app, "info", &format!("  Finding connected topic groups (min_cross_edges={})", min_cross_edges));
 
-        // Call AI to group into uber-categories (similarity-sorted batching for coherent groups)
-        match ai_client::group_into_uber_categories(&categories, &embeddings_map, Some(&tag_anchors)).await {
-            Ok(groupings) if !groupings.is_empty() => {
-                // Filter out garbage names from uber-categories (same pattern as cluster_hierarchy_level)
-                let groupings: Vec<_> = groupings.into_iter()
-                    .filter(|g| !is_garbage_name(&g.name))
+        match group_topics_by_edges(db, &topic_ids, min_cross_edges) {
+            Ok(groups) => {
+                // Filter to groups with 2+ topics (singleton groups stay under Universe)
+                let multi_topic_groups: Vec<_> = groups.into_iter()
+                    .filter(|g| g.len() >= 2)
                     .collect();
 
-                if groupings.is_empty() {
-                    emit_log(app, "warn", "  All uber-categories were garbage names, skipping consolidation");
+                if multi_topic_groups.is_empty() {
+                    emit_log(app, "info", "  No connected topic groups found - topics stay under Universe");
                 } else {
-                emit_log(app, "info", &format!("  AI created {} uber-categories (after filtering)", groupings.len()));
+                    emit_log(app, "info", &format!("  Found {} connected groups (2+ topics each)", multi_topic_groups.len()));
 
-                // Create map from label -> child nodes
-                let mut label_to_children: std::collections::HashMap<String, Vec<&Node>> = std::collections::HashMap::new();
-                for child in &universe_children {
-                    let label = child.cluster_label.as_ref()
-                        .or(child.ai_title.as_ref())
-                        .unwrap_or(&child.title)
-                        .clone();
-                    label_to_children.entry(label).or_default().push(child);
-                }
-
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis();
-                let now = timestamp as i64;
-
-                for (idx, grouping) in groupings.iter().enumerate() {
-                    // Find matching children
-                    let matching_children: Vec<&Node> = grouping.children.iter()
-                        .flat_map(|label| label_to_children.get(label).cloned().unwrap_or_default())
+                    // Create map from topic_id -> child node
+                    let topic_id_to_node: std::collections::HashMap<&str, &Node> = universe_children.iter()
+                        .map(|n| (n.id.as_str(), n))
                         .collect();
 
-                    if matching_children.len() < 2 {
-                        continue; // Skip single-child groups
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis();
+                    let now = timestamp as i64;
+
+                    for (idx, group) in multi_topic_groups.iter().enumerate() {
+                        // Get all papers in this group for naming
+                        let mut all_papers: Vec<Node> = Vec::new();
+                        for topic_id in group {
+                            if let Ok(children) = db.get_children(topic_id) {
+                                for child in children {
+                                    if child.is_item {
+                                        all_papers.push(child);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Name the uber-category from its papers (AI only for naming)
+                        let paper_refs: Vec<&Node> = all_papers.iter().collect();
+                        let uber_name = name_cluster_from_items(&paper_refs, &[], app).await
+                            .unwrap_or_else(|_| format!("Topic Group {}", idx + 1));
+
+                        // Skip garbage names
+                        if is_garbage_name(&uber_name) {
+                            emit_log(app, "debug", &format!("  Skipping garbage name: '{}'", uber_name));
+                            continue;
+                        }
+
+                        // Get matching topic nodes
+                        let matching_topics: Vec<&Node> = group.iter()
+                            .filter_map(|id| topic_id_to_node.get(id.as_str()).copied())
+                            .collect();
+
+                        if matching_topics.len() < 2 {
+                            continue;
+                        }
+
+                        // Create uber-category node
+                        let uber_id = format!("uber-{}-{}", timestamp, idx);
+                        let uber_node = Node {
+                            id: uber_id.clone(),
+                            node_type: NodeType::Cluster,
+                            title: uber_name.clone(),
+                            url: None,
+                            content: None,
+                            position: Position { x: 0.0, y: 0.0 },
+                            created_at: now,
+                            updated_at: now,
+                            cluster_id: None,
+                            cluster_label: Some(uber_name.clone()),
+                            depth: 1,
+                            is_item: false,
+                            is_universe: false,
+                            parent_id: Some(universe.id.clone()),
+                            child_count: matching_topics.len() as i32,
+                            ai_title: None,
+                            summary: None,
+                            tags: None,
+                            emoji: None,
+                            is_processed: false,
+                            conversation_id: None,
+                            sequence_index: None,
+                            is_pinned: false,
+                            last_accessed_at: None,
+                            latest_child_date: None,
+                            is_private: None,
+                            privacy_reason: None,
+                            source: None,
+                            pdf_available: None,
+                            content_type: None,
+                            associated_idea_id: None,
+                            privacy: None,
+                        };
+
+                        db.insert_node(&uber_node).map_err(|e| e.to_string())?;
+
+                        // Reparent topics to the uber-category
+                        for topic in &matching_topics {
+                            db.update_parent(&topic.id, &uber_id).map_err(|e| e.to_string())?;
+                        }
+
+                        // Increment depths of reparented subtrees
+                        let topic_child_ids: Vec<String> = matching_topics.iter().map(|t| t.id.clone()).collect();
+                        db.increment_multiple_subtrees_depth(&topic_child_ids).map_err(|e| e.to_string())?;
+
+                        // Compute centroid for the new uber-category
+                        compute_and_store_centroid(db, &uber_id);
+
+                        uber_categories_created += 1;
+                        emit_log(app, "info", &format!("  Created '{}' with {} topics ({} papers)", uber_name, matching_topics.len(), all_papers.len()));
                     }
 
-                    // Create uber-category node
-                    let uber_id = format!("uber-{}-{}", timestamp, idx);
-                    let uber_node = Node {
-                        id: uber_id.clone(),
-                        node_type: NodeType::Cluster,
-                        title: grouping.name.clone(),
-                        url: None,
-                        content: grouping.description.clone(),
-                        position: Position { x: 0.0, y: 0.0 },
-                        created_at: now,
-                        updated_at: now,
-                        cluster_id: None,
-                        cluster_label: Some(grouping.name.clone()),
-                        depth: 1,
-                        is_item: false,
-                        is_universe: false,
-                        parent_id: Some(universe.id.clone()),
-                        child_count: matching_children.len() as i32,
-                        ai_title: None,
-                        summary: grouping.description.clone(),
-                        tags: None,
-                        emoji: None,
-                        is_processed: false,
-                        conversation_id: None,
-                        sequence_index: None,
-                        is_pinned: false,
-                        last_accessed_at: None,
-                        latest_child_date: None,
-                        is_private: None,
-                        privacy_reason: None,
-                        source: None,
-                        pdf_available: None,
-                        content_type: None,
-                        associated_idea_id: None,
-                        privacy: None,
-                    };
-
-                    db.insert_node(&uber_node).map_err(|e| e.to_string())?;
-
-                    // Reparent children to the uber-category (skip project/personal nodes - safety check)
-                    let reparentable: Vec<_> = matching_children.iter()
-                        .filter(|c| !c.id.starts_with("project-") && c.id != "category-personal")
-                        .collect();
-
-                    for child in &reparentable {
-                        db.update_parent(&child.id, &uber_id).map_err(|e| e.to_string())?;
+                    if uber_categories_created > 0 {
+                        emit_log(app, "info", &format!("✓ Consolidated into {} uber-categories (edge-based, centroids computed)", uber_categories_created));
                     }
-
-                    // Increment depths of reparented subtrees
-                    let child_ids: Vec<String> = reparentable.iter().map(|c| c.id.clone()).collect();
-                    db.increment_multiple_subtrees_depth(&child_ids).map_err(|e| e.to_string())?;
-
-                    uber_categories_created += 1;
-                    emit_log(app, "info", &format!("  Created '{}' with {} children", grouping.name, matching_children.len()));
                 }
-
-                emit_log(app, "info", &format!("✓ Consolidated into {} uber-categories", uber_categories_created));
-                } // end if groupings not empty after filtering
-            }
-            Ok(_) => {
-                emit_log(app, "warn", "  AI returned no uber-categories, skipping consolidation");
             }
             Err(e) => {
-                emit_log(app, "warn", &format!("  Uber-category grouping failed: {}", e));
+                emit_log(app, "warn", &format!("  Edge-based uber-category grouping failed: {}", e));
             }
         }
     }
@@ -2746,6 +3851,41 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
     let final_max_depth = db.get_max_depth().map_err(|e| e.to_string())?;
     emit_log(app, "info", &format!("  Final hierarchy depth: {}", final_max_depth));
 
+    // Phase 5.5: Coherence refinement
+    emit_log(app, "info", "");
+    emit_log(app, "info", "Phase 5.5: Coherence refinement (split incoherent, merge similar)");
+    emit_log(app, "info", "-------------------------------------------------------------");
+    emit_progress(app, AiProgressEvent {
+        current: 5,
+        total: 7,
+        node_title: "Phase 5.5: Coherence".to_string(),
+        new_title: "Refining hierarchy coherence...".to_string(),
+        emoji: Some("".to_string()),
+        status: "processing".to_string(),
+        error_message: None,
+        elapsed_secs: Some(total_start.elapsed().as_secs_f64()),
+        estimate_secs: None,
+        remaining_secs: None,
+    });
+
+    let refine_result = refine_hierarchy_coherence(db, app, RefineConfig::default()).await?;
+    emit_log(app, "info", &format!(
+        "  Relocated {} children, merged {} similar categories",
+        refine_result.children_relocated, refine_result.categories_merged
+    ));
+
+    // Fix any depth inconsistencies from splitting
+    let depths_fixed = db.fix_all_depths().map_err(|e| e.to_string())?;
+    if depths_fixed > 0 {
+        emit_log(app, "info", &format!("  Fixed {} node depths after refinement", depths_fixed));
+    }
+
+    // Recalculate depth after refinement
+    let post_refine_depth = db.get_max_depth().map_err(|e| e.to_string())?;
+    if post_refine_depth != final_max_depth {
+        emit_log(app, "info", &format!("  Hierarchy depth after refinement: {}", post_refine_depth));
+    }
+
     // Step 6: Generate embeddings for ALL nodes that need them (if OpenAI key available)
     emit_log(app, "info", "");
     emit_log(app, "info", "▶ Phase 6: Generating embeddings for semantic search");
@@ -2840,32 +3980,8 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
         (0, 0)
     };
 
-    // Create semantic edges based on embedding similarity (part of Step 6)
-    let semantic_edges_created = if embeddings_generated > 0 || db.get_nodes_with_embeddings().map(|v| v.len()).unwrap_or(0) > 1 {
-        emit_log(app, "info", "");
-        emit_log(app, "info", "Creating semantic edges from embeddings...");
-
-        // Delete old AI-generated semantic edges first
-        if let Ok(deleted) = db.delete_semantic_edges() {
-            if deleted > 0 {
-                emit_log(app, "info", &format!("  Cleared {} old semantic edges", deleted));
-            }
-        }
-
-        // Create new edges: min 50% similarity, max 5 edges per node
-        match db.create_semantic_edges(0.5, 5) {
-            Ok(created) => {
-                emit_log(app, "info", &format!("✓ Created {} semantic edges", created));
-                created
-            }
-            Err(e) => {
-                emit_log(app, "warn", &format!("Failed to create semantic edges: {}", e));
-                0
-            }
-        }
-    } else {
-        0
-    };
+    // Note: Semantic edges are now created earlier (before hierarchy building)
+    // to enable edge-based grouping. Variable semantic_edges_created is set above.
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Phase 7: Associate supporting items with ideas
@@ -2911,6 +4027,18 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
         }
     };
 
+    // Create edges between sibling categories from paper cross-counts
+    emit_log(app, "info", "");
+    emit_log(app, "info", "───────────────────────────────────────────────────────────");
+    emit_log(app, "info", "Creating category edges from paper cross-counts...");
+    let sibling_edges_created = match create_category_edges_from_cross_counts(db, app) {
+        Ok(count) => count,
+        Err(e) => {
+            emit_log(app, "warn", &format!("  Failed to create category edges: {}", e));
+            0
+        }
+    };
+
     // Update edge parent columns for fast per-view lookups
     emit_log(app, "info", "");
     emit_log(app, "info", "───────────────────────────────────────────────────────────");
@@ -2935,6 +4063,7 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
     emit_log(app, "info", &format!("  • {} grouping iterations", grouping_iterations));
     emit_log(app, "info", &format!("  • {} hierarchy levels (depth 0-{})", final_max_depth + 1, final_max_depth));
     emit_log(app, "info", &format!("  • {} semantic edges", semantic_edges_created));
+    emit_log(app, "info", &format!("  • {} sibling category edges", sibling_edges_created));
     emit_log(app, "info", &format!("  • {} edges indexed for views", edges_indexed));
     emit_log(app, "info", &format!("  • {} categories with propagated privacy", privacy_propagated));
     emit_log(app, "info", &format!("  • Total time: {:.1}s", total_elapsed));

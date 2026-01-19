@@ -2,6 +2,33 @@
 
 All notable changes to Mycelica will be documented in this file.
 
+## [0.8.4] - 2026-01-19
+
+### Changed
+- **Edge-based hierarchy building**: Structural decisions now use paper connectivity instead of AI
+  - Uber-category grouping: Topics group by cross-edge counts between their papers
+  - Recursive grouping: Subcategories form from connected components in paper edge graph
+  - Deterministic and free (no API calls for structure, only for naming)
+- **Ollama-first naming**: Cluster naming prefers local Ollama when available
+  - Falls back to Anthropic API only if Ollama not running
+  - Simpler prompt that works for both models
+- **Disabled project detection**: Phase 4 skipped (edge-based grouping handles organization better)
+
+### Added
+- **Sibling category edges**: New `sibling` edge type between categories
+  - Weight derived from paper cross-edge counts (normalized by smaller category size)
+  - Created after hierarchy build for graph visualization
+  - Query with `edges WHERE type = 'sibling'`
+- `delete_edges_by_type()` helper in schema
+
+### Technical
+- `create_category_edges_from_cross_counts()` creates edges between sibling categories
+- `group_topics_by_paper_connectivity()` finds connected components for recursive grouping
+- `map_topics_to_components()` assigns topics to dominant paper component
+- Pipeline reordered: semantic edges created before hierarchy build (enables edge-based grouping on first run)
+
+---
+
 ## [0.8.3] - 2026-01-16
 
 ### Added
