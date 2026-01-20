@@ -487,7 +487,23 @@ enum HierarchyCommands {
     /// Build hierarchy (initial)
     Build,
     /// Rebuild hierarchy from scratch
-    Rebuild,
+    Rebuild {
+        /// Algorithm: classic or dendrogram
+        #[arg(long, default_value = "classic")]
+        algorithm: String,
+        /// Target number of hierarchy levels (dendrogram only)
+        #[arg(long, default_value = "4")]
+        levels: usize,
+        /// Threshold method: dynamic, gap, percentile, or fixed (dendrogram only)
+        #[arg(long, default_value = "dynamic")]
+        method: String,
+        /// Minimum component size to create named category (dendrogram only)
+        #[arg(long, default_value = "5")]
+        min_size: usize,
+        /// Custom thresholds for fixed method (comma-separated, e.g. "0.8,0.7,0.6,0.5")
+        #[arg(long)]
+        thresholds: Option<String>,
+    },
     /// Rebuild without AI (keyword-based)
     RebuildLite,
     /// Flatten single-child chains
@@ -1753,14 +1769,29 @@ async fn handle_hierarchy(cmd: HierarchyCommands, db: &Database, json: bool, qui
                 log!("Hierarchy built successfully");
             }
         }
-        HierarchyCommands::Rebuild => {
-            if !quiet { elog!("Rebuilding hierarchy (this may take a while)..."); }
-            db.delete_hierarchy_nodes().map_err(|e| e.to_string())?;
-            hierarchy::build_hierarchy(db)?;
-            if json {
-                log!(r#"{{"status":"ok"}}"#);
-            } else {
-                log!("Hierarchy rebuilt successfully");
+        HierarchyCommands::Rebuild { algorithm, levels, method, min_size, thresholds } => {
+            match algorithm.as_str() {
+                "dendrogram" => {
+                    if !quiet { elog!("Rebuilding hierarchy with dendrogram algorithm..."); }
+                    let result = rebuild_hierarchy_dendrogram(db, levels, &method, min_size, thresholds.as_deref(), json, quiet).await?;
+                    if json {
+                        log!(r#"{{"status":"ok","categories":{},"papers_assigned":{},"ai_calls":{}}}"#,
+                            result.categories, result.papers_assigned, result.ai_calls);
+                    } else {
+                        log!("Hierarchy rebuilt: {} categories, {} papers assigned, {} AI naming calls",
+                            result.categories, result.papers_assigned, result.ai_calls);
+                    }
+                }
+                "classic" | _ => {
+                    if !quiet { elog!("Rebuilding hierarchy (classic algorithm)..."); }
+                    db.delete_hierarchy_nodes().map_err(|e| e.to_string())?;
+                    hierarchy::build_hierarchy(db)?;
+                    if json {
+                        log!(r#"{{"status":"ok"}}"#);
+                    } else {
+                        log!("Hierarchy rebuilt successfully");
+                    }
+                }
             }
         }
         HierarchyCommands::RebuildLite => {
@@ -1985,6 +2016,393 @@ fn handle_dendrogram_test(db: &Database, target_levels: usize, method: &str, jso
     }
 
     Ok(())
+}
+
+// ============================================================================
+// Dendrogram Rebuild
+// ============================================================================
+
+struct DendrogramRebuildResult {
+    categories: usize,
+    papers_assigned: usize,
+    ai_calls: usize,
+}
+
+async fn rebuild_hierarchy_dendrogram(
+    db: &Database,
+    target_levels: usize,
+    method: &str,
+    min_component_size: usize,
+    custom_thresholds: Option<&str>,
+    _json: bool,
+    quiet: bool,
+) -> Result<DendrogramRebuildResult, String> {
+    use mycelica_lib::dendrogram::{build_dendrogram, find_natural_thresholds, find_percentile_thresholds, fixed_thresholds, find_dynamic_thresholds, extract_levels, subdivide_component, Component};
+    use mycelica_lib::ai_client;
+    use mycelica_lib::db::{Node, NodeType, Position};
+    use std::time::Instant;
+    use std::collections::{HashMap, HashSet};
+
+    let start = Instant::now();
+    let now = chrono::Utc::now().timestamp_millis();
+
+    // Step 1: Clear existing hierarchy
+    if !quiet { elog!("Step 1/6: Clearing existing hierarchy..."); }
+    db.delete_hierarchy_nodes().map_err(|e| e.to_string())?;
+
+    // Step 2: Load edges
+    if !quiet { elog!("Step 2/6: Loading edges..."); }
+    let edges = db.get_all_item_edges_sorted().map_err(|e| e.to_string())?;
+    if edges.is_empty() {
+        return Err("No edges found. Run 'mycelica-cli setup' to create semantic edges first.".to_string());
+    }
+    if !quiet { elog!("  {} edges loaded", edges.len()); }
+
+    // Extract unique paper IDs
+    let mut paper_set = std::collections::HashSet::new();
+    for (source, target, _) in &edges {
+        paper_set.insert(source.clone());
+        paper_set.insert(target.clone());
+    }
+    let papers: Vec<String> = paper_set.into_iter().collect();
+    if !quiet { elog!("  {} unique papers", papers.len()); }
+
+    // Step 3: Build dendrogram
+    if !quiet { elog!("Step 3/6: Building dendrogram..."); }
+    let dendrogram = build_dendrogram(papers.clone(), edges.clone());
+    if !quiet { elog!("  {} merges recorded", dendrogram.merges.len()); }
+
+    // Step 4: Find thresholds and extract levels
+    // Thresholds are returned DESCENDING (highest/tightest first)
+    // We need to process ASCENDING (lowest/broadest first) for proper nesting
+    if !quiet { elog!("Step 4/6: Finding thresholds (method={})...", method); }
+    let mut thresholds = match method {
+        "gap" => find_natural_thresholds(&dendrogram, target_levels),
+        "percentile" => find_percentile_thresholds(&dendrogram, target_levels),
+        "fixed" => {
+            // Parse custom thresholds or use defaults
+            if let Some(t_str) = custom_thresholds {
+                let parsed: Vec<f64> = t_str.split(',')
+                    .filter_map(|s| s.trim().parse::<f64>().ok())
+                    .collect();
+                if parsed.is_empty() {
+                    return Err(format!("Invalid thresholds: '{}'. Use comma-separated decimals like '0.8,0.7,0.6,0.5'", t_str));
+                }
+                fixed_thresholds(&parsed)
+            } else {
+                fixed_thresholds(&[0.8, 0.7, 0.6, 0.5])
+            }
+        }
+        "dynamic" => {
+            // Dynamic: find thresholds where component count meaningfully changes
+            // target_levels becomes max_levels (optional cap)
+            let max_levels = if target_levels > 0 { Some(target_levels) } else { None };
+            find_dynamic_thresholds(&dendrogram, max_levels, Some(0.05), Some(0.5), Some(0.95))
+        }
+        _ => find_percentile_thresholds(&dendrogram, target_levels),
+    };
+    if !quiet { elog!("  Thresholds (descending): {:?}", thresholds); }
+
+    // Reverse thresholds to process broadest (lowest threshold) first
+    thresholds.reverse();
+    if !quiet { elog!("  Processing order (ascending): {:?}", thresholds); }
+
+    let levels = extract_levels(&dendrogram, &thresholds);
+    if !quiet { elog!("  {} levels extracted", levels.levels.len()); }
+
+    // Step 5: Create nested category hierarchy
+    if !quiet { elog!("Step 5/6: Creating nested category hierarchy..."); }
+
+    // Get all paper nodes for naming
+    let all_nodes = db.get_all_nodes(true).map_err(|e| e.to_string())?;
+    let node_map: HashMap<String, &Node> = all_nodes.iter()
+        .map(|n| (n.id.clone(), n))
+        .collect();
+
+    // Count edges per paper for selecting most-connected samples
+    let mut edge_counts: HashMap<String, usize> = HashMap::new();
+    for (source, target, _) in &edges {
+        *edge_counts.entry(source.clone()).or_insert(0) += 1;
+        *edge_counts.entry(target.clone()).or_insert(0) += 1;
+    }
+
+    let mut categories_created = 0;
+    let mut papers_assigned = 0;
+    let mut ai_calls = 0;
+
+    // Create Universe node first
+    let universe_id = format!("universe-{}", uuid::Uuid::new_v4());
+    let universe_node = Node {
+        id: universe_id.clone(),
+        node_type: NodeType::Cluster,
+        title: "Universe".to_string(),
+        url: None,
+        content: None,
+        position: Position { x: 0.0, y: 0.0 },
+        created_at: now,
+        updated_at: now,
+        cluster_id: None,
+        cluster_label: None,
+        depth: 0,
+        is_item: false,
+        is_universe: true,
+        parent_id: None,
+        child_count: 0, // Will update later
+        ai_title: None,
+        summary: None,
+        tags: None,
+        emoji: None,
+        is_processed: true,
+        conversation_id: None,
+        sequence_index: None,
+        is_pinned: false,
+        last_accessed_at: None,
+        latest_child_date: None,
+        is_private: None,
+        privacy_reason: None,
+        source: None,
+        pdf_available: None,
+        content_type: None,
+        associated_idea_id: None,
+        privacy: None,
+    };
+    db.insert_node(&universe_node).map_err(|e| e.to_string())?;
+
+    // Track component -> category_id mapping for parent lookup
+    // Key: (level_idx, component_idx), Value: category_id
+    let mut component_to_category: HashMap<(usize, usize), String> = HashMap::new();
+
+    // Track which papers end up in which leaf category
+    let mut paper_to_leaf_category: HashMap<String, String> = HashMap::new();
+
+    let mut forbidden_names: Vec<String> = vec!["Universe".to_string()];
+
+    // Helper: find parent component at previous level
+    fn find_parent_component_idx(
+        child: &Component,
+        parent_level: &[Component],
+    ) -> Option<usize> {
+        let sample_paper = child.papers.first()?;
+        parent_level.iter()
+            .position(|parent| parent.papers.contains(sample_paper))
+    }
+
+    // Step 6: Process levels from broadest to most specific
+    if !quiet { elog!("Step 6/6: Naming and creating categories..."); }
+
+    let num_levels = levels.levels.len();
+    for (level_idx, level_components) in levels.levels.iter().enumerate() {
+        let threshold = thresholds.get(level_idx).copied().unwrap_or(0.0);
+        let depth = level_idx + 1; // Universe is depth 0
+
+        // Filter to nameable components at this level
+        let nameable: Vec<(usize, &Component)> = level_components.iter()
+            .enumerate()
+            .filter(|(_, c)| c.papers.len() >= min_component_size)
+            .collect();
+
+        // Subdivide giant components (>500 papers) into smaller ones
+        const MAX_COMPONENT_SIZE: usize = 500;
+        let mut components_to_process: Vec<(usize, Component)> = Vec::new();
+
+        for (comp_idx, component) in &nameable {
+            if component.papers.len() > MAX_COMPONENT_SIZE {
+                // Giant component: subdivide it
+                let subdivided = subdivide_component(component, &edges, MAX_COMPONENT_SIZE);
+                if !quiet && subdivided.len() > 1 {
+                    elog!("    Subdivided giant ({} papers) into {} sub-components",
+                        component.papers.len(), subdivided.len());
+                }
+                for (sub_idx, sub) in subdivided.into_iter().enumerate() {
+                    if sub.papers.len() >= min_component_size {
+                        // Use a unique index for subdivided components
+                        components_to_process.push((*comp_idx * 1000 + sub_idx, sub));
+                    }
+                }
+            } else {
+                components_to_process.push((*comp_idx, (*component).clone()));
+            }
+        }
+
+        if !quiet {
+            elog!("  Level {} (threshold {:.3}, depth {}): {} components ({} after subdivision)",
+                level_idx, threshold, depth, nameable.len(), components_to_process.len());
+        }
+
+        for (comp_idx, component) in &components_to_process {
+            let component = component; // reborrow
+            // Find parent category
+            let parent_id = if level_idx == 0 {
+                // First level: parent is Universe
+                universe_id.clone()
+            } else {
+                // Find which component at previous level contains this component
+                let prev_level = &levels.levels[level_idx - 1];
+                if let Some(parent_comp_idx) = find_parent_component_idx(component, prev_level) {
+                    // Look up the category we created for that parent component
+                    component_to_category
+                        .get(&(level_idx - 1, parent_comp_idx))
+                        .cloned()
+                        .unwrap_or_else(|| universe_id.clone())
+                } else {
+                    universe_id.clone()
+                }
+            };
+
+            // Get papers in this component for naming
+            let paper_nodes: Vec<&Node> = component.papers.iter()
+                .filter_map(|id| node_map.get(id).copied())
+                .collect();
+
+            if paper_nodes.is_empty() {
+                continue;
+            }
+
+            // Sort by edge count to get most-connected papers
+            let mut papers_with_counts: Vec<_> = paper_nodes.iter()
+                .map(|n| (*n, edge_counts.get(&n.id).copied().unwrap_or(0)))
+                .collect();
+            papers_with_counts.sort_by(|a, b| b.1.cmp(&a.1));
+
+            // Sample top 10 most-connected papers for naming
+            let sample: Vec<&Node> = papers_with_counts.iter()
+                .take(10)
+                .map(|(n, _)| *n)
+                .collect();
+
+            // Get ALL titles for keyword extraction (large components)
+            let all_titles: Vec<String> = paper_nodes.iter()
+                .map(|n| n.ai_title.clone()
+                    .or_else(|| n.cluster_label.clone())
+                    .unwrap_or_else(|| n.title.clone()))
+                .collect();
+
+            // Get sample titles for AI naming (small components)
+            let sample_titles: Vec<String> = sample.iter()
+                .map(|n| n.ai_title.clone()
+                    .or_else(|| n.cluster_label.clone())
+                    .unwrap_or_else(|| n.title.clone()))
+                .collect();
+
+            // Naming strategy: keyword extraction for large, AI for small
+            let category_name = if component.papers.len() > 200 {
+                // Large component: use keyword frequency naming (faster, more reliable)
+                let name = ai_client::extract_top_keywords(&all_titles, 4);
+                if !quiet && categories_created % 20 == 0 {
+                    elog!("    {} categories created, keywords \"{}\" ({} papers)",
+                        categories_created, name, component.papers.len());
+                }
+                forbidden_names.push(name.clone());
+                name
+            } else {
+                // Small component: AI naming
+                match ai_client::name_cluster_from_samples(&sample_titles, &forbidden_names).await {
+                    Ok(name) => {
+                        ai_calls += 1;
+                        if !quiet && categories_created % 20 == 0 {
+                            elog!("    {} categories created, naming \"{}\" ({} papers)",
+                                categories_created, name, component.papers.len());
+                        }
+                        forbidden_names.push(name.clone());
+                        name
+                    }
+                    Err(e) => {
+                        if !quiet { elog!("    AI naming failed: {}", e); }
+                        // Fallback: use keywords
+                        let fallback = ai_client::extract_top_keywords(&all_titles, 4);
+                        forbidden_names.push(fallback.clone());
+                        fallback
+                    }
+                }
+            };
+
+            // Create category node
+            let category_id = format!("dendro-L{}-{}", level_idx, uuid::Uuid::new_v4());
+
+            // Store merge_weight and level in tags JSON
+            let tags_json = format!(
+                r#"{{"merge_weight":{:.4},"size":{},"level":{}}}"#,
+                threshold, component.papers.len(), level_idx
+            );
+
+            let category_node = Node {
+                id: category_id.clone(),
+                node_type: NodeType::Cluster,
+                title: category_name.clone(),
+                url: None,
+                content: None,
+                position: Position { x: 0.0, y: 0.0 },
+                created_at: now,
+                updated_at: now,
+                cluster_id: None,
+                cluster_label: Some(category_name),
+                depth: depth as i32,
+                is_item: false,
+                is_universe: false,
+                parent_id: Some(parent_id),
+                child_count: component.papers.len() as i32, // Will include both sub-categories and papers
+                ai_title: None,
+                summary: None,
+                tags: Some(tags_json),
+                emoji: None,
+                is_processed: true,
+                conversation_id: None,
+                sequence_index: None,
+                is_pinned: false,
+                last_accessed_at: None,
+                latest_child_date: None,
+                is_private: None,
+                privacy_reason: None,
+                source: None,
+                pdf_available: None,
+                content_type: None,
+                associated_idea_id: None,
+                privacy: None,
+            };
+
+            db.insert_node(&category_node).map_err(|e| e.to_string())?;
+            categories_created += 1;
+
+            // Track this component's category ID
+            component_to_category.insert((level_idx, *comp_idx), category_id.clone());
+
+            // If this is the deepest level, track papers for assignment
+            if level_idx == num_levels - 1 {
+                for paper_id in &component.papers {
+                    paper_to_leaf_category.insert(paper_id.clone(), category_id.clone());
+                }
+            }
+        }
+    }
+
+    // Assign papers to their leaf categories (deepest level only)
+    if !quiet { elog!("Assigning papers to leaf categories..."); }
+    let final_depth = (num_levels + 1) as i32; // Papers are one level deeper than deepest category
+    for (paper_id, category_id) in &paper_to_leaf_category {
+        db.update_parent(paper_id, category_id).map_err(|e| e.to_string())?;
+        db.update_node_hierarchy(paper_id, Some(category_id), final_depth).map_err(|e| e.to_string())?;
+        papers_assigned += 1;
+    }
+
+    // Handle orphan papers (not in any nameable component)
+    let orphan_count = papers.len() - papers_assigned;
+    if orphan_count > 0 && !quiet {
+        elog!("  {} papers remain as orphans (in clusters <{} papers)", orphan_count, min_component_size);
+    }
+
+    let total_time = start.elapsed().as_secs_f64();
+    if !quiet {
+        elog!("Dendrogram rebuild complete in {:.1}s", total_time);
+        elog!("  {} categories created across {} levels", categories_created, num_levels);
+        elog!("  {} papers assigned to leaf categories", papers_assigned);
+        elog!("  {} AI naming calls", ai_calls);
+    }
+
+    Ok(DendrogramRebuildResult {
+        categories: categories_created,
+        papers_assigned,
+        ai_calls,
+    })
 }
 
 // ============================================================================

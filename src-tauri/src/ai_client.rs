@@ -847,10 +847,85 @@ pub async fn name_cluster_from_samples(
         if !is_forbidden {
             return Ok(name);
         }
+
+        // On last attempt, add a suffix instead of failing
+        if attempt == 1 {
+            // Find a unique suffix
+            for suffix in 2..100 {
+                let suffixed = format!("{} {}", name, suffix);
+                let suffixed_lower = suffixed.to_lowercase();
+                if !forbidden_names.iter().any(|f| f.to_lowercase() == suffixed_lower) {
+                    return Ok(suffixed);
+                }
+            }
+        }
         // Forbidden - retry
     }
 
-    Err("Failed to generate unique name after retries".into())
+    // Ultimate fallback - use first title truncated
+    let fallback = titles.first()
+        .map(|t| if t.len() > 40 { format!("{}...", &t[..37]) } else { t.clone() })
+        .unwrap_or_else(|| "Unnamed Group".to_string());
+    Ok(fallback)
+}
+
+/// Extract top keywords from titles using frequency analysis.
+/// Used for large categories where AI naming would be expensive/generic.
+pub fn extract_top_keywords(titles: &[String], top_n: usize) -> String {
+    use std::collections::HashMap;
+
+    const STOPWORDS: &[&str] = &[
+        "the", "a", "of", "in", "and", "for", "with", "on", "to", "from", "by",
+        "is", "are", "an", "as", "at", "its", "or", "that", "this", "be", "was",
+        "were", "been", "study", "studies", "research", "analysis", "review",
+        "paper", "using", "based", "between", "during", "through", "within",
+        "their", "these", "those", "which", "what", "how", "effects", "effect",
+        "role", "new", "novel", "model", "models", "approach", "methods", "method",
+        "results", "data", "case", "cases", "evidence", "findings", "implications",
+    ];
+
+    let stopwords: std::collections::HashSet<&str> = STOPWORDS.iter().copied().collect();
+
+    let mut word_counts: HashMap<String, usize> = HashMap::new();
+
+    for title in titles {
+        for word in title.split_whitespace() {
+            // Clean: lowercase, remove punctuation
+            let clean: String = word.to_lowercase()
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect();
+
+            // Skip short words, stopwords, and numbers
+            if clean.len() < 3 || stopwords.contains(clean.as_str()) || clean.chars().all(|c| c.is_numeric()) {
+                continue;
+            }
+
+            *word_counts.entry(clean).or_insert(0) += 1;
+        }
+    }
+
+    // Sort by frequency descending
+    let mut sorted: Vec<_> = word_counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Take top N, capitalize first letter
+    let keywords: Vec<String> = sorted.into_iter()
+        .take(top_n)
+        .map(|(word, _)| {
+            let mut chars = word.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            }
+        })
+        .collect();
+
+    if keywords.is_empty() {
+        "Mixed Topics".to_string()
+    } else {
+        keywords.join(", ")
+    }
 }
 
 /// Name cluster using Ollama (local LLM)

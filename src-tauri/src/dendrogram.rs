@@ -329,6 +329,188 @@ pub fn fixed_thresholds(levels: &[f64]) -> Vec<f64> {
     thresholds
 }
 
+/// Find dynamic thresholds based on where component count changes meaningfully.
+/// Walks from low threshold (broad) to high threshold (tight), creating a level
+/// only where the component count at least doubles or increases by >=10.
+///
+/// # Arguments
+/// * `dendrogram` - The complete dendrogram
+/// * `max_levels` - Optional maximum number of levels (None = unlimited)
+/// * `step` - Threshold increment (default 0.05)
+/// * `min_threshold` - Lowest threshold to consider (default 0.5)
+/// * `max_threshold` - Highest threshold to consider (default 0.95)
+///
+/// # Returns
+/// Thresholds in descending order (tightest first, for consistency with other methods)
+pub fn find_dynamic_thresholds(
+    dendrogram: &Dendrogram,
+    max_levels: Option<usize>,
+    step: Option<f64>,
+    min_threshold: Option<f64>,
+    max_threshold: Option<f64>,
+) -> Vec<f64> {
+    let step = step.unwrap_or(0.05);
+    let min_t = min_threshold.unwrap_or(0.5);
+    let max_t = max_threshold.unwrap_or(0.95);
+    let max_levels = max_levels.unwrap_or(20); // Sanity limit
+
+    if dendrogram.merges.is_empty() {
+        return vec![];
+    }
+
+    // Pre-sort merges by weight descending for efficient counting
+    let weights: Vec<f64> = dendrogram.merges.iter().map(|m| m.weight).collect();
+
+    // Helper: count components at a given threshold
+    // Components = papers + (merges above threshold) - (papers merged above threshold)
+    // Simpler: at threshold T, components = papers that aren't yet merged above T
+    let count_components = |threshold: f64| -> usize {
+        // Use union-find simulation
+        let mut uf = UnionFind::new(&dendrogram.papers);
+        for merge in &dendrogram.merges {
+            if merge.weight >= threshold {
+                // This merge happens at or above threshold
+                let left_root = uf.find(&merge.left);
+                let right_root = uf.find(&merge.right);
+                if left_root != right_root {
+                    uf.union(&merge.left, &merge.right);
+                }
+            }
+        }
+        // Count unique roots
+        let mut roots = HashSet::new();
+        for paper in &dendrogram.papers {
+            roots.insert(uf.find(paper));
+        }
+        roots.len()
+    };
+
+    // Walk thresholds from min to max, detect meaningful jumps
+    let mut thresholds = Vec::new();
+    let mut prev_count = count_components(min_t);
+    thresholds.push(min_t); // Always include the floor
+
+    let mut current = min_t + step;
+    while current <= max_t && thresholds.len() < max_levels {
+        let count = count_components(current);
+
+        // Create level if component count meaningfully increases
+        let should_create = count >= prev_count * 2 || count >= prev_count + 10;
+
+        if should_create {
+            thresholds.push(current);
+            prev_count = count;
+        }
+
+        current += step;
+    }
+
+    // Return in descending order (tightest/highest first) for consistency
+    thresholds.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    thresholds
+}
+
+/// Subdivide a large component into smaller sub-components.
+/// Uses internal edges (both endpoints in component) to split at median weight.
+/// Recursively subdivides until all components are <= max_size.
+///
+/// # Arguments
+/// * `component` - The component to subdivide
+/// * `all_edges` - All edges (source, target, weight) sorted by weight descending
+/// * `max_size` - Maximum papers per sub-component
+///
+/// # Returns
+/// Vec of sub-components, each <= max_size (or unsplittable)
+pub fn subdivide_component(
+    component: &Component,
+    all_edges: &[(String, String, f64)],
+    max_size: usize,
+) -> Vec<Component> {
+    // If already small enough, return as-is
+    if component.papers.len() <= max_size {
+        return vec![component.clone()];
+    }
+
+    // Filter to internal edges only (both endpoints in this component)
+    let paper_set: HashSet<&String> = component.papers.iter().collect();
+    let internal_edges: Vec<_> = all_edges.iter()
+        .filter(|(s, t, _)| paper_set.contains(s) && paper_set.contains(t))
+        .cloned()
+        .collect();
+
+    // If no internal edges, can't subdivide
+    if internal_edges.is_empty() {
+        return vec![component.clone()];
+    }
+
+    // Find median weight of internal edges
+    let mut weights: Vec<f64> = internal_edges.iter().map(|(_, _, w)| *w).collect();
+    weights.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let median_weight = weights[weights.len() / 2];
+
+    // Use union-find to split at median threshold
+    let papers: Vec<String> = component.papers.clone();
+    let mut uf = UnionFind::new(&papers);
+
+    for (source, target, weight) in &internal_edges {
+        if *weight >= median_weight {
+            uf.union(source, target);
+        }
+    }
+
+    // Extract sub-components
+    let mut root_to_papers: HashMap<String, Vec<String>> = HashMap::new();
+    for paper in &papers {
+        let root = uf.find(paper);
+        root_to_papers.entry(root).or_default().push(paper.clone());
+    }
+
+    // If didn't actually split (all in one component), try higher threshold
+    if root_to_papers.len() == 1 {
+        // Try 75th percentile instead
+        let higher_threshold = weights[weights.len() / 4];
+        if (higher_threshold - median_weight).abs() > 0.01 {
+            let mut uf2 = UnionFind::new(&papers);
+            for (source, target, weight) in &internal_edges {
+                if *weight >= higher_threshold {
+                    uf2.union(source, target);
+                }
+            }
+            root_to_papers.clear();
+            for paper in &papers {
+                let root = uf2.find(paper);
+                root_to_papers.entry(root).or_default().push(paper.clone());
+            }
+        }
+    }
+
+    // Still couldn't split? Return as-is
+    if root_to_papers.len() == 1 {
+        return vec![component.clone()];
+    }
+
+    // Create sub-components and recursively subdivide if needed
+    let mut result = Vec::new();
+    for (idx, (_root, papers)) in root_to_papers.into_iter().enumerate() {
+        let sub = Component {
+            id: format!("{}-sub{}", component.id, idx),
+            papers,
+            parent: component.parent.clone(),
+            children: vec![],
+            merge_weight: Some(median_weight),
+        };
+
+        // Recurse if still too large
+        if sub.papers.len() > max_size {
+            result.extend(subdivide_component(&sub, all_edges, max_size));
+        } else {
+            result.push(sub);
+        }
+    }
+
+    result
+}
+
 /// Extract hierarchy levels by cutting the dendrogram at thresholds.
 /// Optimized version: pre-computes paper membership, processes all levels in one pass.
 ///
