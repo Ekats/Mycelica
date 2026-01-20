@@ -544,13 +544,16 @@ fn map_topics_to_components(
     Ok((topic_to_component, significant_components))
 }
 
-/// Group topics by edge connectivity of their papers
-/// Returns Vec of groups, where each group is topics that should stay together
+/// Group topics by edge connectivity of their papers.
+/// Uses efficient SQL joins - O(E) where E = edges, not O(P²) where P = papers.
+///
+/// Returns Vec of groups, where each group is topics that should stay together.
 fn group_topics_by_paper_connectivity(
     db: &Database,
+    parent_id: &str,
     topic_ids: &[String],
     min_group_size: usize,
-    min_component_size: usize,
+    _min_component_size: usize,  // Unused with SQL approach
 ) -> Result<Vec<Vec<String>>, String> {
     if topic_ids.is_empty() {
         return Ok(vec![]);
@@ -560,23 +563,40 @@ fn group_topics_by_paper_connectivity(
         return Ok(vec![topic_ids.to_vec()]);
     }
 
-    // Map topics to their dominant component
-    let (topic_to_component, significant_components) =
-        map_topics_to_components(db, topic_ids, min_component_size)?;
+    // Get cross-edge counts using efficient SQL join (O(E) not O(P²))
+    // Any edge between topics counts as a connection (threshold = 1)
+    let cross_edges = db.get_cross_edge_counts_for_children(parent_id)
+        .map_err(|e| e.to_string())?;
 
-    if significant_components.is_empty() {
-        // No significant components - all papers are isolated or in tiny groups
-        return Ok(vec![]);
+    // Build set of valid topic IDs
+    let valid_topics: HashSet<&str> = topic_ids.iter().map(|s| s.as_str()).collect();
+
+    // Build adjacency list (any cross-edge = connected)
+    let mut graph: HashMap<String, Vec<String>> = HashMap::new();
+    for topic_id in topic_ids {
+        graph.insert(topic_id.clone(), Vec::new());
     }
 
-    // Invert mapping: component_index -> Vec<topic_id>
-    let mut component_to_topics: HashMap<usize, Vec<String>> = HashMap::new();
-    for (topic_id, comp_idx) in &topic_to_component {
-        component_to_topics.entry(*comp_idx).or_default().push(topic_id.clone());
+    for (topic_a, topic_b, count) in cross_edges {
+        // Any edge counts as connection (count >= 1)
+        if count >= 1
+            && valid_topics.contains(topic_a.as_str())
+            && valid_topics.contains(topic_b.as_str())
+        {
+            if let Some(neighbors) = graph.get_mut(&topic_a) {
+                neighbors.push(topic_b.clone());
+            }
+            if let Some(neighbors) = graph.get_mut(&topic_b) {
+                neighbors.push(topic_a.clone());
+            }
+        }
     }
+
+    // Find connected components
+    let components = find_connected_components(&graph);
 
     // Filter to groups with >= min_group_size topics
-    let groups: Vec<Vec<String>> = component_to_topics.into_values()
+    let groups: Vec<Vec<String>> = components.into_iter()
         .filter(|topics| topics.len() >= min_group_size)
         .collect();
 
@@ -2536,7 +2556,7 @@ pub async fn cluster_hierarchy_level(db: &Database, parent_id: &str, app: Option
     let min_group_size = 2;  // At least 2 topics to form a group
     let min_component_size = 3;  // At least 3 papers to count as significant component
 
-    let edge_groups = group_topics_by_paper_connectivity(db, &child_ids, min_group_size, min_component_size)?;
+    let edge_groups = group_topics_by_paper_connectivity(db, parent_id, &child_ids, min_group_size, min_component_size)?;
 
     let groupings = if edge_groups.len() >= 2 {
         // Log compact summary: group sizes and first topic in each
