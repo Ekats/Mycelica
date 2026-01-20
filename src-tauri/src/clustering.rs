@@ -648,7 +648,7 @@ async fn cluster_single_group(
     // Step 4: Global vs Batch clustering based on dataset size
     // Global: Better cluster quality (no fragmentation/contamination) for small datasets
     // Batch + refinement: Required for large datasets (papers) to avoid O(n²) explosion
-    const GLOBAL_THRESHOLD: usize = 50_000;  // Use global clustering up to 50k items
+    const GLOBAL_THRESHOLD: usize = 100_000;  // Use global clustering up to 100k items
     const BATCH_SIZE: usize = 25_000;
 
     // Time estimate for large datasets
@@ -869,7 +869,8 @@ async fn cluster_single_group(
 }
 
 /// Maximum clusters per AI naming batch to prevent response truncation
-const NAMING_BATCH_SIZE: usize = 30;
+/// Reduced from 30 to 10 for better reliability with smaller models (Ollama)
+const NAMING_BATCH_SIZE: usize = 10;
 
 /// Name clusters using AI with batching to prevent response truncation
 async fn name_clusters_with_ai(
@@ -899,8 +900,8 @@ async fn name_clusters_with_ai(
     }
 
     // Batch clusters for AI naming to prevent response truncation
-    // Run up to 10 concurrent API calls
-    const CONCURRENT_REQUESTS: usize = 10;
+    // Sequential for Ollama (GPU can only run 1 at a time effectively)
+    const CONCURRENT_REQUESTS: usize = 1;
     let num_batches = (clusters_info.len() + NAMING_BATCH_SIZE - 1) / NAMING_BATCH_SIZE;
     if num_batches > 1 {
         println!("[Clustering] Naming {} clusters in {} batches (~{} each, {} concurrent)",
@@ -914,20 +915,20 @@ async fn name_clusters_with_ai(
         .map(|(idx, chunk)| (idx, chunk.to_vec()))
         .collect();
 
-    // Process batches in parallel with concurrency limit
-    let results: Vec<_> = stream::iter(batches)
+    // Process batches sequentially, logging each as it completes
+    use futures::StreamExt;
+    let mut batch_stream = stream::iter(batches)
         .map(|(batch_idx, batch)| async move {
             let result = ai_client::name_clusters(&batch).await;
             (batch_idx, batch, result)
         })
-        .buffer_unordered(CONCURRENT_REQUESTS)
-        .collect()
-        .await;
+        .buffer_unordered(CONCURRENT_REQUESTS);
 
-    // Process results
-    for (batch_idx, batch, result) in results {
+    while let Some((batch_idx, batch, result)) = batch_stream.next().await {
         match result {
             Ok(ai_names) => {
+                let batch_names: Vec<String> = ai_names.iter().map(|(_, n)| n.clone()).collect();
+                println!("[Clustering] Batch {}/{}: {}", batch_idx + 1, num_batches, batch_names.join(" | "));
                 for (cluster_id, name) in ai_names {
                     names.insert(cluster_id, name);
                 }
@@ -1411,8 +1412,8 @@ pub async fn name_unnamed_clusters(db: &Database) -> Result<NamingResult, String
         });
     }
 
-    // Batch AI naming with parallel API calls (up to 10 concurrent)
-    const CONCURRENT_REQUESTS: usize = 10;
+    // Batch AI naming - sequential for Ollama
+    const CONCURRENT_REQUESTS: usize = 1;
     let num_batches = (clusters_info.len() + NAMING_BATCH_SIZE - 1) / NAMING_BATCH_SIZE;
     println!("[Naming] Naming {} clusters in {} batches ({} concurrent)",
              clusters_info.len(), num_batches, CONCURRENT_REQUESTS.min(num_batches));
@@ -1424,21 +1425,22 @@ pub async fn name_unnamed_clusters(db: &Database) -> Result<NamingResult, String
         .map(|(idx, chunk)| (idx, chunk.to_vec()))
         .collect();
 
-    // Process batches in parallel
-    let results: Vec<_> = stream::iter(batches)
+    // Process batches sequentially, logging each as it completes
+    use futures::StreamExt;
+    let mut batch_stream = stream::iter(batches)
         .map(|(batch_idx, batch)| async move {
             let result = ai_client::name_clusters(&batch).await;
             (batch_idx, result)
         })
-        .buffer_unordered(CONCURRENT_REQUESTS)
-        .collect()
-        .await;
+        .buffer_unordered(CONCURRENT_REQUESTS);
 
-    // Apply results to database
+    // Apply results to database as they complete
     let mut named_count = 0;
-    for (batch_idx, result) in results {
+    while let Some((batch_idx, result)) = batch_stream.next().await {
         match result {
             Ok(ai_names) => {
+                let batch_names: Vec<String> = ai_names.iter().map(|(_, n)| n.clone()).collect();
+                println!("[Naming] Batch {}/{}: {}", batch_idx + 1, num_batches, batch_names.join(" | "));
                 for (cluster_id, name) in ai_names {
                     // Update all items in this cluster with the new label
                     if let Err(e) = db.update_cluster_label(cluster_id, &name) {

@@ -382,10 +382,13 @@ fn find_connected_components(
 
 // ==================== Topic-Level Graph Functions (for uber-category grouping) ====================
 
-/// Build affinity graph between topics based on cross-edges between their papers
+/// Build affinity graph between child categories of a parent, based on cross-edges between their items.
+/// Uses efficient SQL joins - O(E) where E = edges, not O(T²) where T = topics.
+///
 /// Returns adjacency list: topic_id -> Vec<connected_topic_id>
-fn build_topic_affinity_graph(
+fn build_topic_affinity_graph_for_parent(
     db: &Database,
+    parent_id: &str,
     topic_ids: &[String],
     min_cross_edges: usize,
 ) -> Result<HashMap<String, Vec<String>>, String> {
@@ -393,9 +396,12 @@ fn build_topic_affinity_graph(
         return Ok(HashMap::new());
     }
 
-    // Get cross-edge counts for all topic pairs
-    let topic_refs: Vec<&str> = topic_ids.iter().map(|s| s.as_str()).collect();
-    let cross_edges = db.count_all_cross_edges(&topic_refs).map_err(|e| e.to_string())?;
+    // Get cross-edge counts using efficient SQL join (O(E) not O(T²))
+    let cross_edges = db.get_cross_edge_counts_for_children(parent_id)
+        .map_err(|e| e.to_string())?;
+
+    // Build set of valid topic IDs for filtering
+    let valid_topics: HashSet<&str> = topic_ids.iter().map(|s| s.as_str()).collect();
 
     // Build adjacency list
     let mut graph: HashMap<String, Vec<String>> = HashMap::new();
@@ -403,20 +409,31 @@ fn build_topic_affinity_graph(
         graph.insert(topic_id.clone(), Vec::new());
     }
 
-    for ((topic_a, topic_b), count) in cross_edges {
-        if count >= min_cross_edges {
-            graph.get_mut(&topic_a).unwrap().push(topic_b.clone());
-            graph.get_mut(&topic_b).unwrap().push(topic_a.clone());
+    for (topic_a, topic_b, count) in cross_edges {
+        // Only include edges between topics in our list
+        if count >= min_cross_edges
+            && valid_topics.contains(topic_a.as_str())
+            && valid_topics.contains(topic_b.as_str())
+        {
+            if let Some(neighbors) = graph.get_mut(&topic_a) {
+                neighbors.push(topic_b.clone());
+            }
+            if let Some(neighbors) = graph.get_mut(&topic_b) {
+                neighbors.push(topic_a.clone());
+            }
         }
     }
 
     Ok(graph)
 }
 
-/// Group topics by edge connectivity
-/// Returns Vec of groups, where each group is a Vec of topic IDs that should form an uber-category
+/// Group child topics of a parent by edge connectivity of their items.
+/// Uses efficient SQL joins - O(E) where E = edges, not O(T²) where T = topics.
+///
+/// Returns Vec of groups, where each group is a Vec of topic IDs that should form an uber-category.
 fn group_topics_by_edges(
     db: &Database,
+    parent_id: &str,
     topic_ids: &[String],
     min_cross_edges: usize,
 ) -> Result<Vec<Vec<String>>, String> {
@@ -428,8 +445,8 @@ fn group_topics_by_edges(
         return Ok(vec![topic_ids.to_vec()]);
     }
 
-    // Build topic affinity graph
-    let graph = build_topic_affinity_graph(db, topic_ids, min_cross_edges)?;
+    // Build topic affinity graph using efficient SQL
+    let graph = build_topic_affinity_graph_for_parent(db, parent_id, topic_ids, min_cross_edges)?;
 
     // Find connected components using existing function
     let components = find_connected_components(&graph);
@@ -576,10 +593,10 @@ fn group_topics_by_paper_connectivity(
 // ==================== Category Edges from Paper Cross-Counts ====================
 
 /// Create edges between sibling categories based on paper cross-edge counts.
-/// Weight reflects fraction of smaller category's papers with cross-connections.
+/// Uses efficient SQL joins - O(E) where E = edges, not O(T²) where T = categories.
 ///
-/// For each pair of sibling categories (same parent), creates one edge with weight
-/// calculated as: raw_cross_edges / min(papers_in_a, papers_in_b), capped at 1.0.
+/// Weight reflects fraction of smaller category's papers with cross-connections:
+/// weight = raw_cross_edges / min(papers_in_a, papers_in_b), capped at 1.0.
 pub fn create_category_edges_from_cross_counts(
     db: &Database,
     app: Option<&AppHandle>,
@@ -589,117 +606,67 @@ pub fn create_category_edges_from_cross_counts(
 
     let mut created = 0;
 
-    // Get all non-item nodes (categories)
+    // Get all unique parent_ids that have category children
     let all_nodes = db.get_all_nodes(false).map_err(|e| e.to_string())?;
-    let categories: Vec<&Node> = all_nodes.iter().filter(|n| !n.is_item).collect();
+    let parent_ids: HashSet<String> = all_nodes.iter()
+        .filter(|n| !n.is_item)
+        .filter_map(|n| n.parent_id.clone())
+        .collect();
 
-    // Group by parent_id to find siblings
-    let mut siblings_map: HashMap<String, Vec<&Node>> = HashMap::new();
-    for cat in &categories {
-        if let Some(parent_id) = &cat.parent_id {
-            siblings_map.entry(parent_id.clone()).or_default().push(cat);
-        }
-    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
 
-    // Process each sibling group
-    for (parent_id, siblings) in &siblings_map {
-        if siblings.len() < 2 {
+    // Process each parent's sibling group using efficient SQL
+    for parent_id in &parent_ids {
+        // Get all sibling pairs with their sizes
+        let all_pairs = db.get_all_sibling_pairs(parent_id).map_err(|e| e.to_string())?;
+        if all_pairs.is_empty() {
             continue;
         }
 
-        // Collect papers for each sibling (recursively)
-        let mut sibling_papers: HashMap<String, Vec<String>> = HashMap::new();
-        for sibling in siblings {
-            let papers = collect_papers_recursively(db, &sibling.id)?;
-            sibling_papers.insert(sibling.id.clone(), papers);
-        }
+        // Get cross-edge counts using efficient SQL join (O(E) not O(T²))
+        let cross_edges = db.get_sibling_cross_edge_counts(parent_id).map_err(|e| e.to_string())?;
 
-        // Build paper -> sibling mapping
-        let mut paper_to_sibling: HashMap<String, String> = HashMap::new();
-        for (sibling_id, papers) in &sibling_papers {
-            for paper_id in papers {
-                paper_to_sibling.insert(paper_id.clone(), sibling_id.clone());
-            }
-        }
-
-        if paper_to_sibling.is_empty() {
-            continue;
-        }
-
-        // Get all edges involving these papers
-        let all_paper_ids: Vec<&str> = paper_to_sibling.keys().map(|s| s.as_str()).collect();
-        let edges = db.get_edges_for_nodes_bulk(&all_paper_ids).map_err(|e| e.to_string())?;
-
-        // Count cross-edges between sibling pairs
-        let mut cross_edge_counts: HashMap<(String, String), usize> = HashMap::new();
-        for (source, target, _weight) in &edges {
-            let source_sibling = paper_to_sibling.get(source);
-            let target_sibling = paper_to_sibling.get(target);
-
-            if let (Some(sib_a), Some(sib_b)) = (source_sibling, target_sibling) {
-                if sib_a != sib_b {
-                    // Canonical ordering
-                    let key = if sib_a < sib_b {
-                        (sib_a.clone(), sib_b.clone())
-                    } else {
-                        (sib_b.clone(), sib_a.clone())
-                    };
-                    *cross_edge_counts.entry(key).or_default() += 1;
-                }
-            }
-        }
-
-        // Divide by 2 (edges counted from both directions in bulk query)
-        for count in cross_edge_counts.values_mut() {
-            *count /= 2;
-        }
+        // Build lookup map for cross-edge counts
+        let cross_edge_map: HashMap<(String, String), (usize, usize, usize)> = cross_edges
+            .into_iter()
+            .map(|(a, b, count, size_a, size_b)| ((a, b), (count, size_a, size_b)))
+            .collect();
 
         // Create edges for all sibling pairs
-        for i in 0..siblings.len() {
-            for j in (i + 1)..siblings.len() {
-                let sib_a = &siblings[i];
-                let sib_b = &siblings[j];
+        for (cat_a, cat_b, size_a, size_b) in all_pairs {
+            // Look up cross-edge count (canonical order already guaranteed)
+            let raw_count = cross_edge_map
+                .get(&(cat_a.clone(), cat_b.clone()))
+                .map(|(count, _, _)| *count)
+                .unwrap_or(0);
 
-                // Canonical ordering for lookup
-                let key = if sib_a.id < sib_b.id {
-                    (sib_a.id.clone(), sib_b.id.clone())
-                } else {
-                    (sib_b.id.clone(), sib_a.id.clone())
-                };
+            // Normalize by smaller category size
+            let min_size = size_a.min(size_b).max(1);
+            let weight = (raw_count as f64 / min_size as f64).min(1.0);
 
-                let raw_count = cross_edge_counts.get(&key).copied().unwrap_or(0);
+            // Insert edge (always, even if weight is 0)
+            let edge_id = format!("sibling-{}-{}", cat_a, cat_b);
+            db.insert_edge(&Edge {
+                id: edge_id,
+                source: cat_a,
+                target: cat_b,
+                edge_type: EdgeType::Sibling,
+                label: None,
+                weight: Some(weight),
+                edge_source: Some("ai".to_string()),
+                evidence_id: None,
+                confidence: None,
+                created_at: now,
+            }).map_err(|e| e.to_string())?;
 
-                // Normalize by smaller category size
-                let size_a = sibling_papers.get(&sib_a.id).map(|v| v.len()).unwrap_or(0);
-                let size_b = sibling_papers.get(&sib_b.id).map(|v| v.len()).unwrap_or(0);
-                let min_size = size_a.min(size_b).max(1);
-                let weight = (raw_count as f64 / min_size as f64).min(1.0);
-
-                // Insert edge (always, even if weight is 0)
-                let edge_id = format!("sibling-{}-{}", sib_a.id, sib_b.id);
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64;
-                db.insert_edge(&Edge {
-                    id: edge_id,
-                    source: sib_a.id.clone(),
-                    target: sib_b.id.clone(),
-                    edge_type: EdgeType::Sibling,
-                    label: None,
-                    weight: Some(weight),
-                    edge_source: Some("ai".to_string()),
-                    evidence_id: None,
-                    confidence: None,
-                    created_at: now,
-                }).map_err(|e| e.to_string())?;
-
-                created += 1;
-            }
+            created += 1;
         }
     }
 
-    emit_log(app, "info", &format!("Created {} sibling edges from paper cross-counts", created));
+    emit_log(app, "info", &format!("Created {} sibling edges from paper cross-counts (O(E) SQL)", created));
     Ok(created)
 }
 
@@ -3497,11 +3464,19 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
         estimate_secs: None,
         remaining_secs: None,
     });
-    let clustering_result = if run_clustering && ai_client::is_available() {
+    // Check if clusters already exist (skip expensive re-clustering if so)
+    let total_items = db.get_items().map(|v| v.len()).unwrap_or(0);
+    let clustered_items = db.count_clustered_items().unwrap_or(0);
+    let has_existing_clusters = clustered_items > total_items / 2; // >50% clustered = use existing
+
+    let clustering_result = if run_clustering && ai_client::is_available() && !has_existing_clusters {
         emit_log(app, "info", "Running AI clustering on idea items (excluding code/debug/paste)...");
         let result = crate::clustering::run_clustering(db, true).await?;
         emit_log(app, "info", &format!("✓ Clustering complete: {} ideas → {} clusters", result.items_assigned, result.clusters_created));
         Some(result)
+    } else if has_existing_clusters {
+        emit_log(app, "info", &format!("Using existing clusters ({} items already clustered)", clustered_items));
+        None
     } else {
         emit_log(app, "info", "Skipping (already done or AI not available)");
         None
@@ -3628,12 +3603,13 @@ pub async fn build_full_hierarchy(db: &Database, run_clustering: bool, app: Opti
             .collect();
 
         // Edge-based uber-category grouping: topics group by cross-edges between their papers
+        // Uses efficient SQL joins - O(E) not O(T²)
         let topic_ids: Vec<String> = categories.iter().map(|c| c.id.clone()).collect();
         let min_cross_edges = 5; // Minimum edges between topics to consider them connected
 
-        emit_log(app, "info", &format!("  Finding connected topic groups (min_cross_edges={})", min_cross_edges));
+        emit_log(app, "info", &format!("  Finding connected topic groups (min_cross_edges={}, using O(E) SQL join)", min_cross_edges));
 
-        match group_topics_by_edges(db, &topic_ids, min_cross_edges) {
+        match group_topics_by_edges(db, &universe.id, &topic_ids, min_cross_edges) {
             Ok(groups) => {
                 // Filter to groups with 2+ topics (singleton groups stay under Universe)
                 let multi_topic_groups: Vec<_> = groups.into_iter()

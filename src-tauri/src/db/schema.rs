@@ -1387,6 +1387,180 @@ impl Database {
         Ok(cross_edge_counts)
     }
 
+    /// Get cross-edge counts between all child categories of a parent using efficient SQL joins.
+    ///
+    /// Returns Vec<(topic_a_id, topic_b_id, count)> for all pairs of children (categories or items)
+    /// that have edges between them. Pairs with zero edges are not included.
+    ///
+    /// This is O(E) where E = edges, not O(T²) where T = topics.
+    /// Much more efficient than count_all_cross_edges for large datasets.
+    ///
+    /// The query joins edges with nodes to find which parent each endpoint belongs to,
+    /// then groups by parent pairs to count cross-edges.
+    pub fn get_cross_edge_counts_for_children(&self, parent_id: &str) -> Result<Vec<(String, String, usize)>> {
+        let conn = self.conn.lock().unwrap();
+
+        // This query:
+        // 1. Joins edges with nodes to get the parent_id of each endpoint
+        // 2. Filters to edges where both endpoints have the specified parent_id as ancestor
+        // 3. Groups by the parent_id pairs and counts
+        // 4. Only returns pairs where endpoints are in DIFFERENT immediate children
+        //
+        // Note: This handles direct children. For recursive (papers under sub-categories),
+        // we'd need a recursive CTE, but direct children is what we need for uber-category grouping.
+        let mut stmt = conn.prepare(
+            "SELECT
+                n1.parent_id as topic_a,
+                n2.parent_id as topic_b,
+                COUNT(*) as cross_count
+             FROM edges e
+             JOIN nodes n1 ON e.source_id = n1.id
+             JOIN nodes n2 ON e.target_id = n2.id
+             WHERE n1.parent_id IS NOT NULL
+               AND n2.parent_id IS NOT NULL
+               AND n1.parent_id != n2.parent_id
+               AND EXISTS (SELECT 1 FROM nodes p1 WHERE p1.id = n1.parent_id AND p1.parent_id = ?1)
+               AND EXISTS (SELECT 1 FROM nodes p2 WHERE p2.id = n2.parent_id AND p2.parent_id = ?1)
+             GROUP BY n1.parent_id, n2.parent_id
+             HAVING COUNT(*) >= 1"
+        )?;
+
+        let results: Vec<(String, String, usize)> = stmt.query_map(params![parent_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, usize>(2)?,
+            ))
+        })?.filter_map(|r| r.ok()).collect();
+
+        // The query counts each edge once from source->target perspective.
+        // Edges are directional in the table, so we get (A,B,count) and (B,A,count) separately.
+        // Combine them into canonical (min_id, max_id, total) pairs.
+        let mut combined: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+        for (a, b, count) in results {
+            let key = if a < b { (a, b) } else { (b, a) };
+            *combined.entry(key).or_default() += count;
+        }
+
+        Ok(combined.into_iter().map(|((a, b), c)| (a, b, c)).collect())
+    }
+
+    /// Get cross-edge counts for sibling categories (categories sharing the same parent).
+    /// Uses efficient SQL joins - O(E) not O(T²).
+    ///
+    /// Returns Vec<(cat_a_id, cat_b_id, count, size_a, size_b)> where:
+    /// - cat_a_id, cat_b_id are sibling category IDs (canonical order: a < b)
+    /// - count is the number of edges between items in cat_a and items in cat_b
+    /// - size_a, size_b are the number of items in each category (for normalization)
+    pub fn get_sibling_cross_edge_counts(&self, parent_id: &str) -> Result<Vec<(String, String, usize, usize, usize)>> {
+        let conn = self.conn.lock().unwrap();
+
+        // First, get all sibling categories and their item counts
+        let mut cat_stmt = conn.prepare(
+            "SELECT c.id, COUNT(i.id) as item_count
+             FROM nodes c
+             LEFT JOIN nodes i ON i.parent_id = c.id AND i.is_item = 1
+             WHERE c.parent_id = ?1 AND c.is_item = 0
+             GROUP BY c.id"
+        )?;
+
+        let category_sizes: std::collections::HashMap<String, usize> = cat_stmt
+            .query_map(params![parent_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if category_sizes.len() < 2 {
+            return Ok(vec![]);
+        }
+
+        // Get cross-edge counts between items in sibling categories
+        // This query finds edges where source and target are items whose parents are different siblings
+        let mut edge_stmt = conn.prepare(
+            "SELECT
+                n1.parent_id as cat_a,
+                n2.parent_id as cat_b,
+                COUNT(*) as cross_count
+             FROM edges e
+             JOIN nodes n1 ON e.source_id = n1.id
+             JOIN nodes n2 ON e.target_id = n2.id
+             WHERE n1.is_item = 1
+               AND n2.is_item = 1
+               AND n1.parent_id IS NOT NULL
+               AND n2.parent_id IS NOT NULL
+               AND n1.parent_id != n2.parent_id
+               AND EXISTS (SELECT 1 FROM nodes p WHERE p.id = n1.parent_id AND p.parent_id = ?1 AND p.is_item = 0)
+               AND EXISTS (SELECT 1 FROM nodes p WHERE p.id = n2.parent_id AND p.parent_id = ?1 AND p.is_item = 0)
+             GROUP BY n1.parent_id, n2.parent_id"
+        )?;
+
+        let edge_results: Vec<(String, String, usize)> = edge_stmt
+            .query_map(params![parent_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, usize>(2)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Combine directional counts into canonical pairs
+        let mut combined: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+        for (a, b, count) in edge_results {
+            let key = if a < b { (a, b) } else { (b, a) };
+            *combined.entry(key).or_default() += count;
+        }
+
+        // Build result with sizes
+        let results: Vec<(String, String, usize, usize, usize)> = combined
+            .into_iter()
+            .map(|((a, b), count)| {
+                let size_a = category_sizes.get(&a).copied().unwrap_or(0);
+                let size_b = category_sizes.get(&b).copied().unwrap_or(0);
+                (a, b, count, size_a, size_b)
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Get all sibling category pairs under a parent (for creating edges even with 0 cross-count).
+    /// Returns Vec<(cat_a_id, cat_b_id, size_a, size_b)> in canonical order.
+    pub fn get_all_sibling_pairs(&self, parent_id: &str) -> Result<Vec<(String, String, usize, usize)>> {
+        let conn = self.conn.lock().unwrap();
+
+        // Get all sibling categories and their item counts
+        let mut stmt = conn.prepare(
+            "SELECT c.id, COUNT(i.id) as item_count
+             FROM nodes c
+             LEFT JOIN nodes i ON i.parent_id = c.id AND i.is_item = 1
+             WHERE c.parent_id = ?1 AND c.is_item = 0
+             GROUP BY c.id
+             ORDER BY c.id"
+        )?;
+
+        let categories: Vec<(String, usize)> = stmt
+            .query_map(params![parent_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Generate all pairs
+        let mut pairs = Vec::new();
+        for i in 0..categories.len() {
+            for j in (i + 1)..categories.len() {
+                let (id_a, size_a) = &categories[i];
+                let (id_b, size_b) = &categories[j];
+                pairs.push((id_a.clone(), id_b.clone(), *size_a, *size_b));
+            }
+        }
+
+        Ok(pairs)
+    }
+
     pub fn delete_edge(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM edges WHERE id = ?1", params![id])?;
@@ -2063,6 +2237,17 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(count)
+    }
+
+    /// Count items that have been assigned to clusters
+    pub fn count_clustered_items(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND cluster_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
     }
 
     /// Get existing cluster info for AI context

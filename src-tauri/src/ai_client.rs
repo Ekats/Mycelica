@@ -481,7 +481,7 @@ Classification:"#,
     }
 }
 
-/// Batch classify multiple items using AI - CHEAP
+/// Batch classify multiple items using AI - CHEAP (DEPRECATED - use pattern classification)
 /// Returns a map of item_id -> content_type
 /// Runs up to 10 concurrent API calls
 pub async fn classify_batch_ai(items: &[(String, String)]) -> Result<Vec<(String, String)>, String> {

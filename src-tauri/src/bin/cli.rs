@@ -2863,9 +2863,34 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
     let needs_processing = non_paper_processed < non_papers;
     let needs_embeddings = with_embeddings < total;
 
-    if !needs_processing && !needs_embeddings {
-        log!("All items are processed and have embeddings. Nothing to do!");
+    // Check if hierarchy needs to be built
+    // Hierarchy is needed if: no universe, universe has few children, or most items orphaned
+    let needs_hierarchy = if let Ok(Some(universe)) = db.get_universe() {
+        let universe_children = db.get_children(&universe.id).unwrap_or_default();
+        let direct_items = universe_children.iter().filter(|n| n.is_item).count();
+        let child_count = universe_children.len();
+
+        // Needs hierarchy if:
+        // 1. Universe has very few children (cleared hierarchy)
+        // 2. >50% of items are directly under Universe (flat hierarchy)
+        // 3. Most items have no parent (orphaned after clear)
+        let orphaned_items = db.get_items().map(|items| {
+            items.iter().filter(|n| n.parent_id.is_none()).count()
+        }).unwrap_or(0);
+
+        child_count < 3 || direct_items > total / 2 || orphaned_items > total / 2
+    } else {
+        true // No universe = definitely needs hierarchy
+    };
+
+    if !needs_processing && !needs_embeddings && !needs_hierarchy {
+        log!("All items are processed, have embeddings, and hierarchy is built. Nothing to do!");
         return Ok(());
+    }
+
+    // Show what needs to be done
+    if needs_hierarchy {
+        log!("  Hierarchy: needs building");
     }
 
     print!("Run processing pipeline? [Y/n]: ");
