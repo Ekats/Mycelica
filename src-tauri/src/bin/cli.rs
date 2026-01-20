@@ -498,6 +498,15 @@ enum HierarchyCommands {
     FixRecentNotes,
     /// Smart add orphan items by finding similar existing items
     SmartAdd,
+    /// Test dendrogram algorithm on current edges (analysis only, no changes)
+    Dendrogram {
+        /// Target number of hierarchy levels
+        #[arg(long, default_value = "4")]
+        levels: usize,
+        /// Threshold method: gap, percentile, or fixed
+        #[arg(long, default_value = "percentile")]
+        method: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1843,7 +1852,138 @@ async fn handle_hierarchy(cmd: HierarchyCommands, db: &Database, json: bool, qui
         HierarchyCommands::SmartAdd => {
             handle_smart_add(&db, json).await?;
         }
+        HierarchyCommands::Dendrogram { levels, method } => {
+            handle_dendrogram_test(&db, levels, &method, json, quiet)?;
+        }
     }
+    Ok(())
+}
+
+// ============================================================================
+// Dendrogram Test
+// ============================================================================
+
+fn handle_dendrogram_test(db: &Database, target_levels: usize, method: &str, json: bool, quiet: bool) -> Result<(), String> {
+    use mycelica_lib::dendrogram::{build_dendrogram, find_natural_thresholds, find_percentile_thresholds, fixed_thresholds, extract_levels, DendrogramConfig};
+    use std::time::Instant;
+
+    let start = Instant::now();
+
+    // Step 1: Get all item edges sorted by weight
+    log!("Loading edges...");
+    let edges = db.get_all_item_edges_sorted().map_err(|e| e.to_string())?;
+    log!("  {} edges loaded in {:.2}s", edges.len(), start.elapsed().as_secs_f64());
+
+    if edges.is_empty() {
+        if json {
+            log!(r#"{{"error":"no_edges"}}"#);
+        } else {
+            log!("No item edges found. Run 'mycelica-cli setup' first to create semantic edges.");
+        }
+        return Ok(());
+    }
+
+    // Step 2: Get unique paper IDs from edges
+    log!("Extracting paper IDs...");
+    let mut paper_set = std::collections::HashSet::new();
+    for (source, target, _) in &edges {
+        paper_set.insert(source.clone());
+        paper_set.insert(target.clone());
+    }
+    let papers: Vec<String> = paper_set.into_iter().collect();
+    log!("  {} unique papers", papers.len());
+
+    // Step 3: Build dendrogram
+    log!("Building dendrogram...");
+    let dendro_start = Instant::now();
+    let dendrogram = build_dendrogram(papers.clone(), edges.clone());
+    log!("  {} merges recorded in {:.3}s", dendrogram.merges.len(), dendro_start.elapsed().as_secs_f64());
+
+    // Step 4: Find thresholds using selected method
+    log!("Finding thresholds (method={}, target {} levels)...", method, target_levels);
+    let thresholds = match method {
+        "gap" => find_natural_thresholds(&dendrogram, target_levels),
+        "percentile" => find_percentile_thresholds(&dendrogram, target_levels),
+        "fixed" => fixed_thresholds(&[0.8, 0.7, 0.6, 0.5]),
+        _ => {
+            log!("Unknown method '{}', using percentile", method);
+            find_percentile_thresholds(&dendrogram, target_levels)
+        }
+    };
+    log!("  Thresholds: {:?}", thresholds);
+
+    // Step 5: Extract levels
+    log!("Extracting hierarchy levels...");
+    let levels = extract_levels(&dendrogram, &thresholds);
+
+    // Step 6: Report statistics
+    log!("\n=== Dendrogram Analysis ===");
+    log!("Papers:     {}", papers.len());
+    log!("Edges:      {}", edges.len());
+    log!("Merges:     {}", dendrogram.merges.len());
+    log!("Levels:     {}", levels.levels.len());
+
+    // Weight distribution
+    if !dendrogram.merges.is_empty() {
+        let weights: Vec<f64> = dendrogram.merges.iter().map(|m| m.weight).collect();
+        let min_w = weights.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_w = weights.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let avg_w: f64 = weights.iter().sum::<f64>() / weights.len() as f64;
+        log!("\nWeight distribution:");
+        log!("  Min: {:.4}", min_w);
+        log!("  Max: {:.4}", max_w);
+        log!("  Avg: {:.4}", avg_w);
+    }
+
+    // Level breakdown
+    log!("\nLevel breakdown:");
+    for (i, level) in levels.levels.iter().enumerate() {
+        let threshold = levels.thresholds.get(i).map(|t| format!("{:.3}", t)).unwrap_or_else(|| "root".to_string());
+        let total_papers: usize = level.iter().map(|c| c.papers.len()).sum::<usize>();
+        let sizes: Vec<usize> = level.iter().map(|c| c.papers.len()).collect();
+        let min_size = sizes.iter().min().copied().unwrap_or(0);
+        let max_size = sizes.iter().max().copied().unwrap_or(0);
+
+        log!("  Level {} (threshold ≥ {}): {} components, {} papers (sizes: {}-{})",
+            i, threshold, level.len(), total_papers, min_size, max_size);
+    }
+
+    // Large components (potential subdivision candidates)
+    let config = DendrogramConfig::default();
+    log!("\nLarge components (>{} papers):", config.max_component_size);
+    let mut large_count = 0;
+    for (level_idx, level) in levels.levels.iter().enumerate() {
+        for comp in level {
+            if comp.papers.len() > config.max_component_size {
+                log!("  Level {}: {} papers", level_idx, comp.papers.len());
+                large_count += 1;
+            }
+        }
+    }
+    if large_count == 0 {
+        log!("  (none)");
+    }
+
+    // Small components (below naming threshold)
+    log!("\nSmall components (<{} papers, would skip naming):", config.min_component_size);
+    let mut small_count = 0;
+    for level in &levels.levels {
+        for comp in level {
+            if comp.papers.len() < config.min_component_size && comp.papers.len() > 0 {
+                small_count += 1;
+            }
+        }
+    }
+    log!("  {} components", small_count);
+
+    let total_time = start.elapsed().as_secs_f64();
+    log!("\nTotal time: {:.2}s", total_time);
+
+    if json {
+        log!(r#"{{"papers":{},"edges":{},"merges":{},"levels":{},"thresholds":{:?},"time_ms":{}}}"#,
+            papers.len(), edges.len(), dendrogram.merges.len(), levels.levels.len(), thresholds, (total_time * 1000.0) as u64);
+    }
+
     Ok(())
 }
 

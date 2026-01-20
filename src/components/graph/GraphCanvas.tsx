@@ -284,7 +284,47 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
 
     svg.attr('width', width).attr('height', height);
 
+    // Add grid pattern to defs
+    const defs = svg.append('defs');
+
+    // Small grid pattern (20px)
+    const smallGrid = defs.append('pattern')
+      .attr('id', 'graph-grid-small')
+      .attr('width', 40)
+      .attr('height', 40)
+      .attr('patternUnits', 'userSpaceOnUse');
+    smallGrid.append('path')
+      .attr('d', 'M 40 0 L 0 0 0 40')
+      .attr('fill', 'none')
+      .attr('stroke', 'rgba(255,255,255,0.04)')
+      .attr('stroke-width', 0.5);
+
+    // Large grid pattern (200px)
+    const largeGrid = defs.append('pattern')
+      .attr('id', 'graph-grid-large')
+      .attr('width', 200)
+      .attr('height', 200)
+      .attr('patternUnits', 'userSpaceOnUse');
+    largeGrid.append('rect')
+      .attr('width', 200)
+      .attr('height', 200)
+      .attr('fill', 'url(#graph-grid-small)');
+    largeGrid.append('path')
+      .attr('d', 'M 200 0 L 0 0 0 200')
+      .attr('fill', 'none')
+      .attr('stroke', 'rgba(255,255,255,0.08)')
+      .attr('stroke-width', 1);
+
     const container = svg.append('g').attr('class', 'graph-container');
+
+    // Add grid background (inside container so it transforms with zoom/pan)
+    container.append('rect')
+      .attr('class', 'grid-background')
+      .attr('x', -50000)
+      .attr('y', -50000)
+      .attr('width', 100000)
+      .attr('height', 100000)
+      .attr('fill', 'url(#graph-grid-large)');
 
     devLog('info', `GraphCanvas: ${graphNodes.length} nodes, ${edgeData.length} edges to render`);
 
@@ -353,8 +393,7 @@ export const GraphCanvas = React.memo(function GraphCanvas(props: GraphCanvasPro
       });
     }
 
-    // Define arrow markers
-    const defs = svg.append('defs');
+    // Define arrow markers (use existing defs from grid pattern)
     edgeData.forEach((d, i) => {
       const normalized = (d.weight - minWeight) / weightRange;
       const color = d.type === 'contains' ? '#6b7280' : getEdgeColor(normalized);

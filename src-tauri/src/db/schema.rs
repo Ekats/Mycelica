@@ -1250,6 +1250,32 @@ impl Database {
         Ok(edges)
     }
 
+    /// Get all edges between items (papers) sorted by weight descending.
+    /// Returns (source_id, target_id, weight) tuples for dendrogram building.
+    /// Only includes edges where both endpoints are items (is_item = true).
+    pub fn get_all_item_edges_sorted(&self) -> Result<Vec<(String, String, f64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT e.source_id, e.target_id, e.weight
+             FROM edges e
+             JOIN nodes n1 ON e.source_id = n1.id
+             JOIN nodes n2 ON e.target_id = n2.id
+             WHERE n1.is_item = 1 AND n2.is_item = 1
+               AND e.weight IS NOT NULL
+             ORDER BY e.weight DESC"
+        )?;
+
+        let edges = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f64>(2)?,
+            ))
+        })?.collect::<Result<Vec<_>>>()?;
+
+        Ok(edges)
+    }
+
     pub fn get_edges_for_node(&self, node_id: &str) -> Result<Vec<Edge>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

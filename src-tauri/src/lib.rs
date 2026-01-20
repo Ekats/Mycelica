@@ -15,6 +15,7 @@ pub mod openaire;
 mod format_abstract;
 pub mod code;
 mod holerabbit;
+pub mod dendrogram;
 
 use commands::{
     AppState,
