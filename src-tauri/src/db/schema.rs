@@ -3153,6 +3153,17 @@ impl Database {
         Ok(deleted)
     }
 
+    /// Count AI-generated semantic edges
+    pub fn count_semantic_edges(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM edges WHERE type = 'related' AND edge_source = 'ai'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     // ==================== Settings Panel Operations ====================
 
     /// Delete all nodes

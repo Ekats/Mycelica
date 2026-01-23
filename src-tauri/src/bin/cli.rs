@@ -488,7 +488,7 @@ enum HierarchyCommands {
     Build,
     /// Rebuild hierarchy from scratch
     Rebuild {
-        /// Algorithm: classic or dendrogram
+        /// Algorithm: classic, dendrogram, or adaptive
         #[arg(long, default_value = "classic")]
         algorithm: String,
         /// Target number of hierarchy levels (dendrogram only)
@@ -497,12 +497,21 @@ enum HierarchyCommands {
         /// Threshold method: dynamic, gap, percentile, or fixed (dendrogram only)
         #[arg(long, default_value = "dynamic")]
         method: String,
-        /// Minimum component size to create named category (dendrogram only)
+        /// Minimum component size to create named category
         #[arg(long, default_value = "5")]
         min_size: usize,
         /// Custom thresholds for fixed method (comma-separated, e.g. "0.8,0.7,0.6,0.5")
         #[arg(long)]
         thresholds: Option<String>,
+        /// [adaptive] Minimum intra/inter ratio for valid split (1.0-2.0)
+        #[arg(long, default_value = "1.2")]
+        cohesion_threshold: f64,
+        /// [adaptive] Minimum gap between parent/child thresholds
+        #[arg(long, default_value = "0.03")]
+        delta_min: f64,
+        /// [adaptive] Variance threshold below which group is tight (no split)
+        #[arg(long, default_value = "0.001")]
+        tight_threshold: f64,
     },
     /// Rebuild without AI (keyword-based)
     RebuildLite,
@@ -885,6 +894,18 @@ enum MaintenanceCommands {
         /// Sample size per depth for coherence analysis
         #[arg(long, default_value = "50")]
         sample_size: usize,
+    },
+    /// Regenerate semantic edges at a different similarity threshold
+    RegenerateEdges {
+        /// Minimum similarity threshold for edges (0.0-1.0)
+        #[arg(long, default_value = "0.3")]
+        threshold: f32,
+        /// Maximum edges per node
+        #[arg(long, default_value = "15")]
+        max_edges: usize,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1769,8 +1790,25 @@ async fn handle_hierarchy(cmd: HierarchyCommands, db: &Database, json: bool, qui
                 log!("Hierarchy built successfully");
             }
         }
-        HierarchyCommands::Rebuild { algorithm, levels, method, min_size, thresholds } => {
+        HierarchyCommands::Rebuild { algorithm, levels, method, min_size, thresholds, cohesion_threshold, delta_min, tight_threshold } => {
             match algorithm.as_str() {
+                "adaptive" => {
+                    if !quiet { elog!("Rebuilding hierarchy with adaptive v2 algorithm..."); }
+                    let config = mycelica_lib::dendrogram::AdaptiveTreeConfig {
+                        min_size,
+                        tight_threshold,
+                        cohesion_threshold,
+                        delta_min,
+                    };
+                    let result = rebuild_hierarchy_adaptive(db, config, json, quiet).await?;
+                    if json {
+                        log!(r#"{{"status":"ok","categories":{},"papers_assigned":{},"sibling_edges":{},"bridges":{}}}"#,
+                            result.categories, result.papers_assigned, result.sibling_edges, result.bridges);
+                    } else {
+                        log!("Hierarchy rebuilt: {} categories, {} papers assigned, {} sibling edges, {} bridge papers",
+                            result.categories, result.papers_assigned, result.sibling_edges, result.bridges);
+                    }
+                }
                 "dendrogram" => {
                     if !quiet { elog!("Rebuilding hierarchy with dendrogram algorithm..."); }
                     let result = rebuild_hierarchy_dendrogram(db, levels, &method, min_size, thresholds.as_deref(), json, quiet).await?;
@@ -2028,6 +2066,488 @@ struct DendrogramRebuildResult {
     ai_calls: usize,
 }
 
+struct AdaptiveRebuildResult {
+    categories: usize,
+    papers_assigned: usize,
+    sibling_edges: usize,
+    bridges: usize,
+}
+
+/// Rebuild hierarchy using v2 adaptive tree algorithm.
+///
+/// This algorithm:
+/// 1. Builds tree recursively with per-subtree thresholds
+/// 2. Validates each split (gap, balance, cohesion checks)
+/// 3. Detects bridge papers (multi-parent membership)
+/// 4. Creates sibling edges with bridge metadata
+async fn rebuild_hierarchy_adaptive(
+    db: &Database,
+    config: mycelica_lib::dendrogram::AdaptiveTreeConfig,
+    _json: bool,
+    quiet: bool,
+) -> Result<AdaptiveRebuildResult, String> {
+    use mycelica_lib::dendrogram::{build_adaptive_tree, TreeNode};
+    use mycelica_lib::ai_client;
+    use mycelica_lib::db::{Node, NodeType, Position, Edge, EdgeType};
+    use std::time::Instant;
+    use std::collections::{HashMap, HashSet};
+
+    let start = Instant::now();
+    let now = chrono::Utc::now().timestamp_millis();
+
+    // Step 1: Clear existing hierarchy
+    if !quiet { elog!("Step 1/7: Clearing existing hierarchy..."); }
+    db.delete_hierarchy_nodes().map_err(|e| e.to_string())?;
+
+    // Step 2: Load edges and check threshold
+    if !quiet { elog!("Step 2/7: Loading edges..."); }
+    let edges = db.get_all_item_edges_sorted().map_err(|e| e.to_string())?;
+    if edges.is_empty() {
+        return Err("No edges found. Run 'mycelica-cli setup' to create semantic edges first.".to_string());
+    }
+    if !quiet { elog!("  {} edges loaded", edges.len()); }
+
+    // Check edge weight distribution
+    let min_weight = edges.iter().map(|(_, _, w)| *w).fold(f64::INFINITY, f64::min);
+    if min_weight > 0.4 {
+        if !quiet {
+            elog!("  Warning: Minimum edge weight is {:.2}. Consider regenerating edges at lower threshold for finer resolution.", min_weight);
+        }
+    }
+
+    // Extract unique paper IDs
+    let mut paper_set = HashSet::new();
+    for (source, target, _) in &edges {
+        paper_set.insert(source.clone());
+        paper_set.insert(target.clone());
+    }
+    let papers: Vec<String> = paper_set.into_iter().collect();
+    if !quiet { elog!("  {} unique papers", papers.len()); }
+
+    // Step 3: Build adaptive tree
+    if !quiet { elog!("Step 3/7: Building adaptive tree..."); }
+    let (root, sibling_edges) = build_adaptive_tree(papers.clone(), edges.clone(), Some(config.clone()));
+
+    // Count tree structure
+    fn count_nodes(node: &TreeNode) -> (usize, usize) {
+        match node {
+            TreeNode::Leaf { papers, .. } => (1, papers.len()),
+            TreeNode::Internal { children, papers, .. } => {
+                let mut leaves = 0;
+                let mut total_papers = papers.len();
+                for child in children {
+                    let (l, p) = count_nodes(child);
+                    leaves += l;
+                    total_papers = total_papers.max(p);
+                }
+                (leaves, total_papers)
+            }
+        }
+    }
+    let (leaf_count, _) = count_nodes(&root);
+    if !quiet { elog!("  {} leaf categories, {} sibling edges", leaf_count, sibling_edges.len()); }
+
+    // Step 4: Create Universe and flatten tree to DB
+    if !quiet { elog!("Step 4/7: Creating categories in database..."); }
+
+    // Create or update Universe
+    let universe_id = "universe".to_string();
+    let universe_exists = db.get_node(&universe_id).map_err(|e| e.to_string())?.is_some();
+
+    if !universe_exists {
+        let universe = Node {
+            id: universe_id.clone(),
+            node_type: NodeType::Cluster,
+            title: "All Knowledge".to_string(),
+            url: None,
+            content: None,
+            position: Position { x: 0.0, y: 0.0 },
+            created_at: now,
+            updated_at: now,
+            cluster_id: None,
+            cluster_label: None,
+            depth: 0,
+            is_item: false,
+            is_universe: true,
+            parent_id: None,
+            child_count: 0,
+            ai_title: None,
+            summary: None,
+            tags: None,
+            emoji: None,
+            is_processed: false,
+            conversation_id: None,
+            sequence_index: None,
+            is_pinned: false,
+            last_accessed_at: None,
+            source: None,
+            is_private: None,
+            privacy_reason: None,
+            privacy: None,
+            content_type: None,
+            associated_idea_id: None,
+            latest_child_date: None,
+            pdf_available: None,
+        };
+        db.insert_node(&universe).map_err(|e| e.to_string())?;
+    }
+
+    // Flatten tree to categories
+    let mut categories_created = 0;
+    let mut papers_assigned = 0;
+    let mut bridge_count = 0;
+    let mut category_id_counter = 0;
+    let mut node_to_category: HashMap<String, String> = HashMap::new();
+
+    fn flatten_tree(
+        node: &TreeNode,
+        parent_id: &str,
+        depth: i32,
+        db: &Database,
+        now: i64,
+        categories_created: &mut usize,
+        papers_assigned: &mut usize,
+        bridge_count: &mut usize,
+        id_counter: &mut usize,
+        node_to_category: &mut HashMap<String, String>,
+        quiet: bool,
+    ) -> Result<String, String> {
+        let category_id = format!("adaptive-{}", *id_counter);
+        *id_counter += 1;
+
+        // Map tree node ID to category ID
+        node_to_category.insert(node.id().to_string(), category_id.clone());
+
+        match node {
+            TreeNode::Leaf { papers, .. } => {
+                // Create category node
+                let category = Node {
+                    id: category_id.clone(),
+                    node_type: NodeType::Cluster,
+                    title: format!("Category {}", *id_counter - 1),
+                    url: None,
+                    content: None,
+                    position: Position { x: 0.0, y: 0.0 },
+                    created_at: now,
+                    updated_at: now,
+                    cluster_id: None,
+                    cluster_label: None,
+                    depth,
+                    is_item: false,
+                    is_universe: false,
+                    parent_id: Some(parent_id.to_string()),
+                    child_count: papers.len() as i32,
+                    ai_title: None,
+                    summary: None,
+                    tags: None,
+                    emoji: None,
+                    is_processed: false,
+                    conversation_id: None,
+                    sequence_index: None,
+                    is_pinned: false,
+                    last_accessed_at: None,
+                    source: None,
+                    is_private: None,
+                    privacy_reason: None,
+                    privacy: None,
+                    content_type: None,
+                    associated_idea_id: None,
+                    latest_child_date: None,
+                    pdf_available: None,
+                };
+                db.insert_node(&category).map_err(|e| e.to_string())?;
+                *categories_created += 1;
+
+                // Assign papers to this category
+                for paper_id in papers {
+                    db.update_node_hierarchy(paper_id, Some(&category_id), depth + 1)
+                        .map_err(|e| e.to_string())?;
+                    *papers_assigned += 1;
+                }
+            }
+            TreeNode::Internal { children, papers, bridges, .. } => {
+                // Collect papers that made it into children
+                let child_papers: std::collections::HashSet<&String> = children.iter()
+                    .flat_map(|c| match c {
+                        TreeNode::Leaf { papers, .. } => papers.iter(),
+                        TreeNode::Internal { papers, .. } => papers.iter(),
+                    })
+                    .collect();
+
+                // Papers in this node but not in any child (orphans from small components)
+                let orphan_papers: Vec<&String> = papers.iter()
+                    .filter(|p| !child_papers.contains(p))
+                    .collect();
+
+                // Create internal category node
+                let category = Node {
+                    id: category_id.clone(),
+                    node_type: NodeType::Cluster,
+                    title: format!("Category {}", *id_counter - 1),
+                    url: None,
+                    content: None,
+                    position: Position { x: 0.0, y: 0.0 },
+                    created_at: now,
+                    updated_at: now,
+                    cluster_id: None,
+                    cluster_label: None,
+                    depth,
+                    is_item: false,
+                    is_universe: false,
+                    parent_id: Some(parent_id.to_string()),
+                    child_count: (children.len() + if orphan_papers.is_empty() { 0 } else { orphan_papers.len() }) as i32,
+                    ai_title: None,
+                    summary: None,
+                    tags: None,
+                    emoji: None,
+                    is_processed: false,
+                    conversation_id: None,
+                    sequence_index: None,
+                    is_pinned: false,
+                    last_accessed_at: None,
+                    source: None,
+                    is_private: None,
+                    privacy_reason: None,
+                    privacy: None,
+                    content_type: None,
+                    associated_idea_id: None,
+                    latest_child_date: None,
+                    pdf_available: None,
+                };
+                db.insert_node(&category).map_err(|e| e.to_string())?;
+                *categories_created += 1;
+
+                // Assign orphan papers directly to this category
+                for paper_id in &orphan_papers {
+                    db.update_node_hierarchy(paper_id, Some(&category_id), depth + 1)
+                        .map_err(|e| e.to_string())?;
+                    *papers_assigned += 1;
+                }
+
+                // Track bridge count
+                *bridge_count += bridges.len();
+
+                // Recurse into children
+                for child in children {
+                    flatten_tree(
+                        child,
+                        &category_id,
+                        depth + 1,
+                        db,
+                        now,
+                        categories_created,
+                        papers_assigned,
+                        bridge_count,
+                        id_counter,
+                        node_to_category,
+                        quiet,
+                    )?;
+                }
+            }
+        }
+
+        Ok(category_id)
+    }
+
+    // Special case: if root is a leaf (all papers in one group), handle directly
+    match &root {
+        TreeNode::Leaf { papers, .. } => {
+            // Assign all papers directly under Universe
+            for paper_id in papers {
+                db.update_node_hierarchy(paper_id, Some(&universe_id), 1)
+                    .map_err(|e| e.to_string())?;
+                papers_assigned += 1;
+            }
+            categories_created = 0; // No intermediate categories
+        }
+        TreeNode::Internal { children, papers, .. } => {
+            // Collect papers that made it into children
+            let child_papers: std::collections::HashSet<&String> = children.iter()
+                .flat_map(|c| match c {
+                    TreeNode::Leaf { papers, .. } => papers.iter(),
+                    TreeNode::Internal { papers, .. } => papers.iter(),
+                })
+                .collect();
+
+            // Papers at root that didn't make it into any child (orphans)
+            let orphan_papers: Vec<&String> = papers.iter()
+                .filter(|p| !child_papers.contains(p))
+                .collect();
+
+            // Flatten children under Universe
+            for child in children {
+                flatten_tree(
+                    child,
+                    &universe_id,
+                    1,
+                    db,
+                    now,
+                    &mut categories_created,
+                    &mut papers_assigned,
+                    &mut bridge_count,
+                    &mut category_id_counter,
+                    &mut node_to_category,
+                    quiet,
+                )?;
+            }
+
+            // Assign root-level orphan papers directly under Universe
+            if !orphan_papers.is_empty() {
+                if !quiet { elog!("  {} orphan papers (small components) assigned to Universe", orphan_papers.len()); }
+                for paper_id in &orphan_papers {
+                    db.update_node_hierarchy(paper_id, Some(&universe_id), 1)
+                        .map_err(|e| e.to_string())?;
+                    papers_assigned += 1;
+                }
+            }
+        }
+    }
+
+    // Update Universe child count
+    let universe_children = db.get_children(&universe_id).map_err(|e| e.to_string())?;
+    db.update_child_count(&universe_id, universe_children.len() as i32)
+        .map_err(|e| e.to_string())?;
+
+    if !quiet { elog!("  {} categories, {} papers assigned", categories_created, papers_assigned); }
+
+    // Step 5: Create sibling edges with bridge metadata
+    if !quiet { elog!("Step 5/7: Creating sibling edges..."); }
+    let mut sibling_edges_created = 0;
+
+    for meta in &sibling_edges {
+        // Map tree node IDs to category IDs
+        let source_cat = node_to_category.get(&meta.source_id);
+        let target_cat = node_to_category.get(&meta.target_id);
+
+        if let (Some(source), Some(target)) = (source_cat, target_cat) {
+            // Serialize bridges to JSON for label
+            let bridges_json = serde_json::to_string(&meta.bridges).unwrap_or_else(|_| "[]".to_string());
+
+            let edge = Edge {
+                id: format!("sibling-{}-{}", source, target),
+                source: source.clone(),
+                target: target.clone(),
+                edge_type: EdgeType::Sibling,
+                label: Some(bridges_json),
+                weight: Some(meta.weight),
+                edge_source: Some("adaptive".to_string()),
+                evidence_id: None,
+                confidence: Some(1.0),
+                created_at: now,
+            };
+            if db.insert_edge(&edge).is_ok() {
+                sibling_edges_created += 1;
+            }
+        }
+    }
+
+    if !quiet { elog!("  {} sibling edges created", sibling_edges_created); }
+
+    // Step 6: Name categories using AI
+    if !quiet { elog!("Step 6/7: Naming categories..."); }
+    // Get all categories we created
+    let categories: Vec<Node> = db.get_nodes_at_depth(1)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|n| n.id.starts_with("adaptive-"))
+        .collect();
+
+    let mut ai_calls = 0;
+    for category in &categories {
+        // Get children titles for naming
+        let children = db.get_children(&category.id).map_err(|e| e.to_string())?;
+        let titles: Vec<String> = children.iter()
+            .take(10) // Limit for AI prompt
+            .map(|c| c.title.clone())
+            .collect();
+
+        if !titles.is_empty() {
+            // Use keyword extraction for large groups, AI for small
+            let name = if titles.len() > 5 {
+                ai_client::extract_top_keywords(&titles, 4)
+            } else {
+                // For small groups, use keyword extraction too (faster than AI)
+                ai_client::extract_top_keywords(&titles, 3)
+            };
+            ai_calls += 1;
+
+            // Update category title
+            db.update_node_title(&category.id, &name).map_err(|e| e.to_string())?;
+        }
+    }
+
+    if !quiet { elog!("  {} categories named", ai_calls); }
+
+    // Step 7: Handle orphan papers (not assigned to any category)
+    if !quiet { elog!("Step 7/7: Handling orphans..."); }
+    let orphans: Vec<Node> = db.get_orphaned_clustered_items()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|n| n.is_item)
+        .collect();
+
+    if !orphans.is_empty() {
+        // Create Uncategorized container if needed
+        let uncategorized_id = "uncategorized".to_string();
+        if db.get_node(&uncategorized_id).map_err(|e| e.to_string())?.is_none() {
+            let uncategorized = Node {
+                id: uncategorized_id.clone(),
+                node_type: NodeType::Cluster,
+                title: "Uncategorized".to_string(),
+                url: None,
+                content: None,
+                position: Position { x: 0.0, y: 0.0 },
+                created_at: now,
+                updated_at: now,
+                cluster_id: None,
+                cluster_label: None,
+                depth: 1,
+                is_item: false,
+                is_universe: false,
+                parent_id: Some(universe_id.clone()),
+                child_count: 0,
+                ai_title: None,
+                summary: None,
+                tags: None,
+                emoji: None,
+                is_processed: false,
+                conversation_id: None,
+                sequence_index: None,
+                is_pinned: false,
+                last_accessed_at: None,
+                source: None,
+                is_private: None,
+                privacy_reason: None,
+                privacy: None,
+                content_type: None,
+                associated_idea_id: None,
+                latest_child_date: None,
+                pdf_available: None,
+            };
+            db.insert_node(&uncategorized).map_err(|e| e.to_string())?;
+        }
+
+        for orphan in &orphans {
+            db.update_node_hierarchy(&orphan.id, Some(&uncategorized_id), 2)
+                .map_err(|e| e.to_string())?;
+        }
+        db.update_child_count(&uncategorized_id, orphans.len() as i32)
+            .map_err(|e| e.to_string())?;
+
+        if !quiet { elog!("  {} orphans moved to Uncategorized", orphans.len()); }
+    }
+
+    let elapsed = start.elapsed();
+    if !quiet { elog!("Completed in {:.1}s", elapsed.as_secs_f64()); }
+
+    Ok(AdaptiveRebuildResult {
+        categories: categories_created,
+        papers_assigned,
+        sibling_edges: sibling_edges_created,
+        bridges: bridge_count,
+    })
+}
+
 async fn rebuild_hierarchy_dendrogram(
     db: &Database,
     target_levels: usize,
@@ -2037,7 +2557,7 @@ async fn rebuild_hierarchy_dendrogram(
     _json: bool,
     quiet: bool,
 ) -> Result<DendrogramRebuildResult, String> {
-    use mycelica_lib::dendrogram::{build_dendrogram, find_natural_thresholds, find_percentile_thresholds, fixed_thresholds, find_dynamic_thresholds, extract_levels, subdivide_component, Component};
+    use mycelica_lib::dendrogram::{build_dendrogram, find_natural_thresholds, find_percentile_thresholds, fixed_thresholds, find_dynamic_thresholds, extract_levels, Component};
     use mycelica_lib::ai_client;
     use mycelica_lib::db::{Node, NodeType, Position};
     use std::time::Instant;
@@ -2172,6 +2692,10 @@ async fn rebuild_hierarchy_dendrogram(
     // Key: (level_idx, component_idx), Value: category_id
     let mut component_to_category: HashMap<(usize, usize), String> = HashMap::new();
 
+    // Track category_id -> name for parent context in naming
+    let mut category_to_name: HashMap<String, String> = HashMap::new();
+    category_to_name.insert(universe_id.clone(), "Universe".to_string());
+
     // Track which papers end up in which leaf category
     let mut paper_to_leaf_category: HashMap<String, String> = HashMap::new();
 
@@ -2201,36 +2725,12 @@ async fn rebuild_hierarchy_dendrogram(
             .filter(|(_, c)| c.papers.len() >= min_component_size)
             .collect();
 
-        // Subdivide giant components (>500 papers) into smaller ones
-        const MAX_COMPONENT_SIZE: usize = 500;
-        let mut components_to_process: Vec<(usize, Component)> = Vec::new();
+        if !quiet {
+            elog!("  Level {} (threshold {:.3}, depth {}): {} nameable components",
+                level_idx, threshold, depth, nameable.len());
+        }
 
         for (comp_idx, component) in &nameable {
-            if component.papers.len() > MAX_COMPONENT_SIZE {
-                // Giant component: subdivide it
-                let subdivided = subdivide_component(component, &edges, MAX_COMPONENT_SIZE);
-                if !quiet && subdivided.len() > 1 {
-                    elog!("    Subdivided giant ({} papers) into {} sub-components",
-                        component.papers.len(), subdivided.len());
-                }
-                for (sub_idx, sub) in subdivided.into_iter().enumerate() {
-                    if sub.papers.len() >= min_component_size {
-                        // Use a unique index for subdivided components
-                        components_to_process.push((*comp_idx * 1000 + sub_idx, sub));
-                    }
-                }
-            } else {
-                components_to_process.push((*comp_idx, (*component).clone()));
-            }
-        }
-
-        if !quiet {
-            elog!("  Level {} (threshold {:.3}, depth {}): {} components ({} after subdivision)",
-                level_idx, threshold, depth, nameable.len(), components_to_process.len());
-        }
-
-        for (comp_idx, component) in &components_to_process {
-            let component = component; // reborrow
             // Find parent category
             let parent_id = if level_idx == 0 {
                 // First level: parent is Universe
@@ -2284,10 +2784,16 @@ async fn rebuild_hierarchy_dendrogram(
                     .unwrap_or_else(|| n.title.clone()))
                 .collect();
 
-            // Naming strategy: keyword extraction for large, AI for small
+            // Get parent name for context
+            let parent_name = category_to_name.get(&parent_id)
+                .cloned()
+                .unwrap_or_else(|| "Universe".to_string());
+
+            // Naming strategy: keyword extraction for large, AI with parent context for small
             let category_name = if component.papers.len() > 200 {
-                // Large component: use keyword frequency naming (faster, more reliable)
-                let name = ai_client::extract_top_keywords(&all_titles, 4);
+                // Large component: use keyword frequency naming with level suffix
+                let keywords = ai_client::extract_top_keywords(&all_titles, 4);
+                let name = format!("{} (L{})", keywords, level_idx);
                 if !quiet && categories_created % 20 == 0 {
                     elog!("    {} categories created, keywords \"{}\" ({} papers)",
                         categories_created, name, component.papers.len());
@@ -2295,8 +2801,8 @@ async fn rebuild_hierarchy_dendrogram(
                 forbidden_names.push(name.clone());
                 name
             } else {
-                // Small component: AI naming
-                match ai_client::name_cluster_from_samples(&sample_titles, &forbidden_names).await {
+                // Small component: AI naming with parent context
+                match ai_client::name_cluster_with_parent(&sample_titles, &parent_name, &forbidden_names).await {
                     Ok(name) => {
                         ai_calls += 1;
                         if !quiet && categories_created % 20 == 0 {
@@ -2308,8 +2814,8 @@ async fn rebuild_hierarchy_dendrogram(
                     }
                     Err(e) => {
                         if !quiet { elog!("    AI naming failed: {}", e); }
-                        // Fallback: use keywords
-                        let fallback = ai_client::extract_top_keywords(&all_titles, 4);
+                        // Fallback: use keywords with level
+                        let fallback = format!("{} (L{})", ai_client::extract_top_keywords(&all_titles, 4), level_idx);
                         forbidden_names.push(fallback.clone());
                         fallback
                     }
@@ -2335,7 +2841,7 @@ async fn rebuild_hierarchy_dendrogram(
                 created_at: now,
                 updated_at: now,
                 cluster_id: None,
-                cluster_label: Some(category_name),
+                cluster_label: Some(category_name.clone()),
                 depth: depth as i32,
                 is_item: false,
                 is_universe: false,
@@ -2363,8 +2869,9 @@ async fn rebuild_hierarchy_dendrogram(
             db.insert_node(&category_node).map_err(|e| e.to_string())?;
             categories_created += 1;
 
-            // Track this component's category ID
+            // Track this component's category ID and name
             component_to_category.insert((level_idx, *comp_idx), category_id.clone());
+            category_to_name.insert(category_id.clone(), category_name.clone());
 
             // If this is the deepest level, track papers for assignment
             if level_idx == num_levels - 1 {
@@ -4517,6 +5024,35 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
 
         MaintenanceCommands::DiagnoseCoherence { max_depth, sample_size } => {
             diagnose_coherence(db, max_depth, sample_size)?;
+        }
+
+        MaintenanceCommands::RegenerateEdges { threshold, max_edges, force } => {
+            // Count existing edges
+            let existing = db.count_semantic_edges().map_err(|e| e.to_string())?;
+
+            if !force {
+                log!("\nThis will delete {} existing semantic edges and regenerate at threshold {:.2}", existing, threshold);
+                log!("This may take several minutes for large databases.\n");
+                print!("Type 'yes' to confirm: ");
+                std::io::stdout().flush().ok();
+
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input).map_err(|e| e.to_string())?;
+
+                if input.trim() != "yes" {
+                    return Err("Operation cancelled".into());
+                }
+            }
+
+            log!("Deleting existing semantic edges...");
+            let deleted = db.delete_semantic_edges().map_err(|e| e.to_string())?;
+            log!("  Deleted {} edges", deleted);
+
+            log!("Regenerating edges at threshold {:.2} (max {} per node)...", threshold, max_edges);
+            let created = db.create_semantic_edges(threshold, max_edges).map_err(|e| e.to_string())?;
+            log!("  Created {} edges", created);
+
+            log!("\nEdge regeneration complete. Run 'hierarchy rebuild --algorithm adaptive' to use new edges.");
         }
     }
     Ok(())

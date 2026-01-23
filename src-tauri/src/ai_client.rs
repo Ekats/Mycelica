@@ -807,6 +807,31 @@ Category name:"#,
     )
 }
 
+fn build_subcategory_naming_prompt(titles: &[String], parent_name: &str) -> String {
+    let titles_list = titles.iter()
+        .take(12)
+        .map(|t| format!("- {}", t.chars().take(80).collect::<String>()))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"This is a subcategory of "{parent_name}". Name it in 3-6 words.
+The name should be MORE SPECIFIC than the parent category.
+
+Papers in this subcategory:
+{titles_list}
+
+Examples (if parent was "DNA Repair"):
+- "Base Excision Repair Pathways"
+- "Double-Strand Break Response"
+- "Mismatch Repair Mechanisms"
+
+Subcategory name:"#,
+        parent_name = parent_name,
+        titles_list = titles_list
+    )
+}
+
 /// Ask AI to name a cluster based on sample item titles
 /// Prefers Ollama (free) if available, falls back to Anthropic
 /// Retries if name matches forbidden_names (up to 2 attempts)
@@ -867,6 +892,64 @@ pub async fn name_cluster_from_samples(
         .map(|t| if t.len() > 40 { format!("{}...", &t[..37]) } else { t.clone() })
         .unwrap_or_else(|| "Unnamed Group".to_string());
     Ok(fallback)
+}
+
+/// Name a subcategory with parent context for better specificity.
+/// Uses a prompt that tells AI this is a subcategory of the parent.
+pub async fn name_cluster_with_parent(
+    titles: &[String],
+    parent_name: &str,
+    forbidden_names: &[String],
+) -> Result<String, String> {
+    if titles.is_empty() {
+        return Err("No titles provided".into());
+    }
+
+    // If parent is Universe or generic, use regular naming
+    if parent_name == "Universe" || parent_name.is_empty() {
+        return name_cluster_from_samples(titles, forbidden_names).await;
+    }
+
+    let prompt = build_subcategory_naming_prompt(titles, parent_name);
+
+    let use_ollama = ollama_available().await;
+
+    for attempt in 0..2 {
+        let name = if use_ollama {
+            name_cluster_ollama(&prompt).await?
+        } else {
+            name_cluster_anthropic(&prompt).await?
+        };
+
+        // Validate length
+        if name.len() < 2 || name.len() > 60 {
+            if attempt == 0 {
+                continue;
+            }
+            return Err(format!("Invalid name length: {} chars", name.len()));
+        }
+
+        // Check forbidden names
+        let name_lower = name.to_lowercase();
+        let is_forbidden = forbidden_names.iter()
+            .any(|f| f.to_lowercase() == name_lower);
+
+        if !is_forbidden {
+            return Ok(name);
+        }
+
+        // On last attempt, differentiate with parent prefix
+        if attempt == 1 {
+            let differentiated = format!("{}: {}", parent_name.split_whitespace().next().unwrap_or("Sub"), name);
+            if differentiated.len() <= 60 {
+                return Ok(differentiated);
+            }
+        }
+    }
+
+    // Fallback: use keywords with parent context
+    let keywords = extract_top_keywords(titles, 3);
+    Ok(format!("{} ({})", keywords, parent_name.split_whitespace().next().unwrap_or("Sub")))
 }
 
 /// Extract top keywords from titles using frequency analysis.
