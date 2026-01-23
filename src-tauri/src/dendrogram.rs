@@ -135,6 +135,82 @@ impl Default for AdaptiveTreeConfig {
     }
 }
 
+/// Compute optimal AdaptiveTreeConfig from edge statistics.
+///
+/// Analyzes edge weight distribution to determine appropriate parameters:
+/// - min_size: scales with sqrt(n_papers)/15, clamped to [3, 7]
+/// - cohesion_threshold: fixed at 1.0 (higher values hurt coverage)
+/// - delta_min: IQR/20 with floor of 0.02
+/// - tight_threshold: fixed at 0.001
+pub fn auto_config(edges: &[(String, String, f64)], n_papers: usize) -> AdaptiveTreeConfig {
+    let weights: Vec<f64> = edges.iter().map(|(_, _, w)| *w).collect();
+    let n = weights.len();
+
+    if n == 0 {
+        return AdaptiveTreeConfig::default();
+    }
+
+    // Sort for percentiles
+    let mut sorted = weights;
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let p25 = sorted[n * 25 / 100];
+    let p75 = sorted[n * 75 / 100];
+    let iqr = p75 - p25;
+
+    AdaptiveTreeConfig {
+        min_size: (((n_papers as f64).sqrt() / 15.0).ceil() as usize).clamp(3, 7),
+        tight_threshold: 0.001,
+        cohesion_threshold: 1.0,
+        delta_min: (iqr / 20.0).max(0.02),
+    }
+}
+
+/// Edge weight statistics for analysis and reporting.
+#[derive(Debug, Clone)]
+pub struct EdgeStats {
+    pub count: usize,
+    pub mean: f64,
+    pub std_dev: f64,
+    pub min: f64,
+    pub max: f64,
+    pub p10: f64,
+    pub p25: f64,
+    pub p50: f64,
+    pub p75: f64,
+    pub p90: f64,
+}
+
+/// Compute edge weight statistics for analysis.
+pub fn compute_edge_stats(edges: &[(String, String, f64)]) -> Option<EdgeStats> {
+    let weights: Vec<f64> = edges.iter().map(|(_, _, w)| *w).collect();
+    let n = weights.len();
+
+    if n == 0 {
+        return None;
+    }
+
+    let mean = weights.iter().sum::<f64>() / n as f64;
+    let variance = weights.iter().map(|w| (w - mean).powi(2)).sum::<f64>() / (n - 1).max(1) as f64;
+    let std_dev = variance.sqrt();
+
+    let mut sorted = weights;
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    Some(EdgeStats {
+        count: n,
+        mean,
+        std_dev,
+        min: sorted[0],
+        max: sorted[n - 1],
+        p10: sorted[n * 10 / 100],
+        p25: sorted[n * 25 / 100],
+        p50: sorted[n * 50 / 100],
+        p75: sorted[n * 75 / 100],
+        p90: sorted[n * 90 / 100],
+    })
+}
+
 /// A similarity range for a subtree.
 #[derive(Debug, Clone, Copy)]
 pub struct SimRange {

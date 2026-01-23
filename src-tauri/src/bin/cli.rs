@@ -512,11 +512,20 @@ enum HierarchyCommands {
         /// [adaptive] Variance threshold below which group is tight (no split)
         #[arg(long, default_value = "0.001")]
         tight_threshold: f64,
+        /// [adaptive] Auto-compute optimal parameters from edge statistics
+        #[arg(long)]
+        auto: bool,
     },
     /// Rebuild without AI (keyword-based)
     RebuildLite,
     /// Flatten single-child chains
     Flatten,
+    /// Analyze edge weight distribution and recommend parameters
+    Analyze {
+        /// Show recommended auto-config parameters
+        #[arg(long)]
+        recommend: bool,
+    },
     /// Show hierarchy statistics
     Stats,
     /// Fix Recent Notes position (move to Universe)
@@ -1790,17 +1799,11 @@ async fn handle_hierarchy(cmd: HierarchyCommands, db: &Database, json: bool, qui
                 log!("Hierarchy built successfully");
             }
         }
-        HierarchyCommands::Rebuild { algorithm, levels, method, min_size, thresholds, cohesion_threshold, delta_min, tight_threshold } => {
+        HierarchyCommands::Rebuild { algorithm, levels, method, min_size, thresholds, cohesion_threshold, delta_min, tight_threshold, auto } => {
             match algorithm.as_str() {
                 "adaptive" => {
                     if !quiet { elog!("Rebuilding hierarchy with adaptive v2 algorithm..."); }
-                    let config = mycelica_lib::dendrogram::AdaptiveTreeConfig {
-                        min_size,
-                        tight_threshold,
-                        cohesion_threshold,
-                        delta_min,
-                    };
-                    let result = rebuild_hierarchy_adaptive(db, config, json, quiet).await?;
+                    let result = rebuild_hierarchy_adaptive(db, min_size, tight_threshold, cohesion_threshold, delta_min, auto, json, quiet).await?;
                     if json {
                         log!(r#"{{"status":"ok","categories":{},"papers_assigned":{},"sibling_edges":{},"bridges":{}}}"#,
                             result.categories, result.papers_assigned, result.sibling_edges, result.bridges);
@@ -1851,6 +1854,54 @@ async fn handle_hierarchy(cmd: HierarchyCommands, db: &Database, json: bool, qui
                 log!(r#"{{"status":"ok"}}"#);
             } else {
                 log!("Flattened successfully");
+            }
+        }
+        HierarchyCommands::Analyze { recommend } => {
+            use mycelica_lib::dendrogram::{compute_edge_stats, auto_config};
+
+            // Load edges
+            let edges = db.get_all_item_edges_sorted().map_err(|e| e.to_string())?;
+            if edges.is_empty() {
+                return Err("No edges found. Run 'mycelica-cli setup' to create semantic edges first.".to_string());
+            }
+
+            // Count papers
+            let mut paper_set = std::collections::HashSet::new();
+            for (source, target, _) in &edges {
+                paper_set.insert(source.clone());
+                paper_set.insert(target.clone());
+            }
+            let n_papers = paper_set.len();
+
+            // Compute statistics
+            if let Some(stats) = compute_edge_stats(&edges) {
+                if json {
+                    log!(r#"{{"edges":{},"papers":{},"mean":{:.4},"std":{:.4},"min":{:.4},"max":{:.4},"p10":{:.4},"p25":{:.4},"p50":{:.4},"p75":{:.4},"p90":{:.4}}}"#,
+                        stats.count, n_papers, stats.mean, stats.std_dev, stats.min, stats.max,
+                        stats.p10, stats.p25, stats.p50, stats.p75, stats.p90);
+                } else {
+                    log!("Edge Weight Analysis:");
+                    log!("  Total edges: {}", stats.count);
+                    log!("  Total papers: {}", n_papers);
+                    log!("  Mean: {:.4}, Std: {:.4}", stats.mean, stats.std_dev);
+                    log!("  Range: [{:.4}, {:.4}]", stats.min, stats.max);
+                    log!("  Percentiles: p10={:.4}, p25={:.4}, p50={:.4}, p75={:.4}, p90={:.4}",
+                        stats.p10, stats.p25, stats.p50, stats.p75, stats.p90);
+
+                    if recommend {
+                        let cfg = auto_config(&edges, n_papers);
+                        log!("");
+                        log!("Recommended Auto-Config:");
+                        log!("  --min-size {}", cfg.min_size);
+                        log!("  --cohesion-threshold {:.2}", cfg.cohesion_threshold);
+                        log!("  --delta-min {:.3}", cfg.delta_min);
+                        log!("  --tight-threshold {:.4}", cfg.tight_threshold);
+                        log!("");
+                        log!("Or use: hierarchy rebuild --algorithm adaptive --auto");
+                    }
+                }
+            } else {
+                return Err("Could not compute edge statistics (no edges?)".to_string());
             }
         }
         HierarchyCommands::Stats => {
@@ -2082,11 +2133,15 @@ struct AdaptiveRebuildResult {
 /// 4. Creates sibling edges with bridge metadata
 async fn rebuild_hierarchy_adaptive(
     db: &Database,
-    config: mycelica_lib::dendrogram::AdaptiveTreeConfig,
+    min_size: usize,
+    tight_threshold: f64,
+    cohesion_threshold: f64,
+    delta_min: f64,
+    auto: bool,
     _json: bool,
     quiet: bool,
 ) -> Result<AdaptiveRebuildResult, String> {
-    use mycelica_lib::dendrogram::{build_adaptive_tree, TreeNode};
+    use mycelica_lib::dendrogram::{build_adaptive_tree, auto_config, AdaptiveTreeConfig, TreeNode};
     use mycelica_lib::ai_client;
     use mycelica_lib::db::{Node, NodeType, Position, Edge, EdgeType};
     use std::time::Instant;
@@ -2123,6 +2178,23 @@ async fn rebuild_hierarchy_adaptive(
     }
     let papers: Vec<String> = paper_set.into_iter().collect();
     if !quiet { elog!("  {} unique papers", papers.len()); }
+
+    // Compute config (auto or manual)
+    let config = if auto {
+        let auto_cfg = auto_config(&edges, papers.len());
+        if !quiet {
+            elog!("  Auto-config: min_size={}, cohesion={:.2}, delta_min={:.3}",
+                auto_cfg.min_size, auto_cfg.cohesion_threshold, auto_cfg.delta_min);
+        }
+        auto_cfg
+    } else {
+        AdaptiveTreeConfig {
+            min_size,
+            tight_threshold,
+            cohesion_threshold,
+            delta_min,
+        }
+    };
 
     // Step 3: Build adaptive tree
     if !quiet { elog!("Step 3/7: Building adaptive tree..."); }
