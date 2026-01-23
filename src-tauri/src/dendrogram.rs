@@ -1435,7 +1435,8 @@ pub fn build_tree(
                     }
                 }
                 if count > 0 {
-                    let avg = sum / child.len() as f64;
+                    // Use actual average of edges found, not divided by total child size
+                    let avg = sum / count as f64;
                     if avg > best_avg {
                         best_avg = avg;
                         best_child_idx = Some(idx);

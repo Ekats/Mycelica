@@ -2478,63 +2478,105 @@ async fn rebuild_hierarchy_adaptive(
 
     if !quiet { elog!("  {} categories named", ai_calls); }
 
-    // Step 7: Handle orphan papers (not assigned to any category)
-    if !quiet { elog!("Step 7/7: Handling orphans..."); }
-    let orphans: Vec<Node> = db.get_orphaned_clustered_items()
+    // Step 7: Final-pass orphan assignment using nearest-neighbor
+    if !quiet { elog!("Step 7/7: Final-pass orphan assignment..."); }
+
+    // Get orphans (items at depth=1 under Universe)
+    let orphan_nodes: Vec<Node> = db.get_children(&universe_id)
         .map_err(|e| e.to_string())?
         .into_iter()
         .filter(|n| n.is_item)
         .collect();
 
-    if !orphans.is_empty() {
-        // Create Uncategorized container if needed
-        let uncategorized_id = "uncategorized".to_string();
-        if db.get_node(&uncategorized_id).map_err(|e| e.to_string())?.is_none() {
-            let uncategorized = Node {
-                id: uncategorized_id.clone(),
-                node_type: NodeType::Cluster,
-                title: "Uncategorized".to_string(),
-                url: None,
-                content: None,
-                position: Position { x: 0.0, y: 0.0 },
-                created_at: now,
-                updated_at: now,
-                cluster_id: None,
-                cluster_label: None,
-                depth: 1,
-                is_item: false,
-                is_universe: false,
-                parent_id: Some(universe_id.clone()),
-                child_count: 0,
-                ai_title: None,
-                summary: None,
-                tags: None,
-                emoji: None,
-                is_processed: false,
-                conversation_id: None,
-                sequence_index: None,
-                is_pinned: false,
-                last_accessed_at: None,
-                source: None,
-                is_private: None,
-                privacy_reason: None,
-                privacy: None,
-                content_type: None,
-                associated_idea_id: None,
-                latest_child_date: None,
-                pdf_available: None,
-            };
-            db.insert_node(&uncategorized).map_err(|e| e.to_string())?;
+    if !orphan_nodes.is_empty() {
+        // Build edge index for O(1) weight lookups
+        use mycelica_lib::dendrogram::EdgeIndex;
+        let edge_index = EdgeIndex::new(&edges);
+
+        // Get all leaf categories (categories whose children are items)
+        // Collect categories across all depths
+        let mut all_categories: Vec<Node> = Vec::new();
+        for depth in 1..=15 {
+            let cats_at_depth: Vec<Node> = db.get_nodes_at_depth(depth)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|n| !n.is_item && n.id.starts_with("adaptive-"))
+                .collect();
+            if cats_at_depth.is_empty() && depth > 1 {
+                break; // No more categories at deeper levels
+            }
+            all_categories.extend(cats_at_depth);
         }
 
-        for orphan in &orphans {
-            db.update_node_hierarchy(&orphan.id, Some(&uncategorized_id), 2)
-                .map_err(|e| e.to_string())?;
+        // For each category, get its item children
+        let mut leaf_categories: Vec<(String, Vec<String>, i32)> = Vec::new(); // (cat_id, member_ids, depth)
+        for cat in &all_categories {
+            let children = db.get_children(&cat.id).map_err(|e| e.to_string())?;
+            let item_children: Vec<String> = children.iter()
+                .filter(|c| c.is_item)
+                .map(|c| c.id.clone())
+                .collect();
+            if !item_children.is_empty() {
+                leaf_categories.push((cat.id.clone(), item_children, cat.depth));
+            }
         }
-        db.update_child_count(&uncategorized_id, orphans.len() as i32)
-            .map_err(|e| e.to_string())?;
 
-        if !quiet { elog!("  {} orphans moved to Uncategorized", orphans.len()); }
+        if !quiet { elog!("  {} orphans, {} leaf categories", orphan_nodes.len(), leaf_categories.len()); }
+
+        let mut rescued = 0;
+        let mut truly_isolated = 0;
+
+        for orphan in &orphan_nodes {
+            // Compute average edge weight to each leaf category
+            let mut best_cat: Option<&str> = None;
+            let mut best_avg: f64 = 0.0;
+            let mut best_depth: i32 = 0;
+
+            for (cat_id, members, depth) in &leaf_categories {
+                let mut sum = 0.0;
+                let mut count = 0;
+                for member in members {
+                    if let Some(w) = edge_index.weight(&orphan.id, member) {
+                        sum += w;
+                        count += 1;
+                    }
+                }
+                if count > 0 {
+                    // Use sum/count (actual average of edges found), not sum/members.len()
+                    let avg = sum / count as f64;
+                    if avg > best_avg {
+                        best_avg = avg;
+                        best_cat = Some(cat_id);
+                        best_depth = *depth;
+                    }
+                }
+            }
+
+            if let Some(cat_id) = best_cat {
+                // Assign orphan to best leaf category
+                db.update_node_hierarchy(&orphan.id, Some(cat_id), best_depth + 1)
+                    .map_err(|e| e.to_string())?;
+                rescued += 1;
+            } else {
+                // Truly isolated - no edges to any categorized paper
+                truly_isolated += 1;
+            }
+        }
+
+        // Update child counts for affected categories
+        for (cat_id, _, _) in &leaf_categories {
+            let children = db.get_children(cat_id).map_err(|e| e.to_string())?;
+            db.update_child_count(cat_id, children.len() as i32).map_err(|e| e.to_string())?;
+        }
+
+        if !quiet {
+            elog!("  {} orphans rescued via NN assignment", rescued);
+            if truly_isolated > 0 {
+                elog!("  {} truly isolated (no edges to any category)", truly_isolated);
+            }
+        }
+
+        papers_assigned += rescued;
     }
 
     let elapsed = start.elapsed();
