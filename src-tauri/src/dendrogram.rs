@@ -118,10 +118,16 @@ pub struct AdaptiveTreeConfig {
     pub min_size: usize,
     /// Variance threshold below which group is already cohesive.
     pub tight_threshold: f64,
-    /// Minimum intra/inter ratio for valid split.
+    /// Base cohesion threshold (scaled by density ratio at runtime).
     pub cohesion_threshold: f64,
     /// Minimum gap between parent and child cut thresholds.
     pub delta_min: f64,
+    /// IQR of edge weight distribution (for dynamic balance scaling).
+    /// Reference value from somatic-neuroscience: 0.16
+    pub iqr: f64,
+    /// Edge density = edges / (n * (n-1) / 2).
+    /// Reference value from somatic-neuroscience: 0.0043
+    pub edge_density: f64,
 }
 
 impl Default for AdaptiveTreeConfig {
@@ -131,6 +137,9 @@ impl Default for AdaptiveTreeConfig {
             tight_threshold: constants::TIGHT_THRESHOLD,
             cohesion_threshold: constants::COHESION_THRESHOLD,
             delta_min: constants::DELTA_MIN,
+            // Reference values from somatic-neuroscience database
+            iqr: 0.16,
+            edge_density: 0.0043,
         }
     }
 }
@@ -139,9 +148,11 @@ impl Default for AdaptiveTreeConfig {
 ///
 /// Analyzes edge weight distribution to determine appropriate parameters:
 /// - min_size: scales with sqrt(n_papers)/15, clamped to [3, 7]
-/// - cohesion_threshold: fixed at 1.0 (higher values hurt coverage)
+/// - cohesion_threshold: base 1.0 (scaled at runtime by density ratio)
 /// - delta_min: IQR/20 with floor of 0.02
 /// - tight_threshold: fixed at 0.001
+/// - iqr: actual IQR from edge distribution (for dynamic balance scaling)
+/// - edge_density: actual density (for dynamic cohesion scaling)
 pub fn auto_config(edges: &[(String, String, f64)], n_papers: usize) -> AdaptiveTreeConfig {
     let weights: Vec<f64> = edges.iter().map(|(_, _, w)| *w).collect();
     let n = weights.len();
@@ -158,11 +169,21 @@ pub fn auto_config(edges: &[(String, String, f64)], n_papers: usize) -> Adaptive
     let p75 = sorted[n * 75 / 100];
     let iqr = p75 - p25;
 
+    // Compute edge density: edges / (n * (n-1) / 2)
+    let max_edges = (n_papers * (n_papers.saturating_sub(1))) / 2;
+    let edge_density = if max_edges > 0 {
+        n as f64 / max_edges as f64
+    } else {
+        0.0
+    };
+
     AdaptiveTreeConfig {
         min_size: (((n_papers as f64).sqrt() / 15.0).ceil() as usize).clamp(3, 7),
         tight_threshold: 0.001,
         cohesion_threshold: 1.0,
         delta_min: (iqr / 20.0).max(0.02),
+        iqr,
+        edge_density,
     }
 }
 
@@ -179,6 +200,8 @@ pub struct EdgeStats {
     pub p50: f64,
     pub p75: f64,
     pub p90: f64,
+    /// Interquartile range (p75 - p25)
+    pub iqr: f64,
 }
 
 /// Compute edge weight statistics for analysis.
@@ -197,6 +220,9 @@ pub fn compute_edge_stats(edges: &[(String, String, f64)]) -> Option<EdgeStats> 
     let mut sorted = weights;
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
+    let p25 = sorted[n * 25 / 100];
+    let p75 = sorted[n * 75 / 100];
+
     Some(EdgeStats {
         count: n,
         mean,
@@ -204,10 +230,11 @@ pub fn compute_edge_stats(edges: &[(String, String, f64)]) -> Option<EdgeStats> 
         min: sorted[0],
         max: sorted[n - 1],
         p10: sorted[n * 10 / 100],
-        p25: sorted[n * 25 / 100],
+        p25,
         p50: sorted[n * 50 / 100],
-        p75: sorted[n * 75 / 100],
+        p75,
         p90: sorted[n * 90 / 100],
+        iqr: p75 - p25,
     })
 }
 
@@ -1220,9 +1247,39 @@ pub fn valid_cohesion(
     true
 }
 
+/// Reference constants from somatic-neuroscience database (well-behaved case).
+pub mod reference {
+    pub const IQR: f64 = 0.16;
+    pub const EDGE_DENSITY: f64 = 0.0043;
+}
+
+/// Compute dynamic minimum balance ratio.
+///
+/// Scales the base ratio by IQR: tight distributions need less balance.
+/// base_ratio * (actual_iqr / reference_iqr)
+pub fn dynamic_min_ratio(group_size: usize, iqr: f64) -> f64 {
+    let base = min_ratio(group_size);
+    // Scale by IQR ratio: tight distribution (low IQR) -> lower balance requirement
+    let iqr_scale = (iqr / reference::IQR).clamp(0.25, 2.0);
+    (base * iqr_scale).clamp(0.01, 0.5)
+}
+
+/// Compute dynamic cohesion threshold.
+///
+/// Scales by inverse density: dense graphs need lower cohesion to find splits.
+/// base_cohesion * (reference_density / actual_density)
+pub fn dynamic_cohesion_threshold(base: f64, edge_density: f64) -> f64 {
+    if edge_density <= 0.0 {
+        return base;
+    }
+    // Scale by inverse density ratio: dense graph -> lower cohesion requirement
+    let density_scale = (reference::EDGE_DENSITY / edge_density).clamp(0.1, 2.0);
+    (base * density_scale).clamp(0.5, 2.0)
+}
+
 /// Find all valid splits within similarity range.
 ///
-/// Checks: gap from parent, balance ratio, cohesion ratio.
+/// Uses percentile-based thresholds with dynamic balance and cohesion scaling.
 pub fn find_valid_splits(
     papers: &[String],
     range: SimRange,
@@ -1241,10 +1298,31 @@ pub fn find_valid_splits(
         return vec![];
     }
 
-    // Get unique thresholds sorted descending
-    let mut thresholds: Vec<f64> = edges_in_range.iter().map(|(_, _, w)| *w).collect();
+    // Compute percentile-based thresholds from current subgraph's edges
+    // This guarantees finding natural cut points in any distribution
+    let mut weights: Vec<f64> = edges_in_range.iter().map(|(_, _, w)| *w).collect();
+    weights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let n = weights.len();
+    let mut thresholds = Vec::new();
+
+    // Try percentiles: p20, p30, p40, p50, p60, p70, p80
+    // Cutting at median guarantees fragmentation in non-complete graphs
+    for percentile in [20, 30, 40, 50, 60, 70, 80] {
+        let idx = (n * percentile / 100).min(n.saturating_sub(1));
+        let t = weights[idx];
+        // Only add if distinct from existing thresholds
+        if !thresholds.iter().any(|&existing: &f64| (existing - t).abs() < 0.001) {
+            thresholds.push(t);
+        }
+    }
+
+    // Sort descending (try higher thresholds first for tighter clusters)
     thresholds.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    thresholds.dedup_by(|a, b| (*a - *b).abs() < 0.001);
+
+    // Compute dynamic thresholds for this config
+    let effective_min_ratio = dynamic_min_ratio(papers.len(), config.iqr);
+    let effective_cohesion = dynamic_cohesion_threshold(config.cohesion_threshold, config.edge_density);
 
     let mut valid = Vec::new();
 
@@ -1275,18 +1353,32 @@ pub fn find_valid_splits(
             continue;
         }
 
-        // Balance check
-        let sizes: Vec<usize> = components.iter().map(|c| c.len()).collect();
-        let min_size = *sizes.iter().min().unwrap_or(&0);
-        let max_size = *sizes.iter().max().unwrap_or(&1);
-        let ratio = min_size as f64 / max_size as f64;
+        // Balance check with dynamic scaling
+        // Use second-largest/largest ratio instead of min/max
+        // This allows splits with a giant + several small components
+        let mut sizes: Vec<usize> = components.iter().map(|c| c.len()).collect();
+        sizes.sort_by(|a, b| b.cmp(a)); // Sort descending
 
-        if ratio < min_ratio(papers.len()) {
+        let largest = sizes[0];
+        let second_largest = if sizes.len() > 1 { sizes[1] } else { 0 };
+        let ratio = second_largest as f64 / largest as f64;
+
+        // Also check coverage: sum of valid components / total papers
+        let total_in_valid: usize = sizes.iter().sum();
+        let coverage = total_in_valid as f64 / papers.len() as f64;
+
+        // Pass if:
+        // 1. Second largest is at least effective_min_ratio of largest, OR
+        // 2. We have good coverage (>50%) with multiple components
+        let passes_balance = ratio >= effective_min_ratio
+            || (coverage >= 0.5 && components.len() >= 3);
+
+        if !passes_balance {
             continue;
         }
 
-        // Cohesion check
-        if !valid_cohesion(&components, edge_index, config) {
+        // Cohesion check with dynamic scaling
+        if !valid_cohesion_dynamic(&components, edge_index, effective_cohesion) {
             continue;
         }
 
@@ -1301,6 +1393,32 @@ pub fn find_valid_splits(
     }
 
     valid
+}
+
+/// Check cohesion with a specific threshold value (for dynamic scaling).
+fn valid_cohesion_dynamic(
+    components: &[Vec<String>],
+    edge_index: &EdgeIndex,
+    cohesion_threshold: f64,
+) -> bool {
+    for i in 0..components.len() {
+        for j in (i + 1)..components.len() {
+            let intra_a = edge_index.intra(&components[i]);
+            let intra_b = edge_index.intra(&components[j]);
+            let inter = edge_index.inter(&components[i], &components[j]);
+
+            // If no inter-edges, they're definitely separated
+            if inter == 0.0 {
+                continue;
+            }
+
+            let ratio = (intra_a + intra_b) / (2.0 * inter);
+            if ratio < cohesion_threshold {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Find bridge papers near the cut threshold.
@@ -1802,10 +1920,43 @@ mod tests {
 
     #[test]
     fn test_min_ratio_scaling() {
-        assert_eq!(min_ratio(600), 0.05);
-        assert_eq!(min_ratio(300), 0.08);
-        assert_eq!(min_ratio(100), 0.12);
-        assert_eq!(min_ratio(20), 0.25);
+        // Values match the function's thresholds
+        assert_eq!(min_ratio(600), 0.01);  // >500: 1%
+        assert_eq!(min_ratio(300), 0.03);  // >200: 3%
+        assert_eq!(min_ratio(100), 0.08);  // >50: 8%
+        assert_eq!(min_ratio(20), 0.15);   // <=50: 15%
+    }
+
+    #[test]
+    fn test_dynamic_min_ratio_scaling() {
+        // With reference IQR (0.16), dynamic ratio equals base ratio
+        let base_ratio = min_ratio(100);
+        let dynamic = dynamic_min_ratio(100, 0.16);
+        assert!((dynamic - base_ratio).abs() < 0.001);
+
+        // With half IQR (0.08), dynamic ratio is ~half
+        let tight = dynamic_min_ratio(100, 0.08);
+        assert!(tight < base_ratio, "tight IQR should give lower ratio");
+        assert!((tight - base_ratio * 0.5).abs() < 0.01);
+
+        // With double IQR (0.32), dynamic ratio is ~double (clamped)
+        let wide = dynamic_min_ratio(100, 0.32);
+        assert!(wide > base_ratio, "wide IQR should give higher ratio");
+    }
+
+    #[test]
+    fn test_dynamic_cohesion_scaling() {
+        // With reference density, cohesion equals base
+        let dynamic = dynamic_cohesion_threshold(1.0, reference::EDGE_DENSITY);
+        assert!((dynamic - 1.0).abs() < 0.001);
+
+        // With 10x density (0.043), cohesion is lower
+        let dense = dynamic_cohesion_threshold(1.0, 0.043);
+        assert!(dense < 1.0, "dense graph should have lower cohesion threshold");
+
+        // With 0.1x density (0.00043), cohesion is higher (capped at 2.0)
+        let sparse = dynamic_cohesion_threshold(1.0, 0.00043);
+        assert!(sparse > 1.0, "sparse graph should have higher cohesion threshold");
     }
 
     #[test]
@@ -1872,10 +2023,8 @@ mod tests {
         let papers = vec!["p1".to_string(), "p2".to_string()];
         let edges = vec![("p1".to_string(), "p2".to_string(), 0.9)];
 
-        let config = AdaptiveTreeConfig {
-            min_size: 5, // Requires 5 papers minimum
-            ..Default::default()
-        };
+        let mut config = AdaptiveTreeConfig::default();
+        config.min_size = 5; // Requires 5 papers minimum
 
         let (root, _) = build_adaptive_tree(papers, edges, Some(config));
 

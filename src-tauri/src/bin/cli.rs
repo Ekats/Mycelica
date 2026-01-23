@@ -1889,7 +1889,17 @@ async fn handle_hierarchy(cmd: HierarchyCommands, db: &Database, json: bool, qui
                         stats.p10, stats.p25, stats.p50, stats.p75, stats.p90);
 
                     if recommend {
+                        use mycelica_lib::dendrogram::{dynamic_min_ratio, dynamic_cohesion_threshold, reference};
+
                         let cfg = auto_config(&edges, n_papers);
+                        log!("");
+                        log!("Distribution Characteristics:");
+                        log!("  IQR: {:.4} (reference: {:.4})", cfg.iqr, reference::IQR);
+                        log!("  Density: {:.4} (reference: {:.4})", cfg.edge_density, reference::EDGE_DENSITY);
+                        log!("");
+                        log!("Dynamic Scaling (for 1000 papers):");
+                        log!("  Balance ratio: {:.4} (base: {:.4})", dynamic_min_ratio(1000, cfg.iqr), 0.01);
+                        log!("  Cohesion: {:.2} (base: {:.2})", dynamic_cohesion_threshold(1.0, cfg.edge_density), 1.0);
                         log!("");
                         log!("Recommended Auto-Config:");
                         log!("  --min-size {}", cfg.min_size);
@@ -2179,12 +2189,15 @@ async fn rebuild_hierarchy_adaptive(
     let papers: Vec<String> = paper_set.into_iter().collect();
     if !quiet { elog!("  {} unique papers", papers.len()); }
 
-    // Compute config (auto or manual)
+    // Always compute edge statistics for dynamic scaling
+    let auto_cfg = auto_config(&edges, papers.len());
+
+    // Compute config (auto uses all auto values, manual uses CLI args but keeps iqr/density)
     let config = if auto {
-        let auto_cfg = auto_config(&edges, papers.len());
         if !quiet {
             elog!("  Auto-config: min_size={}, cohesion={:.2}, delta_min={:.3}",
                 auto_cfg.min_size, auto_cfg.cohesion_threshold, auto_cfg.delta_min);
+            elog!("  Distribution: IQR={:.3}, density={:.4}", auto_cfg.iqr, auto_cfg.edge_density);
         }
         auto_cfg
     } else {
@@ -2193,6 +2206,9 @@ async fn rebuild_hierarchy_adaptive(
             tight_threshold,
             cohesion_threshold,
             delta_min,
+            // Use actual data statistics for dynamic scaling even in manual mode
+            iqr: auto_cfg.iqr,
+            edge_density: auto_cfg.edge_density,
         }
     };
 
