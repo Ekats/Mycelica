@@ -2534,40 +2534,53 @@ async fn rebuild_hierarchy_adaptive(
 
     if !quiet { elog!("  {} sibling edges created", sibling_edges_created); }
 
-    // Step 6: Name categories using AI
+    // Step 6: Name categories using keyword extraction (bottom-up)
     if !quiet { elog!("Step 6/7: Naming categories..."); }
-    // Get all categories we created
-    let categories: Vec<Node> = db.get_nodes_at_depth(1)
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .filter(|n| n.id.starts_with("adaptive-"))
-        .collect();
 
-    let mut ai_calls = 0;
-    for category in &categories {
-        // Get children titles for naming
-        let children = db.get_children(&category.id).map_err(|e| e.to_string())?;
-        let titles: Vec<String> = children.iter()
-            .take(10) // Limit for AI prompt
-            .map(|c| c.title.clone())
+    // Collect adaptive categories by depth (to process bottom-up)
+    let mut categories_by_depth: Vec<Vec<Node>> = Vec::new();
+    for depth in 1..=15 {
+        let cats_at_depth: Vec<Node> = db.get_nodes_at_depth(depth)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|n| n.id.starts_with("adaptive-"))
             .collect();
+        if cats_at_depth.is_empty() && depth > 1 {
+            break;
+        }
+        categories_by_depth.push(cats_at_depth);
+    }
 
-        if !titles.is_empty() {
-            // Use keyword extraction for large groups, AI for small
-            let name = if titles.len() > 5 {
-                ai_client::extract_top_keywords(&titles, 4)
-            } else {
-                // For small groups, use keyword extraction too (faster than AI)
-                ai_client::extract_top_keywords(&titles, 3)
-            };
-            ai_calls += 1;
+    // Process bottom-up: deepest categories first (they have item children)
+    // Then their parents can use the newly-named subcategory titles
+    let mut named_count = 0;
+    for cats_at_depth in categories_by_depth.iter().rev() {
+        for category in cats_at_depth {
+            let children = db.get_children(&category.id).map_err(|e| e.to_string())?;
 
-            // Update category title
-            db.update_node_title(&category.id, &name).map_err(|e| e.to_string())?;
+            // Collect titles from children (items or already-named subcategories)
+            let titles: Vec<String> = children.iter()
+                .filter(|c| !c.title.is_empty() && c.title != "Category")
+                .take(15)
+                .map(|c| c.title.clone())
+                .collect();
+
+            if !titles.is_empty() {
+                let name = if titles.len() > 5 {
+                    ai_client::extract_top_keywords(&titles, 4)
+                } else {
+                    ai_client::extract_top_keywords(&titles, 3)
+                };
+
+                if !name.is_empty() && name != "Category" {
+                    db.update_node_title(&category.id, &name).map_err(|e| e.to_string())?;
+                    named_count += 1;
+                }
+            }
         }
     }
 
-    if !quiet { elog!("  {} categories named", ai_calls); }
+    if !quiet { elog!("  {} categories named", named_count); }
 
     // Step 7: Final-pass orphan assignment using nearest-neighbor
     if !quiet { elog!("Step 7/7: Final-pass orphan assignment..."); }
