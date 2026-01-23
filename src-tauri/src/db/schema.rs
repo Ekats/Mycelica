@@ -2110,6 +2110,18 @@ impl Database {
         Ok(())
     }
 
+    /// Recalculate child_count for ALL categories (non-items) in one SQL statement
+    pub fn recalculate_all_child_counts(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE nodes SET child_count = (
+                SELECT COUNT(*) FROM nodes AS children WHERE children.parent_id = nodes.id
+            ) WHERE is_item = 0",
+            [],
+        )?;
+        Ok(updated)
+    }
+
     /// Count children of a node
     #[allow(dead_code)]
     pub fn count_children(&self, parent_id: &str) -> Result<i32> {

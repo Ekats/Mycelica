@@ -1266,15 +1266,16 @@ pub fn dynamic_min_ratio(group_size: usize, iqr: f64) -> f64 {
 
 /// Compute dynamic cohesion threshold.
 ///
-/// Scales by inverse density: dense graphs need lower cohesion to find splits.
-/// base_cohesion * (reference_density / actual_density)
+/// Dense graphs need lower cohesion to find splits (more edges = clearer signal).
+/// Sparse graphs stay at base (never make it HARDER to split).
 pub fn dynamic_cohesion_threshold(base: f64, edge_density: f64) -> f64 {
     if edge_density <= 0.0 {
         return base;
     }
-    // Scale by inverse density ratio: dense graph -> lower cohesion requirement
-    let density_scale = (reference::EDGE_DENSITY / edge_density).clamp(0.1, 2.0);
-    (base * density_scale).clamp(0.5, 2.0)
+    // Dense graph -> lower cohesion (easier splits)
+    // Sparse graph -> stay at base (cap at 1.0, never increase)
+    let density_scale = (reference::EDGE_DENSITY / edge_density).clamp(0.1, 1.0);
+    (base * density_scale).clamp(0.3, 1.0)
 }
 
 /// Find all valid splits within similarity range.
@@ -1950,13 +1951,14 @@ mod tests {
         let dynamic = dynamic_cohesion_threshold(1.0, reference::EDGE_DENSITY);
         assert!((dynamic - 1.0).abs() < 0.001);
 
-        // With 10x density (0.043), cohesion is lower
+        // With 10x density (0.043), cohesion is lower (easier splits)
         let dense = dynamic_cohesion_threshold(1.0, 0.043);
         assert!(dense < 1.0, "dense graph should have lower cohesion threshold");
 
-        // With 0.1x density (0.00043), cohesion is higher (capped at 2.0)
+        // With 0.1x density (0.00043), cohesion stays at base (capped at 1.0)
+        // Sparse graphs should NOT have harder splits
         let sparse = dynamic_cohesion_threshold(1.0, 0.00043);
-        assert!(sparse > 1.0, "sparse graph should have higher cohesion threshold");
+        assert!((sparse - 1.0).abs() < 0.001, "sparse graph should stay at base cohesion, got {}", sparse);
     }
 
     #[test]

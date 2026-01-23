@@ -2667,6 +2667,15 @@ async fn rebuild_hierarchy_adaptive(
         papers_assigned += rescued;
     }
 
+    // Final step: Recalculate child_count for all categories
+    // This ensures graph view can drill into categories correctly
+    let updated = db.recalculate_all_child_counts().map_err(|e| e.to_string())?;
+    if !quiet { elog!("  Updated child_count for {} categories", updated); }
+
+    // Update edge parent IDs so edges appear in the correct views
+    let edge_updates = db.update_edge_parents().map_err(|e| e.to_string())?;
+    if !quiet { elog!("  Updated parent IDs for {} edges", edge_updates); }
+
     let elapsed = start.elapsed();
     if !quiet { elog!("Completed in {:.1}s", elapsed.as_secs_f64()); }
 
