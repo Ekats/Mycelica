@@ -273,6 +273,9 @@ enum Commands {
         /// Include code items in AI processing (generate summaries)
         #[arg(long)]
         include_code: bool,
+        /// Hierarchy algorithm: adaptive (default) or classic
+        #[arg(long, default_value = "adaptive")]
+        algorithm: String,
     },
     /// Recent nodes
     Recent {
@@ -1067,7 +1070,7 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Privacy { cmd } => handle_privacy(cmd, &db, cli.json, cli.quiet).await,
         Commands::Paper { cmd } => handle_paper(cmd, &db, cli.json).await,
         Commands::Config { cmd } => handle_config(cmd, cli.json),
-        Commands::Setup { skip_pipeline, fos, include_code } => handle_setup(&db, skip_pipeline, fos, include_code, cli.quiet).await,
+        Commands::Setup { skip_pipeline, fos, include_code, algorithm } => handle_setup(&db, skip_pipeline, fos, include_code, &algorithm, cli.quiet).await,
         Commands::Recent { cmd } => handle_recent(cmd, &db, cli.json),
         Commands::Pinned { cmd } => handle_pinned(cmd, &db, cli.json),
         Commands::Nav { cmd } => handle_nav(cmd, &db, cli.json).await,
@@ -3989,7 +3992,7 @@ fn handle_config(cmd: ConfigCommands, json: bool) -> Result<(), String> {
 // Setup Command
 // ============================================================================
 
-async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include_code: bool, quiet: bool) -> Result<(), String> {
+async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include_code: bool, algorithm: &str, quiet: bool) -> Result<(), String> {
     use std::io::{Write, BufRead};
 
     log!("=== Mycelica Setup ===\n");
@@ -4361,9 +4364,56 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
             Ok(count) => log!("  ✓ FOS edges: {} edges precomputed", count),
             Err(e) => elog!("  ✗ FOS edge precomputation failed: {}", e),
         }
+    } else if algorithm == "adaptive" {
+        // Adaptive algorithm: uses edge-based clustering with auto-config
+        log!("Running adaptive hierarchy algorithm...");
+        log!("");
+
+        // Step 2a: Generate semantic edges at 0.30 threshold for finer resolution
+        log!("  [2a] Generating semantic edges (threshold=0.30)...");
+        if let Ok(deleted) = db.delete_semantic_edges() {
+            if deleted > 0 {
+                log!("    Cleared {} old semantic edges", deleted);
+            }
+        }
+        match db.create_semantic_edges(0.30, 10) {
+            Ok(created) => log!("    ✓ Created {} semantic edges", created),
+            Err(e) => {
+                elog!("    ✗ Failed to create semantic edges: {}", e);
+                return Err(format!("Semantic edge creation failed: {}", e));
+            }
+        }
+
+        // Step 2b: Run adaptive hierarchy with auto-config
+        log!("  [2b] Building hierarchy with adaptive algorithm (auto-config)...");
+        // Use default values - auto_config will compute optimal params
+        match rebuild_hierarchy_adaptive(
+            db,
+            5,      // min_size (will be overridden by auto)
+            0.001,  // tight_threshold (will be overridden by auto)
+            1.0,    // cohesion_threshold (will be overridden by auto)
+            0.02,   // delta_min (will be overridden by auto)
+            true,   // auto = true
+            false,  // json
+            quiet,
+        ).await {
+            Ok(result) => {
+                log!("");
+                log!("  ✓ Hierarchy complete: {} categories, {} items assigned",
+                    result.categories, result.papers_assigned);
+                if result.sibling_edges > 0 {
+                    log!("    {} sibling edges, {} bridges detected",
+                        result.sibling_edges, result.bridges);
+                }
+            }
+            Err(e) => {
+                elog!("  ✗ Adaptive hierarchy failed: {}", e);
+                return Err(format!("Adaptive hierarchy build failed: {}", e));
+            }
+        }
     } else {
-        // Non-FOS path: Use full 7-step hierarchy build with recursive AI grouping
-        log!("Running full hierarchy build (7 steps)...");
+        // Classic algorithm: uses AI-based clustering and grouping
+        log!("Running classic hierarchy build (7 steps)...");
         log!("");
         match hierarchy::build_full_hierarchy(db, true, None).await {
             Ok(result) => {
