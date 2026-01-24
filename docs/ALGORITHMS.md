@@ -524,16 +524,16 @@ FIND_VALID_SPLITS(group, range, parent_threshold):
 ```rust
 fn min_size_at_depth(depth: usize) -> usize {
     match depth {
-        0..=4 => 5,     // 5 at root through depth 4
-        5..=8 => 10,    // 10 at depths 5-8
-        9..=12 => 20,   // 20 at depths 9-12
-        13..=15 => 40,  // 40 at depths 13-15
-        _ => 100,       // 100+ at depth 16+
+        0..=2 => 5,     // 5 at depths 0-2
+        3..=4 => 10,    // 10 at depths 3-4
+        5..=6 => 20,    // 20 at depths 5-6
+        7 => 40,        // 40 at depth 7
+        _ => 100,       // 100 at depth 8+
     }
 }
 ```
 
-**Effect**: Tree depth naturally caps at ~15-16 levels.
+**Effect**: Tree depth naturally caps at ~9 levels after uber-consolidation.
 
 ### Centroid Bisection Fallback
 

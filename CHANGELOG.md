@@ -29,8 +29,10 @@ All notable changes to Mycelica will be documented in this file.
 - Missing `edgeType` field in SimilarNode TypeScript interface
 - Bottom-up category naming (was only naming depth-1 categories)
 - Standardized universe node ID to 'universe' (fixes dual-universe bug)
-- Progressive min_size caps tree depth (~15 instead of 27 on large databases)
+- Progressive min_size caps tree depth (~9 instead of 27 on large databases)
 - Live name deduplication prevents duplicate category names
+- Compressed depth brackets for min_size (0-2/3-4/5-6/7/8+) for shallower trees
+- Non-English text detection: local LLMs (Ollama) fall back to TF-IDF keywords for non-ASCII titles
 
 ### Documentation
 - **ALGORITHMS.md rewrite**: Replaced old hierarchy building docs with adaptive tree algorithm

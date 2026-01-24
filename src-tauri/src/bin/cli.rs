@@ -100,6 +100,26 @@ fn elog_both(msg: &str) {
     }
 }
 
+/// Check if text is predominantly English using ASCII ratio heuristic.
+/// Returns true if >90% of characters are ASCII (letters, numbers, punctuation).
+/// Used to detect non-English text that local LLMs may hallucinate on.
+fn is_predominantly_english(texts: &[String]) -> bool {
+    if texts.is_empty() {
+        return true;
+    }
+
+    let combined: String = texts.join(" ");
+    if combined.is_empty() {
+        return true;
+    }
+
+    let total_chars = combined.chars().count();
+    let ascii_chars = combined.chars().filter(|c| c.is_ascii()).count();
+
+    let ascii_ratio = ascii_chars as f64 / total_chars as f64;
+    ascii_ratio > 0.90
+}
+
 /// Macro for logging to both terminal and file
 macro_rules! log {
     ($($arg:tt)*) => {
@@ -2543,10 +2563,16 @@ async fn rebuild_hierarchy_adaptive(
 
     // Step 6: Name categories (bottom-up)
     // Use LLM by default for better quality names, --keywords-only for faster but lower quality
-    let use_llm = !keywords_only && (ai_client::ollama_available().await || ai_client::is_available());
+    // Local LLMs (Ollama) hallucinate on non-English text, so fall back to TF-IDF for those
+    let llm_available = !keywords_only && (ai_client::ollama_available().await || ai_client::is_available());
+    let is_local_llm = settings::get_llm_backend() == "ollama";
     if !quiet {
-        if use_llm {
-            elog!("Step 6/7: Naming categories with LLM...");
+        if llm_available {
+            if is_local_llm {
+                elog!("Step 6/7: Naming categories with local LLM (keyword fallback for non-English)...");
+            } else {
+                elog!("Step 6/7: Naming categories with LLM...");
+            }
         } else {
             elog!("Step 6/7: Naming categories with keyword extraction...");
         }
@@ -2592,7 +2618,12 @@ async fn rebuild_hierarchy_adaptive(
                 .collect();
 
             if !titles.is_empty() {
-                let name = if use_llm {
+                // Check if we should use LLM for this category
+                // Local LLMs hallucinate on non-English text, so use keywords instead
+                let use_llm_for_this = llm_available &&
+                    (!is_local_llm || is_predominantly_english(&titles));
+
+                let name = if use_llm_for_this {
                     // Get parent name for context
                     let parent_name: Option<String> = if let Some(parent_id) = &category.parent_id {
                         db.get_node(parent_id)
@@ -2624,7 +2655,7 @@ async fn rebuild_hierarchy_adaptive(
                         }
                     }
                 } else {
-                    // Keyword extraction only
+                    // Keyword extraction only (either forced or non-English with local LLM)
                     if titles.len() > 5 {
                         ai_client::extract_top_keywords(&titles, 4)
                     } else {

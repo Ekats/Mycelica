@@ -38,9 +38,9 @@ Mycelica shows structure you can navigate, plus connections that cross category 
 ## Features
 
 - **Visual Graph Navigation** — Zoomable, pannable D3 canvas with dynamic hierarchy levels
-- **AI-Powered Analysis** — Claude generates titles, summaries, tags, and emojis for imported content
-- **Smart Clustering** — Multi-method clustering (AI + TF-IDF fallback) organizes items into semantic topics
-- **Dynamic Hierarchy** — Auto-creates navigable structure with 8-15 children per level
+- **AI-Powered Analysis** — Claude/Ollama generates titles, summaries, and tags for imported content
+- **Smart Clustering** — Embedding-based cosine similarity groups items into semantic topics
+- **Dynamic Hierarchy** — Adaptive tree algorithm creates navigable structure from edge weights
 - **Instant Similarity Search** — HNSW index enables O(log n) nearest neighbor lookup:
   - 50-100x faster than brute-force (~10ms vs ~870ms for 50k nodes)
   - Index auto-builds on first launch, saved to disk for instant subsequent loads
@@ -100,10 +100,10 @@ Set via **Settings panel** or environment variables:
 
 | Key | Required | Purpose |
 |-----|----------|---------|
-| `ANTHROPIC_API_KEY` | Yes* | AI analysis, clustering, hierarchy build |
+| `ANTHROPIC_API_KEY` | Yes* | AI analysis (titles, summaries, tags), category naming |
 
-*Or use **Ollama** as a local alternative for AI processing (Settings → API Keys → toggle Claude/Ollama).
-Embeddings are always local (all-MiniLM-L6-v2) — no OpenAI key needed.
+*Or use **Ollama** as a local alternative (Settings → API Keys → toggle Claude/Ollama).
+Embeddings, clustering, and hierarchy structure are always local — no API needed for those.
 
 ---
 
@@ -342,20 +342,20 @@ Universe (root)
 ```
 
 - **Universe** — Single root node, always exists
-- **Categories/Topics** — AI-generated groupings, depth adjusts to content size
+- **Categories/Topics** — Groupings created by adaptive tree algorithm, named by AI
 - **Items** — Importable content, click to open in full-screen reader
 
 ### Processing Pipeline (Conceptual Overview)
 
 1. **Import** — Claude conversations, Markdown, OpenAIRE papers, Google Keep, or source code
 2. **AI Analysis** — Generate titles, summaries, tags (code items skip this, keep function signatures)
-3. **Clustering** — Group items into semantic topics
-4. **Hierarchy Build** — Create navigable structure (8-15 children per level)
-5. **Embeddings** — Generate vectors for semantic similarity edges
-6. **HNSW Index** — Build approximate nearest neighbor index for instant similarity queries
-7. **Call Graph** — Extract function call relationships (code only)
+3. **Embeddings** — Generate vectors locally (all-MiniLM-L6-v2), build HNSW index
+4. **Semantic Edges** — Create "Related" edges between similar items
+5. **Hierarchy Build** — Adaptive tree creates categories from edge weights
+6. **Category Naming** — AI names categories bottom-up with deduplication
+7. **Call Graph** — Extract function call relationships (code imports only)
 
-*For exact implementation steps, run `mycelica-cli setup --help` or see [algorithm doc](docs/mycelica-adaptive-tree-algorithm-v2.md).*
+*For exact implementation steps, run `mycelica-cli setup --help` or see [ALGORITHMS.md](docs/ALGORITHMS.md).*
 
 ---
 
@@ -381,8 +381,9 @@ mycelica/
 │       ├── db/             # SQLite layer
 │       ├── code/           # Source code parsers (Rust, Python, TS, C)
 │       ├── ai_client.rs    # Anthropic/Ollama integration
-│       ├── hierarchy.rs    # Hierarchy algorithms
-│       ├── clustering.rs   # Topic clustering
+│       ├── dendrogram.rs   # Adaptive tree algorithm
+│       ├── hierarchy.rs    # Hierarchy utilities
+│       ├── clustering.rs   # Embedding-based clustering
 │       ├── local_embeddings.rs  # all-MiniLM-L6-v2
 │       ├── http_server.rs  # Browser extension API (port 9876)
 │       └── holerabbit.rs   # Browsing session tracking

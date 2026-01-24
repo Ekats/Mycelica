@@ -149,11 +149,11 @@ impl AdaptiveTreeConfig {
     /// Grows progressively to naturally cap tree depth.
     pub fn min_size_at_depth(&self, depth: usize) -> usize {
         match depth {
-            0..=4 => self.min_size,
-            5..=8 => self.min_size * 2,
-            9..=12 => self.min_size * 4,
-            13..=15 => self.min_size * 8,
-            _ => 100,
+            0..=2 => self.min_size,      // 5 at depths 0-2
+            3..=4 => self.min_size * 2,  // 10 at depths 3-4
+            5..=6 => self.min_size * 4,  // 20 at depths 5-6
+            7 => self.min_size * 8,      // 40 at depth 7
+            _ => 100,                    // 100 at depth 8+
         }
     }
 }
