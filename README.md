@@ -50,9 +50,10 @@ Mycelica shows structure you can navigate, plus connections that cross category 
   "Consciousness research"  ←─ 0.76 ─→  "Philosophy of mind"
   ```
 - **Code Import** — Import source code with function/class extraction and call graph analysis:
-  - Supports Rust, Python, TypeScript, C/C++, RST documentation
+  - Supports Rust, Python, TypeScript, JavaScript, C, Markdown, RST documentation
   - `Calls` edges show function call relationships
   - Semantic search across your codebase
+  - Note: Export formats (BibTeX, JSON, Markdown, DOT) are CLI-only
 - **Browser Integration** — [Holerabbit Firefox extension](https://github.com/Ekats/Mycelica-Firefox) tracks browsing sessions:
   - Automatic session grouping with navigation edges
   - Pause/resume/rename sessions from app or extension
@@ -61,7 +62,7 @@ Mycelica shows structure you can navigate, plus connections that cross category 
 - **Privacy Filtering** — Showcase/normal modes for safe database exports
 - **Import** — Claude conversations, Markdown files, OpenAIRE papers, Google Keep, source code
 - **OpenAIRE Integration** — Query EU Open Research Graph with country/field/year filters, optional PDF download
-- **CLI & TUI** — 20 command categories, interactive terminal UI, BibTeX/JSON/Markdown/DOT export
+- **CLI & TUI** — 21 command categories, interactive terminal UI, BibTeX/JSON/Markdown/DOT export
 - **Local-First** — SQLite database stays on your machine
 
 ---
@@ -344,7 +345,7 @@ Universe (root)
 - **Categories/Topics** — AI-generated groupings, depth adjusts to content size
 - **Items** — Importable content, click to open in full-screen reader
 
-### Processing Pipeline
+### Processing Pipeline (Conceptual Overview)
 
 1. **Import** — Claude conversations, Markdown, OpenAIRE papers, Google Keep, or source code
 2. **AI Analysis** — Generate titles, summaries, tags (code items skip this, keep function signatures)
@@ -353,6 +354,8 @@ Universe (root)
 5. **Embeddings** — Generate vectors for semantic similarity edges
 6. **HNSW Index** — Build approximate nearest neighbor index for instant similarity queries
 7. **Call Graph** — Extract function call relationships (code only)
+
+*For exact implementation steps, run `mycelica-cli setup --help` or see [algorithm doc](docs/mycelica-adaptive-tree-algorithm-v2.md).*
 
 ---
 

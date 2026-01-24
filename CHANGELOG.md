@@ -28,6 +28,19 @@ All notable changes to Mycelica will be documented in this file.
 - Edge loading for universe view (was skipping when at root level)
 - Missing `edgeType` field in SimilarNode TypeScript interface
 - Bottom-up category naming (was only naming depth-1 categories)
+- Standardized universe node ID to 'universe' (fixes dual-universe bug)
+- Progressive min_size caps tree depth (~15 instead of 27 on large databases)
+- Live name deduplication prevents duplicate category names
+
+### Documentation
+- **ALGORITHMS.md rewrite**: Replaced old hierarchy building docs with adaptive tree algorithm
+  - Removed deprecated sections (depth limits, edge-based grouping, coherence refinement, full trace)
+  - Added: dendrogram construction, split quality metrics, bridge detection, centroid bisection fallback
+  - Added: category naming with live deduplication, 8-step setup pipeline
+  - Updated constants table with dendrogram.rs values (EDGE_FLOOR, TIGHT_THRESHOLD, COHESION_THRESHOLD)
+- **README.md**: Fixed language support (C not C/C++, added JavaScript), labeled Processing Pipeline as "Conceptual Overview"
+- **CLAUDE.md**: Added key files (dendrogram.rs, clustering.rs, similarity.rs, openaire.rs), reorganized edge types into Auto-Generated/Manual/Future sections
+- **ARCHITECTURE.md**: Updated date
 
 ### Technical
 - `rebuild_hierarchy_adaptive()` with auto-config from `EdgeIndex` statistics

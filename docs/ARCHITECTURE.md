@@ -1,6 +1,6 @@
 # Mycelica Architecture
 
-> Comprehensive map of the codebase. Last updated: 2026-01-10
+> Comprehensive map of the codebase. Last updated: 2026-01-25
 
 ## Overview
 
