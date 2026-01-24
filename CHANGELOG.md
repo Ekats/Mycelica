@@ -2,6 +2,41 @@
 
 All notable changes to Mycelica will be documented in this file.
 
+## [0.9.0] - 2026-01-24
+
+### Added
+- **Adaptive tree algorithm**: New hierarchy building that auto-configures from data
+  - Parameters derive from edge statistics (IQR, density)
+  - Works on both sparse and dense graphs
+  - 100% item coverage with nearest-neighbor orphan assignment
+  - Replaces manual threshold tuning
+- **LLM category naming**: Categories named by LLM (Ollama/Anthropic) by default
+  - Uses parent category as context for better subcategory names
+  - `--keywords-only` flag for faster keyword extraction fallback
+  - Bottom-up naming: deepest categories first, parents use child names
+- **Category embeddings**: Setup pipeline generates embeddings for categories
+  - Similar nodes feature now works for categories
+  - HNSW index includes both items and categories
+- **Edge type display**: Similar nodes panel shows "calls", "documents" etc. in blue
+
+### Changed
+- `setup` command uses adaptive algorithm by default (`--algorithm adaptive`)
+- Setup pipeline now 8 steps (0-7) with category embeddings before HNSW build
+- `hierarchy rebuild --algorithm adaptive --auto` for auto-configured rebuild
+
+### Fixed
+- Edge loading for universe view (was skipping when at root level)
+- Missing `edgeType` field in SimilarNode TypeScript interface
+- Bottom-up category naming (was only naming depth-1 categories)
+
+### Technical
+- `rebuild_hierarchy_adaptive()` with auto-config from `EdgeIndex` statistics
+- `build_adaptive_tree()` in dendrogram lib with cohesion-based splitting
+- `name_cluster_with_parent()` for context-aware LLM naming
+- O(E) SQL joins replace O(T²) edge-based grouping
+
+---
+
 ## [0.8.4] - 2026-01-19
 
 ### Changed
