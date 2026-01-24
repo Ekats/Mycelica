@@ -4182,7 +4182,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
 
     // Step 0: Pattern Classification (FREE, identifies hidden items to skip)
     log!("");
-    log!("▶ STEP 0/6: Pattern Classification");
+    log!("▶ STEP 0/7: Pattern Classification");
     log!("───────────────────────────────────────────────────────────");
     log!("  Classifying items using pattern matching (FREE)...");
 
@@ -4207,7 +4207,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
 
     // Step 1: AI Processing + Embeddings
     log!("");
-    log!("▶ STEP 1/6: AI Processing + Embeddings");
+    log!("▶ STEP 1/7: AI Processing + Embeddings");
     log!("───────────────────────────────────────────────────────────");
 
     // 1a: AI process non-paper, non-hidden items
@@ -4375,7 +4375,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
     // Step 2: Clustering & Hierarchy
     // Note: hierarchy::build_full_hierarchy has its own verbose logging via emit_log()
     log!("");
-    log!("▶ STEP 2/6: Clustering & Hierarchy");
+    log!("▶ STEP 2/7: Clustering & Hierarchy");
     log!("───────────────────────────────────────────────────────────");
 
     // If FOS flag is set, run full FOS pipeline: FOS grouping → clustering → hierarchy
@@ -4494,7 +4494,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
     // Step 3: Code edges (only if code nodes exist)
     // Note: Category embeddings handled by Hierarchy Step 6/7
     log!("");
-    log!("▶ STEP 3/6: Code Analysis");
+    log!("▶ STEP 3/7: Code Analysis");
     log!("───────────────────────────────────────────────────────────");
 
     let code_functions: Vec<_> = items.iter()
@@ -4578,7 +4578,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
 
     // Step 4: Flatten hierarchy (remove empty intermediate levels)
     log!("");
-    log!("▶ STEP 4/6: Flatten Hierarchy");
+    log!("▶ STEP 4/7: Flatten Hierarchy");
     log!("───────────────────────────────────────────────────────────");
     match db.flatten_empty_levels() {
         Ok(removed) => {
@@ -4593,9 +4593,58 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
         }
     }
 
-    // Step 5: Build HNSW index for fast similarity search
+    // Step 5: Generate embeddings for categories (so similar nodes works for them)
     log!("");
-    log!("▶ STEP 5/6: Build HNSW Index");
+    log!("▶ STEP 5/7: Category Embeddings");
+    log!("───────────────────────────────────────────────────────────");
+    {
+        use mycelica_lib::local_embeddings;
+
+        // Find categories without embeddings (get_nodes_needing_embeddings includes categories with titles)
+        let nodes_needing_embeddings = db.get_nodes_needing_embeddings()
+            .map_err(|e| e.to_string())?;
+        let categories_without_embeddings: Vec<_> = nodes_needing_embeddings
+            .into_iter()
+            .filter(|n| !n.is_item && !n.title.is_empty())
+            .collect();
+
+        if categories_without_embeddings.is_empty() {
+            log!("✓ All categories already have embeddings");
+        } else {
+            log!("Generating embeddings for {} categories...", categories_without_embeddings.len());
+            let start = std::time::Instant::now();
+            let mut generated = 0;
+
+            for category in &categories_without_embeddings {
+                // Use title + summary for embedding text
+                let text = if let Some(summary) = &category.summary {
+                    format!("{}: {}", category.title, summary)
+                } else {
+                    category.title.clone()
+                };
+
+                match local_embeddings::generate(&text) {
+                    Ok(embedding) => {
+                        if let Err(e) = db.update_node_embedding(&category.id, &embedding) {
+                            elog!("  Failed to save embedding for {}: {}", category.id, e);
+                        } else {
+                            generated += 1;
+                        }
+                    }
+                    Err(e) => {
+                        elog!("  Failed to generate embedding for {}: {}", category.id, e);
+                    }
+                }
+            }
+
+            log!("✓ Generated {} category embeddings in {:.1}s",
+                generated, start.elapsed().as_secs_f64());
+        }
+    }
+
+    // Step 6: Build HNSW index for fast similarity search
+    log!("");
+    log!("▶ STEP 6/7: Build HNSW Index");
     log!("───────────────────────────────────────────────────────────");
     {
         use mycelica_lib::commands::{HnswIndex, hnsw_index_path};
@@ -4620,9 +4669,9 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
         }
     }
 
-    // Step 6: Index edges for fast view loading
+    // Step 7: Index edges for fast view loading
     log!("");
-    log!("▶ STEP 6/6: Index Edge Parents");
+    log!("▶ STEP 7/7: Index Edge Parents");
     log!("───────────────────────────────────────────────────────────");
     match db.update_edge_parents() {
         Ok(count) => log!("✓ Indexed {} edges with parent IDs", count),
