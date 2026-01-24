@@ -89,6 +89,7 @@ interface SimilarNode {
   emoji: string | null;
   summary: string | null;
   similarity: number;
+  edgeType: string | null;  // "calls", "called by", "documents", etc.
 }
 
 // Simple hash function to generate consistent number from string
@@ -335,13 +336,18 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     loadMaxDepth();
   }, [setMaxDepth]);
 
-  // Load edges for current view (O(1) indexed lookup instead of loading all 338k edges)
+  // Load edges for current view (O(1) indexed lookup instead of loading all edges)
   useEffect(() => {
     if (currentParentId) {
       loadEdgesForView(currentParentId);
+    } else {
+      // Universe view: load sibling edges between top-level categories
+      const universe = Array.from(nodes.values()).find(n => n.isUniverse);
+      if (universe) {
+        loadEdgesForView(universe.id);
+      }
     }
-    // Universe view (currentParentId = null) doesn't need edges - it shows top-level categories
-  }, [currentParentId, loadEdgesForView]);
+  }, [currentParentId, nodes, loadEdgesForView]);
 
   // Load pinned node IDs on mount
   useEffect(() => {

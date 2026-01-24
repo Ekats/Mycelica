@@ -276,6 +276,9 @@ enum Commands {
         /// Hierarchy algorithm: adaptive (default) or classic
         #[arg(long, default_value = "adaptive")]
         algorithm: String,
+        /// Use keyword extraction instead of LLM for category naming (faster but lower quality)
+        #[arg(long)]
+        keywords_only: bool,
     },
     /// Recent nodes
     Recent {
@@ -518,6 +521,9 @@ enum HierarchyCommands {
         /// [adaptive] Auto-compute optimal parameters from edge statistics
         #[arg(long)]
         auto: bool,
+        /// Use keyword extraction instead of LLM for category naming (faster but lower quality)
+        #[arg(long)]
+        keywords_only: bool,
     },
     /// Rebuild without AI (keyword-based)
     RebuildLite,
@@ -1070,7 +1076,7 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Privacy { cmd } => handle_privacy(cmd, &db, cli.json, cli.quiet).await,
         Commands::Paper { cmd } => handle_paper(cmd, &db, cli.json).await,
         Commands::Config { cmd } => handle_config(cmd, cli.json),
-        Commands::Setup { skip_pipeline, fos, include_code, algorithm } => handle_setup(&db, skip_pipeline, fos, include_code, &algorithm, cli.quiet).await,
+        Commands::Setup { skip_pipeline, fos, include_code, algorithm, keywords_only } => handle_setup(&db, skip_pipeline, fos, include_code, &algorithm, keywords_only, cli.quiet).await,
         Commands::Recent { cmd } => handle_recent(cmd, &db, cli.json),
         Commands::Pinned { cmd } => handle_pinned(cmd, &db, cli.json),
         Commands::Nav { cmd } => handle_nav(cmd, &db, cli.json).await,
@@ -1802,11 +1808,11 @@ async fn handle_hierarchy(cmd: HierarchyCommands, db: &Database, json: bool, qui
                 log!("Hierarchy built successfully");
             }
         }
-        HierarchyCommands::Rebuild { algorithm, levels, method, min_size, thresholds, cohesion_threshold, delta_min, tight_threshold, auto } => {
+        HierarchyCommands::Rebuild { algorithm, levels, method, min_size, thresholds, cohesion_threshold, delta_min, tight_threshold, auto, keywords_only } => {
             match algorithm.as_str() {
                 "adaptive" => {
                     if !quiet { elog!("Rebuilding hierarchy with adaptive v2 algorithm..."); }
-                    let result = rebuild_hierarchy_adaptive(db, min_size, tight_threshold, cohesion_threshold, delta_min, auto, json, quiet).await?;
+                    let result = rebuild_hierarchy_adaptive(db, min_size, tight_threshold, cohesion_threshold, delta_min, auto, json, quiet, keywords_only).await?;
                     if json {
                         log!(r#"{{"status":"ok","categories":{},"papers_assigned":{},"sibling_edges":{},"bridges":{}}}"#,
                             result.categories, result.papers_assigned, result.sibling_edges, result.bridges);
@@ -2153,6 +2159,7 @@ async fn rebuild_hierarchy_adaptive(
     auto: bool,
     _json: bool,
     quiet: bool,
+    keywords_only: bool,
 ) -> Result<AdaptiveRebuildResult, String> {
     use mycelica_lib::dendrogram::{build_adaptive_tree, auto_config, AdaptiveTreeConfig, TreeNode};
     use mycelica_lib::ai_client;
@@ -2534,8 +2541,16 @@ async fn rebuild_hierarchy_adaptive(
 
     if !quiet { elog!("  {} sibling edges created", sibling_edges_created); }
 
-    // Step 6: Name categories using keyword extraction (bottom-up)
-    if !quiet { elog!("Step 6/7: Naming categories..."); }
+    // Step 6: Name categories (bottom-up)
+    // Use LLM by default for better quality names, --keywords-only for faster but lower quality
+    let use_llm = !keywords_only && (ai_client::ollama_available().await || ai_client::is_available());
+    if !quiet {
+        if use_llm {
+            elog!("Step 6/7: Naming categories with LLM...");
+        } else {
+            elog!("Step 6/7: Naming categories with keyword extraction...");
+        }
+    }
 
     // Collect adaptive categories by depth (to process bottom-up)
     let mut categories_by_depth: Vec<Vec<Node>> = Vec::new();
@@ -2550,6 +2565,9 @@ async fn rebuild_hierarchy_adaptive(
         }
         categories_by_depth.push(cats_at_depth);
     }
+
+    // Get all existing category names to avoid duplicates
+    let forbidden_names = db.get_all_category_names().unwrap_or_default();
 
     // Process bottom-up: deepest categories first (they have item children)
     // Then their parents can use the newly-named subcategory titles
@@ -2566,10 +2584,42 @@ async fn rebuild_hierarchy_adaptive(
                 .collect();
 
             if !titles.is_empty() {
-                let name = if titles.len() > 5 {
-                    ai_client::extract_top_keywords(&titles, 4)
+                let name = if use_llm {
+                    // Get parent name for context
+                    let parent_name: Option<String> = if let Some(parent_id) = &category.parent_id {
+                        db.get_node(parent_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|p| if p.title != "Universe" && !p.title.is_empty() { Some(p.title.clone()) } else { None })
+                    } else {
+                        None
+                    };
+
+                    // Use LLM with parent context if available
+                    let llm_result = if let Some(parent) = parent_name {
+                        ai_client::name_cluster_with_parent(&titles, &parent, &forbidden_names).await
+                    } else {
+                        ai_client::name_cluster_from_samples(&titles, &forbidden_names).await
+                    };
+
+                    // Fall back to keyword extraction if LLM fails
+                    match llm_result {
+                        Ok(n) if !n.is_empty() => n,
+                        _ => {
+                            if titles.len() > 5 {
+                                ai_client::extract_top_keywords(&titles, 4)
+                            } else {
+                                ai_client::extract_top_keywords(&titles, 3)
+                            }
+                        }
+                    }
                 } else {
-                    ai_client::extract_top_keywords(&titles, 3)
+                    // Keyword extraction only
+                    if titles.len() > 5 {
+                        ai_client::extract_top_keywords(&titles, 4)
+                    } else {
+                        ai_client::extract_top_keywords(&titles, 3)
+                    }
                 };
 
                 if !name.is_empty() && name != "Category" {
@@ -4005,7 +4055,7 @@ fn handle_config(cmd: ConfigCommands, json: bool) -> Result<(), String> {
 // Setup Command
 // ============================================================================
 
-async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include_code: bool, algorithm: &str, quiet: bool) -> Result<(), String> {
+async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include_code: bool, algorithm: &str, keywords_only: bool, quiet: bool) -> Result<(), String> {
     use std::io::{Write, BufRead};
 
     log!("=== Mycelica Setup ===\n");
@@ -4409,6 +4459,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
             true,   // auto = true
             false,  // json
             quiet,
+            keywords_only,
         ).await {
             Ok(result) => {
                 log!("");
