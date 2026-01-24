@@ -144,6 +144,20 @@ impl Default for AdaptiveTreeConfig {
     }
 }
 
+impl AdaptiveTreeConfig {
+    /// Get effective min_size for a given depth.
+    /// Grows progressively to naturally cap tree depth.
+    pub fn min_size_at_depth(&self, depth: usize) -> usize {
+        match depth {
+            0..=4 => self.min_size,
+            5..=8 => self.min_size * 2,
+            9..=12 => self.min_size * 4,
+            13..=15 => self.min_size * 8,
+            _ => 100,
+        }
+    }
+}
+
 /// Compute optimal AdaptiveTreeConfig from edge statistics.
 ///
 /// Analyzes edge weight distribution to determine appropriate parameters:
@@ -1281,11 +1295,13 @@ pub fn dynamic_cohesion_threshold(base: f64, edge_density: f64) -> f64 {
 /// Find all valid splits within similarity range.
 ///
 /// Uses percentile-based thresholds with dynamic balance and cohesion scaling.
+/// `effective_min_size` is the depth-aware minimum cluster size.
 pub fn find_valid_splits(
     papers: &[String],
     range: SimRange,
     parent_threshold: Option<f64>,
     edge_index: &EdgeIndex,
+    effective_min_size: usize,
     config: &AdaptiveTreeConfig,
 ) -> Vec<Split> {
     // Get internal edges within range
@@ -1343,10 +1359,10 @@ pub fn find_valid_splits(
             }
         }
 
-        // Get components and filter to >= MIN_SIZE
+        // Get components and filter to >= effective_min_size
         let components: Vec<Vec<String>> = uf.get_components()
             .into_iter()
-            .filter(|c| c.len() >= config.min_size)
+            .filter(|c| c.len() >= effective_min_size)
             .collect();
 
         // Need at least 2 components
@@ -1610,8 +1626,11 @@ pub fn build_tree(
     let node_id = format!("node-{}", *id_counter);
     *id_counter += 1;
 
-    // Stopping condition 1: too small
-    if papers.len() < config.min_size {
+    // Compute depth-aware min_size for this level
+    let effective_min_size = config.min_size_at_depth(depth);
+
+    // Stopping condition 1: too small for this depth
+    if papers.len() < effective_min_size {
         return TreeNode::Leaf {
             id: node_id,
             papers,
@@ -1639,7 +1658,7 @@ pub fn build_tree(
     }
 
     // Find valid splits
-    let splits = find_valid_splits(&papers, range, parent_threshold, edge_index, config);
+    let splits = find_valid_splits(&papers, range.clone(), parent_threshold, edge_index, effective_min_size, config);
 
     // Check if we need forced bisection (no valid splits OR best split doesn't make progress)
     let needs_bisection = if splits.is_empty() {
@@ -1654,7 +1673,7 @@ pub fn build_tree(
     };
 
     // Force centroid bisection when threshold cutting fails or doesn't make progress
-    if needs_bisection && papers.len() >= 2 * config.min_size {
+    if needs_bisection && papers.len() >= 2 * effective_min_size {
         let (left, right) = centroid_bisection(&papers, edge_index);
 
         // Recurse on bisected halves

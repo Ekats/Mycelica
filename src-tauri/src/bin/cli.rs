@@ -2553,8 +2553,10 @@ async fn rebuild_hierarchy_adaptive(
     }
 
     // Collect adaptive categories by depth (to process bottom-up)
+    // Use high upper limit; loop breaks early when no categories found
     let mut categories_by_depth: Vec<Vec<Node>> = Vec::new();
-    for depth in 1..=15 {
+    let mut max_cat_depth: i32 = 1;
+    for depth in 1i32..=50 {
         let cats_at_depth: Vec<Node> = db.get_nodes_at_depth(depth)
             .map_err(|e| e.to_string())?
             .into_iter()
@@ -2563,11 +2565,17 @@ async fn rebuild_hierarchy_adaptive(
         if cats_at_depth.is_empty() && depth > 1 {
             break;
         }
+        if !cats_at_depth.is_empty() {
+            max_cat_depth = depth;
+        }
         categories_by_depth.push(cats_at_depth);
     }
 
-    // Get all existing category names to avoid duplicates
-    let forbidden_names = db.get_all_category_names().unwrap_or_default();
+    // Get all existing category names to avoid duplicates (use HashSet for live deduplication)
+    let mut forbidden_names: std::collections::HashSet<String> = db.get_all_category_names()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
 
     // Process bottom-up: deepest categories first (they have item children)
     // Then their parents can use the newly-named subcategory titles
@@ -2596,10 +2604,12 @@ async fn rebuild_hierarchy_adaptive(
                     };
 
                     // Use LLM with parent context if available
+                    // Convert HashSet to Vec for AI functions
+                    let forbidden_vec: Vec<String> = forbidden_names.iter().cloned().collect();
                     let llm_result = if let Some(parent) = parent_name {
-                        ai_client::name_cluster_with_parent(&titles, &parent, &forbidden_names).await
+                        ai_client::name_cluster_with_parent(&titles, &parent, &forbidden_vec).await
                     } else {
-                        ai_client::name_cluster_from_samples(&titles, &forbidden_names).await
+                        ai_client::name_cluster_from_samples(&titles, &forbidden_vec).await
                     };
 
                     // Fall back to keyword extraction if LLM fails
@@ -2624,6 +2634,7 @@ async fn rebuild_hierarchy_adaptive(
 
                 if !name.is_empty() && name != "Category" {
                     db.update_node_title(&category.id, &name).map_err(|e| e.to_string())?;
+                    forbidden_names.insert(name.clone());  // Live deduplication
                     named_count += 1;
                 }
             }
@@ -2648,9 +2659,9 @@ async fn rebuild_hierarchy_adaptive(
         let edge_index = EdgeIndex::new(&edges);
 
         // Get all leaf categories (categories whose children are items)
-        // Collect categories across all depths
+        // Collect categories across all depths (reuse max_cat_depth from naming phase)
         let mut all_categories: Vec<Node> = Vec::new();
-        for depth in 1..=15 {
+        for depth in 1..=max_cat_depth {
             let cats_at_depth: Vec<Node> = db.get_nodes_at_depth(depth)
                 .map_err(|e| e.to_string())?
                 .into_iter()
