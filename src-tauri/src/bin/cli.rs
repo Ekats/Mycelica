@@ -2292,7 +2292,7 @@ async fn rebuild_hierarchy_adaptive(
 
     // Flatten tree to categories
     let mut categories_created = 0;
-    let mut papers_assigned = 0;
+    let mut papers_assigned: HashSet<String> = HashSet::new();
     let mut bridge_count = 0;
     let mut category_id_counter = 0;
     let mut node_to_category: HashMap<String, String> = HashMap::new();
@@ -2304,7 +2304,7 @@ async fn rebuild_hierarchy_adaptive(
         db: &Database,
         now: i64,
         categories_created: &mut usize,
-        papers_assigned: &mut usize,
+        papers_assigned: &mut HashSet<String>,
         bridge_count: &mut usize,
         id_counter: &mut usize,
         node_to_category: &mut HashMap<String, String>,
@@ -2360,7 +2360,7 @@ async fn rebuild_hierarchy_adaptive(
                 for paper_id in papers {
                     db.update_node_hierarchy(paper_id, Some(&category_id), depth + 1)
                         .map_err(|e| e.to_string())?;
-                    *papers_assigned += 1;
+                    papers_assigned.insert(paper_id.clone());
                 }
             }
             TreeNode::Internal { children, papers, bridges, .. } => {
@@ -2419,7 +2419,7 @@ async fn rebuild_hierarchy_adaptive(
                 for paper_id in &orphan_papers {
                     db.update_node_hierarchy(paper_id, Some(&category_id), depth + 1)
                         .map_err(|e| e.to_string())?;
-                    *papers_assigned += 1;
+                    papers_assigned.insert(paper_id.to_string());
                 }
 
                 // Track bridge count
@@ -2454,7 +2454,7 @@ async fn rebuild_hierarchy_adaptive(
             for paper_id in papers {
                 db.update_node_hierarchy(paper_id, Some(&universe_id), 1)
                     .map_err(|e| e.to_string())?;
-                papers_assigned += 1;
+                papers_assigned.insert(paper_id.clone());
             }
             categories_created = 0; // No intermediate categories
         }
@@ -2495,7 +2495,7 @@ async fn rebuild_hierarchy_adaptive(
                 for paper_id in &orphan_papers {
                     db.update_node_hierarchy(paper_id, Some(&universe_id), 1)
                         .map_err(|e| e.to_string())?;
-                    papers_assigned += 1;
+                    papers_assigned.insert(paper_id.to_string());
                 }
             }
         }
@@ -2506,7 +2506,7 @@ async fn rebuild_hierarchy_adaptive(
     db.update_child_count(&universe_id, universe_children.len() as i32)
         .map_err(|e| e.to_string())?;
 
-    if !quiet { elog!("  {} categories, {} papers assigned", categories_created, papers_assigned); }
+    if !quiet { elog!("  {} categories, {} papers assigned", categories_created, papers_assigned.len()); }
 
     // Step 5: Create sibling edges with bridge metadata
     if !quiet { elog!("Step 5/7: Creating sibling edges..."); }
@@ -2710,6 +2710,7 @@ async fn rebuild_hierarchy_adaptive(
                 // Assign orphan to best leaf category
                 db.update_node_hierarchy(&orphan.id, Some(cat_id), best_depth + 1)
                     .map_err(|e| e.to_string())?;
+                papers_assigned.insert(orphan.id.clone());
                 rescued += 1;
             } else {
                 // Truly isolated - no edges to any categorized paper
@@ -2730,7 +2731,6 @@ async fn rebuild_hierarchy_adaptive(
             }
         }
 
-        papers_assigned += rescued;
     }
 
     // Final step: Recalculate child_count for all categories
@@ -2747,7 +2747,7 @@ async fn rebuild_hierarchy_adaptive(
 
     Ok(AdaptiveRebuildResult {
         categories: categories_created,
-        papers_assigned,
+        papers_assigned: papers_assigned.len(),
         sibling_edges: sibling_edges_created,
         bridges: bridge_count,
     })

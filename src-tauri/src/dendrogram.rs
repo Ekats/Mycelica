@@ -1537,6 +1537,54 @@ pub fn create_sibling_edge_meta(
     }
 }
 
+/// Force bisection by centroid similarity when threshold-based splits fail.
+///
+/// Algorithm:
+/// 1. Find centroid paper (highest sum of edge weights to all others in group)
+/// 2. Sort all papers by similarity to centroid
+/// 3. Split into top half / bottom half
+///
+/// Guarantees 50/50 split regardless of graph structure.
+/// Papers with no edge to centroid get similarity 0.0 and sort arbitrarily among themselves.
+pub fn centroid_bisection(
+    papers: &[String],
+    edge_index: &EdgeIndex,
+) -> (Vec<String>, Vec<String>) {
+    if papers.len() < 2 {
+        return (papers.to_vec(), vec![]);
+    }
+
+    let paper_set: HashSet<&String> = papers.iter().collect();
+
+    // Find centroid (highest total edge weight sum to other papers in group)
+    let (centroid_idx, _) = papers.iter().enumerate()
+        .map(|(i, p)| {
+            let sum: f64 = edge_index.edges_for(p)
+                .iter()
+                .filter(|(other, _)| paper_set.contains(other))
+                .map(|(_, w)| *w)
+                .sum();
+            (i, sum)
+        })
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or((0, 0.0));
+
+    let centroid = &papers[centroid_idx];
+
+    // Sort by similarity to centroid (descending)
+    let mut paper_sims: Vec<_> = papers.iter()
+        .map(|p| (p.clone(), edge_index.weight(p, centroid).unwrap_or(0.0)))
+        .collect();
+    paper_sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Split at midpoint
+    let mid = paper_sims.len() / 2;
+    let left: Vec<String> = paper_sims[..mid].iter().map(|(p, _)| p.clone()).collect();
+    let right: Vec<String> = paper_sims[mid..].iter().map(|(p, _)| p.clone()).collect();
+
+    (left, right)
+}
+
 /// Build adaptive tree recursively with per-subtree thresholds.
 ///
 /// # Arguments
@@ -1593,7 +1641,53 @@ pub fn build_tree(
     // Find valid splits
     let splits = find_valid_splits(&papers, range, parent_threshold, edge_index, config);
 
-    // Stopping condition 4: no valid splits
+    // Check if we need forced bisection (no valid splits OR best split doesn't make progress)
+    let needs_bisection = if splits.is_empty() {
+        true
+    } else {
+        // Check if best split makes meaningful progress (largest child < 90% of parent)
+        let best_candidate = splits.iter()
+            .max_by(|a, b| a.quality.partial_cmp(&b.quality).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap();
+        let largest_child = best_candidate.children.iter().map(|c| c.len()).max().unwrap_or(0);
+        largest_child as f64 >= 0.9 * papers.len() as f64
+    };
+
+    // Force centroid bisection when threshold cutting fails or doesn't make progress
+    if needs_bisection && papers.len() >= 2 * config.min_size {
+        let (left, right) = centroid_bisection(&papers, edge_index);
+
+        // Recurse on bisected halves
+        let left_node = build_tree(
+            left,
+            range.clone(),
+            parent_threshold,
+            edge_index,
+            config,
+            depth + 1,
+            id_counter,
+        );
+        let right_node = build_tree(
+            right,
+            range.clone(),
+            parent_threshold,
+            edge_index,
+            config,
+            depth + 1,
+            id_counter,
+        );
+
+        return TreeNode::Internal {
+            id: node_id,
+            papers,
+            children: vec![left_node, right_node],
+            threshold: range.min,  // Synthetic threshold
+            range,
+            bridges: vec![],  // No bridges for forced bisection
+        };
+    }
+
+    // Stopping condition 4: no valid splits and can't bisect
     if splits.is_empty() {
         return TreeNode::Leaf {
             id: node_id,
