@@ -2210,7 +2210,7 @@ fn create_universe(db: &Database, child_ids: &[String]) -> Result<String, String
         .unwrap()
         .as_millis() as i64;
 
-    let universe_id = "universe-root".to_string();
+    let universe_id = "universe".to_string();
 
     let universe_node = Node {
         id: universe_id.clone(),

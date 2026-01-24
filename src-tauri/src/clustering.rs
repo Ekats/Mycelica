@@ -1223,7 +1223,7 @@ pub async fn cluster_with_fos_pregrouping(db: &Database) -> Result<ClusteringRes
             // Create Universe node
             println!("[Clustering FOS] Creating Universe node");
             let universe_node = Node {
-                id: "universe-root".to_string(),
+                id: "universe".to_string(),
                 node_type: NodeType::Cluster,
                 title: "All Knowledge".to_string(),
                 url: None,

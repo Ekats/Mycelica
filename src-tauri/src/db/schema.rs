@@ -2023,10 +2023,11 @@ impl Database {
     }
 
     /// Get the Universe node (single root, is_universe = true)
+    /// Prefers id='universe' if multiple universe nodes exist (legacy cleanup)
     pub fn get_universe(&self) -> Result<Option<Node>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {} FROM nodes WHERE is_universe = 1 LIMIT 1",
+            "SELECT {} FROM nodes WHERE is_universe = 1 ORDER BY CASE WHEN id = 'universe' THEN 0 ELSE 1 END LIMIT 1",
             Self::NODE_COLUMNS
         ))?;
 
