@@ -33,6 +33,8 @@ All notable changes to Mycelica will be documented in this file.
 - Live name deduplication prevents duplicate category names
 - Compressed depth brackets for min_size (0-2/3-4/5-6/7/8+) for shallower trees
 - Non-English text detection: local LLMs (Ollama) fall back to TF-IDF keywords for non-ASCII titles
+- Consolidate Root now generates embeddings and sibling edges for uber-categories
+- Added Unconsolidate Root command to reverse consolidation (flatten uber-categories back to Universe)
 
 ### Documentation
 - **ALGORITHMS.md rewrite**: Replaced old hierarchy building docs with adaptive tree algorithm

@@ -63,7 +63,7 @@ interface SettingsPanelProps {
   onDataChanged?: () => void;
 }
 
-type ConfirmAction = 'deleteAll' | 'resetAi' | 'resetClustering' | 'clearEmbeddings' | 'clearHierarchy' | 'clearTags' | 'resetPrivacy' | 'fullRebuild' | 'flattenHierarchy' | 'consolidateRoot' | 'tidyDatabase' | 'scorePrivacy' | 'reclassifyPattern' | 'reclassifyAi' | 'rebuildLite' | 'nameClusters' | 'resetProcessing' | 'clearStructure' | null;
+type ConfirmAction = 'deleteAll' | 'resetAi' | 'resetClustering' | 'clearEmbeddings' | 'regenerateEdges' | 'clearHierarchy' | 'clearTags' | 'resetPrivacy' | 'fullRebuild' | 'flattenHierarchy' | 'consolidateRoot' | 'tidyDatabase' | 'scorePrivacy' | 'reclassifyPattern' | 'reclassifyAi' | 'rebuildLite' | 'nameClusters' | 'resetProcessing' | 'clearStructure' | null;
 
 interface TidyReport {
   sameNameMerged: number;
@@ -75,6 +75,7 @@ interface TidyReport {
   orphansReparented: number;
   deadEdgesPruned: number;
   duplicateEdgesRemoved: number;
+  edgesIndexed: number;
   durationMs: number;
 }
 
@@ -207,7 +208,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const [protectRecentNotes, setProtectRecentNotes] = useState(true);
 
   // Tips setting from store (shared with Graph)
-  const { showTips, setShowTips, showHidden, setShowHidden } = useGraphStore();
+  const { showTips, setShowTips, showHidden, setShowHidden, edgeWeightThreshold, setEdgeWeightThreshold } = useGraphStore();
 
   // Local embeddings
   const [useLocalEmbeddings, setUseLocalEmbeddings] = useState(false);
@@ -1253,6 +1254,14 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
         return `Cleared embeddings for ${count} nodes`;
       },
     },
+    regenerateEdges: {
+      title: 'Regenerate Edges',
+      message: 'This will delete existing semantic edges and recreate them from embeddings (threshold 0.3, max 10 per node). Use after importing new items or changing embeddings.',
+      handler: async () => {
+        const result = await invoke<{ deleted: number; created: number }>('regenerate_semantic_edges', { threshold: 0.3, maxEdges: 10 });
+        return `Deleted ${result.deleted} old edges, created ${result.created} new edges`;
+      },
+    },
     clearHierarchy: {
       title: 'Clear Hierarchy',
       message: 'This will delete all intermediate category nodes (keeping your items). You\'ll need to run "Full Rebuild" to recreate the hierarchy.',
@@ -1750,6 +1759,36 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                       }`}
                     />
                   </button>
+                </div>
+
+                {/* Edge Weight Threshold Slider */}
+                <div className="pt-2 border-t border-gray-800">
+                  <div className="flex items-center justify-between mb-2">
+                    <div>
+                      <div className="text-sm font-medium text-gray-200">Edge Display Threshold</div>
+                      <div className="text-xs text-gray-500 mt-0.5">Only show edges with similarity above this value</div>
+                    </div>
+                    <div className="text-lg font-mono text-white">{edgeWeightThreshold.toFixed(1)}</div>
+                  </div>
+                  <input
+                    type="range"
+                    min="0.3"
+                    max="0.9"
+                    step="0.1"
+                    value={edgeWeightThreshold}
+                    onChange={(e) => setEdgeWeightThreshold(parseFloat(e.target.value))}
+                    className="w-full h-2 rounded-lg appearance-none cursor-pointer"
+                    style={{
+                      background: `linear-gradient(to right,
+                        rgb(59, 130, 246) 0%,
+                        rgb(168, 85, 247) 50%,
+                        rgb(236, 72, 153) 100%)`
+                    }}
+                  />
+                  <div className="flex justify-between text-xs text-gray-500 mt-1">
+                    <span>0.3 (more edges)</span>
+                    <span>0.9 (fewer edges)</span>
+                  </div>
                 </div>
               </div>
             </section>
@@ -2827,6 +2866,15 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                     >
                       <span className="text-sm font-medium text-gray-200">Clear Embeddings</span>
                       <span className="text-xs text-gray-500">Similarity vectors</span>
+                    </button>
+
+                    {/* Regenerate Edges (rebuild semantic connections) */}
+                    <button
+                      onClick={() => setConfirmAction('regenerateEdges')}
+                      className="flex flex-col items-center gap-2 p-4 bg-gray-900/50 hover:bg-gray-900 rounded-lg transition-colors text-center"
+                    >
+                      <span className="text-sm font-medium text-gray-200">Regenerate Edges</span>
+                      <span className="text-xs text-gray-500">Semantic connections</span>
                     </button>
 
                     {/* Combined: Clear Structure (Clustering + Hierarchy) */}

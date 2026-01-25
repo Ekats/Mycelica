@@ -135,6 +135,8 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     // UI preferences from store
     showTips,
     setShowTips,
+    // Edge display threshold
+    edgeWeightThreshold,
   } = useGraphStore();
   const { loadEdgesForView } = useGraph();
   const [zoomLevel, setZoomLevel] = useState(1);
@@ -1238,14 +1240,19 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
       ringIndex++;
     }
 
-    // Build edge data
+    // Build edge data (filtered by weight threshold)
     const nodeMap = new Map(graphNodes.map(n => [n.id, n]));
     const edgeData: EdgeData[] = [];
     edges.forEach(edge => {
       const source = nodeMap.get(edge.source);
       const target = nodeMap.get(edge.target);
+      const weight = edge.weight ?? 0.5;
+      // Filter out edges below threshold (but always show structural edges like 'contains', 'sibling')
       if (source && target) {
-        edgeData.push({ source, target, type: edge.type, weight: edge.weight ?? 0.5 });
+        const isStructural = edge.type === 'contains' || edge.type === 'sibling';
+        if (isStructural || weight >= edgeWeightThreshold) {
+          edgeData.push({ source, target, type: edge.type, weight });
+        }
       }
     });
 
@@ -1255,7 +1262,7 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     }
 
     return { graphNodesComputed: graphNodes, edgeDataComputed: edgeData };
-  }, [nodes, edges, width, height, currentDepth, currentParentId, hidePrivate, privacyThreshold, getNodeEmoji]);
+  }, [nodes, edges, width, height, currentDepth, currentParentId, hidePrivate, privacyThreshold, edgeWeightThreshold, getNodeEmoji]);
 
   // Callback for showing context menu
   const handleShowContextMenu = useCallback((nodeId: string, pos: { x: number; y: number }) => {

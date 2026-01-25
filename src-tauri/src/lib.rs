@@ -60,7 +60,7 @@ use commands::{
     // Leaf view commands
     get_leaf_content,
     // Settings panel commands
-    delete_all_data, reset_ai_processing, reset_clustering, clear_embeddings, clear_hierarchy, clear_tags, delete_empty_nodes, flatten_hierarchy, consolidate_root, get_db_stats,
+    delete_all_data, reset_ai_processing, reset_clustering, clear_embeddings, regenerate_semantic_edges, clear_hierarchy, clear_tags, delete_empty_nodes, flatten_hierarchy, consolidate_root, unconsolidate_root, get_db_stats,
     get_db_path, switch_database, tidy_database, export_trimmed_database,
     // Processing stats commands
     get_processing_stats, add_ai_processing_time, add_rebuild_time,
@@ -414,11 +414,13 @@ pub fn run() {
             reset_ai_processing,
             reset_clustering,
             clear_embeddings,
+            regenerate_semantic_edges,
             clear_hierarchy,
             clear_tags,
             delete_empty_nodes,
             flatten_hierarchy,
             consolidate_root,
+            unconsolidate_root,
             tidy_database,
             get_db_stats,
             get_db_path,

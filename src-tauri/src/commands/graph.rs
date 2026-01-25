@@ -1912,6 +1912,39 @@ pub fn clear_embeddings(state: State<AppState>) -> Result<usize, String> {
     state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clear_all_embeddings().map_err(|e| e.to_string())
 }
 
+/// Regenerate semantic edges between items based on embedding similarity
+#[tauri::command]
+pub fn regenerate_semantic_edges(
+    state: State<AppState>,
+    threshold: Option<f32>,
+    max_edges: Option<usize>,
+) -> Result<RegenerateEdgesResult, String> {
+    let threshold = threshold.unwrap_or(0.3);
+    let max_edges = max_edges.unwrap_or(10);
+
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+
+    // Delete existing semantic edges
+    let deleted = db.delete_semantic_edges().map_err(|e| e.to_string())?;
+
+    // Create new edges
+    let created = db.create_semantic_edges(threshold, max_edges).map_err(|e| e.to_string())?;
+
+    // Index edges for view lookups
+    let _ = db.update_edge_parents();
+
+    Ok(RegenerateEdgesResult { deleted, created, threshold, max_edges })
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegenerateEdgesResult {
+    pub deleted: usize,
+    pub created: usize,
+    pub threshold: f32,
+    pub max_edges: usize,
+}
+
 /// Clear hierarchy (delete intermediate nodes, keep items)
 #[tauri::command]
 pub fn clear_hierarchy(state: State<AppState>) -> Result<usize, String> {
@@ -1944,7 +1977,7 @@ pub fn flatten_hierarchy(state: State<AppState>) -> Result<usize, String> {
 #[tauri::command]
 pub async fn consolidate_root(state: State<'_, AppState>) -> Result<ConsolidateResult, String> {
     use crate::ai_client::{self, TopicInfo};
-    use crate::db::{Node, NodeType, Position};
+    use crate::db::{Edge, EdgeType, Node, NodeType, Position};
 
     // Get Universe
     let universe = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_universe()
@@ -2114,12 +2147,76 @@ pub async fn consolidate_root(state: State<'_, AppState>) -> Result<ConsolidateR
     state.db.read().map_err(|e| format!("DB lock error: {}", e))?.update_child_count(&universe.id, new_universe_child_count as i32)
         .map_err(|e| e.to_string())?;
 
-    println!("[Consolidate] Complete: {} uber-categories, {} children reparented, {} stayed at top level",
-             uber_categories_created, children_reparented, children_stayed_at_top);
+    // Compute centroid embeddings for new uber-categories and collect IDs
+    println!("[Consolidate] Computing embeddings for {} uber-categories...", uber_categories_created);
+    let mut uber_category_ids: Vec<String> = Vec::new();
+    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+    for (idx, _grouping) in groupings.iter().enumerate() {
+        let uber_id = format!("uber-{}-{}", timestamp, idx);
+        // Get children's embeddings
+        if let Ok(children) = db.get_children(&uber_id) {
+            let child_embeddings: Vec<Vec<f32>> = children
+                .iter()
+                .filter_map(|c| db.get_node_embedding(&c.id).ok().flatten())
+                .collect();
+            if !child_embeddings.is_empty() {
+                let refs: Vec<&[f32]> = child_embeddings.iter().map(|e| e.as_slice()).collect();
+                if let Some(centroid) = crate::similarity::compute_centroid(&refs) {
+                    let _ = db.update_node_embedding(&uber_id, &centroid);
+                }
+            }
+        }
+        uber_category_ids.push(uber_id);
+    }
+
+    // Create sibling edges between uber-categories based on embedding similarity
+    println!("[Consolidate] Creating sibling edges between uber-categories...");
+    let mut sibling_edges_created = 0;
+
+    // Get embeddings for all uber-categories
+    let uber_embeddings: Vec<(String, Vec<f32>)> = uber_category_ids.iter()
+        .filter_map(|id| db.get_node_embedding(id).ok().flatten().map(|e| (id.clone(), e)))
+        .collect();
+
+    // Create edges between pairs with similarity > 0.3
+    let edge_timestamp = chrono::Utc::now().timestamp_millis();
+    for i in 0..uber_embeddings.len() {
+        for j in (i + 1)..uber_embeddings.len() {
+            let (id_a, emb_a) = &uber_embeddings[i];
+            let (id_b, emb_b) = &uber_embeddings[j];
+
+            let sim = crate::similarity::cosine_similarity(emb_a, emb_b);
+            if sim > 0.3 {
+                let edge = Edge {
+                    id: format!("sibling-{}-{}", edge_timestamp, sibling_edges_created),
+                    source: id_a.clone(),
+                    target: id_b.clone(),
+                    edge_type: EdgeType::Sibling,
+                    label: None,
+                    weight: Some(sim as f64),
+                    edge_source: Some("consolidate".to_string()),
+                    evidence_id: None,
+                    confidence: None,
+                    created_at: edge_timestamp,
+                };
+                if db.insert_edge(&edge).is_ok() {
+                    sibling_edges_created += 1;
+                }
+            }
+        }
+    }
+
+    // Index edges for view lookups
+    let _ = db.update_edge_parents();
+    drop(db);
+
+    println!("[Consolidate] Complete: {} uber-categories, {} children reparented, {} stayed at top level, {} sibling edges",
+             uber_categories_created, children_reparented, children_stayed_at_top, sibling_edges_created);
 
     Ok(ConsolidateResult {
         uber_categories_created: uber_categories_created as i32,
         children_reparented: children_reparented as i32,
+        sibling_edges_created: sibling_edges_created as i32,
     })
 }
 
@@ -2128,6 +2225,99 @@ pub async fn consolidate_root(state: State<'_, AppState>) -> Result<ConsolidateR
 pub struct ConsolidateResult {
     pub uber_categories_created: i32,
     pub children_reparented: i32,
+    pub sibling_edges_created: i32,
+}
+
+/// Reverse consolidation: flatten uber-categories back to Universe
+#[tauri::command]
+pub async fn unconsolidate_root(state: State<'_, AppState>) -> Result<UnconsolidateResult, String> {
+    // Get Universe
+    let universe = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_universe()
+        .map_err(|e| e.to_string())?
+        .ok_or("No Universe node found")?;
+
+    // Find uber-category nodes (depth 1, id starts with "uber-")
+    let all_children = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_children(&universe.id).map_err(|e| e.to_string())?;
+    let uber_categories: Vec<Node> = all_children
+        .into_iter()
+        .filter(|n| n.id.starts_with("uber-"))
+        .collect();
+
+    if uber_categories.is_empty() {
+        return Err("No uber-categories found to unconsolidate".to_string());
+    }
+
+    println!("[Unconsolidate] Found {} uber-categories to flatten", uber_categories.len());
+
+    let mut categories_removed = 0;
+    let mut children_reparented = 0;
+    let mut all_children_to_update: Vec<String> = Vec::new();
+
+    for uber in &uber_categories {
+        // Get uber-category's children
+        let uber_children = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_children(&uber.id).map_err(|e| e.to_string())?;
+
+        // Reparent children to Universe
+        for child in &uber_children {
+            state.db.read().map_err(|e| format!("DB lock error: {}", e))?.update_parent(&child.id, &universe.id).map_err(|e| e.to_string())?;
+            all_children_to_update.push(child.id.clone());
+            children_reparented += 1;
+        }
+
+        // Delete the uber-category node
+        state.db.read().map_err(|e| format!("DB lock error: {}", e))?.delete_node(&uber.id).map_err(|e| e.to_string())?;
+        categories_removed += 1;
+
+        println!("[Unconsolidate] Flattened '{}' ({} children)", uber.title, uber_children.len());
+    }
+
+    // Decrement depths for reparented subtrees
+    if !all_children_to_update.is_empty() {
+        println!("[Unconsolidate] Updating depths for {} reparented nodes...", all_children_to_update.len());
+        let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+        for child_id in &all_children_to_update {
+            let _ = db.decrement_subtree_depth(child_id);
+        }
+        drop(db);
+    }
+
+    // Update Universe's child count
+    let new_child_count = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_children(&universe.id).map_err(|e| e.to_string())?.len();
+    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.update_child_count(&universe.id, new_child_count as i32).map_err(|e| e.to_string())?;
+
+    // Delete sibling edges (they're now invalid)
+    let _edges_deleted = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.delete_edges_by_type("sibling").unwrap_or(0);
+
+    // Recreate sibling edges for the new flat structure
+    println!("[Unconsolidate] Recreating sibling edges...");
+    let db_guard = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+    let sibling_edges_created = hierarchy::create_category_edges_from_cross_counts(
+        &**db_guard,
+        None
+    ).unwrap_or(0);
+
+    // Index edges for view lookups
+    if sibling_edges_created > 0 {
+        let _ = db_guard.update_edge_parents();
+    }
+    drop(db_guard);
+
+    println!("[Unconsolidate] Complete: {} uber-categories removed, {} children reparented, {} sibling edges recreated",
+             categories_removed, children_reparented, sibling_edges_created);
+
+    Ok(UnconsolidateResult {
+        categories_removed: categories_removed as i32,
+        children_reparented: children_reparented as i32,
+        sibling_edges_created: sibling_edges_created as i32,
+    })
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnconsolidateResult {
+    pub categories_removed: i32,
+    pub children_reparented: i32,
+    pub sibling_edges_created: i32,
 }
 
 // ==================== Tidy Database Command ====================
@@ -2144,6 +2334,7 @@ pub struct TidyReport {
     pub orphans_reparented: usize,
     pub dead_edges_pruned: usize,
     pub duplicate_edges_removed: usize,
+    pub edges_indexed: usize,
     pub duration_ms: u64,
 }
 
@@ -2164,6 +2355,7 @@ pub fn tidy_database(state: State<AppState>) -> Result<TidyReport, String> {
     let orphans_reparented = db.reparent_orphans().map_err(|e| e.to_string())?;
     let dead_edges_pruned = db.prune_dead_edges().map_err(|e| e.to_string())?;
     let duplicate_edges_removed = db.deduplicate_edges().map_err(|e| e.to_string())?;
+    let edges_indexed = db.update_edge_parents().map_err(|e| e.to_string())?;
 
     Ok(TidyReport {
         same_name_merged,
@@ -2175,6 +2367,7 @@ pub fn tidy_database(state: State<AppState>) -> Result<TidyReport, String> {
         orphans_reparented,
         dead_edges_pruned,
         duplicate_edges_removed,
+        edges_indexed,
         duration_ms: start.elapsed().as_millis() as u64,
     })
 }
@@ -3235,6 +3428,11 @@ pub fn analyze_code_edges(
                 }
             }
         }
+    }
+
+    // Index edges for view lookups
+    if edges_created > 0 {
+        let _ = db.update_edge_parents();
     }
 
     Ok(CodeEdgesResult {

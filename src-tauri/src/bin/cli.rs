@@ -570,6 +570,10 @@ enum HierarchyCommands {
         #[arg(long, default_value = "percentile")]
         method: String,
     },
+    /// Consolidate root: group top-level categories into uber-categories
+    Consolidate,
+    /// Unconsolidate root: flatten uber-categories back to Universe
+    Unconsolidate,
 }
 
 #[derive(Subcommand)]
@@ -2014,6 +2018,12 @@ async fn handle_hierarchy(cmd: HierarchyCommands, db: &Database, json: bool, qui
         HierarchyCommands::Dendrogram { levels, method } => {
             handle_dendrogram_test(&db, levels, &method, json, quiet)?;
         }
+        HierarchyCommands::Consolidate => {
+            handle_consolidate(&db, json, quiet).await?;
+        }
+        HierarchyCommands::Unconsolidate => {
+            handle_unconsolidate(&db, json, quiet)?;
+        }
     }
     Ok(())
 }
@@ -2141,6 +2151,353 @@ fn handle_dendrogram_test(db: &Database, target_levels: usize, method: &str, jso
     if json {
         log!(r#"{{"papers":{},"edges":{},"merges":{},"levels":{},"thresholds":{:?},"time_ms":{}}}"#,
             papers.len(), edges.len(), dendrogram.merges.len(), levels.levels.len(), thresholds, (total_time * 1000.0) as u64);
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Consolidate / Unconsolidate Root
+// ============================================================================
+
+async fn handle_consolidate(db: &Database, json: bool, quiet: bool) -> Result<(), String> {
+    use mycelica_lib::ai_client::{self, TopicInfo};
+    use mycelica_lib::hierarchy;
+    use mycelica_lib::db::{Node, NodeType, Position};
+    use mycelica_lib::similarity;
+    use std::time::Instant;
+
+    let start = Instant::now();
+
+    // Get Universe
+    let universe = db.get_universe()
+        .map_err(|e| e.to_string())?
+        .ok_or("No Universe node found")?;
+
+    // Get Universe's direct children (excluding protected)
+    let all_children = db.get_children(&universe.id).map_err(|e| e.to_string())?;
+    let protected_ids = db.get_protected_node_ids();
+    let children: Vec<_> = all_children
+        .into_iter()
+        .filter(|child| !protected_ids.contains(&child.id))
+        .collect();
+
+    if !protected_ids.is_empty() && !quiet {
+        log!("Excluding {} protected nodes", protected_ids.len());
+    }
+
+    if children.is_empty() {
+        return Err("Universe has no children to consolidate".to_string());
+    }
+
+    if children.len() <= 8 {
+        return Err(format!("Universe only has {} children - already consolidated enough", children.len()));
+    }
+
+    if !quiet {
+        log!("Grouping {} categories into uber-categories...", children.len());
+    }
+
+    // Build topic info for AI
+    let categories: Vec<TopicInfo> = children
+        .iter()
+        .map(|child| TopicInfo {
+            id: child.id.clone(),
+            label: child.cluster_label
+                .clone()
+                .or_else(|| child.ai_title.clone())
+                .unwrap_or_else(|| child.title.clone()),
+            item_count: child.child_count.max(1),
+        })
+        .collect();
+
+    // Pre-fetch embeddings for similarity-sorted batching
+    let embeddings_map: std::collections::HashMap<String, Vec<f32>> = categories
+        .iter()
+        .filter_map(|c| {
+            db.get_node_embedding(&c.id)
+                .ok()
+                .flatten()
+                .map(|emb| (c.id.clone(), emb))
+        })
+        .collect();
+
+    if !quiet {
+        log!("Fetched {}/{} topic embeddings", embeddings_map.len(), categories.len());
+    }
+
+    // Call AI to group into uber-categories
+    let groupings = ai_client::group_into_uber_categories(&categories, &embeddings_map, None).await?;
+
+    if groupings.is_empty() {
+        return Err("AI returned no uber-categories".to_string());
+    }
+
+    if !quiet {
+        log!("AI created {} uber-categories", groupings.len());
+    }
+
+    // Create map from label -> child nodes
+    let mut label_to_children: std::collections::HashMap<String, Vec<_>> = std::collections::HashMap::new();
+    for child in &children {
+        let label = child.cluster_label
+            .as_ref()
+            .or(child.ai_title.as_ref())
+            .unwrap_or(&child.title)
+            .clone();
+        label_to_children.entry(label).or_default().push(child);
+    }
+
+    // Generate timestamp for unique IDs
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let mut uber_categories_created = 0;
+    let mut categories_reparented = 0;
+    let mut uber_category_ids: Vec<String> = Vec::new();
+    let mut all_children_to_update: Vec<String> = Vec::new();
+
+    for (idx, grouping) in groupings.iter().enumerate() {
+        let uber_id = format!("uber-{}-{}", timestamp, idx);
+
+        // Find matching children for this grouping
+        let mut matching_children: Vec<&Node> = Vec::new();
+        for member_label in &grouping.children {
+            if let Some(nodes) = label_to_children.get(member_label) {
+                matching_children.extend(nodes.iter());
+            }
+        }
+
+        if matching_children.is_empty() {
+            continue;
+        }
+
+        // Create uber-category node
+        let uber_node = Node {
+            id: uber_id.clone(),
+            node_type: NodeType::Cluster,
+            title: grouping.name.clone(),
+            url: None,
+            content: grouping.description.clone(),
+            position: Position { x: 0.0, y: 0.0 },
+            created_at: now,
+            updated_at: now,
+            cluster_id: None,
+            cluster_label: Some(grouping.name.clone()),
+            depth: 1,
+            is_item: false,
+            is_universe: false,
+            parent_id: Some(universe.id.clone()),
+            child_count: matching_children.len() as i32,
+            ai_title: None,
+            summary: grouping.description.clone(),
+            tags: None,
+            emoji: None,
+            is_processed: false,
+            conversation_id: None,
+            sequence_index: None,
+            is_pinned: false,
+            last_accessed_at: None,
+            latest_child_date: None,
+            is_private: None,
+            privacy_reason: None,
+            source: None,
+            pdf_available: None,
+            content_type: None,
+            associated_idea_id: None,
+            privacy: None,
+        };
+
+        db.insert_node(&uber_node).map_err(|e| e.to_string())?;
+        uber_category_ids.push(uber_id.clone());
+        uber_categories_created += 1;
+
+        // Reparent matching children
+        for child in &matching_children {
+            db.update_parent(&child.id, &uber_id).map_err(|e| e.to_string())?;
+            all_children_to_update.push(child.id.clone());
+            categories_reparented += 1;
+        }
+
+        if !quiet {
+            log!("Created '{}' with {} children", grouping.name, matching_children.len());
+        }
+    }
+
+    // Batch update depths
+    if !all_children_to_update.is_empty() {
+        db.increment_multiple_subtrees_depth(&all_children_to_update).map_err(|e| e.to_string())?;
+    }
+
+    // Update Universe's child count
+    let new_child_count = db.get_children(&universe.id).map_err(|e| e.to_string())?.len();
+    db.update_child_count(&universe.id, new_child_count as i32).map_err(|e| e.to_string())?;
+
+    // Generate embeddings for uber-categories
+    if !quiet {
+        log!("Computing embeddings for uber-categories...");
+    }
+    for uber_id in &uber_category_ids {
+        let uber_children = db.get_children(uber_id).map_err(|e| e.to_string())?;
+        let child_embeddings: Vec<Vec<f32>> = uber_children
+            .iter()
+            .filter_map(|c| db.get_node_embedding(&c.id).ok().flatten())
+            .collect();
+
+        if !child_embeddings.is_empty() {
+            let refs: Vec<&[f32]> = child_embeddings.iter().map(|e| e.as_slice()).collect();
+            if let Some(centroid) = similarity::compute_centroid(&refs) {
+                let _ = db.update_node_embedding(uber_id, &centroid);
+            }
+        }
+    }
+
+    // Create sibling edges between uber-categories based on embedding similarity
+    if !quiet {
+        log!("Creating sibling edges between uber-categories...");
+    }
+    let mut sibling_edges = 0;
+
+    // Get embeddings for all uber-categories
+    let uber_embeddings: Vec<(String, Vec<f32>)> = uber_category_ids.iter()
+        .filter_map(|id| db.get_node_embedding(id).ok().flatten().map(|e| (id.clone(), e)))
+        .collect();
+
+    // Create edges between pairs with similarity > 0.3
+    let edge_timestamp = chrono::Utc::now().timestamp_millis();
+    for i in 0..uber_embeddings.len() {
+        for j in (i + 1)..uber_embeddings.len() {
+            let (id_a, emb_a) = &uber_embeddings[i];
+            let (id_b, emb_b) = &uber_embeddings[j];
+
+            let sim = similarity::cosine_similarity(emb_a, emb_b);
+            if sim > 0.3 {
+                let edge = mycelica_lib::db::Edge {
+                    id: format!("sibling-{}-{}", edge_timestamp, sibling_edges),
+                    source: id_a.clone(),
+                    target: id_b.clone(),
+                    edge_type: mycelica_lib::db::EdgeType::Sibling,
+                    label: None,
+                    weight: Some(sim as f64),
+                    edge_source: Some("consolidate".to_string()),
+                    evidence_id: None,
+                    confidence: None,
+                    created_at: edge_timestamp,
+                };
+                if db.insert_edge(&edge).is_ok() {
+                    sibling_edges += 1;
+                }
+            }
+        }
+    }
+
+    // Index edges for view lookups
+    if sibling_edges > 0 {
+        let _ = db.update_edge_parents();
+    }
+
+    let duration = start.elapsed().as_secs_f64();
+
+    if json {
+        println!(r#"{{"uber_categories_created":{},"categories_reparented":{},"sibling_edges_created":{},"duration_ms":{}}}"#,
+            uber_categories_created, categories_reparented, sibling_edges, (duration * 1000.0) as u64);
+    } else if !quiet {
+        log!("Consolidation complete:");
+        log!("  {} uber-categories created", uber_categories_created);
+        log!("  {} categories reparented", categories_reparented);
+        log!("  {} sibling edges created", sibling_edges);
+        log!("  Time: {:.2}s", duration);
+    }
+
+    Ok(())
+}
+
+fn handle_unconsolidate(db: &Database, json: bool, quiet: bool) -> Result<(), String> {
+    use mycelica_lib::hierarchy;
+    use std::time::Instant;
+
+    let start = Instant::now();
+
+    // Get Universe
+    let universe = db.get_universe()
+        .map_err(|e| e.to_string())?
+        .ok_or("No Universe node found")?;
+
+    // Find uber-category nodes (id starts with "uber-")
+    let all_children = db.get_children(&universe.id).map_err(|e| e.to_string())?;
+    let uber_categories: Vec<_> = all_children
+        .into_iter()
+        .filter(|n| n.id.starts_with("uber-"))
+        .collect();
+
+    if uber_categories.is_empty() {
+        return Err("No uber-categories found to unconsolidate".to_string());
+    }
+
+    if !quiet {
+        log!("Found {} uber-categories to flatten", uber_categories.len());
+    }
+
+    let mut categories_removed = 0;
+    let mut children_reparented = 0;
+    let mut all_children_to_update: Vec<String> = Vec::new();
+
+    for uber in &uber_categories {
+        let uber_children = db.get_children(&uber.id).map_err(|e| e.to_string())?;
+
+        // Reparent children to Universe
+        for child in &uber_children {
+            db.update_parent(&child.id, &universe.id).map_err(|e| e.to_string())?;
+            all_children_to_update.push(child.id.clone());
+            children_reparented += 1;
+        }
+
+        // Delete the uber-category node
+        db.delete_node(&uber.id).map_err(|e| e.to_string())?;
+        categories_removed += 1;
+
+        if !quiet {
+            log!("Flattened '{}' ({} children)", uber.title, uber_children.len());
+        }
+    }
+
+    // Decrement depths for reparented subtrees
+    for child_id in &all_children_to_update {
+        let _ = db.decrement_subtree_depth(child_id);
+    }
+
+    // Update Universe's child count
+    let new_child_count = db.get_children(&universe.id).map_err(|e| e.to_string())?.len();
+    db.update_child_count(&universe.id, new_child_count as i32).map_err(|e| e.to_string())?;
+
+    // Delete old sibling edges
+    let _ = db.delete_edges_by_type("sibling");
+
+    // Recreate sibling edges for the new flat structure
+    if !quiet {
+        log!("Recreating sibling edges...");
+    }
+    let sibling_edges = hierarchy::create_category_edges_from_cross_counts(db, None).unwrap_or(0);
+
+    // Index edges for view lookups
+    if sibling_edges > 0 {
+        let _ = db.update_edge_parents();
+    }
+
+    let duration = start.elapsed().as_secs_f64();
+
+    if json {
+        println!(r#"{{"categories_removed":{},"children_reparented":{},"sibling_edges_created":{},"duration_ms":{}}}"#,
+            categories_removed, children_reparented, sibling_edges, (duration * 1000.0) as u64);
+    } else if !quiet {
+        log!("Unconsolidation complete:");
+        log!("  {} uber-categories removed", categories_removed);
+        log!("  {} children reparented", children_reparented);
+        log!("  {} sibling edges recreated", sibling_edges);
+        log!("  Time: {:.2}s", duration);
     }
 
     Ok(())
@@ -5395,6 +5752,11 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
             log!("Regenerating edges at threshold {:.2} (max {} per node)...", threshold, max_edges);
             let created = db.create_semantic_edges(threshold, max_edges).map_err(|e| e.to_string())?;
             log!("  Created {} edges", created);
+
+            // Index edges for view lookups
+            log!("Indexing edges for view lookups...");
+            let indexed = db.update_edge_parents().map_err(|e| e.to_string())?;
+            log!("  Indexed {} edges", indexed);
 
             log!("\nEdge regeneration complete. Run 'hierarchy rebuild --algorithm adaptive' to use new edges.");
         }

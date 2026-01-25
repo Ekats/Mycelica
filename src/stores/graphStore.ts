@@ -44,6 +44,9 @@ interface GraphState {
   // UI preferences
   showTips: boolean;                // Show popup hints on selected nodes
 
+  // Edge display threshold
+  edgeWeightThreshold: number;      // Only show edges with weight >= this value (0.0-1.0)
+
   // Actions
   setNodes: (nodes: Map<string, Node>) => void;
   addNode: (node: Node) => void;
@@ -80,6 +83,9 @@ interface GraphState {
 
   // UI preference actions
   setShowTips: (show: boolean) => void;
+
+  // Edge display actions
+  setEdgeWeightThreshold: (threshold: number) => void;
 }
 
 export const useGraphStore = create<GraphState>((set, get) => ({
@@ -109,6 +115,9 @@ export const useGraphStore = create<GraphState>((set, get) => ({
 
   // UI preferences
   showTips: true,
+
+  // Edge display threshold - default to 0.5 (only show stronger connections)
+  edgeWeightThreshold: 0.5,
 
   setNodes: (nodes) => set({ nodes }),
 
@@ -306,4 +315,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
 
   // UI preference actions
   setShowTips: (show) => set({ showTips: show }),
+
+  // Edge display actions
+  setEdgeWeightThreshold: (threshold) => set({ edgeWeightThreshold: threshold }),
 }));
