@@ -46,111 +46,7 @@ Where `||v||₂ = √Σvᵢ²`
 
 ---
 
-## 2. Initial Clustering
-
-### Agglomerative Clustering with Union-Find
-
-**Complexity:** O(n²) for similarity computation, O(n·α(n)) for union-find operations
-
-### Adjusted Similarity with Bonuses
-
-```
-sim(i, j) = min(1.0, cos(eᵢ, eⱼ) + conversation_bonus + tag_bonus)
-
-conversation_bonus = 0.1   if conversation_id(i) = conversation_id(j)
-                   = 0.0   otherwise
-
-tag_bonus = 0.08 × |tags(i) ∩ tags(j)|
-```
-
-### Thresholds (configurable, defaults)
-
-```
-primary_threshold   = 0.75   # Items cluster if sim ≥ 0.75
-secondary_threshold = 0.60   # Multi-path associations
-```
-
-### Union-Find Clustering
-
-```python
-def agglomerative_cluster(embeddings, threshold):
-    uf = UnionFind(len(embeddings))
-
-    for i in range(n):
-        for j in range(i+1, n):
-            if sim(i, j) >= threshold:
-                uf.union(i, j)
-
-    return group_by_root(uf)
-```
-
-### Union-Find Data Structure
-
-```python
-class UnionFind:
-    def __init__(self, n):
-        self.parent = list(range(n))
-        self.rank = [0] * n
-
-    def find(self, x):
-        if self.parent[x] != x:
-            self.parent[x] = self.find(self.parent[x])  # Path compression
-        return self.parent[x]
-
-    def union(self, x, y):
-        px, py = self.find(x), self.find(y)
-        if px == py: return
-        # Union by rank
-        if self.rank[px] < self.rank[py]:
-            self.parent[px] = py
-        elif self.rank[px] > self.rank[py]:
-            self.parent[py] = px
-        else:
-            self.parent[py] = px
-            self.rank[px] += 1
-```
-
-### Batch Mode (n ≥ 100,000)
-
-For large datasets, clustering is done in batches to avoid O(n²) memory explosion:
-
-```
-BATCH_SIZE = 25,000
-GLOBAL_THRESHOLD = 100,000
-
-if n >= GLOBAL_THRESHOLD:
-    # Shuffle to spread similar items across batches
-    shuffle(embeddings)
-
-    # Cluster each batch
-    for batch in chunks(embeddings, BATCH_SIZE):
-        batch_clusters = cluster_batch(batch, primary_threshold)
-        all_clusters.extend(batch_clusters)
-
-    # Merge similar clusters across batches
-    merge_threshold = primary_threshold * 0.95  # 0.7125
-    merge_similar_clusters(all_clusters, merge_threshold)
-
-    # K-means refinement (max 10 iterations)
-    for iter in range(10):
-        changed = reassign_to_nearest_centroid(all_clusters)
-        recompute_centroids(all_clusters)
-        if not changed: break
-```
-
-### Weighted Centroid Merge
-
-When merging clusters:
-
-```
-centroid_merged = Σ(centroidᵢ × sizeᵢ) / Σsizeᵢ
-```
-
-- **Implementation:** `src-tauri/src/clustering.rs`
-
----
-
-## 3. Semantic Edges
+## 2. Semantic Edges
 
 Created by `setup` step 2 to enable hierarchy edge-based grouping:
 
@@ -627,41 +523,46 @@ for category in categories_to_name {
 
 ## 9. Setup Pipeline
 
-The `mycelica-cli setup` command runs a complete pipeline for newly imported items:
+The `mycelica-cli setup` command runs a complete pipeline for newly imported items.
+
+### Adaptive Tree Pipeline (Default)
 
 ```
 Step 0: Pattern Classification (FREE)
-    - Identify items as papers, conversations, code, etc.
-    - No API calls, just regex matching
+    - Classify items by content patterns (code, debug, paste, etc.)
+    - Hidden items skip AI processing
 
 Step 1: AI Processing + Embeddings
     [1a] AI process items (title, summary, tags via Claude/Ollama)
     [1b] Generate embeddings (local all-MiniLM-L6-v2, no API)
-    [1c] Build HNSW index for fast similarity search
+         - Papers: title + abstract
+         - Code: signature + body
 
-Step 2: Semantic Edge Generation
-    - Use HNSW to find k-nearest neighbors for each item
-    - Create "Related" edges above similarity threshold
+Step 2: Clustering & Hierarchy
+    [2a] Generate semantic edges at 0.30 threshold
+         - Brute-force O(n²) pairwise cosine similarity
+         - Lower threshold = more edges = finer dendrogram resolution
+    [2b] Build hierarchy with adaptive tree algorithm
+         - Edges → Dendrogram → Adaptive cuts → Tree
+         - NO pre-clustering step (edges define structure directly)
+         - Includes category naming (bottom-up, LLM or keyword extraction)
+         - Live dedup via forbidden name set
 
-Step 3: Clustering & Hierarchy (Adaptive Tree)
-    - Run full adaptive tree algorithm
-    - Create category nodes and parent-child edges
+Step 3: Code Analysis (if code nodes exist)
+    - Create Calls edges between functions
 
-Step 4: Hierarchy Flattening
-    - Collapse single-child chains
-    - Ensure 8-15 children per category where possible
+Step 4: Flatten Hierarchy
+    - Remove sparse intermediate levels
 
-Step 5: Generate Category Embeddings
-    - Compute mean embeddings for all categories
-    - Add categories to HNSW index
+Step 5: Category Embeddings
+    - Compute centroid embeddings for all categories
 
-Step 6: Category Naming (Bottom-up, Live Dedup)
-    - Name categories from leaves to root
-    - Use forbidden name set to prevent duplicates
+Step 6: Build HNSW Index
+    - Build approximate nearest-neighbor index for GUI similarity panel
+    - Includes all items + category centroids
 
-Step 7: Orphan Assignment (Nearest-Neighbor)
-    - Find items not in any category
-    - Assign to nearest category by embedding similarity
+Step 7: Index Edge Parents
+    - Precompute parent_id for edges (faster view loading)
 ```
 
 **Total time**: ~2-5 minutes for 1000 items (depends on AI backend speed).
@@ -671,17 +572,6 @@ Step 7: Orphan Assignment (Nearest-Neighbor)
 ---
 
 ## 10. Constants Summary
-
-### Clustering Constants
-
-| Constant | Value | Purpose |
-|----------|-------|---------|
-| `CONVERSATION_BONUS` | 0.10 | Same conversation boost |
-| `TAG_BONUS_PER_TAG` | 0.08 | Per shared tag |
-| `primary_threshold` | 0.75 | Clustering similarity |
-| `secondary_threshold` | 0.60 | Multi-path associations |
-| `GLOBAL_THRESHOLD` | 100,000 | Batch mode trigger |
-| `BATCH_SIZE` | 25,000 | Batch clustering size |
 
 ### Adaptive Tree Constants
 

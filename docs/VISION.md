@@ -1,53 +1,55 @@
 # Mycelica Vision
 
-> What if we organized external knowledge the way neurons organize internal knowledge?
+> What if we organized external knowledge the way associative memory organizes internal knowledge?
 
 ## The Problem
 
-Knowledge is scattered. AI conversations disappear into chat history. Notes live in 5 different apps. Ideas connect across domains but tools force hierarchical folders.
+Knowledge scatters. AI conversations disappear into chat history. Notes live in separate apps. Research papers sit in flat lists. Code and documentation drift apart. Ideas connect across domains but tools force you into folders or tags that capture one relationship at a time.
 
-Real thinking is **associative**—one idea triggers another. Current tools don't support this.
+Real thinking is associative. One idea triggers another. Current tools don't support this.
 
 ## The Solution
 
-**Mycelica** is a visual knowledge graph for all your thoughts. Named after mycelium—the underground fungal network that connects forest ecosystems.
+Mycelica is a visual knowledge graph that builds structure from content automatically. Named after mycelium, the underground fungal network that connects forest ecosystems.
 
-Everything goes in:
-- AI conversations (Claude, ChatGPT)
-- Notes (quick and deep)
-- Voice memos (transcribed)
-- Bookmarks, code snippets, research threads
+Import your data:
+- AI conversations (Claude, ChatGPT exports)
+- Research papers (via OpenAIRE)
+- Notes and markdown files
+- Source code (with call graphs and doc links)
+- Web sessions (via browser extension)
 
-Everything gets connected automatically. Everything becomes searchable by meaning, not just keywords.
+Mycelica generates embeddings locally, computes semantic similarity edges between documents, then builds a navigable hierarchy from edge topology. Categories form because their contents actually connect. You explore by drilling down through levels, not by searching and scrolling through flat results.
 
 ## Core Principles
 
-### 1. Associative, Not Hierarchical
-Notes have multiple retrieval paths (alt-titles). Connections are weighted. Depth adapts to domain complexity.
+### Emergent Structure
+Hierarchy comes from connectivity, not manual organization. Import 50,000 papers, get a browsable tree where related work clusters together automatically. The algorithm is deterministic: same edges produce the same tree.
 
-### 2. AI-Assisted, Human-Verified
-Connections are discovered automatically. Contradictions surface structurally. Humans validate what matters.
+### AI-Assisted, Auditable
+AI generates category names after structure exists. All structural decisions trace back to measurable edge weights. You can inspect why documents clustered together (they share edges above threshold) and why clusters split (cohesion dropped below validation).
 
-### 3. Local-First
-Your data lives on your device. No cloud required for core functionality.
+### Local-First
+Your data lives on your device. No server, no account, no subscription. Works offline. Privacy by architecture, not policy.
 
-### 4. Decentralized by Design
-Built with future federation in mind. Trust derived from graph structure rather than central authority.
+## Current State
 
-## Roadmap
+Working desktop application with GUI, CLI, and TUI interfaces. Tested on 53,000 research papers. Cross-platform builds for Linux and Windows. AGPL-3.0 licensed.
 
-```
-Phase 1 (current)  →  Personal knowledge graph (desktop app)
-Phase 2            →  Multi-user collaboration features
-Phase 3 (future)   →  Optional federation for shared knowledge bases
-```
+The adaptive tree algorithm reads hierarchical structure directly from edge weights using dendrogram extraction with threshold cuts validated for balance and cohesion.
+
+## What Comes Next
+
+Edge type classification (supports, contradicts, extends, replicates). Citation graph integration. Incremental hierarchy updates. More import sources. Better doc-to-code linking.
+
+The longer term possibility: if the core approach proves useful, it could extend to shared knowledge bases and cross-instance queries. But that depends on getting the fundamentals right first.
 
 ## Success Metric
 
-**Using Mycelica daily. Finding old and most relevant conversations quickly and easily. Discovering connections I'd forgotten.**
+Using Mycelica daily. Finding old conversations and papers quickly. Discovering connections I had forgotten. Seeing the shape of what I know.
 
 Everything else follows from that.
 
 ---
 
-*For implementation details, see `/docs/ARCHITECTURE.md` and `/docs/specs/`*
+*For implementation details, see ALGORITHMS.md and ARCHITECTURE.md*

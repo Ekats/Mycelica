@@ -4,16 +4,37 @@
 
 ## Installation
 
-The CLI is built alongside the main application:
+### For Development (with GUI)
+
+The CLI must be installed globally AND copied to the sidecar location for the GUI to use it:
 
 ```bash
-cargo build --release --bin mycelica-cli
+cd src-tauri
+
+# Install globally (requires nightly for CUDA)
+cargo +nightly install --path . --bin mycelica-cli --features cuda --force
+
+# Copy to sidecar location (required for GUI to spawn CLI)
+cp ~/.cargo/bin/mycelica-cli binaries/mycelica-cli-x86_64-unknown-linux-gnu
+```
+
+Platform-specific sidecar names:
+- Linux: `mycelica-cli-x86_64-unknown-linux-gnu`
+- macOS Intel: `mycelica-cli-x86_64-apple-darwin`
+- macOS ARM: `mycelica-cli-aarch64-apple-darwin`
+- Windows: `mycelica-cli-x86_64-pc-windows-msvc.exe`
+
+### CLI-Only (no GUI)
+
+```bash
+cd src-tauri
+cargo +nightly build --release --bin mycelica-cli --features cuda
 # Binary at: target/release/mycelica-cli
 ```
 
-Or install globally:
+Or install globally without sidecar:
 ```bash
-cargo install --path src-tauri --bin mycelica-cli
+cargo +nightly install --path src-tauri --bin mycelica-cli --features cuda
 ```
 
 ---
@@ -104,7 +125,6 @@ mycelica-cli process reset         # Mark all nodes as unprocessed
 ```bash
 mycelica-cli cluster run           # Cluster items needing clustering
 mycelica-cli cluster recluster     # Force recluster all items
-mycelica-cli cluster fos           # FOS-based clustering (for papers)
 mycelica-cli cluster status        # Show clustering statistics
 ```
 
@@ -192,7 +212,6 @@ mycelica-cli maintenance vacuum            # Vacuum database
 mycelica-cli maintenance fix-counts        # Fix child counts
 mycelica-cli maintenance fix-depths        # Fix node depths
 mycelica-cli maintenance prune-edges       # Prune dead edges
-mycelica-cli maintenance precompute-fos-edges  # Precompute FOS edge sets
 mycelica-cli maintenance index-edges          # Index edges by parent
 mycelica-cli maintenance merge-small-categories  # Merge small siblings by embedding similarity
 mycelica-cli maintenance repair-code-tags <PATH>  # Restore file_path metadata to code nodes
@@ -234,7 +253,10 @@ mycelica-cli code show <ID>
 
 ```bash
 # Interactive setup wizard
-mycelica-cli setup [--fos]          # --fos: Use FOS clustering for papers
+mycelica-cli setup
+
+# Non-interactive setup (auto-confirm, skip prompts)
+mycelica-cli setup --yes
 
 # Interactive TUI
 mycelica-cli tui
@@ -295,9 +317,6 @@ mycelica-cli setup
 # Import papers
 mycelica-cli import openaire "neural networks" --max-results 200
 
-# FOS-based clustering
-mycelica-cli cluster fos
-
 # Build hierarchy
 mycelica-cli hierarchy rebuild
 
@@ -321,7 +340,7 @@ mycelica-cli --json node search "rust" | jq '.[].title'
 
 ### Fully Implemented in Both
 - Import (all 5 types: claude, markdown, keep, openaire, code)
-- Clustering (run, recluster, fos)
+- Clustering (run, recluster)
 - Hierarchy build/rebuild
 - Embeddings (regenerate, clear, status)
 - Settings/config management
@@ -352,4 +371,4 @@ CLI operations can be cancelled with Ctrl+C. This is different from GUI which us
 
 ---
 
-*Last updated: 2026-01-13*
+*Last updated: 2026-01-25*
