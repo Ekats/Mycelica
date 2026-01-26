@@ -1,5 +1,5 @@
 import { memo, useState, useCallback, useMemo, useEffect, useRef } from 'react';
-import { Pin, PinOff, Lock, LockOpen, GitBranch, GitMerge, MoreHorizontal } from 'lucide-react';
+import { Pin, PinOff, Lock, LockOpen, GitBranch, MoreHorizontal } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import type { Node, Edge } from '../../types/graph';
 import { getSimilarityColor, getHeatColor } from '../../utils/similarityColor';
@@ -39,7 +39,6 @@ interface SimilarNodesPanelProps {
   onTogglePin: (nodeId: string, currentlyPinned: boolean) => void;
   onTogglePrivacy: (nodeId: string, currentlyPrivate: boolean) => void;
   onSplitNode?: (nodeId: string) => void;  // Flatten node - move children up to parent level
-  onGroupNode?: (nodeId: string) => void;  // Group children into AI-generated categories
   onClearAll: () => void;
   onToggleStack: () => void;
   onStartResize: () => void;
@@ -68,7 +67,6 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
   onTogglePin,
   onTogglePrivacy,
   onSplitNode,
-  onGroupNode,
   onClearAll,
   onToggleStack,
   onStartResize,
@@ -650,18 +648,6 @@ export const SimilarNodesPanel = memo(function SimilarNodesPanel({
                             >
                               <GitBranch className="w-4 h-4" />
                               Split
-                            </button>
-                          )}
-                          {sourceNode && sourceNode.childCount > 0 && onGroupNode && (
-                            <button
-                              onClick={() => {
-                                onGroupNode(sourceId);
-                                setMoreMenuOpen(null);
-                              }}
-                              className="w-full px-3 py-1.5 text-left text-sm flex items-center gap-2 text-gray-400 hover:bg-gray-600 hover:text-purple-400 transition-colors"
-                            >
-                              <GitMerge className="w-4 h-4" />
-                              Group
                             </button>
                           )}
                         </div>

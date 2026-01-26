@@ -552,7 +552,7 @@ async fn cluster_with_embeddings_impl(
     items: &[Node],
     use_ai_naming: bool,
 ) -> Result<ClusteringResult, String> {
-    // Group items by parent_id to preserve existing hierarchy (e.g., FOS categories)
+    // Group items by parent_id to preserve existing hierarchy
     // Items with same parent get clustered together; items without parent cluster together
     let items_by_parent: HashMap<Option<String>, Vec<Node>> = items
         .iter()
@@ -564,7 +564,7 @@ async fn cluster_with_embeddings_impl(
 
     let num_groups = items_by_parent.len();
     if num_groups > 1 {
-        println!("[Clustering] Respecting {} parent groups (FOS/hierarchy preserved)", num_groups);
+        println!("[Clustering] Respecting {} parent groups (hierarchy preserved)", num_groups);
     }
 
     let mut total_result = ClusteringResult {
@@ -1184,165 +1184,6 @@ pub async fn cluster_with_embeddings_lite(db: &Database) -> Result<ClusteringRes
         items_assigned: result.items_assigned,
         edges_created: result.edges_created,
         method: "embedding-lite".to_string(),
-    })
-}
-
-/// Cluster papers by FOS (Field of Science) - creates actual hierarchy nodes
-/// No embeddings needed - just reads FOS from papers.subjects JSON.
-/// Creates FOS parent nodes under universe, assigns papers as children.
-/// Fast O(n) operation.
-pub async fn cluster_with_fos_pregrouping(db: &Database) -> Result<ClusteringResult, String> {
-    use crate::db::{Node, NodeType, Position};
-
-    // Get papers grouped by FOS directly from database
-    let papers_by_fos = db.get_papers_by_fos().map_err(|e| e.to_string())?;
-
-    if papers_by_fos.is_empty() {
-        println!("[Clustering FOS] No papers with FOS data found");
-        return Ok(ClusteringResult {
-            items_processed: 0,
-            clusters_created: 0,
-            items_assigned: 0,
-            edges_created: 0,
-            method: "fos".to_string(),
-        });
-    }
-
-    let total_papers: usize = papers_by_fos.values().map(|v| v.len()).sum();
-    println!("[Clustering FOS] {} papers across {} FOS categories", total_papers, papers_by_fos.len());
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-
-    // Get or create universe node
-    let universe = match db.get_universe().map_err(|e| e.to_string())? {
-        Some(u) => u,
-        None => {
-            // Create Universe node
-            println!("[Clustering FOS] Creating Universe node");
-            let universe_node = Node {
-                id: "universe".to_string(),
-                node_type: NodeType::Cluster,
-                title: "All Knowledge".to_string(),
-                url: None,
-                content: Some("The root of everything".to_string()),
-                position: Position { x: 0.0, y: 0.0 },
-                created_at: now,
-                updated_at: now,
-                cluster_id: None,
-                cluster_label: Some("Universe".to_string()),
-                depth: 0,
-                is_item: false,
-                is_universe: true,
-                parent_id: None,
-                child_count: 0,
-                emoji: Some("🌌".to_string()),
-                summary: None,
-                ai_title: None,
-                tags: None,
-                is_processed: false,
-                is_pinned: false,
-                is_private: None,
-                last_accessed_at: None,
-                conversation_id: None,
-                sequence_index: None,
-                latest_child_date: None,
-                privacy_reason: None,
-                source: None,
-                pdf_available: None,
-                content_type: None,
-                associated_idea_id: None,
-                privacy: None,
-            };
-            db.insert_node(&universe_node).map_err(|e| e.to_string())?;
-            universe_node
-        }
-    };
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-
-    let mut items_assigned = 0;
-    let mut clusters_created = 0;
-
-    // Create FOS parent nodes and assign papers
-    for (fos_name, paper_ids) in &papers_by_fos {
-        if paper_ids.is_empty() {
-            continue;
-        }
-
-        // Create FOS category node
-        let fos_id = format!("fos-{}", fos_name.to_lowercase().replace(' ', "-"));
-
-        // Check if FOS node already exists
-        let fos_node = if let Ok(Some(existing)) = db.get_node(&fos_id) {
-            println!("[Clustering FOS] '{}': using existing node", fos_name);
-            existing
-        } else {
-            // Create new FOS parent node
-            let node = Node {
-                id: fos_id.clone(),
-                node_type: NodeType::Cluster,
-                title: fos_name.clone(),
-                url: None,
-                content: Some(format!("{} papers", paper_ids.len())),
-                position: Position { x: 0.0, y: 0.0 },
-                created_at: now,
-                updated_at: now,
-                cluster_id: None,
-                cluster_label: Some(fos_name.clone()),
-                depth: 1, // Direct child of universe
-                is_item: false,
-                is_universe: false,
-                parent_id: Some(universe.id.clone()),
-                child_count: paper_ids.len() as i32,
-                emoji: Some("📚".to_string()),
-                summary: None,
-                ai_title: None,
-                tags: None,
-                is_processed: true,
-                is_pinned: false,
-                is_private: None,
-                last_accessed_at: None,
-                conversation_id: None,
-                sequence_index: None,
-                latest_child_date: None,
-                privacy_reason: None,
-                source: None,
-                pdf_available: None,
-                content_type: None,
-                associated_idea_id: None,
-                privacy: None,
-            };
-
-            db.insert_node(&node).map_err(|e| e.to_string())?;
-            clusters_created += 1;
-            println!("[Clustering FOS] '{}': created node with {} papers", fos_name, paper_ids.len());
-            node
-        };
-
-        // Assign all papers in this FOS as children of the FOS node
-        for paper_id in paper_ids {
-            if let Err(e) = db.update_node_parent(paper_id, &fos_node.id) {
-                eprintln!("[Clustering FOS] Failed to assign {}: {}", paper_id, e);
-            } else {
-                items_assigned += 1;
-            }
-        }
-    }
-
-    println!("[Clustering FOS] Complete: {} papers → {} FOS categories", items_assigned, clusters_created);
-
-    Ok(ClusteringResult {
-        items_processed: total_papers,
-        clusters_created,
-        items_assigned,
-        edges_created: 0,
-        method: "fos".to_string(),
     })
 }
 

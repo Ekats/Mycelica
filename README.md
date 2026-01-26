@@ -116,14 +116,17 @@ Mycelica includes a headless CLI for scripting, automation, and server use.
 ```bash
 cd src-tauri
 
-# CPU build (default)
+# Install globally with CUDA (recommended, requires nightly)
+cargo +nightly install --path . --bin mycelica-cli --features cuda --force
+
+# Copy to sidecar location (required for GUI to spawn CLI)
+cp ~/.cargo/bin/mycelica-cli binaries/mycelica-cli-x86_64-unknown-linux-gnu
+
+# CPU-only build (no nightly required)
 cargo build --release --bin mycelica-cli
-
-# CUDA build (GPU-accelerated embeddings, requires nightly)
-cargo +nightly build --release --bin mycelica-cli --features cuda
-
-# Binary at: target/release/mycelica-cli
 ```
+
+The sidecar copy is required for GUI buttons like "Full Setup" and "Build Hierarchy" which spawn the CLI internally.
 
 ### CLI Usage
 

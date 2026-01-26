@@ -150,7 +150,6 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
   const [nodeToDelete, setNodeToDelete] = useState<string | null>(null); // Node pending deletion
   // Workflow states (used for auto-build and internal functions)
   const [isProcessing, setIsProcessing] = useState(false);
-  const [isClustering, setIsClustering] = useState(false);
   const [isBuildingHierarchy, setIsBuildingHierarchy] = useState(false);
   const [isUpdatingDates, setIsUpdatingDates] = useState(false);
   const [isFullRebuilding, setIsFullRebuilding] = useState(false);
@@ -469,26 +468,6 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     }
   }, [nodes, devLog, onDataChanged]);
 
-  // Handle grouping a node's children into sub-categories (max 5 groups)
-  const handleGroupNode = useCallback(async (nodeId: string) => {
-    const node = nodes.get(nodeId);
-    const nodeName = node?.aiTitle || node?.title || nodeId.slice(0, 8);
-    try {
-      devLog('info', `Grouping children of "${nodeName}" into categories...`);
-      await invoke('cluster_hierarchy_level', { parentId: nodeId, maxGroups: 5 });
-      devLog('info', `Group complete! Refreshing graph...`);
-      // Clear the panel and refresh the graph data
-      setSimilarNodesMap(new Map());
-      if (onDataChanged) {
-        await onDataChanged();
-        devLog('info', `Graph refreshed. Navigate into "${nodeName}" to see new structure.`);
-      }
-    } catch (err) {
-      console.error('Failed to group node:', err);
-      devLog('error', `Failed to group: ${err}`);
-    }
-  }, [nodes, devLog, onDataChanged]);
-
   // Track the latest requested node to prevent race conditions
   const latestFetchRef = useRef<string | null>(null);
 
@@ -580,16 +559,16 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
         devLog('info', `Auto-build: Found ${itemsWithClusters.length} clustered items, no Universe - building hierarchy...`);
         setIsBuildingHierarchy(true);
         try {
-          // Use build_full_hierarchy with runClustering=false (already clustered)
-          const result = await invoke<{
-            clusteringResult: { itemsProcessed: number; clustersCreated: number; itemsAssigned: number } | null;
-            hierarchyResult: { levelsCreated: number; intermediateNodesCreated: number; itemsOrganized: number; maxDepth: number };
-            levelsCreated: number;
-            groupingIterations: number;
-          }>('build_full_hierarchy', { runClustering: false });
-          devLog('info', `Auto-build SUCCESS: ${result.levelsCreated} levels, ${result.groupingIterations} AI grouping iterations`);
-          setHierarchyBuilt(true);
-          setMaxDepth(result.hierarchyResult.maxDepth);
+          // Use adaptive tree algorithm (faster, no AI needed for structure)
+          const result = await invoke<{ success: boolean; output: string; error: string | null }>('run_cli_hierarchy', {
+            keywordsOnly: true,  // Faster for auto-build
+          });
+          if (result.success) {
+            devLog('info', 'Auto-build SUCCESS with adaptive tree algorithm');
+            setHierarchyBuilt(true);
+          } else {
+            devLog('error', `Auto-build FAILED: ${result.error}`);
+          }
 
           // Wait 3 seconds so user can see the log, then reload
           devLog('info', 'Reloading in 3 seconds...');
@@ -734,22 +713,6 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     };
   }, [devLog]);
 
-  // Run clustering
-  const runClustering = useCallback(async () => {
-    setIsClustering(true);
-    devLog('info', 'Starting clustering...');
-    try {
-      const result = await invoke<{ clusters_created: number; nodes_clustered: number }>('run_clustering');
-      devLog('info', `Clustering complete: ${result.clusters_created} clusters, ${result.nodes_clustered} nodes`);
-      // Reload the page to get updated cluster assignments
-      window.location.reload();
-    } catch (error) {
-      devLog('error', `Clustering failed: ${error}`);
-    } finally {
-      setIsClustering(false);
-    }
-  }, [devLog]);
-
   // Run AI processing on nodes
   const runProcessing = useCallback(async () => {
     setIsProcessing(true);
@@ -828,25 +791,18 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     devLog('info', `Types: ${Object.entries(typeCounts).map(([t, c]) => `${t}:${c}`).join(', ')}`);
     devLog('info', `With cluster_id: ${clusteredCount}`);
 
-    devLog('info', 'Building full hierarchy with recursive AI grouping...');
+    devLog('info', 'Building hierarchy with adaptive tree algorithm...');
     try {
-      // Use new build_full_hierarchy command - does NOT re-run clustering
-      const result = await invoke<{
-        clusteringResult: { itemsProcessed: number; clustersCreated: number; itemsAssigned: number } | null;
-        hierarchyResult: { levelsCreated: number; intermediateNodesCreated: number; itemsOrganized: number; maxDepth: number };
-        levelsCreated: number;
-        groupingIterations: number;
-      }>('build_full_hierarchy', { runClustering: false });
+      const result = await invoke<{ success: boolean; output: string; error: string | null }>('run_cli_hierarchy', {
+        keywordsOnly: false,
+      });
 
-      devLog('info', `Build SUCCESS: ${result.levelsCreated} levels, ${result.groupingIterations} AI grouping iterations`);
-      devLog('info', `Intermediate nodes: ${result.hierarchyResult.intermediateNodesCreated}, Items organized: ${result.hierarchyResult.itemsOrganized}`);
-
-      if (result.hierarchyResult.intermediateNodesCreated === 0 && itemCount > 0) {
-        devLog('warn', 'No intermediate nodes created. Items may be unclustered.');
+      if (result.success) {
+        devLog('info', 'Build SUCCESS with adaptive tree algorithm');
+        setHierarchyBuilt(true);
+      } else {
+        devLog('error', `Build FAILED: ${result.error}`);
       }
-
-      setHierarchyBuilt(true);
-      setMaxDepth(result.hierarchyResult.maxDepth);
 
       // Wait 3 seconds so user can see the log, then reload
       devLog('info', 'Reloading in 3 seconds...');
@@ -856,7 +812,7 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
       devLog('error', `Manual build FAILED: ${JSON.stringify(error)}`);
       setIsBuildingHierarchy(false);
     }
-  }, [devLog, nodes, setMaxDepth]);
+  }, [devLog, nodes]);
 
   // Full rebuild: cluster + hierarchy in one shot
   const fullRebuild = useCallback(async () => {
@@ -872,21 +828,19 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
     setIsFullRebuilding(true);
     setCancelRequested(null);
     rebuildStartTimeRef.current = Date.now();
-    devLog('info', '=== FULL REBUILD: Clustering + Hierarchy + AI Grouping ===');
+    devLog('info', '=== FULL REBUILD: Adaptive Tree Algorithm ===');
     try {
-      const result = await invoke<{
-        clusteringResult: { itemsProcessed: number; clustersCreated: number; itemsAssigned: number } | null;
-        hierarchyResult: { levelsCreated: number; intermediateNodesCreated: number; itemsOrganized: number; maxDepth: number };
-        levelsCreated: number;
-        groupingIterations: number;
-      }>('build_full_hierarchy', { runClustering: true });
+      const result = await invoke<{ success: boolean; output: string; error: string | null }>('run_cli_hierarchy', {
+        keywordsOnly: false,
+      });
 
       const elapsedSecs = (Date.now() - rebuildStartTimeRef.current) / 1000;
 
-      if (result.clusteringResult) {
-        devLog('info', `Clustering: ${result.clusteringResult.itemsAssigned} items → ${result.clusteringResult.clustersCreated} clusters`);
+      if (result.success) {
+        devLog('info', `Hierarchy rebuilt with adaptive tree (took ${formatTime(elapsedSecs)})`);
+      } else {
+        devLog('error', `Full rebuild FAILED: ${result.error}`);
       }
-      devLog('info', `Hierarchy: ${result.levelsCreated} levels, ${result.groupingIterations} AI grouping iterations (took ${formatTime(elapsedSecs)})`);
 
       // Save rebuild time to persistent stats
       try {
@@ -896,7 +850,6 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
       }
 
       setHierarchyBuilt(true);
-      setMaxDepth(result.hierarchyResult.maxDepth);
 
       devLog('info', 'Reloading in 3 seconds...');
       await new Promise(resolve => setTimeout(resolve, 3000));
@@ -905,7 +858,7 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
       devLog('error', `Full rebuild FAILED: ${JSON.stringify(error)}`);
       setIsFullRebuilding(false);
     }
-  }, [devLog, setMaxDepth, isProcessing]);
+  }, [devLog, isProcessing]);
 
   // Keep ref updated
   fullRebuildRef.current = fullRebuild;
@@ -1511,7 +1464,6 @@ export function Graph({ width, height, onDataChanged }: GraphProps) {
             onTogglePin={handleTogglePin}
             onTogglePrivacy={handleTogglePrivacy}
             onSplitNode={handleSplitNode}
-            onGroupNode={handleGroupNode}
             onClearAll={() => setSimilarNodesMap(new Map())}
             onToggleStack={() => setStackNodes(!stackNodes)}
             onStartResize={() => setIsResizingDetails(true)}

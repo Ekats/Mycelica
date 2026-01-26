@@ -84,3 +84,4 @@ pkg/
 *.local
 PRIVACYFILTER.md
 aur-mycelica-bin/
+src-tauri/binaries/

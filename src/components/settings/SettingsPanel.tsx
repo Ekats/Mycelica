@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
 import { readTextFile } from '@tauri-apps/plugin-fs';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
@@ -63,7 +64,7 @@ interface SettingsPanelProps {
   onDataChanged?: () => void;
 }
 
-type ConfirmAction = 'deleteAll' | 'resetAi' | 'resetClustering' | 'clearEmbeddings' | 'regenerateEdges' | 'clearHierarchy' | 'clearTags' | 'resetPrivacy' | 'fullRebuild' | 'flattenHierarchy' | 'consolidateRoot' | 'tidyDatabase' | 'scorePrivacy' | 'reclassifyPattern' | 'reclassifyAi' | 'rebuildLite' | 'nameClusters' | 'resetProcessing' | 'clearStructure' | null;
+type ConfirmAction = 'deleteAll' | 'resetAi' | 'clearEmbeddings' | 'regenerateEdges' | 'clearHierarchy' | 'clearTags' | 'resetPrivacy' | 'fullRebuild' | 'flattenHierarchy' | 'consolidateRoot' | 'unconsolidateRoot' | 'tidyDatabase' | 'scorePrivacy' | 'reclassifyPattern' | 'reclassifyAi' | 'rebuildLite' | 'nameClusters' | 'resetProcessing' | 'clearStructure' | null;
 
 interface TidyReport {
   sameNameMerged: number;
@@ -190,7 +191,6 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
 
   // Setup flow operations
   const [isProcessingAi, setIsProcessingAi] = useState(false);
-  const [isClustering, setIsClustering] = useState(false);
   const [isBuildingHierarchy, setIsBuildingHierarchy] = useState(false);
   const [isUpdatingDates, setIsUpdatingDates] = useState(false);
   const [isQuickAdding, setIsQuickAdding] = useState(false);
@@ -214,12 +214,6 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const [useLocalEmbeddings, setUseLocalEmbeddings] = useState(false);
   const [isRegeneratingEmbeddings, setIsRegeneratingEmbeddings] = useState(false);
   const [regenerateProgress, setRegenerateProgress] = useState<{ current: number; total: number; status: string } | null>(null);
-
-  // Clustering thresholds
-  const [clusteringPrimary, setClusteringPrimary] = useState<string>('');
-  const [clusteringSecondary, setClusteringSecondary] = useState<string>('');
-  const [savingThresholds, setSavingThresholds] = useState(false);
-  const [thresholdResult, setThresholdResult] = useState<string | null>(null);
 
   // Privacy threshold (for Personal category separation)
   const [privacyThresholdInput, setPrivacyThresholdInput] = useState<string>('0.5');
@@ -248,7 +242,6 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
       loadProtectionSettings();
       loadShowTips();
       loadLocalEmbeddingsStatus();
-      loadClusteringThresholds();
       loadPrivacyThresholdSetting();
       setImportResult(null);
       setActionResult(null);
@@ -425,45 +418,6 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     } catch (err) {
       setActionResult(`Error: ${err}`);
     }
-  };
-
-  const loadClusteringThresholds = async () => {
-    try {
-      const [primary, secondary] = await invoke<[number | null, number | null]>('get_clustering_thresholds');
-      setClusteringPrimary(primary !== null ? primary.toString() : '');
-      setClusteringSecondary(secondary !== null ? secondary.toString() : '');
-    } catch (err) {
-      console.error('Failed to load clustering thresholds:', err);
-    }
-  };
-
-  const handleSaveClusteringThresholds = async () => {
-    setSavingThresholds(true);
-    setThresholdResult(null);
-    try {
-      const primary = clusteringPrimary ? parseFloat(clusteringPrimary) : null;
-      const secondary = clusteringSecondary ? parseFloat(clusteringSecondary) : null;
-
-      // Validate ranges
-      if (primary !== null && (primary < 0.3 || primary > 0.95)) {
-        setThresholdResult('Primary threshold must be between 0.3 and 0.95');
-        setSavingThresholds(false);
-        return;
-      }
-      if (secondary !== null && (secondary < 0.2 || secondary > 0.85)) {
-        setThresholdResult('Secondary threshold must be between 0.2 and 0.85');
-        setSavingThresholds(false);
-        return;
-      }
-
-      await invoke('set_clustering_thresholds', { primary, secondary });
-      setThresholdResult(primary && secondary
-        ? `Saved: ${primary}/${secondary}. Run Full Rebuild to apply.`
-        : 'Using adaptive thresholds. Run Full Rebuild to apply.');
-    } catch (err) {
-      setThresholdResult(`Error: ${err}`);
-    }
-    setSavingThresholds(false);
   };
 
   const loadPrivacyThresholdSetting = async () => {
@@ -1099,32 +1053,18 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     }
   };
 
-  const handleClustering = async () => {
-    setIsClustering(true);
-    setSetupResult(null);
-    try {
-      const result = await invoke<{ clusters_created: number; nodes_clustered: number }>('run_clustering');
-      setSetupResult(`Clustering complete: ${result.clusters_created} clusters, ${result.nodes_clustered} nodes`);
-      await loadDbStats();
-      onDataChanged?.();
-      window.location.reload();
-    } catch (err) {
-      setSetupResult(`Error: ${err}`);
-      setIsClustering(false);
-    }
-  };
-
   const handleBuildHierarchy = async () => {
     setIsBuildingHierarchy(true);
     setSetupResult(null);
     try {
-      const result = await invoke<{
-        clusteringResult: { itemsProcessed: number; clustersCreated: number; itemsAssigned: number } | null;
-        hierarchyResult: { levelsCreated: number; intermediateNodesCreated: number; itemsOrganized: number; maxDepth: number };
-        levelsCreated: number;
-        groupingIterations: number;
-      }>('build_full_hierarchy', { runClustering: false });
-      setSetupResult(`Hierarchy built: ${result.levelsCreated} levels, ${result.groupingIterations} AI grouping iterations`);
+      const result = await invoke<{ success: boolean; output: string; error: string | null }>('run_cli_hierarchy', {
+        keywordsOnly: false,
+      });
+      if (result.success) {
+        setSetupResult('Hierarchy built with adaptive tree algorithm');
+      } else {
+        setSetupResult(`Error: ${result.error || 'Unknown error'}`);
+      }
       await loadDbStats();
       onDataChanged?.();
       window.location.reload();
@@ -1152,39 +1092,42 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const handleFullSetup = async () => {
     setIsFullSetup(true);
     setSetupResult(null);
+    setFullSetupStep('Starting setup (adaptive tree algorithm)...');
+
+    // Listen for progress events from CLI
+    const unlisten = await listen<{ line: string; is_error: boolean }>('cli-setup-progress', (event) => {
+      const { line, is_error } = event.payload;
+      if (line.startsWith('▶') || line.includes('STEP')) {
+        // Update step display for major progress indicators
+        setFullSetupStep(line.replace(/[▶✓✗⊘]/g, '').trim());
+      }
+      if (is_error) {
+        console.error('[CLI Setup]', line);
+      }
+    });
+
     try {
-      // Step 0: Pre-classify (pattern matching, FREE)
-      setFullSetupStep('Classifying items (pattern matching)...');
-      const classifyResult = await invoke<{ classified: number; hiddenCount: number; visibleCount: number }>('preclassify_items');
+      // Run CLI setup with adaptive tree algorithm
+      const result = await invoke<{ success: boolean; output: string; error: string | null }>('run_cli_setup', {
+        skipAi: false,
+        keywordsOnly: false,
+      });
 
-      // Step 1: Process AI (skips hidden items)
-      setFullSetupStep(`Processing AI (${classifyResult.hiddenCount} hidden items will skip)...`);
-      const aiResult = await invoke<{ processed: number; skipped: number }>('process_nodes');
+      unlisten(); // Stop listening
 
-      // Step 2: Cluster
-      setFullSetupStep('Clustering items by similarity...');
-      const clusterResult = await invoke<{ clusters_created: number; nodes_clustered: number }>('run_clustering');
-
-      // Step 3: Build Hierarchy
-      setFullSetupStep('Building hierarchy with AI grouping...');
-      const hierarchyResult = await invoke<{
-        clusteringResult: { itemsProcessed: number; clustersCreated: number; itemsAssigned: number } | null;
-        hierarchyResult: { levelsCreated: number; intermediateNodesCreated: number; itemsOrganized: number; maxDepth: number };
-        levelsCreated: number;
-        groupingIterations: number;
-      }>('build_full_hierarchy', { runClustering: false });
-
-      // Step 4: Flatten hierarchy (remove empty intermediate levels)
-      setFullSetupStep('Flattening hierarchy...');
-      const flattenResult = await invoke<number>('flatten_hierarchy');
-
-      setFullSetupStep('');
-      const flattenMsg = flattenResult > 0 ? `, ${flattenResult} empty levels removed` : '';
-      setSetupResult(`Full setup complete: ${aiResult.processed} items processed, ${clusterResult.clusters_created} clusters, ${hierarchyResult.levelsCreated} hierarchy levels${flattenMsg}`);
-      await loadDbStats();
-      onDataChanged?.();
-      window.location.reload();
+      if (result.success) {
+        setFullSetupStep('');
+        setSetupResult('Full setup complete (adaptive tree algorithm)');
+        await loadDbStats();
+        onDataChanged?.();
+        window.location.reload();
+      } else {
+        setSetupResult(`Setup failed: ${result.error || 'Unknown error'}`);
+        setFullSetupStep('');
+        setIsFullSetup(false);
+      }
     } catch (err) {
+      unlisten();
       setSetupResult(`Error: ${err}`);
       setFullSetupStep('');
       setIsFullSetup(false);
@@ -1238,14 +1181,6 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
         return `Reset AI processing for ${count} items`;
       },
     },
-    resetClustering: {
-      title: 'Reset Clustering',
-      message: 'This will mark all items as needing re-clustering. You\'ll need to run "Full Rebuild" to re-cluster them.',
-      handler: async () => {
-        const count = await invoke<number>('reset_clustering');
-        return `Reset clustering for ${count} items`;
-      },
-    },
     clearEmbeddings: {
       title: 'Clear Embeddings',
       message: 'This will delete all embeddings and semantic edges. You\'ll need to run "Full Rebuild" to re-generate them.',
@@ -1289,24 +1224,25 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     },
     fullRebuild: {
       title: 'Full Rebuild',
-      message: 'This will run embedding clustering (free), AI hierarchy grouping (Sonnet), and flatten empty levels. Replaces all organization.',
+      message: 'This will rebuild the hierarchy using the adaptive tree algorithm (no AI needed), then flatten empty levels. Replaces all organization.',
       handler: async () => {
         setIsFullRebuilding(true);
         setOperationResult(null);
         try {
-          const result = await invoke<{
-            clusteringResult: { itemsProcessed: number; clustersCreated: number; itemsAssigned: number } | null;
-            hierarchyResult: { levelsCreated: number; intermediateNodesCreated: number; itemsOrganized: number; maxDepth: number };
-            levelsCreated: number;
-            groupingIterations: number;
-          }>('build_full_hierarchy', { runClustering: true });
+          const result = await invoke<{ success: boolean; output: string; error: string | null }>('run_cli_hierarchy', {
+            keywordsOnly: false,
+          });
+
+          if (!result.success) {
+            const msg = `Error: ${result.error || 'Unknown error'}`;
+            setOperationResult(msg);
+            return msg;
+          }
 
           // Flatten empty passthrough levels
           const flattenCount = await invoke<number>('flatten_hierarchy');
 
-          const msg = result.clusteringResult
-            ? `Clustered ${result.clusteringResult.itemsAssigned} items → ${result.clusteringResult.clustersCreated} clusters, ${result.hierarchyResult.intermediateNodesCreated} nodes, flattened ${flattenCount}`
-            : `Created ${result.hierarchyResult.intermediateNodesCreated} hierarchy nodes, flattened ${flattenCount}`;
+          const msg = `Hierarchy rebuilt with adaptive tree, flattened ${flattenCount} empty levels`;
           setOperationResult(msg);
           return msg;
         } finally {
@@ -1339,6 +1275,22 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
         try {
           const result = await invoke<{ uberCategoriesCreated: number; childrenReparented: number }>('consolidate_root');
           const msg = `Created ${result.uberCategoriesCreated} uber-categories, reparented ${result.childrenReparented} children`;
+          setOperationResult(msg);
+          return msg;
+        } finally {
+          setIsConsolidating(false);
+        }
+      },
+    },
+    unconsolidateRoot: {
+      title: 'Unconsolidate Root',
+      message: 'This will reverse consolidation: remove uber-categories and flatten their children back to the root level.',
+      handler: async () => {
+        setIsConsolidating(true);
+        setOperationResult(null);
+        try {
+          const result = await invoke<{ uberCategoriesRemoved: number; childrenFlattened: number }>('unconsolidate_root');
+          const msg = `Removed ${result.uberCategoriesRemoved} uber-categories, flattened ${result.childrenFlattened} children`;
           setOperationResult(msg);
           return msg;
         } finally {
@@ -2009,33 +1961,9 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                       </button>
                     </div>
 
-                    {/* Step 3: Cluster */}
+                    {/* Step 3: Build Hierarchy */}
                     <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
-                      <span className="flex-shrink-0 w-7 h-7 rounded-full bg-cyan-600 flex items-center justify-center text-white text-sm font-bold">3</span>
-                      <div className="flex-1 min-w-0">
-                        <div className="text-sm font-medium text-gray-200">Cluster</div>
-                        <div className="text-xs text-gray-500">Group items by embedding similarity (free)</div>
-                        {dbStats && dbStats.unclusteredItems > 0 && (
-                          <div className="text-xs text-cyan-400 mt-0.5">
-                            {dbStats.unclusteredItems} items to cluster · Local embeddings
-                          </div>
-                        )}
-                        {dbStats && dbStats.unclusteredItems === 0 && (
-                          <div className="text-xs text-green-500/70 mt-0.5">All items clustered</div>
-                        )}
-                      </div>
-                      <button
-                        onClick={handleClustering}
-                        disabled={isClustering}
-                        style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-cyan-600 hover:bg-cyan-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
-                      >
-                        {isClustering ? <Loader2 className="w-5 h-5 animate-spin" /> : '🎯'}
-                      </button>
-                    </div>
-
-                    {/* Step 4: Build Hierarchy */}
-                    <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
-                      <span className="flex-shrink-0 w-7 h-7 rounded-full bg-green-600 flex items-center justify-center text-white text-sm font-bold">4</span>
+                      <span className="flex-shrink-0 w-7 h-7 rounded-full bg-green-600 flex items-center justify-center text-white text-sm font-bold">3</span>
                       <div className="flex-1 min-w-0">
                         <div className="text-sm font-medium text-gray-200">Build Hierarchy</div>
                         <div className="text-xs text-gray-500">Create navigation structure + group embeddings</div>
@@ -2053,7 +1981,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                           </div>
                         )}
                         {dbStats && dbStats.topicsCount === 0 && (
-                          <div className="text-xs text-gray-500 mt-0.5">Run Cluster first</div>
+                          <div className="text-xs text-gray-500 mt-0.5">Ready to build hierarchy</div>
                         )}
                       </div>
                       <button
@@ -2432,7 +2360,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                           </>
                         )}
                         {dbStats.topicsCount <= 15 && dbStats.topicsCount > 0 && (
-                          <span className="text-cyan-400">Clustering: free (local embeddings)</span>
+                          <span className="text-green-400">~1 Sonnet call for naming</span>
                         )}
                         <span className="text-gray-500 ml-1">({dbStats.topicsCount} topics, {dbStats.totalItems} items)</span>
                       </div>
@@ -2484,6 +2412,25 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                     style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-purple-600 hover:bg-purple-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isConsolidating ? <Loader2 className="w-5 h-5 animate-spin" /> : '🏛️'}
+                  </button>
+                </div>
+
+                {/* Unconsolidate Root */}
+                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-gray-600 flex items-center justify-center text-white text-sm">
+                    <Zap className="w-3.5 h-3.5" />
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-200">Unconsolidate Root</div>
+                    <div className="text-xs text-gray-500">Reverse consolidation, flatten uber-categories</div>
+                    <div className="text-xs text-gray-600 mt-0.5">No API calls · Fast local operation</div>
+                  </div>
+                  <button
+                    onClick={() => setConfirmAction('unconsolidateRoot')}
+                    disabled={isConsolidating || isFullRebuilding || isFlattening || isTidying}
+                    style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-gray-600 hover:bg-gray-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
+                  >
+                    {isConsolidating ? <Loader2 className="w-5 h-5 animate-spin" /> : '📦'}
                   </button>
                 </div>
 
@@ -2719,70 +2666,6 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                     </div>
                   </div>
                 )}
-              </div>
-            </section>
-
-            {/* Clustering Thresholds Section */}
-            <section>
-              <div className="flex items-center gap-2 mb-4">
-                <Zap className="w-5 h-5 text-amber-400" />
-                <h3 className="text-lg font-medium text-white">Clustering Thresholds</h3>
-              </div>
-
-              <div className="bg-gray-900/50 rounded-lg p-4 space-y-4">
-                <p className="text-xs text-gray-400">
-                  Higher = tighter clusters, more categories. Lower = looser clusters, fewer categories.
-                  Default: <span className="text-amber-400">0.75 / 0.60</span> for accurate clustering.
-                </p>
-
-                <div className="flex gap-4">
-                  <div className="flex-1">
-                    <label className="text-sm text-gray-400">Primary (0.3-0.95)</label>
-                    <input
-                      type="number"
-                      step="0.05"
-                      min="0.3"
-                      max="0.95"
-                      placeholder="0.75"
-                      value={clusteringPrimary}
-                      onChange={(e) => setClusteringPrimary(e.target.value)}
-                      className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm text-white placeholder-gray-500 focus:border-amber-500 focus:ring-1 focus:ring-amber-500 outline-none"
-                    />
-                  </div>
-                  <div className="flex-1">
-                    <label className="text-sm text-gray-400">Secondary (0.2-0.85)</label>
-                    <input
-                      type="number"
-                      step="0.05"
-                      min="0.2"
-                      max="0.85"
-                      placeholder="0.60"
-                      value={clusteringSecondary}
-                      onChange={(e) => setClusteringSecondary(e.target.value)}
-                      className="w-full mt-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm text-white placeholder-gray-500 focus:border-amber-500 focus:ring-1 focus:ring-amber-500 outline-none"
-                    />
-                  </div>
-                </div>
-
-                <div className="flex items-center justify-between">
-                  <button
-                    onClick={handleSaveClusteringThresholds}
-                    disabled={savingThresholds}
-                    className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
-                  >
-                    {savingThresholds ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
-                    Save Thresholds
-                  </button>
-                  {thresholdResult && (
-                    <p className={`text-xs ${thresholdResult.startsWith('Error') ? 'text-red-400' : 'text-green-400'}`}>
-                      {thresholdResult}
-                    </p>
-                  )}
-                </div>
-
-                <p className="text-xs text-gray-500">
-                  Lower values (0.50-0.65) create fewer, broader clusters. Adjust and rebuild to experiment.
-                </p>
               </div>
             </section>
 

@@ -20,10 +20,10 @@ pub mod dendrogram;
 use commands::{
     AppState,
     get_nodes, get_node, create_node, add_note, update_node, update_node_content, delete_node,
-    get_edges, get_edges_for_node, get_edges_for_fos, get_edges_for_view, create_edge, delete_edge,
+    get_edges, get_edges_for_node, get_edges_for_view, create_edge, delete_edge,
     search_nodes,
     // Clustering commands
-    run_clustering, recluster_all, name_clusters, get_clustering_status,
+    name_clusters, get_clustering_status,
     // AI processing commands
     process_nodes, get_ai_status, cancel_processing, cancel_rebuild, cancel_all,
     get_api_key_status, save_api_key, clear_api_key,
@@ -32,7 +32,7 @@ use commands::{
     get_pipeline_state, set_pipeline_state, get_db_metadata,
     // Hierarchy commands
     get_nodes_at_depth, get_children, get_universe, get_items, get_max_depth,
-    build_hierarchy, build_full_hierarchy, cluster_hierarchy_level, unsplit_node, get_children_flat,
+    build_hierarchy, unsplit_node, get_children_flat,
     propagate_latest_dates, smart_add_to_hierarchy,
     // Multi-path association commands
     get_item_associations, get_related_items, get_category_items,
@@ -46,7 +46,9 @@ use commands::{
     // Import commands
     import_claude_conversations, import_chatgpt_conversations, import_markdown_files, import_google_keep, import_openaire, count_openaire_papers, cancel_openaire, get_imported_paper_count,
     // Code import commands
-    import_code, analyze_code_edges,
+    import_code,
+    // CLI execution commands
+    run_cli_setup, run_cli_hierarchy,
     // Paper retrieval commands
     get_paper_metadata, get_paper_pdf, get_paper_document, has_paper_pdf, open_paper_external, reformat_paper_abstracts, sync_paper_pdf_status, sync_paper_dates, download_paper_on_demand,
     // Quick access commands (Sidebar)
@@ -89,6 +91,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             // Get app data directory for settings
             let app_data_dir = app.path().app_data_dir()
@@ -310,14 +313,11 @@ pub fn run() {
             delete_node,
             get_edges,
             get_edges_for_node,
-            get_edges_for_fos,
             get_edges_for_view,
             create_edge,
             delete_edge,
             search_nodes,
             // Clustering
-            run_clustering,
-            recluster_all,
             name_clusters,
             get_clustering_status,
             // AI processing
@@ -343,8 +343,6 @@ pub fn run() {
             get_items,
             get_max_depth,
             build_hierarchy,
-            build_full_hierarchy,
-            cluster_hierarchy_level,
             unsplit_node,
             propagate_latest_dates,
             smart_add_to_hierarchy,
@@ -378,7 +376,9 @@ pub fn run() {
             get_imported_paper_count,
             // Code import
             import_code,
-            analyze_code_edges,
+            // CLI execution
+            run_cli_setup,
+            run_cli_hierarchy,
             // Paper retrieval
             get_paper_metadata,
             get_paper_pdf,

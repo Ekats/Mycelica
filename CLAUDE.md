@@ -96,13 +96,15 @@ mycelica-cli import code <file-or-directory> --update
 
 Do not proceed without updating the index. Deletes old nodes, reimports, regenerates embeddings, refreshes edges. Seconds, not minutes.
 
-**After editing CLI or library code, always reinstall:**
+**After editing CLI or library code, always reinstall and update sidecar:**
 ```bash
 cd src-tauri
 cargo +nightly install --path . --bin mycelica-cli --features cuda --force
+cp ~/.cargo/bin/mycelica-cli binaries/mycelica-cli-x86_64-unknown-linux-gnu
 ```
 
 Never run CLI from `./target/release/` — always install globally with nightly+cuda.
+The sidecar copy is needed for the GUI to spawn the CLI (Tauri bundles it from `binaries/`).
 
 ---
 

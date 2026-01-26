@@ -1,5 +1,5 @@
 use crate::db::{Database, Node, Edge, Position, NodeType};
-use crate::clustering::{self, ClusteringResult as ClusterResult};
+use crate::clustering;
 use crate::ai_client;
 use crate::hierarchy;
 use crate::import;
@@ -510,11 +510,6 @@ pub fn get_edges_for_node(state: State<AppState>, node_id: String) -> Result<Vec
 }
 
 #[tauri::command]
-pub fn get_edges_for_fos(state: State<AppState>, fos_id: String) -> Result<Vec<Edge>, String> {
-    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_edges_for_fos(&fos_id).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 pub fn get_edges_for_view(state: State<AppState>, parent_id: String) -> Result<Vec<Edge>, String> {
     let start = std::time::Instant::now();
     let result = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_edges_for_view(&parent_id).map_err(|e| e.to_string());
@@ -559,23 +554,6 @@ pub fn get_clustering_status(state: State<AppState>) -> Result<ClusteringStatus,
         total_items: all_items.len(),
         ai_available: ai_client::is_available(),
     })
-}
-
-/// Run clustering on items that need it
-/// Uses AI when available, falls back to TF-IDF
-#[tauri::command]
-pub async fn run_clustering(state: State<'_, AppState>, use_ai: Option<bool>) -> Result<ClusterResult, String> {
-    let use_ai = use_ai.unwrap_or(true); // Default to using AI
-    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clone();
-    clustering::run_clustering(&db, use_ai).await
-}
-
-/// Force re-clustering of all items
-#[tauri::command]
-pub async fn recluster_all(state: State<'_, AppState>, use_ai: Option<bool>) -> Result<ClusterResult, String> {
-    let use_ai = use_ai.unwrap_or(true);
-    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clone();
-    clustering::recluster_all(&db, use_ai).await
 }
 
 /// Result of cluster naming operation
@@ -965,41 +943,6 @@ pub fn get_max_depth(state: State<AppState>) -> Result<i32, String> {
 pub fn build_hierarchy(state: State<'_, AppState>) -> Result<hierarchy::HierarchyResult, String> {
     let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
     hierarchy::build_hierarchy(&db)
-}
-
-/// Build full navigable hierarchy with recursive AI grouping
-///
-/// Flow:
-/// 1. Optionally run clustering to assign items to fine-grained topics
-/// 2. Build initial hierarchy (flat topics under Universe)
-/// 3. Recursively group any level with >15 children until navigable (8-15 children per level)
-#[tauri::command]
-pub async fn build_full_hierarchy(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    run_clustering: Option<bool>,
-) -> Result<hierarchy::FullHierarchyResult, String> {
-    let should_cluster = run_clustering.unwrap_or(false);
-    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clone();
-    hierarchy::build_full_hierarchy(&db, should_cluster, Some(&app)).await
-}
-
-/// Cluster children of a specific parent node into groups using AI
-///
-/// Returns true if grouping was performed, false if node has <2 children.
-/// Use this for manual/targeted hierarchy adjustment.
-/// max_groups: optional maximum number of groups to create (default 5)
-/// This is a manual split, so force=true bypasses automatic threshold checks.
-#[tauri::command]
-pub async fn cluster_hierarchy_level(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    parent_id: String,
-    max_groups: Option<usize>,
-) -> Result<bool, String> {
-    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clone();
-    // force=true: manual split from UI bypasses automatic thresholds
-    hierarchy::cluster_hierarchy_level(&db, &parent_id, Some(&app), max_groups, true).await
 }
 
 /// Split a node - delete it and move its children up to its parent
@@ -3102,11 +3045,11 @@ pub async fn rebuild_hierarchy_only(
     let _ = app.emit("rebuild-hierarchy-progress", serde_json::json!({
         "step": 2,
         "total_steps": 2,
-        "status": "Building hierarchy with AI grouping..."
+        "status": "Building hierarchy..."
     }));
 
-    // Build full hierarchy with AI grouping
-    let result = hierarchy::build_full_hierarchy(&db, false, Some(&app)).await?;
+    // Build hierarchy (creates Universe and topic nodes from cluster assignments)
+    let result = hierarchy::build_hierarchy(&db)?;
 
     let _ = app.emit("rebuild-hierarchy-progress", serde_json::json!({
         "step": 2,
@@ -3116,8 +3059,7 @@ pub async fn rebuild_hierarchy_only(
 
     println!("[Rebuild Hierarchy] === COMPLETE ===");
     println!("  Levels created: {}", result.levels_created);
-    println!("  Grouping iterations: {}", result.grouping_iterations);
-    println!("  Cost: ~$0.05-0.15 (AI grouping only)");
+    println!("  Items organized: {}", result.items_organized);
 
     Ok(RebuildLiteResult {
         items_classified: 0,
@@ -3331,123 +3273,254 @@ pub fn import_code(
     Ok(result.into())
 }
 
+// ============================================================================
+// CLI Execution Commands (spawn mycelica-cli subprocess)
+// ============================================================================
+
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct CodeEdgesResult {
-    pub functions_analyzed: usize,
-    pub edges_found: usize,
-    pub edges_created: usize,
+pub struct CliSetupProgress {
+    pub line: String,
+    pub is_error: bool,
 }
 
-/// Analyze code and create "Calls" edges between functions.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CliSetupResult {
+    pub success: bool,
+    pub output: String,
+    pub error: Option<String>,
+}
+
+/// Run the CLI setup command with the adaptive tree algorithm.
+/// Uses Tauri sidecar to spawn bundled mycelica-cli binary.
 #[tauri::command]
-pub fn analyze_code_edges(
-    state: State<AppState>,
-    path_filter: Option<String>,
-) -> Result<CodeEdgesResult, String> {
-    use std::collections::{HashMap, HashSet};
-    use crate::db::EdgeType;
+pub async fn run_cli_setup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    skip_ai: Option<bool>,
+    keywords_only: Option<bool>,
+) -> Result<CliSetupResult, String> {
+    use tauri_plugin_shell::ShellExt;
+    use tauri_plugin_shell::process::CommandEvent;
 
-    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
+    let db_path = state.db_path.to_string_lossy().to_string();
 
-    // Get all code function nodes
-    let all_nodes = db.get_items().map_err(|e| e.to_string())?;
-    let code_functions: Vec<_> = all_nodes
-        .iter()
-        .filter(|n| {
-            n.content_type.as_deref() == Some("code_function")
-                && n.source.as_deref().map(|s| s.starts_with("code-")).unwrap_or(false)
-        })
-        .filter(|n| {
-            if let Some(ref filter) = path_filter {
-                n.tags.as_ref().map(|t| t.contains(filter)).unwrap_or(false)
-            } else {
-                true
+    // Build args
+    let mut args = vec![
+        "--db".to_string(), db_path,
+        "setup".to_string(),
+        "--algorithm".to_string(), "adaptive".to_string(),
+    ];
+
+    if skip_ai.unwrap_or(false) {
+        args.push("--skip-pipeline".to_string());
+    }
+    if keywords_only.unwrap_or(false) {
+        args.push("--keywords-only".to_string());
+    }
+    // Non-interactive mode for sidecar (no stdin prompts)
+    args.push("--yes".to_string());
+    args.push("--quiet".to_string());
+
+    // Spawn sidecar (bundled CLI binary)
+    let (mut rx, _child) = app.shell()
+        .sidecar("mycelica-cli")
+        .map_err(|e| format!("Failed to find CLI binary: {}. For dev, copy CLI to src-tauri/binaries/", e))?
+        .args(&args)
+        .spawn()
+        .map_err(|e| format!("Failed to spawn CLI: {}", e))?;
+
+    let mut output_lines = Vec::new();
+    let mut error_lines = Vec::new();
+    let mut exit_code = None;
+
+    println!("[CLI setup] Starting: mycelica-cli {}", args.join(" "));
+
+    // Process events from CLI
+    while let Some(event) = rx.recv().await {
+        match event {
+            CommandEvent::Stdout(bytes) => {
+                if let Ok(line) = String::from_utf8(bytes) {
+                    for l in line.lines() {
+                        println!("[CLI setup] {}", l);
+                        let _ = app.emit("cli-setup-progress", CliSetupProgress {
+                            line: l.to_string(),
+                            is_error: false,
+                        });
+                        output_lines.push(l.to_string());
+                    }
+                }
             }
-        })
-        .collect();
-
-    // Build function name -> node ID map
-    let mut name_to_id: HashMap<String, String> = HashMap::new();
-    for func in &code_functions {
-        if let Some(name) = extract_fn_name(&func.title) {
-            name_to_id.insert(name, func.id.clone());
+            CommandEvent::Stderr(bytes) => {
+                if let Ok(line) = String::from_utf8(bytes) {
+                    for l in line.lines() {
+                        eprintln!("[CLI setup] {}", l);
+                        let _ = app.emit("cli-setup-progress", CliSetupProgress {
+                            line: l.to_string(),
+                            is_error: true,
+                        });
+                        error_lines.push(l.to_string());
+                    }
+                }
+            }
+            CommandEvent::Terminated(payload) => {
+                exit_code = payload.code;
+                println!("[CLI setup] Terminated with code: {:?}", payload.code);
+            }
+            _ => {}
         }
     }
 
-    // Get existing Calls edges
-    let existing_edges: HashSet<(String, String)> = db
-        .get_all_edges()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|e| e.edge_type == EdgeType::Calls)
-        .map(|e| (e.source, e.target))
-        .collect();
+    // Invalidate caches since database changed
+    if let Ok(mut cache) = state.embeddings_cache.write() {
+        cache.invalidate();
+    }
+    if let Ok(mut cache) = state.similarity_cache.write() {
+        cache.invalidate();
+    }
 
-    let mut edges_created = 0;
-    let mut edges_found = 0;
-
-    for func in &code_functions {
-        let content = match &func.content {
-            Some(c) => c,
-            None => continue,
-        };
-
-        let caller_id = &func.id;
-        let caller_name = extract_fn_name(&func.title).unwrap_or_default();
-
-        // Find called functions
-        for (name, callee_id) in &name_to_id {
-            if *name == caller_name {
-                continue; // Skip self
-            }
-
-            // Simple heuristic: name followed by '(' in content
-            let call_pattern = format!("{}(", name);
-            if content.contains(&call_pattern) {
-                if existing_edges.contains(&(caller_id.clone(), callee_id.clone())) {
-                    continue;
-                }
-
-                edges_found += 1;
-
-                let edge = crate::db::Edge {
-                    id: format!("calls-{}-{}", &caller_id[..8.min(caller_id.len())], &callee_id[..8.min(callee_id.len())]),
-                    source: caller_id.clone(),
-                    target: callee_id.clone(),
-                    edge_type: EdgeType::Calls,
-                    label: Some(format!("{} -> {}", caller_name, name)),
-                    weight: Some(1.0),
-                    edge_source: Some("code-analysis".to_string()),
-                    evidence_id: None,
-                    confidence: Some(0.8),
-                    created_at: chrono::Utc::now().timestamp_millis(),
-                };
-
-                if db.insert_edge(&edge).is_ok() {
-                    edges_created += 1;
+    // Reload HNSW index from disk (CLI setup builds and saves it)
+    let hnsw_path = hnsw_index_path(&state.db_path);
+    if hnsw_path.exists() {
+        if let Ok(mut index) = state.hnsw_index.write() {
+            match index.load(&hnsw_path) {
+                Ok(count) => println!("[CLI setup] Reloaded HNSW index with {} points", count),
+                Err(e) => {
+                    eprintln!("[CLI setup] Failed to reload HNSW index: {}", e);
+                    index.invalidate();
                 }
             }
         }
+    } else {
+        // No index file - invalidate so background build can happen on next startup
+        if let Ok(mut index) = state.hnsw_index.write() {
+            index.invalidate();
+        }
     }
 
-    // Index edges for view lookups
-    if edges_created > 0 {
-        let _ = db.update_edge_parents();
+    let success = exit_code == Some(0);
+    if success {
+        Ok(CliSetupResult {
+            success: true,
+            output: output_lines.join("\n"),
+            error: None,
+        })
+    } else {
+        Ok(CliSetupResult {
+            success: false,
+            output: output_lines.join("\n"),
+            error: Some(error_lines.join("\n")),
+        })
     }
-
-    Ok(CodeEdgesResult {
-        functions_analyzed: code_functions.len(),
-        edges_found,
-        edges_created,
-    })
 }
 
-fn extract_fn_name(title: &str) -> Option<String> {
-    let fn_idx = title.find("fn ")?;
-    let after_fn = &title[fn_idx + 3..];
-    let name_end = after_fn
-        .find(|c: char| !c.is_alphanumeric() && c != '_')
-        .unwrap_or(after_fn.len());
-    let name = &after_fn[..name_end];
-    if name.is_empty() { None } else { Some(name.to_string()) }
+// ============================================================================
+// CLI Hierarchy Rebuild (uses adaptive tree algorithm)
+// ============================================================================
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CliHierarchyResult {
+    pub success: bool,
+    pub output: String,
+    pub error: Option<String>,
+}
+
+/// Run CLI hierarchy rebuild with adaptive tree algorithm.
+/// Uses Tauri sidecar to spawn bundled mycelica-cli binary.
+/// Note: No run_clustering param - adaptive tree builds from edges, not clusters.
+#[tauri::command]
+pub async fn run_cli_hierarchy(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    keywords_only: Option<bool>,
+) -> Result<CliHierarchyResult, String> {
+    use tauri_plugin_shell::ShellExt;
+    use tauri_plugin_shell::process::CommandEvent;
+
+    let db_path = state.db_path.to_string_lossy().to_string();
+
+    // Build args
+    let mut args = vec![
+        "--db".to_string(), db_path,
+        "hierarchy".to_string(), "rebuild".to_string(),
+        "--algorithm".to_string(), "adaptive".to_string(),
+    ];
+
+    if keywords_only.unwrap_or(false) {
+        args.push("--keywords-only".to_string());
+    }
+
+    // Spawn sidecar (bundled CLI binary)
+    let (mut rx, _child) = app.shell()
+        .sidecar("mycelica-cli")
+        .map_err(|e| format!("Failed to find CLI binary: {}. For dev, copy CLI to src-tauri/binaries/", e))?
+        .args(&args)
+        .spawn()
+        .map_err(|e| format!("Failed to spawn CLI: {}", e))?;
+
+    let mut output_lines = Vec::new();
+    let mut error_lines = Vec::new();
+    let mut exit_code = None;
+
+    println!("[CLI hierarchy] Starting: mycelica-cli {}", args.join(" "));
+
+    // Process events from CLI
+    while let Some(event) = rx.recv().await {
+        match event {
+            CommandEvent::Stdout(bytes) => {
+                if let Ok(line) = String::from_utf8(bytes) {
+                    for l in line.lines() {
+                        println!("[CLI hierarchy] {}", l);
+                        let _ = app.emit("cli-hierarchy-progress", CliSetupProgress {
+                            line: l.to_string(),
+                            is_error: false,
+                        });
+                        output_lines.push(l.to_string());
+                    }
+                }
+            }
+            CommandEvent::Stderr(bytes) => {
+                if let Ok(line) = String::from_utf8(bytes) {
+                    for l in line.lines() {
+                        eprintln!("[CLI hierarchy] {}", l);
+                        let _ = app.emit("cli-hierarchy-progress", CliSetupProgress {
+                            line: l.to_string(),
+                            is_error: true,
+                        });
+                        error_lines.push(l.to_string());
+                    }
+                }
+            }
+            CommandEvent::Terminated(payload) => {
+                exit_code = payload.code;
+                println!("[CLI hierarchy] Terminated with code: {:?}", payload.code);
+            }
+            _ => {}
+        }
+    }
+
+    // Invalidate caches since database changed
+    if let Ok(mut index) = state.hnsw_index.write() {
+        index.invalidate();
+    }
+    if let Ok(mut cache) = state.embeddings_cache.write() {
+        cache.invalidate();
+    }
+    if let Ok(mut cache) = state.similarity_cache.write() {
+        cache.invalidate();
+    }
+
+    let success = exit_code == Some(0);
+    if success {
+        Ok(CliHierarchyResult {
+            success: true,
+            output: output_lines.join("\n"),
+            error: None,
+        })
+    } else {
+        Ok(CliHierarchyResult {
+            success: false,
+            output: output_lines.join("\n"),
+            error: Some(error_lines.join("\n")),
+        })
+    }
 }

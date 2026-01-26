@@ -287,18 +287,18 @@ enum Commands {
         /// Skip the processing pipeline
         #[arg(long)]
         skip_pipeline: bool,
-        /// Use FOS (Field of Science) pre-grouping for papers before clustering
-        #[arg(long)]
-        fos: bool,
         /// Include code items in AI processing (generate summaries)
         #[arg(long)]
         include_code: bool,
-        /// Hierarchy algorithm: adaptive (default) or classic
+        /// Hierarchy algorithm: adaptive (default) or dendrogram
         #[arg(long, default_value = "adaptive")]
         algorithm: String,
         /// Use keyword extraction instead of LLM for category naming (faster but lower quality)
         #[arg(long)]
         keywords_only: bool,
+        /// Non-interactive mode: skip prompts, auto-confirm pipeline
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Recent nodes
     Recent {
@@ -514,8 +514,8 @@ enum HierarchyCommands {
     Build,
     /// Rebuild hierarchy from scratch
     Rebuild {
-        /// Algorithm: classic, dendrogram, or adaptive
-        #[arg(long, default_value = "classic")]
+        /// Algorithm: adaptive (default) or dendrogram
+        #[arg(long, default_value = "adaptive")]
         algorithm: String,
         /// Target number of hierarchy levels (dendrogram only)
         #[arg(long, default_value = "4")]
@@ -609,8 +609,6 @@ enum ClusterCommands {
     },
     /// Name clusters that have keyword-only names (runs AI naming)
     Name,
-    /// Cluster with FOS (Field of Science) pre-grouping for papers
-    Fos,
     /// Reset clustering data
     Reset,
     /// Get or set clustering thresholds
@@ -878,8 +876,6 @@ enum MaintenanceCommands {
         #[arg(long, short)]
         verbose: bool,
     },
-    /// Precompute FOS edge sets for fast view loading
-    PrecomputeFosEdges,
     /// Index edges by parent for fast per-view loading
     IndexEdges,
     /// Merge small sibling categories by embedding similarity
@@ -897,20 +893,6 @@ enum MaintenanceCommands {
         #[arg(default_value = ".")]
         path: String,
         /// Show what would be repaired without making changes
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Refine hierarchy by splitting incoherent and merging similar categories
-    RefineCoherence {
-        /// Coherence threshold (0.0-1.0). Categories below this get split.
-        #[arg(long, default_value = "0.45")]
-        coherence_threshold: f32,
-
-        /// Merge threshold (0.0-1.0). Sibling categories above this get auto-merged.
-        #[arg(long, default_value = "0.65")]
-        merge_threshold: f32,
-
-        /// Only analyze, don't make changes
         #[arg(long)]
         dry_run: bool,
     },
@@ -1100,7 +1082,7 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Privacy { cmd } => handle_privacy(cmd, &db, cli.json, cli.quiet).await,
         Commands::Paper { cmd } => handle_paper(cmd, &db, cli.json).await,
         Commands::Config { cmd } => handle_config(cmd, cli.json),
-        Commands::Setup { skip_pipeline, fos, include_code, algorithm, keywords_only } => handle_setup(&db, skip_pipeline, fos, include_code, &algorithm, keywords_only, cli.quiet).await,
+        Commands::Setup { skip_pipeline, include_code, algorithm, keywords_only, yes } => handle_setup(&db, skip_pipeline, include_code, &algorithm, keywords_only, yes, cli.quiet).await,
         Commands::Recent { cmd } => handle_recent(cmd, &db, cli.json),
         Commands::Pinned { cmd } => handle_pinned(cmd, &db, cli.json),
         Commands::Nav { cmd } => handle_nav(cmd, &db, cli.json).await,
@@ -1856,15 +1838,8 @@ async fn handle_hierarchy(cmd: HierarchyCommands, db: &Database, json: bool, qui
                             result.categories, result.papers_assigned, result.ai_calls);
                     }
                 }
-                "classic" | _ => {
-                    if !quiet { elog!("Rebuilding hierarchy (classic algorithm)..."); }
-                    db.delete_hierarchy_nodes().map_err(|e| e.to_string())?;
-                    hierarchy::build_hierarchy(db)?;
-                    if json {
-                        log!(r#"{{"status":"ok"}}"#);
-                    } else {
-                        log!("Hierarchy rebuilt successfully");
-                    }
+                other => {
+                    return Err(format!("Unknown algorithm '{}'. Valid options: adaptive, dendrogram", other));
                 }
             }
         }
@@ -3815,17 +3790,6 @@ async fn handle_cluster(cmd: ClusterCommands, db: &Database, json: bool, quiet: 
                     result.items_processed, result.clusters_created, result.items_assigned);
             }
         }
-        ClusterCommands::Fos => {
-            if !quiet { elog!("Clustering with FOS pre-grouping for papers..."); }
-            let result = clustering::cluster_with_fos_pregrouping(db).await?;
-            if json {
-                log!(r#"{{"items_processed":{},"clusters_created":{},"items_assigned":{},"edges_created":{}}}"#,
-                    result.items_processed, result.clusters_created, result.items_assigned, result.edges_created);
-            } else {
-                log!("Processed {} items, created {} clusters, assigned {} items, {} edges",
-                    result.items_processed, result.clusters_created, result.items_assigned, result.edges_created);
-            }
-        }
         ClusterCommands::Reset => {
             // Reset clustering by clearing cluster assignments
             // Note: update_node_cluster requires an ID, so we'll just report status
@@ -4454,7 +4418,7 @@ fn handle_config(cmd: ConfigCommands, json: bool) -> Result<(), String> {
 // Setup Command
 // ============================================================================
 
-async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include_code: bool, algorithm: &str, keywords_only: bool, quiet: bool) -> Result<(), String> {
+async fn handle_setup(db: &Database, skip_pipeline: bool, include_code: bool, algorithm: &str, keywords_only: bool, yes: bool, quiet: bool) -> Result<(), String> {
     use std::io::{Write, BufRead};
 
     log!("=== Mycelica Setup ===\n");
@@ -4472,7 +4436,8 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
     log!("");
 
     // Prompt for OpenAI key if not set (required for embeddings)
-    if !has_openai {
+    // Skip prompt in non-interactive mode
+    if !has_openai && !yes {
         print!("Enter OpenAI API key (for embeddings, or press Enter to skip): ");
         std::io::stdout().flush().ok();
 
@@ -4488,7 +4453,8 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
     }
 
     // Prompt for Anthropic key if not set (required for AI processing)
-    if !has_anthropic {
+    // Skip prompt in non-interactive mode
+    if !has_anthropic && !yes {
         print!("Enter Anthropic API key (for AI processing, or press Enter to skip): ");
         std::io::stdout().flush().ok();
 
@@ -4562,12 +4528,17 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
         log!("  Hierarchy: needs building");
     }
 
-    print!("Run processing pipeline? [Y/n]: ");
-    std::io::stdout().flush().ok();
+    // In non-interactive mode, auto-confirm; otherwise prompt
+    let run_pipeline = if yes {
+        true
+    } else {
+        print!("Run processing pipeline? [Y/n]: ");
+        std::io::stdout().flush().ok();
 
-    let mut input = String::new();
-    std::io::stdin().lock().read_line(&mut input).ok();
-    let run_pipeline = input.trim().is_empty() || input.trim().to_lowercase().starts_with('y');
+        let mut input = String::new();
+        std::io::stdin().lock().read_line(&mut input).ok();
+        input.trim().is_empty() || input.trim().to_lowercase().starts_with('y')
+    };
 
     if !run_pipeline {
         log!("Setup complete. Run 'mycelica-cli process run' later to process items.");
@@ -4772,61 +4743,11 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
     }
 
     // Step 2: Clustering & Hierarchy
-    // Note: hierarchy::build_full_hierarchy has its own verbose logging via emit_log()
     log!("");
     log!("▶ STEP 2/7: Clustering & Hierarchy");
     log!("───────────────────────────────────────────────────────────");
 
-    // If FOS flag is set, run full FOS pipeline: FOS grouping → clustering → hierarchy
-    if use_fos {
-        log!("Running FOS (Field of Science) pipeline...");
-        log!("");
-
-        // Step 2a: Create FOS parent nodes
-        log!("  [2a] Creating FOS parent nodes...");
-        match clustering::cluster_with_fos_pregrouping(db).await {
-            Ok(result) => {
-                log!("  ✓ FOS grouping: {} papers → {} FOS categories",
-                    result.items_assigned, result.clusters_created);
-            }
-            Err(e) => {
-                elog!("  ✗ FOS pre-grouping failed: {}", e);
-            }
-        }
-
-        // Step 2b: Run clustering within each FOS group (assigns cluster_id)
-        log!("  [2b] Clustering within FOS groups...");
-        match clustering::run_clustering(db, true).await {
-            Ok(result) => {
-                log!("  ✓ Clustered: {} items → {} clusters",
-                    result.items_assigned, result.clusters_created);
-            }
-            Err(e) => {
-                elog!("  ✗ Clustering failed: {}", e);
-            }
-        }
-
-        // Step 2c: Build full hierarchy with recursive AI grouping
-        log!("  [2c] Building hierarchy with AI grouping...");
-        log!("");
-        match hierarchy::build_full_hierarchy(db, false, None).await {
-            Ok(result) => {
-                log!("");
-                log!("  ✓ Hierarchy complete: {} levels, {} items organized",
-                    result.hierarchy_result.max_depth, result.hierarchy_result.items_organized);
-            }
-            Err(e) => {
-                elog!("  ✗ Hierarchy build failed: {}", e);
-            }
-        }
-
-        // Step 2d: Precompute FOS edges for fast view loading
-        log!("  [2d] Precomputing FOS edge sets...");
-        match db.precompute_fos_edges() {
-            Ok(count) => log!("  ✓ FOS edges: {} edges precomputed", count),
-            Err(e) => elog!("  ✗ FOS edge precomputation failed: {}", e),
-        }
-    } else if algorithm == "adaptive" {
+    if algorithm == "adaptive" {
         // Adaptive algorithm: uses edge-based clustering with auto-config
         log!("Running adaptive hierarchy algorithm...");
         log!("");
@@ -4875,19 +4796,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, use_fos: bool, include
             }
         }
     } else {
-        // Classic algorithm: uses AI-based clustering and grouping
-        log!("Running classic hierarchy build (7 steps)...");
-        log!("");
-        match hierarchy::build_full_hierarchy(db, true, None).await {
-            Ok(result) => {
-                log!("");
-                log!("✓ Hierarchy complete: {} levels, {} items organized",
-                    result.hierarchy_result.max_depth, result.hierarchy_result.items_organized);
-            }
-            Err(e) => {
-                elog!("✗ Hierarchy build failed: {}", e);
-            }
-        }
+        return Err(format!("Unknown algorithm '{}'. Valid options: adaptive, dendrogram", algorithm));
     }
 
     // Step 3: Code edges (only if code nodes exist)
@@ -5654,12 +5563,6 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
             }
         }
 
-        MaintenanceCommands::PrecomputeFosEdges => {
-            log!("Precomputing FOS edge sets...");
-            let count = db.precompute_fos_edges().map_err(|e| e.to_string())?;
-            log!("Precomputed {} edges across FOS categories", count);
-        }
-
         MaintenanceCommands::IndexEdges => {
             log!("Indexing edges by parent for fast per-view loading...");
             let count = db.update_edge_parents().map_err(|e| e.to_string())?;
@@ -5679,27 +5582,6 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
 
         MaintenanceCommands::RepairCodeTags { path, dry_run } => {
             repair_code_tags(db, &path, dry_run)?;
-        }
-
-        MaintenanceCommands::RefineCoherence { coherence_threshold, merge_threshold, dry_run } => {
-            log!("Refining hierarchy coherence (coh={:.2}, merge={:.2}, dry_run={})...",
-                coherence_threshold, merge_threshold, dry_run);
-
-            let config = hierarchy::RefineConfig {
-                coherence_threshold,
-                merge_threshold,
-                dry_run,
-            };
-
-            let result = hierarchy::refine_hierarchy_coherence(db, None, config).await
-                .map_err(|e| format!("Refinement failed: {}", e))?;
-
-            log!("Refinement complete:");
-            log!("  {} categories analyzed", result.categories_analyzed);
-            log!("  {} incoherent found", result.incoherent_found);
-            log!("  {} children relocated", result.children_relocated);
-            log!("  {} categories merged", result.categories_merged);
-            log!("  {} iterations", result.iterations);
         }
 
         MaintenanceCommands::RefineGraph { merge_threshold, min_component, dry_run } => {
