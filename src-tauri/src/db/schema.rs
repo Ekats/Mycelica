@@ -492,6 +492,18 @@ impl Database {
             eprintln!("Migration: Added doc_format column to papers");
         }
 
+        // Migration: Add content_hash column to papers for deduplication
+        let has_content_hash: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('papers') WHERE name = 'content_hash'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !has_content_hash {
+            conn.execute("ALTER TABLE papers ADD COLUMN content_hash TEXT", [])?;
+            eprintln!("Migration: Added content_hash column to papers for deduplication");
+        }
+
         // Migration: Add parent columns to edges for fast per-view lookups
         let has_source_parent: bool = conn.query_row(
             "SELECT COUNT(*) > 0 FROM pragma_table_info('edges') WHERE name = 'source_parent_id'",
@@ -519,6 +531,8 @@ impl Database {
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_privacy ON nodes(privacy)", [])?;
         // Index for fast per-view edge lookups (edges where both endpoints share the same parent)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_view ON edges(source_parent_id, target_parent_id)", [])?;
+        // Index for paper deduplication by content hash
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_papers_content_hash ON papers(content_hash)", [])?;
 
         // Rebuild FTS index to fix any corruption from interrupted writes (e.g., HMR during dev)
         // This is safe to run on every startup - it rebuilds from the content table
@@ -1660,108 +1674,6 @@ impl Database {
             params![node_id, title],
         )?;
         Ok(())
-    }
-
-    // FOS Edge Cache
-
-    /// Clear the FOS edge cache
-    pub fn clear_fos_edges(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM fos_edges", [])?;
-        Ok(())
-    }
-
-    /// Precompute edges for each FOS category
-    /// For each FOS node, finds all edges where both source and target are descendants
-    pub fn precompute_fos_edges(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
-
-        // Clear existing
-        conn.execute("DELETE FROM fos_edges", [])?;
-
-        // Get all FOS nodes (depth 1, id starts with "fos-")
-        let mut fos_stmt = conn.prepare(
-            "SELECT id FROM nodes WHERE depth = 1 AND id LIKE 'fos-%'"
-        )?;
-        let fos_ids: Vec<String> = fos_stmt.query_map([], |r| r.get(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        let mut total_edges = 0;
-
-        for fos_id in &fos_ids {
-            // Get all descendant node IDs (items with this FOS as ancestor)
-            let mut desc_stmt = conn.prepare(
-                "WITH RECURSIVE descendants AS (
-                    SELECT id FROM nodes WHERE parent_id = ?1
-                    UNION ALL
-                    SELECT n.id FROM nodes n JOIN descendants d ON n.parent_id = d.id
-                )
-                SELECT id FROM descendants"
-            )?;
-            let descendant_ids: Vec<String> = desc_stmt.query_map([fos_id], |r| r.get(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-
-            if descendant_ids.is_empty() {
-                continue;
-            }
-
-            // Find edges where both endpoints are descendants
-            // Use temp table to avoid SQLite parameter limits
-            conn.execute("CREATE TEMP TABLE IF NOT EXISTS temp_descendants (id TEXT PRIMARY KEY)", [])?;
-            conn.execute("DELETE FROM temp_descendants", [])?;
-
-            {
-                let mut insert_stmt = conn.prepare("INSERT OR IGNORE INTO temp_descendants VALUES (?1)")?;
-                for id in &descendant_ids {
-                    insert_stmt.execute([id])?;
-                }
-            }
-
-            // Insert matching edges into fos_edges
-            let inserted = conn.execute(
-                "INSERT OR IGNORE INTO fos_edges (fos_id, edge_id)
-                 SELECT ?1, e.id FROM edges e
-                 WHERE e.source_id IN (SELECT id FROM temp_descendants)
-                   AND e.target_id IN (SELECT id FROM temp_descendants)",
-                [fos_id]
-            )?;
-
-            println!("[FOS Edges] {}: {} descendants, {} edges", fos_id, descendant_ids.len(), inserted);
-            total_edges += inserted;
-        }
-
-        conn.execute("DROP TABLE IF EXISTS temp_descendants", [])?;
-
-        Ok(total_edges)
-    }
-
-    /// Get precomputed edges for a FOS category
-    pub fn get_edges_for_fos(&self, fos_id: &str) -> Result<Vec<Edge>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT e.id, e.source_id, e.target_id, e.type, e.label, e.weight,
-                    e.edge_source, e.evidence_id, e.confidence, e.created_at
-             FROM edges e
-             JOIN fos_edges fe ON e.id = fe.edge_id
-             WHERE fe.fos_id = ?1"
-        )?;
-
-        let edges = stmt.query_map([fos_id], |row| {
-            Ok(Edge {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                target: row.get(2)?,
-                edge_type: EdgeType::from_str(&row.get::<_, String>(3)?).unwrap_or(EdgeType::Related),
-                label: row.get(4)?,
-                weight: row.get(5)?,
-                edge_source: row.get(6)?,
-                evidence_id: row.get(7)?,
-                confidence: row.get(8)?,
-                created_at: row.get(9)?,
-            })
-        })?.collect::<std::result::Result<Vec<_>, _>>()?;
-
-        Ok(edges)
     }
 
     /// Update edge parent columns based on current node hierarchy
@@ -3025,9 +2937,6 @@ impl Database {
         use crate::similarity::cosine_similarity;
         use std::collections::{HashMap, HashSet};
 
-        // Clear FOS edge cache (edges changing, cache will be stale)
-        self.clear_fos_edges().ok();
-
         // Get all nodes with embeddings
         let nodes_with_embeddings = self.get_nodes_with_embeddings()?;
         let n = nodes_with_embeddings.len();
@@ -3212,25 +3121,6 @@ impl Database {
             params![node_id],
         )?;
         Ok(updated)
-    }
-
-    /// Delete fos_edges entries for a node (as fos_id) and for edges referencing this node
-    /// Required before deleting edges/node because fos_edges FK lacks CASCADE
-    pub fn delete_fos_edges_for_node(&self, node_id: &str) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
-        // First: delete fos_edges where the edge references this node
-        let deleted1 = conn.execute(
-            "DELETE FROM fos_edges WHERE edge_id IN (
-                SELECT id FROM edges WHERE source_id = ?1 OR target_id = ?1
-            )",
-            params![node_id],
-        )?;
-        // Second: delete fos_edges where fos_id = this node
-        let deleted2 = conn.execute(
-            "DELETE FROM fos_edges WHERE fos_id = ?1",
-            params![node_id],
-        )?;
-        Ok(deleted1 + deleted2)
     }
 
     /// Delete empty items (items with no meaningful content/raw data)
@@ -4363,6 +4253,7 @@ impl Database {
         pdf_url: Option<&str>,
         subjects: Option<&str>,
         access_right: Option<&str>,
+        content_hash: Option<&str>,
     ) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         let now = std::time::SystemTime::now()
@@ -4371,9 +4262,9 @@ impl Database {
             .as_millis() as i64;
 
         conn.execute(
-            "INSERT INTO papers (node_id, openaire_id, doi, authors, publication_date, journal, publisher, abstract, abstract_formatted, abstract_sections, pdf_url, subjects, access_right, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![node_id, openaire_id, doi, authors, publication_date, journal, publisher, abstract_text, abstract_formatted, abstract_sections, pdf_url, subjects, access_right, now],
+            "INSERT INTO papers (node_id, openaire_id, doi, authors, publication_date, journal, publisher, abstract, abstract_formatted, abstract_sections, pdf_url, subjects, access_right, content_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![node_id, openaire_id, doi, authors, publication_date, journal, publisher, abstract_text, abstract_formatted, abstract_sections, pdf_url, subjects, access_right, content_hash, now],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -4430,6 +4321,53 @@ impl Database {
         Ok(ids)
     }
 
+    /// Get all DOIs for batch duplicate checking (O(1) lookup)
+    pub fn get_all_paper_dois(&self) -> Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT LOWER(doi) FROM papers WHERE doi IS NOT NULL AND doi != ''")?;
+        let ids = stmt.query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(ids)
+    }
+
+    /// Get all content hashes for batch duplicate checking (O(1) lookup)
+    pub fn get_all_content_hashes(&self) -> Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT content_hash FROM papers WHERE content_hash IS NOT NULL")?;
+        let ids = stmt.query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(ids)
+    }
+
+    /// Update content_hash for a paper (for backfilling existing papers)
+    pub fn update_paper_content_hash(&self, node_id: &str, content_hash: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE papers SET content_hash = ?2 WHERE node_id = ?1",
+            params![node_id, content_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Get papers that need content_hash backfilled
+    /// Returns (node_id, title, abstract_text) tuples
+    pub fn get_papers_needing_content_hash(&self) -> Result<Vec<(String, String, Option<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT p.node_id, n.title, p.abstract FROM papers p
+             JOIN nodes n ON p.node_id = n.id
+             WHERE p.content_hash IS NULL"
+        )?;
+        let papers = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+        Ok(papers)
+    }
+
     /// Count papers matching OpenAIRE IDs (for showing "X already imported")
     pub fn count_papers_by_openaire_ids(&self, openaire_ids: &[String]) -> Result<i32> {
         if openaire_ids.is_empty() {
@@ -4445,52 +4383,6 @@ impl Database {
         let params: Vec<&dyn rusqlite::ToSql> = openaire_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
         let count: i32 = conn.query_row(&sql, params.as_slice(), |row| row.get(0))?;
         Ok(count)
-    }
-
-    /// Get papers grouped by their top-level Field of Science (FOS)
-    /// Extracts 2-digit FOS codes and maps to standard category names
-    /// Returns a HashMap where keys are FOS names and values are lists of node IDs
-    pub fn get_papers_by_fos(&self) -> Result<std::collections::HashMap<String, Vec<String>>> {
-        use crate::db::models::PaperSubject;
-
-        // Top-level FOS categories (2-digit codes)
-        let fos_names: std::collections::HashMap<&str, &str> = [
-            ("01", "Natural Sciences"),
-            ("02", "Engineering and Technology"),
-            ("03", "Medical and Health Sciences"),
-            ("04", "Agricultural and Veterinary Sciences"),
-            ("05", "Social Sciences"),
-            ("06", "Humanities and the Arts"),
-        ].into_iter().collect();
-
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT n.id, p.subjects FROM nodes n
-             JOIN papers p ON n.id = p.node_id
-             WHERE n.content_type = 'paper' AND p.subjects IS NOT NULL"
-        )?;
-
-        let mut by_fos: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-
-        for row in stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })? {
-            let (node_id, subjects_json) = row?;
-            if let Ok(subjects) = serde_json::from_str::<Vec<PaperSubject>>(&subjects_json) {
-                // Find first FOS subject and extract top-level code (first 2 digits)
-                let fos = subjects.iter()
-                    .find(|s| s.scheme == "FOS")
-                    .and_then(|s| {
-                        // Extract 2-digit code from values like "0301 basic medicine" or "03 medical..."
-                        let code = s.value.chars().take(2).collect::<String>();
-                        fos_names.get(code.as_str()).map(|name| name.to_string())
-                    })
-                    .unwrap_or_else(|| "Other".to_string());
-                by_fos.entry(fos).or_default().push(node_id);
-            }
-        }
-
-        Ok(by_fos)
     }
 
     /// Get PDF blob for a paper
@@ -4679,6 +4571,45 @@ impl Database {
         }
 
         Ok(count)
+    }
+
+    /// Find duplicate papers by title for cleanup
+    /// Returns (node_id, title, doi, abstract_text, node_content) where title appears more than once
+    pub fn find_duplicate_papers_by_title(&self) -> Result<Vec<(String, String, Option<String>, Option<String>, Option<String>)>> {
+        let conn = self.conn.lock().unwrap();
+
+        // Find titles that appear more than once
+        let mut stmt = conn.prepare(
+            "SELECT n.id, n.title, p.doi, p.abstract, n.content
+             FROM nodes n
+             JOIN papers p ON n.id = p.node_id
+             WHERE n.title IN (
+                 SELECT title FROM nodes WHERE content_type = 'paper' GROUP BY title HAVING COUNT(*) > 1
+             )
+             ORDER BY n.title"
+        )?;
+
+        let papers: Vec<(String, String, Option<String>, Option<String>, Option<String>)> = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+        Ok(papers)
+    }
+
+    /// Delete a paper and its node
+    pub fn delete_paper_and_node(&self, node_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        // Cascade will handle papers table due to foreign key
+        conn.execute("DELETE FROM nodes WHERE id = ?1", params![node_id])?;
+        Ok(())
     }
 }
 

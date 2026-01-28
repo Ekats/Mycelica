@@ -1001,21 +1001,6 @@ pub fn extract_levels(dendrogram: &Dendrogram, thresholds: &[f64]) -> HierarchyL
     }
 }
 
-/// Find a paper ID in a subtree (either a paper itself or dig into a merge).
-fn find_paper_in_subtree(id: &str, dendrogram: &Dendrogram) -> Option<String> {
-    if dendrogram.paper_to_leaf.contains_key(id) {
-        return Some(id.to_string());
-    }
-
-    // It's a merge ID, find the merge and recurse
-    if let Some(merge) = dendrogram.merges.iter().find(|m| m.id == id) {
-        find_paper_in_subtree(&merge.left, dendrogram)
-            .or_else(|| find_paper_in_subtree(&merge.right, dendrogram))
-    } else {
-        None
-    }
-}
-
 /// Link parent-child relationships between adjacent levels.
 fn link_levels(levels: &mut [Vec<Component>]) {
     if levels.len() < 2 {

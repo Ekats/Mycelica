@@ -1103,7 +1103,63 @@ pub struct OpenAireImportResult {
     pub pdfs_downloaded: usize,
     pub pdfs_skipped: usize,
     pub duplicates_skipped: usize,
+    pub doi_duplicates_skipped: usize,
+    pub garbage_skipped: usize,
+    pub hash_duplicates_skipped: usize,
     pub errors: Vec<String>,
+}
+
+/// Compute content hash for deduplication (SHA-256 of normalized title + abstract)
+/// Uses SHA-256 for stability across Rust versions
+fn compute_content_hash(title: &str, abstract_text: Option<&str>) -> String {
+    use sha2::{Sha256, Digest};
+
+    // Normalize: lowercase, collapse whitespace, trim
+    let normalized_title = title.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let normalized_abstract = abstract_text
+        .map(|a| a.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+
+    let mut hasher = Sha256::new();
+    hasher.update(normalized_title.as_bytes());
+    hasher.update(b"|"); // Separator to prevent collisions
+    hasher.update(normalized_abstract.as_bytes());
+    let result = hasher.finalize();
+    // Use first 16 bytes (32 hex chars) for reasonable uniqueness
+    format!("{:032x}", u128::from_be_bytes(result[..16].try_into().unwrap()))
+}
+
+/// Check if content is garbage (purely numeric, empty, or too short)
+fn is_garbage_content(title: &str, abstract_text: Option<&str>) -> bool {
+    // Empty or very short title is suspicious
+    let title_clean = title.trim();
+    if title_clean.is_empty() || title_clean.len() < 5 {
+        return true;
+    }
+
+    // Purely numeric title (e.g., "12345")
+    if title_clean.chars().all(|c| c.is_ascii_digit() || c.is_whitespace() || c == '.' || c == '-') {
+        return true;
+    }
+
+    // Abstract check: if present, must be meaningful
+    if let Some(abs) = abstract_text {
+        let abs_clean = abs.trim();
+        // Too short to be a real abstract
+        if !abs_clean.is_empty() && abs_clean.len() < 50 {
+            return true;
+        }
+        // Purely numeric abstract
+        if abs_clean.chars().all(|c| c.is_ascii_digit() || c.is_whitespace() || c == '.' || c == '-') {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Import scientific papers from OpenAIRE
@@ -1130,12 +1186,18 @@ pub async fn import_openaire_papers(
         pdfs_downloaded: 0,
         pdfs_skipped: 0,
         duplicates_skipped: 0,
+        doi_duplicates_skipped: 0,
+        garbage_skipped: 0,
+        hash_duplicates_skipped: 0,
         errors: Vec::new(),
     };
 
-    // Pre-load all existing OpenAIRE IDs for O(1) duplicate checking
+    // Pre-load all existing IDs for O(1) duplicate checking
     let existing_ids = db.get_all_openaire_ids().unwrap_or_default();
-    println!("[OpenAIRE] Pre-loaded {} existing paper IDs for duplicate check", existing_ids.len());
+    let existing_dois = db.get_all_paper_dois().unwrap_or_default();
+    let existing_hashes = db.get_all_content_hashes().unwrap_or_default();
+    println!("[OpenAIRE] Pre-loaded {} IDs, {} DOIs, {} hashes for duplicate check",
+        existing_ids.len(), existing_dois.len(), existing_hashes.len());
 
     let page_size = 100u32.min(max_papers);
     let mut current_page = 1u32;
@@ -1180,15 +1242,36 @@ pub async fn import_openaire_papers(
                 break;
             }
 
-            // Check for duplicates using pre-loaded HashSet (O(1) instead of DB query)
+            // 1. OpenAIRE ID dedup (existing check)
             if existing_ids.contains(&paper.id) {
                 result.duplicates_skipped += 1;
-                // Don't count duplicates toward progress - keep fetching until we have enough new ones
+                continue;
+            }
+
+            // 2. DOI dedup - papers with same DOI are definitely duplicates
+            if let Some(ref doi) = paper.doi {
+                let doi_lower = doi.to_lowercase();
+                if existing_dois.contains(&doi_lower) {
+                    result.doi_duplicates_skipped += 1;
+                    continue;
+                }
+            }
+
+            // 3. Content sanity check - skip garbage papers
+            if is_garbage_content(&paper.title, paper.description.as_deref()) {
+                result.garbage_skipped += 1;
+                continue;
+            }
+
+            // 4. Content hash dedup - papers with same title+abstract are duplicates
+            let content_hash = compute_content_hash(&paper.title, paper.description.as_deref());
+            if existing_hashes.contains(&content_hash) {
+                result.hash_duplicates_skipped += 1;
                 continue;
             }
 
             // Import the paper
-            match import_single_paper(db, &paper, download_pdfs, max_pdf_size_mb, &client).await {
+            match import_single_paper(db, &paper, download_pdfs, max_pdf_size_mb, &client, &content_hash).await {
                 Ok(pdf_downloaded) => {
                     result.papers_imported += 1;
                     if pdf_downloaded {
@@ -1220,11 +1303,14 @@ pub async fn import_openaire_papers(
     }
 
     println!(
-        "[OpenAIRE] Import complete: {} papers, {} PDFs, {} skipped, {} duplicates, {} errors",
+        "[OpenAIRE] Import complete: {} papers, {} PDFs, {} pdf_skipped, {} id_dups, {} doi_dups, {} garbage, {} hash_dups, {} errors",
         result.papers_imported,
         result.pdfs_downloaded,
         result.pdfs_skipped,
         result.duplicates_skipped,
+        result.doi_duplicates_skipped,
+        result.garbage_skipped,
+        result.hash_duplicates_skipped,
         result.errors.len()
     );
 
@@ -1238,6 +1324,7 @@ async fn import_single_paper(
     download_pdfs: bool,
     max_pdf_size_mb: u32,
     client: &OpenAireClient,
+    content_hash: &str,
 ) -> Result<bool, String> {
     let node_id = format!("paper-{}", uuid::Uuid::new_v4());
 
@@ -1331,6 +1418,7 @@ async fn import_single_paper(
         pdf_url.as_deref(),
         subjects_json.as_deref(),
         Some(&paper.access_right),
+        Some(content_hash),
     ).map_err(|e| e.to_string())?;
 
     // Download document (PDF/DOCX/DOC) if requested

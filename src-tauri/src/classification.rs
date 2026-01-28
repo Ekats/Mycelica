@@ -338,65 +338,6 @@ fn is_trivial(content: &str) -> bool {
     false
 }
 
-/// Detect code patterns
-fn has_code_patterns(content: &str) -> bool {
-    let lower = content.to_lowercase();
-
-    // Strong indicators: code blocks
-    if content.contains("```") {
-        return true;
-    }
-
-    // Count code-like patterns
-    let mut code_signals = 0;
-
-    // File extensions in context
-    let extension_patterns = [
-        ".rs", ".tsx", ".ts", ".js", ".jsx", ".py", ".go", ".java",
-        ".cpp", ".c", ".h", ".hpp", ".cs", ".rb", ".php", ".swift",
-        ".kt", ".scala", ".vue", ".svelte", ".json", ".yaml", ".yml",
-        ".toml", ".sql", ".sh", ".bash", ".zsh", ".ps1", ".dockerfile"
-    ];
-    for ext in extension_patterns {
-        if lower.contains(ext) {
-            code_signals += 1;
-        }
-    }
-
-    // Syntax keywords (weighted more heavily)
-    let syntax_patterns = [
-        "fn ", "pub fn", "async fn", "impl ", "struct ", "enum ", "trait ",  // Rust
-        "const ", "let ", "mut ", "-> ", "=> ", ":: ", "&mut", "&self",
-        "function ", "export ", "import ", "require(", "module.",           // JS/TS
-        "def ", "class ", "self.", "__init__", "elif ", "lambda ",          // Python
-        "func ", "package ", "go func", "interface{",                       // Go
-        "public ", "private ", "protected ", "static ", "void ",            // Java/C#
-        "#include", "#define", "#ifdef", "int main", "std::",               // C/C++
-        "SELECT ", "INSERT ", "UPDATE ", "DELETE ", "FROM ", "WHERE ",      // SQL
-        "CREATE TABLE", "ALTER TABLE", "DROP TABLE",
-    ];
-    for pattern in syntax_patterns {
-        if content.contains(pattern) {
-            code_signals += 2;
-        }
-    }
-
-    // High indentation ratio (4+ spaces at line start)
-    let lines: Vec<&str> = content.lines().collect();
-    if lines.len() > 3 {
-        let indented_lines = lines.iter()
-            .filter(|line| line.starts_with("    ") || line.starts_with("\t"))
-            .count();
-        let ratio = indented_lines as f32 / lines.len() as f32;
-        if ratio > 0.3 {
-            code_signals += 3;
-        }
-    }
-
-    // Threshold: need multiple signals
-    code_signals >= 3
-}
-
 /// Detect debug/error patterns
 fn has_debug_patterns(content: &str) -> bool {
     let lower = content.to_lowercase();

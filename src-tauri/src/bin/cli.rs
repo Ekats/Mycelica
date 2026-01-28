@@ -6,7 +6,7 @@
 
 use clap::{Parser, Subcommand, CommandFactory};
 use clap_complete::{generate, Shell};
-use mycelica_lib::{db::{Database, Node, NodeType, EdgeType}, settings, import, hierarchy, similarity, clustering, openaire, ai_client, utils, classification};
+use mycelica_lib::{db::{Database, Node, NodeType, EdgeType}, settings, import, hierarchy, similarity, openaire, ai_client, utils, classification};
 use serde_json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -256,11 +256,6 @@ enum Commands {
     Process {
         #[command(subcommand)]
         cmd: ProcessCommands,
-    },
-    /// Clustering operations
-    Cluster {
-        #[command(subcommand)]
-        cmd: ClusterCommands,
     },
     /// Embedding operations
     Embeddings {
@@ -545,8 +540,6 @@ enum HierarchyCommands {
         #[arg(long)]
         keywords_only: bool,
     },
-    /// Rebuild without AI (keyword-based)
-    RebuildLite,
     /// Flatten single-child chains
     Flatten,
     /// Analyze edge weight distribution and recommend parameters
@@ -591,35 +584,6 @@ enum ProcessCommands {
     Status,
     /// Reset all AI processing flags
     Reset,
-}
-
-#[derive(Subcommand)]
-enum ClusterCommands {
-    /// Run clustering on new items
-    Run {
-        /// Use keyword-based naming instead of AI (faster, free)
-        #[arg(long)]
-        lite: bool,
-    },
-    /// Recluster all items
-    All {
-        /// Use keyword-based naming instead of AI (faster, free)
-        #[arg(long)]
-        lite: bool,
-    },
-    /// Name clusters that have keyword-only names (runs AI naming)
-    Name,
-    /// Reset clustering data
-    Reset,
-    /// Get or set clustering thresholds
-    Thresholds {
-        /// Primary threshold (0.0-1.0)
-        #[arg(long)]
-        primary: Option<f32>,
-        /// Secondary threshold (0.0-1.0)
-        #[arg(long)]
-        secondary: Option<f32>,
-    },
 }
 
 #[derive(Subcommand)]
@@ -931,6 +895,14 @@ enum MaintenanceCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Clean duplicate papers (same title, keep best metadata)
+    CleanDuplicates {
+        /// Only analyze, don't delete
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Backfill content hashes for existing papers (for deduplication)
+    BackfillHashes,
 }
 
 #[derive(Subcommand)]
@@ -1077,7 +1049,6 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Node { cmd } => handle_node(cmd, &db, cli.json).await,
         Commands::Hierarchy { cmd } => handle_hierarchy(cmd, &db, cli.json, cli.quiet).await,
         Commands::Process { cmd } => handle_process(cmd, &db, cli.json, cli.quiet).await,
-        Commands::Cluster { cmd } => handle_cluster(cmd, &db, cli.json, cli.quiet).await,
         Commands::Embeddings { cmd } => handle_embeddings(cmd, &db, cli.json).await,
         Commands::Privacy { cmd } => handle_privacy(cmd, &db, cli.json, cli.quiet).await,
         Commands::Paper { cmd } => handle_paper(cmd, &db, cli.json).await,
@@ -1841,18 +1812,6 @@ async fn handle_hierarchy(cmd: HierarchyCommands, db: &Database, json: bool, qui
                 other => {
                     return Err(format!("Unknown algorithm '{}'. Valid options: adaptive, dendrogram", other));
                 }
-            }
-        }
-        HierarchyCommands::RebuildLite => {
-            if !quiet { elog!("Rebuilding hierarchy (lite, no AI)..."); }
-            // Use clustering with lite mode
-            let result = clustering::cluster_with_embeddings_lite(db).await?;
-            if json {
-                log!(r#"{{"clusters_created":{},"items_assigned":{}}}"#,
-                    result.clusters_created, result.items_assigned);
-            } else {
-                log!("Created {} clusters, assigned {} items",
-                    result.clusters_created, result.items_assigned);
             }
         }
         HierarchyCommands::Flatten => {
@@ -3741,92 +3700,6 @@ async fn handle_process(cmd: ProcessCommands, db: &Database, json: bool, quiet: 
 }
 
 // ============================================================================
-// Cluster Commands
-// ============================================================================
-
-async fn handle_cluster(cmd: ClusterCommands, db: &Database, json: bool, quiet: bool) -> Result<(), String> {
-    match cmd {
-        ClusterCommands::Run { lite } => {
-            if !quiet {
-                if lite {
-                    elog!("Running clustering (lite mode, no AI naming)...");
-                } else {
-                    elog!("Running clustering...");
-                }
-            }
-            let result = clustering::run_clustering(db, !lite).await?;
-            if json {
-                log!(r#"{{"items_processed":{},"clusters_created":{},"items_assigned":{}}}"#,
-                    result.items_processed, result.clusters_created, result.items_assigned);
-            } else {
-                log!("Processed {} items, created {} clusters, assigned {} items",
-                    result.items_processed, result.clusters_created, result.items_assigned);
-            }
-        }
-        ClusterCommands::Name => {
-            if !quiet { elog!("Naming clusters with AI..."); }
-            let result = clustering::name_unnamed_clusters(db).await?;
-            if json {
-                log!(r#"{{"clusters_named":{},"clusters_skipped":{}}}"#,
-                    result.clusters_named, result.clusters_skipped);
-            } else {
-                log!("Named {} clusters, skipped {}", result.clusters_named, result.clusters_skipped);
-            }
-        }
-        ClusterCommands::All { lite } => {
-            if !quiet {
-                if lite {
-                    elog!("Reclustering all items (lite mode, no AI)...");
-                } else {
-                    elog!("Reclustering all items...");
-                }
-            }
-            let result = clustering::recluster_all(db, !lite).await?;
-            if json {
-                log!(r#"{{"items_processed":{},"clusters_created":{},"items_assigned":{}}}"#,
-                    result.items_processed, result.clusters_created, result.items_assigned);
-            } else {
-                log!("Processed {} items, created {} clusters, assigned {} items",
-                    result.items_processed, result.clusters_created, result.items_assigned);
-            }
-        }
-        ClusterCommands::Reset => {
-            // Reset clustering by clearing cluster assignments
-            // Note: update_node_cluster requires an ID, so we'll just report status
-            let items = db.get_items().map_err(|e| e.to_string())?;
-            let clustered: Vec<_> = items.iter().filter(|n| n.cluster_id.is_some()).collect();
-            if json {
-                log!(r#"{{"status":"info","clustered_items":{},"message":"Use GUI to reset clustering"}}"#, clustered.len());
-            } else {
-                log!("{} items have cluster assignments", clustered.len());
-                log!("Use 'hierarchy rebuild' to recluster from scratch");
-            }
-        }
-        ClusterCommands::Thresholds { primary, secondary } => {
-            if primary.is_some() || secondary.is_some() {
-                settings::set_clustering_thresholds(primary, secondary)?;
-                if json {
-                    log!(r#"{{"status":"ok"}}"#);
-                } else {
-                    log!("Thresholds updated");
-                }
-            } else {
-                let (p, s) = settings::get_clustering_thresholds();
-                if json {
-                    log!(r#"{{"primary":{},"secondary":{}}}"#,
-                        p.map(|v| v.to_string()).unwrap_or("null".to_string()),
-                        s.map(|v| v.to_string()).unwrap_or("null".to_string()));
-                } else {
-                    log!("Primary:   {}", p.map(|v| format!("{:.2}", v)).unwrap_or("default (0.75)".to_string()));
-                    log!("Secondary: {}", s.map(|v| format!("{:.2}", v)).unwrap_or("default (0.60)".to_string()));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-// ============================================================================
 // Embeddings Commands
 // ============================================================================
 
@@ -5641,6 +5514,157 @@ async fn handle_maintenance(cmd: MaintenanceCommands, db: &Database, _json: bool
             log!("  Indexed {} edges", indexed);
 
             log!("\nEdge regeneration complete. Run 'hierarchy rebuild --algorithm adaptive' to use new edges.");
+        }
+
+        MaintenanceCommands::CleanDuplicates { dry_run } => {
+            log!("Scanning for garbage duplicate papers...");
+
+            // Helper: check if content is garbage (purely numeric, empty, or very short)
+            fn is_garbage(content: Option<&str>) -> bool {
+                match content {
+                    None => true,
+                    Some(s) => {
+                        let trimmed = s.trim();
+                        if trimmed.is_empty() || trimmed.len() < 50 {
+                            return true;
+                        }
+                        // Purely numeric (like "40016569269")
+                        trimmed.chars().all(|c| c.is_ascii_digit() || c.is_whitespace() || c == '.' || c == '-')
+                    }
+                }
+            }
+
+            let duplicates = db.find_duplicate_papers_by_title().map_err(|e| e.to_string())?;
+            if duplicates.is_empty() {
+                log!("No duplicate papers found.");
+                return Ok(());
+            }
+
+            // Group by title: (node_id, doi, abstract, node_content)
+            let mut by_title: std::collections::HashMap<String, Vec<(String, Option<String>, Option<String>, Option<String>)>> =
+                std::collections::HashMap::new();
+            for (node_id, title, doi, abstract_text, node_content) in duplicates {
+                by_title.entry(title).or_default().push((node_id, doi, abstract_text, node_content));
+            }
+
+            let mut to_delete = Vec::new();
+            let mut skipped_different_dois = 0;
+            let mut groups_cleaned = 0;
+
+            for (title, papers) in &by_title {
+                if papers.len() <= 1 {
+                    continue;
+                }
+
+                // Check if papers have different DOIs - if so, they're legitimately different
+                let dois: std::collections::HashSet<_> = papers.iter()
+                    .filter_map(|(_, doi, _, _)| doi.as_ref().map(|d| d.to_lowercase()))
+                    .collect();
+
+                if dois.len() > 1 {
+                    // Different DOIs = different papers, skip this group
+                    skipped_different_dois += 1;
+                    continue;
+                }
+
+                // All papers have same DOI (or no DOI) - find garbage ones to delete
+                let mut garbage_papers = Vec::new();
+                let mut good_papers = Vec::new();
+
+                for (node_id, doi, abstract_text, node_content) in papers {
+                    // Paper is garbage if BOTH abstract and node_content are garbage
+                    let abs_garbage = is_garbage(abstract_text.as_deref());
+                    let content_garbage = is_garbage(node_content.as_deref());
+
+                    if abs_garbage && content_garbage && doi.is_none() {
+                        garbage_papers.push((node_id.clone(), title.clone()));
+                    } else {
+                        good_papers.push(node_id.clone());
+                    }
+                }
+
+                // Only delete garbage papers if we have at least one good one to keep
+                // (or if all are garbage, keep one arbitrarily)
+                if !garbage_papers.is_empty() {
+                    if good_papers.is_empty() {
+                        // All garbage - keep one, delete rest
+                        garbage_papers.pop(); // Remove last one to keep
+                    }
+                    groups_cleaned += 1;
+                    to_delete.extend(garbage_papers);
+                }
+            }
+
+            log!("Analysis:");
+            log!("  {} title groups with duplicates", by_title.len());
+            log!("  {} groups skipped (different DOIs = different papers)", skipped_different_dois);
+            log!("  {} groups with garbage duplicates to clean", groups_cleaned);
+            log!("  {} garbage papers to delete", to_delete.len());
+
+            if to_delete.is_empty() {
+                log!("\nNo garbage duplicates found.");
+                return Ok(());
+            }
+
+            if dry_run {
+                log!("\n[DRY RUN] Would delete:");
+                for (node_id, title) in &to_delete {
+                    log!("  {} - {}", node_id, title);
+                }
+                log!("\nRun without --dry-run to delete.");
+                return Ok(());
+            }
+
+            let mut deleted = 0;
+            for (node_id, title) in &to_delete {
+                match db.delete_paper_and_node(node_id) {
+                    Ok(_) => deleted += 1,
+                    Err(e) => log!("  Failed to delete '{}': {}", title, e),
+                }
+            }
+
+            log!("\nDeleted {} garbage duplicate papers.", deleted);
+        }
+
+        MaintenanceCommands::BackfillHashes => {
+            use sha2::{Sha256, Digest};
+
+            log!("Backfilling content hashes for existing papers...");
+
+            let papers = db.get_papers_needing_content_hash().map_err(|e| e.to_string())?;
+
+            let total = papers.len();
+            if total == 0 {
+                log!("All papers already have content hashes.");
+                return Ok(());
+            }
+
+            log!("Backfilling {} papers...", total);
+
+            let mut updated = 0;
+            for (node_id, title, abstract_text) in papers {
+                // Compute SHA-256 hash (stable across Rust versions)
+                let normalized_title = title.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+                let normalized_abstract = abstract_text
+                    .map(|a| a.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default();
+
+                let mut hasher = Sha256::new();
+                hasher.update(normalized_title.as_bytes());
+                hasher.update(b"|");
+                hasher.update(normalized_abstract.as_bytes());
+                let result = hasher.finalize();
+                let content_hash = format!("{:032x}", u128::from_be_bytes(result[..16].try_into().unwrap()));
+
+                if db.update_paper_content_hash(&node_id, &content_hash).is_ok() {
+                    updated += 1;
+                    if updated % 1000 == 0 {
+                        log!("  Progress: {}/{}", updated, total);
+                    }
+                }
+            }
+
+            log!("Backfilled content hashes for {} papers.", updated);
         }
     }
     Ok(())

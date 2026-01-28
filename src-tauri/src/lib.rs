@@ -2,7 +2,6 @@ pub mod db;
 pub mod commands;
 pub mod utils;
 mod http_server;
-pub mod clustering;
 pub mod ai_client;
 pub mod settings;
 pub mod hierarchy;
@@ -22,8 +21,6 @@ use commands::{
     get_nodes, get_node, create_node, add_note, update_node, update_node_content, delete_node,
     get_edges, get_edges_for_node, get_edges_for_view, create_edge, delete_edge,
     search_nodes,
-    // Clustering commands
-    name_clusters, get_clustering_status,
     // AI processing commands
     process_nodes, get_ai_status, cancel_processing, cancel_rebuild, cancel_all,
     get_api_key_status, save_api_key, clear_api_key,
@@ -40,7 +37,7 @@ use commands::{
     get_graph_children, get_supporting_items, get_associated_items, get_supporting_counts,
     classify_and_associate, classify_and_associate_children,
     // Rebuild Lite commands
-    preclassify_items, reclassify_pattern, reclassify_ai, rebuild_lite, rebuild_hierarchy_only,
+    preclassify_items, reclassify_pattern, reclassify_ai, rebuild_hierarchy_only,
     // Conversation context commands
     get_conversation_context,
     // Import commands
@@ -62,7 +59,7 @@ use commands::{
     // Leaf view commands
     get_leaf_content,
     // Settings panel commands
-    delete_all_data, reset_ai_processing, reset_clustering, clear_embeddings, regenerate_semantic_edges, clear_hierarchy, clear_tags, delete_empty_nodes, flatten_hierarchy, consolidate_root, unconsolidate_root, get_db_stats,
+    delete_all_data, reset_ai_processing, clear_embeddings, regenerate_semantic_edges, clear_hierarchy, clear_tags, delete_empty_nodes, flatten_hierarchy, consolidate_root, unconsolidate_root, get_db_stats,
     get_db_path, switch_database, tidy_database, export_trimmed_database,
     // Processing stats commands
     get_processing_stats, add_ai_processing_time, add_rebuild_time,
@@ -317,9 +314,6 @@ pub fn run() {
             create_edge,
             delete_edge,
             search_nodes,
-            // Clustering
-            name_clusters,
-            get_clustering_status,
             // AI processing
             process_nodes,
             get_ai_status,
@@ -361,7 +355,6 @@ pub fn run() {
             preclassify_items,
             reclassify_pattern,
             reclassify_ai,
-            rebuild_lite,
             rebuild_hierarchy_only,
             // Conversation context
             get_conversation_context,
@@ -412,7 +405,6 @@ pub fn run() {
             // Settings panel
             delete_all_data,
             reset_ai_processing,
-            reset_clustering,
             clear_embeddings,
             regenerate_semantic_edges,
             clear_hierarchy,

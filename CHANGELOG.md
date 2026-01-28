@@ -2,6 +2,83 @@
 
 All notable changes to Mycelica will be documented in this file.
 
+## [0.9.1] - 2026-01-29
+
+### Removed
+- **Legacy clustering subsystem**: Deleted entire classic clustering pipeline (~2,570 lines)
+  - Removed `clustering.rs` module (1,322 lines) - embedding-based agglomerative clustering with multi-path assignments
+  - Removed clustering commands: `cluster run`, `cluster all`, `cluster name`, `cluster reset`, `cluster thresholds`
+  - Removed hierarchy commands: `hierarchy rebuild-lite`
+  - Removed Tauri commands: `get_clustering_status`, `name_clusters`, `reset_clustering`, `rebuild_lite`
+  - Removed UI: "Rebuild Lite" and "Name Clusters (AI)" buttons from Settings panel
+  - Removed from `hierarchy.rs` (683 lines):
+    - K-means clustering system (`calculate_target_k`, `kmeans_cluster`, `kmeans_plusplus_init`, `recompute_centroids`, `cluster_items_by_embedding`)
+    - Recursive parent level creation (`create_parent_level`)
+    - Depth-based configuration (`max_children_for_depth`, `is_coherent_for_deep_split`)
+    - Semantic level naming (`level_name`, `level_emoji` - Universe/Galaxy/Domain/Region)
+    - AI progress tracking (`AiProgressEvent`, `emit_progress`)
+  - Removed tag vocabulary system from `tags.rs` (346 lines):
+    - `generate_tags_from_item_vocabulary` - tag clustering and hierarchy building
+    - Tag-based similarity bonuses (`get_tag_similarity_bonus`)
+  - Removed FOS edge cache system from `schema.rs` (110 lines):
+    - `precompute_fos_edges`, `get_edges_for_fos`, `clear_fos_edges`, `delete_fos_edges_for_node`
+    - `get_papers_by_fos` - FOS-based pre-grouping
+  - Removed from other files:
+    - `has_code_patterns` from `classification.rs` (55 lines)
+    - `find_paper_in_subtree` helper from `dendrogram.rs` (13 lines)
+
+### Added
+- **Paper deduplication system**: Content-based duplicate detection for OpenAIRE imports
+  - New `content_hash` column on papers table with index for O(1) lookups
+  - `get_all_paper_dois`, `get_all_content_hashes` for batch import filtering
+  - `find_duplicate_papers_by_title` for manual cleanup
+  - `update_paper_content_hash` for backfilling existing papers
+  - CLI commands: `maintenance clean-duplicates`, `maintenance backfill-hashes`
+- **Implementation documentation**: `docs/implementation/DEAD_CODE_CLEANUP_2026-01.md` (979 lines)
+  - Complete file-by-file breakdown of all deletions
+  - Architectural analysis (before/after pipeline diagrams)
+  - Migration guide for users and developers
+  - Performance impact comparison (~50% faster rebuilds: 5-7 min → 2-3 min)
+
+### Changed
+- **Simplified architecture**: Two-stage pipeline (clustering → hierarchy) unified into single adaptive tree
+  - Before: `Items → [Clustering] → Topics → [Hierarchy] → Categories`
+  - After: `Items → [Embeddings] → Edges → [Adaptive Tree] → Categories`
+- **Flat hierarchy**: 3-level structure (Universe → Topics → Items) replaces multi-tier recursive building
+- **Direct edge-based**: Dendrogram reads similarity edges directly (no separate O(n²) clustering pass)
+- **Adaptive thresholds**: Per-subtree threshold selection replaces fixed 0.75/0.60 global thresholds
+- **Inline naming**: Categories named during tree construction (no separate naming pass)
+- **Clear Structure** command now only clears hierarchy (removed clustering reset step)
+
+### Migration Guide
+**Old workflow (REMOVED):**
+```bash
+mycelica-cli cluster run          # Cluster new items
+mycelica-cli cluster all --lite   # Recluster (keyword naming)
+mycelica-cli cluster name         # AI naming pass
+mycelica-cli hierarchy rebuild-lite  # Safe rebuild
+```
+
+**New workflow:**
+```bash
+mycelica-cli setup                # One-command: embeddings + hierarchy
+mycelica-cli hierarchy build      # Rebuild hierarchy only
+mycelica-cli hierarchy smart-add  # Add orphan items intelligently
+```
+
+### Technical
+- Deleted modules: `clustering.rs`, tag vocabulary from `tags.rs`, FOS cache from `schema.rs`
+- Deleted 4 Tauri command registrations from `lib.rs`
+- Active commands: 147 Tauri, 20 CLI groups, 10 hierarchy subcommands
+- Dendrogram replaces all clustering functionality:
+  - Agglomerative clustering → Dendrogram merging
+  - Multi-path assignment → Bridge detection
+  - Fixed thresholds → Adaptive cuts
+  - Recursive hierarchy → Flat 3-level structure
+- Performance: ~50% faster full rebuilds (no separate O(n²) clustering phase)
+
+---
+
 ## [0.9.0] - 2026-01-24
 
 ### Added

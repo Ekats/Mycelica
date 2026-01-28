@@ -64,7 +64,7 @@ interface SettingsPanelProps {
   onDataChanged?: () => void;
 }
 
-type ConfirmAction = 'deleteAll' | 'resetAi' | 'clearEmbeddings' | 'regenerateEdges' | 'clearHierarchy' | 'clearTags' | 'resetPrivacy' | 'fullRebuild' | 'flattenHierarchy' | 'consolidateRoot' | 'unconsolidateRoot' | 'tidyDatabase' | 'scorePrivacy' | 'reclassifyPattern' | 'reclassifyAi' | 'rebuildLite' | 'nameClusters' | 'resetProcessing' | 'clearStructure' | null;
+type ConfirmAction = 'deleteAll' | 'resetAi' | 'clearEmbeddings' | 'regenerateEdges' | 'clearHierarchy' | 'clearTags' | 'resetPrivacy' | 'fullRebuild' | 'flattenHierarchy' | 'consolidateRoot' | 'unconsolidateRoot' | 'tidyDatabase' | 'scorePrivacy' | 'reclassifyPattern' | 'reclassifyAi' | 'resetProcessing' | 'clearStructure' | null;
 
 interface TidyReport {
   sameNameMerged: number;
@@ -185,8 +185,6 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   const [isExportingTrimmed, setIsExportingTrimmed] = useState(false);
   const [isReclassifyingPattern, setIsReclassifyingPattern] = useState(false);
   const [isReclassifyingAi, setIsReclassifyingAi] = useState(false);
-  const [isRebuildingLite, setIsRebuildingLite] = useState(false);
-  const [isNamingClusters, setIsNamingClusters] = useState(false);
   const [operationResult, setOperationResult] = useState<string | null>(null);
 
   // Setup flow operations
@@ -1375,38 +1373,6 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
         }
       },
     },
-    rebuildLite: {
-      title: 'Rebuild Lite',
-      message: 'Reclassify items + recluster with existing embeddings. SAFE: Hierarchy untouched. FREE.',
-      handler: async () => {
-        setIsRebuildingLite(true);
-        setOperationResult(null);
-        try {
-          const result = await invoke<{ itemsClassified: number; clustersCreated: number; hierarchyLevels: number; method: string }>('rebuild_lite');
-          const msg = `Rebuilt: ${result.itemsClassified} items classified, ${result.clustersCreated} clusters (hierarchy untouched)`;
-          setOperationResult(msg);
-          return msg;
-        } finally {
-          setIsRebuildingLite(false);
-        }
-      },
-    },
-    nameClusters: {
-      title: 'Name Clusters (AI)',
-      message: 'Name clusters that have keyword-only names using AI. This improves cluster names without re-clustering.',
-      handler: async () => {
-        setIsNamingClusters(true);
-        setOperationResult(null);
-        try {
-          const result = await invoke<{ clustersNamed: number; clustersSkipped: number }>('name_clusters');
-          const msg = `Named ${result.clustersNamed} clusters, skipped ${result.clustersSkipped}`;
-          setOperationResult(msg);
-          return msg;
-        } finally {
-          setIsNamingClusters(false);
-        }
-      },
-    },
     resetProcessing: {
       title: 'Reset Processing',
       message: 'This will reset AI processing AND embeddings. Items will be re-analyzed and get new embeddings. Run "Full Rebuild" after.',
@@ -1418,11 +1384,10 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
     },
     clearStructure: {
       title: 'Clear Structure',
-      message: 'This will clear clustering AND hierarchy. Items keep their embeddings. Run "Full Rebuild" to re-cluster.',
+      message: 'This will clear hierarchy. Items keep their embeddings. Run "Full Rebuild" to reorganize.',
       handler: async () => {
-        const clusterCount = await invoke<number>('reset_clustering');
         const hierarchyCount = await invoke<number>('clear_hierarchy');
-        return `Reset clustering for ${clusterCount} items, deleted ${hierarchyCount} hierarchy nodes`;
+        return `Deleted ${hierarchyCount} hierarchy nodes`;
       },
     },
   };
@@ -2439,44 +2404,6 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   <h4 className="text-xs font-semibold text-gray-400 uppercase tracking-wide">Budget Options</h4>
                 </div>
 
-                {/* Rebuild Lite - SAFE */}
-                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3 border border-green-500/30">
-                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-green-700 flex items-center justify-center text-white text-sm">
-                    <RefreshCw className="w-3.5 h-3.5" />
-                  </span>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm font-medium text-gray-200">Rebuild Lite <span className="text-green-400">(SAFE)</span></div>
-                    <div className="text-xs text-gray-500">Reclassify + recluster. Hierarchy untouched.</div>
-                    <div className="text-xs text-green-400 mt-0.5">FREE · Reuses embeddings</div>
-                  </div>
-                  <button
-                    onClick={() => setConfirmAction('rebuildLite')}
-                    disabled={isRebuildingLite || isFullRebuilding || isFlattening || isConsolidating || isTidying}
-                    style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-green-700 hover:bg-green-800 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
-                  >
-                    {isRebuildingLite ? <Loader2 className="w-5 h-5 animate-spin" /> : '🔄'}
-                  </button>
-                </div>
-
-                {/* Name Clusters (AI) */}
-                <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
-                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-amber-600 flex items-center justify-center text-white text-sm">
-                    <Cpu className="w-3.5 h-3.5" />
-                  </span>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm font-medium text-gray-200">Name Clusters (AI)</div>
-                    <div className="text-xs text-gray-500">Improve cluster names using AI (after Rebuild Lite)</div>
-                    <div className="text-xs text-amber-400 mt-0.5">Haiku · Names keyword-only clusters</div>
-                  </div>
-                  <button
-                    onClick={() => setConfirmAction('nameClusters')}
-                    disabled={isNamingClusters || isRebuildingLite || isFullRebuilding}
-                    style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-amber-600 hover:bg-amber-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
-                  >
-                    {isNamingClusters ? <Loader2 className="w-5 h-5 animate-spin" /> : '🏷️'}
-                  </button>
-                </div>
-
                 {/* Reclassify (Pattern) */}
                 <div className="bg-gray-900/50 rounded-lg p-3 flex items-center gap-3">
                   <span className="flex-shrink-0 w-7 h-7 rounded-full bg-emerald-600 flex items-center justify-center text-white text-sm">
@@ -2489,7 +2416,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   </div>
                   <button
                     onClick={() => setConfirmAction('reclassifyPattern')}
-                    disabled={isReclassifyingPattern || isReclassifyingAi || isFullRebuilding || isRebuildingLite}
+                    disabled={isReclassifyingPattern || isReclassifyingAi || isFullRebuilding}
                     style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isReclassifyingPattern ? <Loader2 className="w-5 h-5 animate-spin" /> : '🏷️'}
@@ -2512,7 +2439,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   </div>
                   <button
                     onClick={() => setConfirmAction('reclassifyAi')}
-                    disabled={isReclassifyingAi || isReclassifyingPattern || isFullRebuilding || isRebuildingLite}
+                    disabled={isReclassifyingAi || isReclassifyingPattern || isFullRebuilding}
                     style={{ fontSize: '2.5rem' }} className="flex-shrink-0 w-16 h-16 flex items-center justify-center bg-teal-600 hover:bg-teal-700 text-white rounded text-xs font-medium transition-colors disabled:opacity-50"
                   >
                     {isReclassifyingAi ? <Loader2 className="w-5 h-5 animate-spin" /> : '🤖'}

@@ -1,5 +1,4 @@
 use crate::db::{Database, Node, Edge, Position, NodeType};
-use crate::clustering;
 use crate::ai_client;
 use crate::hierarchy;
 use crate::import;
@@ -532,47 +531,7 @@ pub fn search_nodes(state: State<AppState>, query: String) -> Result<Vec<Node>, 
     state.db.read().map_err(|e| format!("DB lock error: {}", e))?.search_nodes(&query).map_err(|e| e.to_string())
 }
 
-// ==================== Clustering Commands ====================
-
-/// Status of items needing clustering
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ClusteringStatus {
-    pub items_needing_clustering: i32,
-    pub total_items: usize,
-    pub ai_available: bool,
-}
-
-/// Get clustering status
-#[tauri::command]
-pub fn get_clustering_status(state: State<AppState>) -> Result<ClusteringStatus, String> {
-    let needs_clustering = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.count_items_needing_clustering().map_err(|e| e.to_string())?;
-    let all_items = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_items().map_err(|e| e.to_string())?;
-
-    Ok(ClusteringStatus {
-        items_needing_clustering: needs_clustering,
-        total_items: all_items.len(),
-        ai_available: ai_client::is_available(),
-    })
-}
-
-/// Result of cluster naming operation
-#[derive(Serialize)]
-pub struct NamingResult {
-    pub clusters_named: usize,
-    pub clusters_skipped: usize,
-}
-
-/// Name clusters that have keyword-only names (runs AI naming)
-#[tauri::command]
-pub async fn name_clusters(state: State<'_, AppState>) -> Result<NamingResult, String> {
-    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clone();
-    let result = clustering::name_unnamed_clusters(&db).await?;
-    Ok(NamingResult {
-        clusters_named: result.clusters_named,
-        clusters_skipped: result.clusters_skipped,
-    })
-}
+// ==================== AI Processing Commands ====================
 
 #[derive(Serialize)]
 pub struct AiStatus {
@@ -1841,12 +1800,6 @@ pub fn reset_ai_processing(state: State<AppState>) -> Result<usize, String> {
     state.db.read().map_err(|e| format!("DB lock error: {}", e))?.reset_ai_processing().map_err(|e| e.to_string())
 }
 
-/// Reset clustering flag on all items
-#[tauri::command]
-pub fn reset_clustering(state: State<AppState>) -> Result<usize, String> {
-    state.db.read().map_err(|e| format!("DB lock error: {}", e))?.mark_all_items_need_clustering().map_err(|e| e.to_string())
-}
-
 /// Clear all embeddings
 #[tauri::command]
 pub fn clear_embeddings(state: State<AppState>) -> Result<usize, String> {
@@ -2955,65 +2908,6 @@ pub async fn reclassify_ai(
     }
 
     Ok(classified)
-}
-
-/// Rebuild Lite: Reclassify + recluster only (FREE)
-///
-/// SAFE: Does NOT touch hierarchy structure.
-/// Only updates content_type and cluster_id on items.
-#[tauri::command]
-pub async fn rebuild_lite(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<RebuildLiteResult, String> {
-    use crate::classification;
-
-    let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clone();
-
-    println!("[Rebuild Lite] === STARTING ===");
-    println!("[Rebuild Lite] SAFE: Only updating content_type + cluster_id (hierarchy untouched)");
-
-    // Step 1: Pattern classify all items (FREE)
-    println!("[Rebuild Lite] Step 1/2: Classifying items...");
-    let _ = app.emit("rebuild-lite-progress", serde_json::json!({
-        "step": 1,
-        "total_steps": 2,
-        "status": "Classifying items..."
-    }));
-
-    let classified = classification::classify_all_items(&db)?;
-
-    // Step 2: Recluster with existing embeddings (FREE)
-    println!("[Rebuild Lite] Step 2/2: Reclustering...");
-    let _ = app.emit("rebuild-lite-progress", serde_json::json!({
-        "step": 2,
-        "total_steps": 2,
-        "status": "Reclustering..."
-    }));
-
-    let items_marked = db.mark_all_items_need_clustering().map_err(|e| e.to_string())?;
-    println!("[Rebuild Lite] Marked {} items for clustering", items_marked);
-
-    let cluster_result = clustering::cluster_with_embeddings_lite(&db).await?;
-
-    let _ = app.emit("rebuild-lite-progress", serde_json::json!({
-        "step": 2,
-        "total_steps": 2,
-        "status": "Complete!"
-    }));
-
-    println!("[Rebuild Lite] === COMPLETE ===");
-    println!("  Items classified: {}", classified);
-    println!("  Clusters: {}", cluster_result.clusters_created);
-    println!("  Hierarchy: UNTOUCHED");
-    println!("  Cost: FREE");
-
-    Ok(RebuildLiteResult {
-        items_classified: classified,
-        clusters_created: cluster_result.clusters_created,
-        hierarchy_levels: 0,
-        method: "lite-safe".to_string(),
-    })
 }
 
 /// Rebuild Hierarchy Only: Regroup existing topics into uber-categories (CHEAP)
