@@ -544,3 +544,31 @@ Sample 50 nodes across certainty range, manually verify:
 3. Speculative discussions are clearly distinguishable from verified decisions
 4. Zero additional API costs for 80%+ of nodes (embedding-only scoring)
 5. Full certainty scoring completes in <30 minutes for 16k nodes
+
+---
+
+## Theoretical Endnote: Toward Grounded Epistemics
+
+This system approximates something humans do naturally: weighting knowledge by how it was acquired and whether it held up over time.
+
+The current design uses three grounding layers:
+
+1. **Conversational** — agreement, resolution, certainty signals from the dialogue itself
+2. **Codebase** — cross-reference against what actually exists in source files
+3. **Temporal** — staleness, supersession, realization tracking
+
+But there's a fourth layer we're not yet touching: **version control as epistemological record**.
+
+Git history is a timestamped, immutable log of what was actually built. A commit message saying "implement HAC clustering" is stronger evidence than a conversation saying "I'll implement HAC clustering." A revert is evidence of a failed approach. A file surviving 50 commits without major changes suggests stability.
+
+```
+Future grounding hierarchy:
+
+Speculation < Plan < Decision < Observation < Code exists < Code committed < Code survived
+```
+
+The deeper you can ground a claim, the higher its certainty floor. Conversations are context. Code is evidence. Git is proof.
+
+This plan implements layers 1-3. Layer 4 (git integration) remains future work — parsing history, correlating commits to conversations by time and semantic similarity, tracking survival through refactors. It's significant engineering, but the architecture here is designed to accommodate it: `certainty_grounded` and `certainty_validity` can incorporate git signals without restructuring.
+
+The end goal isn't a truth oracle. It's a system where you can ask "what do I actually know?" and get an answer weighted by evidence, not recency or verbosity. Knowledge graphs that can distinguish "I thought about this once" from "I built this and it's still running" are rare. That's what we're building toward.
