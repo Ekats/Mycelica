@@ -1,8 +1,10 @@
 # Mycelica
 
-**Visual knowledge graph for connected thinking**
+**Knowledge organization that mirrors how you actually think**
 
-Turn scattered conversations and notes into a navigable knowledge graph with semantic edges. Named after mycelium, the underground fungal network that connects everything.
+Import conversations, papers, code — get navigable hierarchy with semantic edges and certainty scoring. No manual tagging. Structure emerges from content.
+
+Named after mycelium, the underground fungal network that connects forests without central control.
 
 https://github.com/user-attachments/assets/149d3241-1b93-4269-94c2-10edb9153db3
 
