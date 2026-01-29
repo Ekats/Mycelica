@@ -118,7 +118,6 @@ The sidecar copy is needed for the GUI to spawn the CLI (Tauri bundles it from `
 | Tauri commands | `src-tauri/src/commands/graph.rs` |
 | Hierarchy build | `src-tauri/src/hierarchy.rs` |
 | **Adaptive tree algorithm** | `src-tauri/src/dendrogram.rs` |
-| **Topic clustering** | `src-tauri/src/clustering.rs` |
 | **Similarity computation** | `src-tauri/src/similarity.rs` |
 | Code parsing | `src-tauri/src/code/rust_parser.rs` |
 | Code import | `src-tauri/src/code/mod.rs` |
@@ -140,7 +139,7 @@ The sidecar copy is needed for the GUI to spawn the CLI (Tauri bundles it from `
 | `DefinedIn` | Code item in file/module | `import code` |
 | `Documents` | Markdown doc references code | `import code` |
 | `Sibling` | Category shares parent with category | `hierarchy build` (dendrogram) |
-| `BelongsTo` | Item belongs to category | `hierarchy build` (multi-path clustering) |
+| `BelongsTo` | Item belongs to category | `hierarchy build` (adaptive algorithm) |
 | `Clicked` | Followed a link | Holerabbit extension |
 | `Backtracked` | Returned to previous page | Holerabbit extension |
 | `SessionItem` | Node belongs to session | Holerabbit extension |

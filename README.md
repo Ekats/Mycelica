@@ -39,8 +39,9 @@ Mycelica shows structure you can navigate, plus connections that cross category 
 
 - **Visual Graph Navigation** — Zoomable, pannable D3 canvas with dynamic hierarchy levels
 - **AI-Powered Analysis** — Claude/Ollama generates titles, summaries, and tags for imported content
-- **Smart Clustering** — Embedding-based cosine similarity groups items into semantic topics
-- **Dynamic Hierarchy** — Adaptive tree algorithm creates navigable structure from edge weights
+- **Adaptive Hierarchy** — Edge-based algorithm builds navigable tree structure from semantic similarity
+  - Items automatically organized into categories based on embedding similarity
+  - No manual categorization required - structure emerges from the data
 - **Instant Similarity Search** — HNSW index enables O(log n) nearest neighbor lookup:
   - 50-100x faster than brute-force (~10ms vs ~870ms for 50k nodes)
   - Index auto-builds on first launch, saved to disk for instant subsequent loads
@@ -165,7 +166,6 @@ mycelica-cli [OPTIONS] <COMMAND>
 | `node` | Node operations |
 | `hierarchy` | Hierarchy operations |
 | `process` | AI processing |
-| `cluster` | Clustering |
 | `embeddings` | Embedding operations |
 | `privacy` | Privacy analysis |
 | `paper` | Paper operations |
@@ -187,6 +187,7 @@ mycelica-cli [OPTIONS] <COMMAND>
 |---------|-------------|
 | `import openaire -q "..."` | Import from OpenAIRE |
 | `import claude <file>` | Import Claude JSON |
+| `import chatgpt <file>` | Import ChatGPT JSON |
 | `import markdown <path>` | Import Markdown |
 | `import keep <zip>` | Import Google Keep |
 | `import code <path>` | Import source code (Rust, Python, TS, C) |
@@ -352,10 +353,10 @@ Universe (root)
 
 1. **Import** — Claude conversations, Markdown, OpenAIRE papers, Google Keep, or source code
 2. **AI Analysis** — Generate titles, summaries, tags (code items skip this, keep function signatures)
-3. **Embeddings** — Generate vectors locally (all-MiniLM-L6-v2), build HNSW index
+3. **Embeddings** — Generate vectors locally (all-MiniLM-L6-v2)
 4. **Semantic Edges** — Create "Related" edges between similar items
-5. **Hierarchy Build** — Adaptive tree creates categories from edge weights
-6. **Category Naming** — AI names categories bottom-up with deduplication
+5. **Hierarchy Build** — Adaptive tree creates categories from edge weights (includes AI naming)
+6. **Similarity Index** — Build HNSW index for fast nearest-neighbor lookups
 7. **Call Graph** — Extract function call relationships (code imports only)
 
 *For exact implementation steps, run `mycelica-cli setup --help` or see [ALGORITHMS.md](docs/ALGORITHMS.md).*
@@ -386,7 +387,6 @@ mycelica/
 │       ├── ai_client.rs    # Anthropic/Ollama integration
 │       ├── dendrogram.rs   # Adaptive tree algorithm
 │       ├── hierarchy.rs    # Hierarchy utilities
-│       ├── clustering.rs   # Embedding-based clustering
 │       ├── local_embeddings.rs  # all-MiniLM-L6-v2
 │       ├── http_server.rs  # Browser extension API (port 9876)
 │       └── holerabbit.rs   # Browsing session tracking
