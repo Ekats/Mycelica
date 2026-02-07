@@ -2,6 +2,37 @@
 
 All notable changes to Mycelica will be documented in this file.
 
+## [0.9.2] - 2026-02-07
+
+### Fixed
+- **PDF resolver identifier extraction**: Fixed bug where only DOI was passed to resolver
+  - Now includes all PDF URLs in identifiers array so `arxiv::extract_arxiv_id()` and `pmc::extract_pmcid()` can parse arXiv IDs and PMCIDs from URLs
+  - Papers should now show `[PDF Resolver] Downloaded from arxiv:` instead of falling back to `[OpenAIRE] Downloading document:`
+- **Debug logging for PDF resolver**: Added logging in `resolver.rs` showing extracted arXiv/PMC IDs and source identifiers to diagnose 404 errors
+
+### Changed
+- **Adaptive tree algorithm**: Replaced centroid bisection with greedy Louvain community detection
+  - Centroid bisection forced 50/50 binary splits regardless of graph structure
+  - New greedy Louvain produces natural 2-8 way splits based on edge connectivity
+  - Added coefficient of variation check (CV < 0.1) to detect uniform density clusters and make them leaves immediately
+  - Binary cascade merger (Step 7.5) merges sibling categories with >75% name similarity (though rarely needed now)
+
+### Performance
+Tested on 50,253 consciousness research papers:
+- **Binary splits**: 41.2% → 9.7% (76% reduction) - eliminates binary cascade disease
+- **Max depth**: 12 → 8 (4 levels eliminated) - no more depths 10-12 consciousness cascades
+- **Internal cohesion**: 16.2% → 21.6% (33% improvement) - modest but measurable
+- **Total categories**: 2,718 → 2,194 (19% reduction) - cleaner hierarchy
+
+### Technical
+- Greedy Louvain optimizes edge weight maximization (move to neighbor with highest connection) rather than true modularity
+- Works extremely well for this use case: prevents binary cascades, reduces depth, produces multi-way splits
+- Adaptive behavior: correctly makes leaves when finding 0-1 communities or uniform density
+- No merger needed at Step 7.5 in test (cascades prevented upfront by multi-way splits)
+- Files modified: `src-tauri/src/dendrogram.rs` (+153 lines), `src-tauri/src/bin/cli.rs` (+18 lines), `src-tauri/src/import.rs`, `src-tauri/src/papers/resolver.rs`
+
+---
+
 ## [0.9.1] - 2026-01-29
 
 ### Removed

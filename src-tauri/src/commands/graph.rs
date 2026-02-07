@@ -1196,8 +1196,10 @@ pub async fn import_openaire(
     let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.clone();
     let max_size = max_pdf_size_mb.unwrap_or(20);
 
-    // Get OpenAIRE API key from settings (optional - public API also works)
+    // Get API keys/email from settings (all optional)
     let api_key = settings::get_openaire_api_key();
+    let unpaywall_email = settings::get_unpaywall_email();
+    let core_api_key = settings::get_core_api_key();
 
     // Progress callback that emits events to frontend
     let app_handle = app.clone();
@@ -1219,6 +1221,8 @@ pub async fn import_openaire(
         download_pdfs,
         max_size,
         api_key,
+        unpaywall_email,
+        core_api_key,
         on_progress,
     ).await
 }
@@ -1748,6 +1752,42 @@ pub fn save_openaire_api_key(key: String) -> Result<(), String> {
 #[tauri::command]
 pub fn clear_openaire_api_key() -> Result<(), String> {
     settings::set_openaire_api_key(String::new())
+}
+
+// ==================== Unpaywall Email Commands ====================
+
+#[tauri::command]
+pub fn get_unpaywall_email_status() -> Result<Option<String>, String> {
+    // Return masked email for display, or None if not set
+    Ok(settings::get_masked_unpaywall_email())
+}
+
+#[tauri::command]
+pub fn save_unpaywall_email(email: String) -> Result<(), String> {
+    settings::set_unpaywall_email(email)
+}
+
+#[tauri::command]
+pub fn clear_unpaywall_email() -> Result<(), String> {
+    settings::set_unpaywall_email(String::new())
+}
+
+// ==================== CORE API Key Commands ====================
+
+#[tauri::command]
+pub fn get_core_api_key_status() -> Result<Option<String>, String> {
+    // Return masked key for display, or None if not set
+    Ok(settings::get_masked_core_api_key())
+}
+
+#[tauri::command]
+pub fn save_core_api_key(key: String) -> Result<(), String> {
+    settings::set_core_api_key(key)
+}
+
+#[tauri::command]
+pub fn clear_core_api_key() -> Result<(), String> {
+    settings::set_core_api_key(String::new())
 }
 
 // ==================== Leaf View Commands ====================

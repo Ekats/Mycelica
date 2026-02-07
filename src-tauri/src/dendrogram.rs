@@ -1586,6 +1586,122 @@ pub fn centroid_bisection(
     (left, right)
 }
 
+/// Louvain community detection for multi-way splits when threshold cutting fails.
+///
+/// Optimizes modularity Q = (internal edges - expected random) / total edges.
+/// Unlike centroid bisection, produces natural multi-way splits (2-10+ communities).
+///
+/// # Algorithm
+/// 1. Initialize each paper in its own community
+/// 2. Iteratively move papers to neighbor communities that maximize modularity gain
+/// 3. Contract graph (communities → super-nodes) and repeat until convergence
+/// 4. Return communities with size >= min_size
+///
+/// # Returns
+/// Vec of communities (each community is Vec<String> of paper IDs).
+/// Returns empty vec if no valid split found.
+pub fn louvain_split(
+    papers: &[String],
+    edge_index: &EdgeIndex,
+    min_size: usize,
+) -> Vec<Vec<String>> {
+    if papers.len() < min_size * 2 {
+        return vec![];
+    }
+
+    // Initialize: each paper in its own community
+    let mut paper_to_community: HashMap<String, usize> = papers.iter()
+        .enumerate()
+        .map(|(i, p)| (p.clone(), i))
+        .collect();
+
+    let paper_set: HashSet<&String> = papers.iter().collect();
+    let mut total_weight = 0.0;
+    let mut degree: HashMap<String, f64> = HashMap::new();
+
+    // Compute total weight and node degrees (only internal edges)
+    for paper in papers {
+        let mut d = 0.0;
+        for (neighbor, weight) in edge_index.edges_for(paper) {
+            if paper_set.contains(neighbor) {
+                d += weight;
+                if paper < neighbor {
+                    total_weight += weight;
+                }
+            }
+        }
+        degree.insert(paper.clone(), d);
+    }
+
+    if total_weight == 0.0 {
+        return vec![]; // No edges, can't split
+    }
+
+    // Phase 1: Local optimization
+    let mut improved = true;
+    let mut iterations = 0;
+    const MAX_ITERATIONS: usize = 20;
+
+    while improved && iterations < MAX_ITERATIONS {
+        improved = false;
+        iterations += 1;
+
+        for paper in papers {
+            let current_comm = paper_to_community[paper];
+
+            // Find neighbor communities and compute modularity gain for moving to each
+            let mut neighbor_communities: HashMap<usize, f64> = HashMap::new();
+            for (neighbor, weight) in edge_index.edges_for(paper) {
+                if let Some(&neighbor_comm) = paper_to_community.get(neighbor) {
+                    *neighbor_communities.entry(neighbor_comm).or_insert(0.0) += weight;
+                }
+            }
+
+            // Compute best community to move to
+            let mut best_comm = current_comm;
+            let mut best_gain = 0.0;
+
+            for (&neighbor_comm, &edge_weight_to_comm) in &neighbor_communities {
+                if neighbor_comm == current_comm {
+                    continue;
+                }
+
+                // Modularity gain formula:
+                // ΔQ = (edge_weight_to_comm / total_weight) - (degree[paper] * comm_degree / (2 * total_weight^2))
+                // Simplified: focus on edge weight difference
+                let gain = edge_weight_to_comm / total_weight;
+
+                if gain > best_gain {
+                    best_gain = gain;
+                    best_comm = neighbor_comm;
+                }
+            }
+
+            // Move paper to best community if gain is positive
+            if best_comm != current_comm && best_gain > 0.0 {
+                paper_to_community.insert(paper.clone(), best_comm);
+                improved = true;
+            }
+        }
+    }
+
+    // Extract communities
+    let mut communities: HashMap<usize, Vec<String>> = HashMap::new();
+    for (paper, comm_id) in paper_to_community {
+        communities.entry(comm_id).or_insert_with(Vec::new).push(paper);
+    }
+
+    // Filter by min_size and return
+    let mut result: Vec<Vec<String>> = communities.into_values()
+        .filter(|c| c.len() >= min_size)
+        .collect();
+
+    // Sort communities by size descending for determinism
+    result.sort_by(|a, b| b.len().cmp(&a.len()));
+
+    result
+}
+
 /// Build adaptive tree recursively with per-subtree thresholds.
 ///
 /// # Arguments
@@ -1623,6 +1739,34 @@ pub fn build_tree(
         };
     }
 
+    // Stopping condition 1.5: uniform density (no natural structure to split)
+    // If all edges have similar weights (CV < 0.1), any split would be arbitrary
+    let internal_edges = edge_index.internal_edges(&papers);
+    if !internal_edges.is_empty() && papers.len() >= 10 {
+        let weights: Vec<f64> = internal_edges.iter().map(|(_, _, w)| *w).collect();
+        if weights.len() >= 3 {
+            let mean = weights.iter().sum::<f64>() / weights.len() as f64;
+            if mean > 0.0 {
+                let variance = weights.iter()
+                    .map(|w| (w - mean).powi(2))
+                    .sum::<f64>() / weights.len() as f64;
+                let cv = (variance.sqrt() / mean).abs();
+
+                if cv < 0.1 {
+                    eprintln!(
+                        "[Adaptive] Uniform density (CV={:.3}, mean={:.3}) for {} papers at depth {}, making leaf",
+                        cv, mean, papers.len(), depth
+                    );
+                    return TreeNode::Leaf {
+                        id: node_id,
+                        papers,
+                        range,
+                    };
+                }
+            }
+        }
+    }
+
     // Stopping condition 2: already tight (low variance)
     let variance = edge_weight_variance(&papers, edge_index);
     if variance < config.tight_threshold {
@@ -1657,37 +1801,58 @@ pub fn build_tree(
         largest_child as f64 >= 0.9 * papers.len() as f64
     };
 
-    // Force centroid bisection when threshold cutting fails or doesn't make progress
+    // Force Louvain community detection when threshold cutting fails or doesn't make progress
     if needs_bisection && papers.len() >= 2 * effective_min_size {
-        let (left, right) = centroid_bisection(&papers, edge_index);
-
-        // Recurse on bisected halves
-        let left_node = build_tree(
-            left,
-            range.clone(),
-            parent_threshold,
-            edge_index,
-            config,
-            depth + 1,
-            id_counter,
-        );
-        let right_node = build_tree(
-            right,
-            range.clone(),
-            parent_threshold,
-            edge_index,
-            config,
-            depth + 1,
-            id_counter,
+        eprintln!(
+            "[Adaptive] Threshold cutting failed for {} papers at depth {}, trying Louvain",
+            papers.len(),
+            depth
         );
 
-        return TreeNode::Internal {
+        let communities = louvain_split(&papers, edge_index, effective_min_size);
+
+        if communities.len() >= 2 {
+            eprintln!(
+                "[Adaptive] Louvain found {} communities (sizes: {:?})",
+                communities.len(),
+                communities.iter().map(|c| c.len()).collect::<Vec<_>>()
+            );
+
+            // Recurse on each community
+            let mut children = Vec::new();
+            for community in communities {
+                let child_node = build_tree(
+                    community,
+                    range.clone(),
+                    parent_threshold,
+                    edge_index,
+                    config,
+                    depth + 1,
+                    id_counter,
+                );
+                children.push(child_node);
+            }
+
+            return TreeNode::Internal {
+                id: node_id,
+                papers,
+                children,
+                threshold: range.min,  // Synthetic threshold
+                range,
+                bridges: vec![],  // No bridges for Louvain splits
+            };
+        }
+
+        // If Louvain found 0-1 communities, this is truly uniform - make it a leaf
+        eprintln!(
+            "[Adaptive] Louvain found {} communities for {} papers, making leaf",
+            communities.len(),
+            papers.len()
+        );
+        return TreeNode::Leaf {
             id: node_id,
             papers,
-            children: vec![left_node, right_node],
-            threshold: range.min,  // Synthetic threshold
             range,
-            bridges: vec![],  // No bridges for forced bisection
         };
     }
 
@@ -1886,6 +2051,161 @@ pub fn build_adaptive_tree(
     collect_sibling_edges(&root, &edge_index, &mut sibling_edges);
 
     (root, sibling_edges)
+}
+
+/// Merge binary siblings with similar names (post-naming cleanup).
+///
+/// Detects binary cascades where the AI couldn't semantically differentiate
+/// two sibling categories (gave them very similar names). Merges such siblings
+/// to eliminate redundant hierarchy levels.
+///
+/// # Algorithm
+/// 1. Find all categories with exactly 2 children (both categories, not items)
+/// 2. Compute name similarity between the two children (Jaccard word overlap)
+/// 3. If similarity > threshold:
+///    - Keep child with more total descendants
+///    - Reparent losing child's children to winning child
+///    - Delete losing child
+///
+/// # Arguments
+/// * `db` - Database connection
+/// * `name_similarity_threshold` - Jaccard similarity threshold (0.0-1.0, typically 0.75)
+///
+/// # Returns
+/// Count of merged nodes
+pub fn merge_similar_binary_siblings(
+    db: &crate::db::Database,
+    name_similarity_threshold: f64,
+) -> Result<usize, String> {
+    // Query all categories (non-item nodes) with exactly 2 children
+    let all_categories: Vec<crate::db::Node> = db.get_all_nodes(false)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|n| !n.is_item)
+        .collect();
+
+    let mut merged_count = 0;
+
+    for parent in &all_categories {
+        if parent.child_count != 2 {
+            continue;
+        }
+
+        let children = db.get_children(&parent.id).map_err(|e| e.to_string())?;
+
+        // Only process if both children are categories (not items)
+        if children.len() != 2 {
+            continue;
+        }
+        if children[0].is_item || children[1].is_item {
+            continue;
+        }
+
+        let child_a = &children[0];
+        let child_b = &children[1];
+
+        // Compute name similarity (Jaccard word overlap)
+        let similarity = jaccard_word_similarity(&child_a.title, &child_b.title);
+
+        if similarity >= name_similarity_threshold {
+            // Decide which child to keep (one with more total descendants)
+            let desc_a = count_descendants(db, &child_a.id).unwrap_or(0);
+            let desc_b = count_descendants(db, &child_b.id).unwrap_or(0);
+
+            let (keep_id, merge_id) = if desc_a >= desc_b {
+                (&child_a.id, &child_b.id)
+            } else {
+                (&child_b.id, &child_a.id)
+            };
+
+            eprintln!(
+                "[Merger] Merging '{}' into '{}' (similarity={:.2}, desc: {} vs {})",
+                db.get_node(merge_id)
+                    .ok()
+                    .flatten()
+                    .map(|n| n.title)
+                    .unwrap_or_default(),
+                db.get_node(keep_id)
+                    .ok()
+                    .flatten()
+                    .map(|n| n.title)
+                    .unwrap_or_default(),
+                similarity,
+                if keep_id == &child_a.id { desc_a } else { desc_b },
+                if merge_id == &child_a.id { desc_a } else { desc_b }
+            );
+
+            // Reparent children of merge_id to keep_id
+            let grandchildren = db.get_children(merge_id).map_err(|e| e.to_string())?;
+            for grandchild in &grandchildren {
+                db.update_parent(&grandchild.id, keep_id)
+                    .map_err(|e| e.to_string())?;
+            }
+
+            // Update child_count of keep_id
+            let new_child_count = db.get_children(keep_id).map_err(|e| e.to_string())?.len();
+            db.update_child_count(keep_id, new_child_count as i32)
+                .map_err(|e| e.to_string())?;
+
+            // Delete merge_id
+            db.delete_node(merge_id).map_err(|e| e.to_string())?;
+
+            merged_count += 1;
+        }
+    }
+
+    Ok(merged_count)
+}
+
+/// Compute Jaccard similarity between two strings based on word overlap.
+fn jaccard_word_similarity(s1: &str, s2: &str) -> f64 {
+    use std::collections::HashSet;
+
+    let words1: HashSet<String> = s1
+        .to_lowercase()
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_string())
+        .collect();
+
+    let words2: HashSet<String> = s2
+        .to_lowercase()
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_string())
+        .collect();
+
+    if words1.is_empty() && words2.is_empty() {
+        return 1.0;
+    }
+    if words1.is_empty() || words2.is_empty() {
+        return 0.0;
+    }
+
+    let intersection = words1.intersection(&words2).count();
+    let union = words1.union(&words2).count();
+
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
+}
+
+/// Count total descendants (children + grandchildren + ...) of a node.
+fn count_descendants(db: &crate::db::Database, node_id: &str) -> Result<usize, String> {
+    let children = db.get_children(node_id).map_err(|e| e.to_string())?;
+    let mut count = children.len();
+
+    for child in &children {
+        if !child.is_item {
+            count += count_descendants(db, &child.id)?;
+        }
+    }
+
+    Ok(count)
 }
 
 #[cfg(test)]

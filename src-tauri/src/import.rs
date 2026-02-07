@@ -1165,7 +1165,7 @@ fn is_garbage_content(title: &str, abstract_text: Option<&str>) -> bool {
 /// Import scientific papers from OpenAIRE
 ///
 /// Fetches papers matching the query, creates nodes with paper metadata,
-/// and optionally downloads PDFs.
+/// and optionally downloads PDFs using multi-source resolver.
 pub async fn import_openaire_papers(
     db: &Database,
     query: String,
@@ -1177,6 +1177,8 @@ pub async fn import_openaire_papers(
     download_pdfs: bool,
     max_pdf_size_mb: u32,
     api_key: Option<String>,
+    unpaywall_email: Option<String>,
+    core_api_key: Option<String>,
     on_progress: impl Fn(usize, usize),
 ) -> Result<OpenAireImportResult, String> {
     let client = OpenAireClient::new_with_key(api_key);
@@ -1271,7 +1273,16 @@ pub async fn import_openaire_papers(
             }
 
             // Import the paper
-            match import_single_paper(db, &paper, download_pdfs, max_pdf_size_mb, &client, &content_hash).await {
+            match import_single_paper(
+                db,
+                &paper,
+                download_pdfs,
+                max_pdf_size_mb,
+                &client,
+                &content_hash,
+                unpaywall_email.as_deref(),
+                core_api_key.as_deref(),
+            ).await {
                 Ok(pdf_downloaded) => {
                     result.papers_imported += 1;
                     if pdf_downloaded {
@@ -1325,6 +1336,8 @@ async fn import_single_paper(
     max_pdf_size_mb: u32,
     client: &OpenAireClient,
     content_hash: &str,
+    unpaywall_email: Option<&str>,
+    core_api_key: Option<&str>,
 ) -> Result<bool, String> {
     let node_id = format!("paper-{}", uuid::Uuid::new_v4());
 
@@ -1421,29 +1434,89 @@ async fn import_single_paper(
         Some(content_hash),
     ).map_err(|e| e.to_string())?;
 
-    // Download document (PDF/DOCX/DOC) if requested
+    // Download document (PDF/DOCX/DOC) if requested - using multi-source resolver
     let mut pdf_downloaded = false;
+    let mut pdf_source = None;
+
     if download_pdfs {
-        if let Some(url) = &pdf_url {
-            match client.download_document(url, max_pdf_size_mb).await {
-                Ok(Some((doc_bytes, format))) => {
-                    if let Err(e) = db.update_paper_document(&node_id, &doc_bytes, &format) {
-                        eprintln!("[OpenAIRE] Failed to store document: {}", e);
+        // Use the PDF resolver with priority-based fallback chain
+        use crate::papers::resolver::PdfResolver;
+
+        let mut resolver = PdfResolver::new(
+            unpaywall_email.map(|s| s.to_string()),
+            core_api_key.map(|s| s.to_string()),
+        );
+
+        // Extract identifiers for resolver (arXiv ID, PMCID from paper metadata)
+        let mut identifiers = Vec::new();
+        if let Some(ref doi) = paper.doi {
+            identifiers.push(doi.clone());
+        }
+        // Add PDF URLs so resolver can extract arXiv IDs and PMCIDs from them
+        for url in &paper.pdf_urls {
+            identifiers.push(url.clone());
+        }
+
+        match resolver.resolve(
+            paper.doi.as_deref(),
+            &identifiers,
+            &paper.pdf_urls,
+        ).await {
+            Ok(resolved_pdf) => {
+                // Validate size
+                if resolved_pdf.bytes.len() <= (max_pdf_size_mb as usize * 1024 * 1024) {
+                    if let Err(e) = db.update_paper_document(&node_id, &resolved_pdf.bytes, "pdf") {
+                        eprintln!("[PDF Resolver] Failed to store PDF: {}", e);
                     } else {
                         pdf_downloaded = true;
-                        // Mark node as having document for graph badge display
-                        let source = format!("openaire-{}", format);
+                        pdf_source = Some(resolved_pdf.source.clone());
+
+                        // Update node source for graph badge display
+                        let source = format!("{}-pdf", resolved_pdf.source);
                         if let Err(e) = db.update_node_source(&node_id, &source) {
-                            eprintln!("[OpenAIRE] Failed to update node source: {}", e);
+                            eprintln!("[PDF Resolver] Failed to update node source: {}", e);
+                        }
+
+                        println!("[PDF Resolver] ✓ Downloaded from {}: {}", resolved_pdf.source, paper.title);
+                    }
+                } else {
+                    eprintln!("[PDF Resolver] PDF from {} too large: {} MB (max: {} MB)",
+                        resolved_pdf.source,
+                        resolved_pdf.bytes.len() / 1024 / 1024,
+                        max_pdf_size_mb);
+                }
+            }
+            Err(e) => {
+                // Resolver failed - try fallback to OpenAIRE URL
+                if let Some(url) = &pdf_url {
+                    match client.download_document(url, max_pdf_size_mb).await {
+                        Ok(Some((doc_bytes, format))) => {
+                            if let Err(e) = db.update_paper_document(&node_id, &doc_bytes, &format) {
+                                eprintln!("[OpenAIRE] Failed to store document: {}", e);
+                            } else {
+                                pdf_downloaded = true;
+                                pdf_source = Some("openaire".to_string());
+                                let source = format!("openaire-{}", format);
+                                if let Err(e) = db.update_node_source(&node_id, &source) {
+                                    eprintln!("[OpenAIRE] Failed to update node source: {}", e);
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            eprintln!("[PDF Resolver] All sources failed for: {}", paper.title);
+                        }
+                        Err(e) => {
+                            eprintln!("[PDF Resolver] All sources failed (including OpenAIRE): {}", e);
                         }
                     }
                 }
-                Ok(None) => {
-                    // Document download failed or was too large - that's OK, we have the URL
-                }
-                Err(e) => {
-                    eprintln!("[OpenAIRE] Document download error: {}", e);
-                }
+            }
+        }
+
+        // Store pdf_source in database if we got a PDF
+        if let Some(source) = pdf_source {
+            if let Err(e) = db.update_paper_pdf_source(&node_id, &source) {
+                eprintln!("[PDF Resolver] Failed to update pdf_source: {}", e);
             }
         }
     }

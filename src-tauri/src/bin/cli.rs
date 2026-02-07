@@ -408,6 +408,12 @@ enum ImportCommands {
         /// Maximum PDF size in MB
         #[arg(long, default_value = "20")]
         max_pdf_size: u32,
+        /// Unpaywall email for PDF lookup (fallback after arXiv/PMC)
+        #[arg(long)]
+        unpaywall_email: Option<String>,
+        /// CORE API key for PDF lookup (fallback after Unpaywall)
+        #[arg(long)]
+        core_api_key: Option<String>,
     },
     /// Import markdown files
     Markdown {
@@ -1286,13 +1292,31 @@ async fn handle_db(cmd: DbCommands, db: &Database, json: bool) -> Result<(), Str
 
 async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bool) -> Result<(), String> {
     match cmd {
-        ImportCommands::Openaire { query, country, fos, from_year, to_year, max, download_pdfs, max_pdf_size } => {
+        ImportCommands::Openaire { query, country, fos, from_year, to_year, max, download_pdfs, max_pdf_size, unpaywall_email, core_api_key } => {
             let api_key = settings::get_openaire_api_key();
+
+            // Get Unpaywall email from CLI flag or settings
+            let unpaywall_email = unpaywall_email.or_else(|| settings::get_unpaywall_email());
+
+            // Get CORE API key from CLI flag or settings
+            let core_api_key = core_api_key.or_else(|| settings::get_core_api_key());
 
             if !quiet {
                 log!("[OpenAIRE] Searching: \"{}\"", query);
                 if let Some(ref c) = country {
                     log!("[OpenAIRE]   Country: {}", c);
+                }
+                if download_pdfs {
+                    log!("[PDF Resolver] Multi-source fallback enabled:");
+                    log!("  1. arXiv (direct, ~95% success)");
+                    log!("  2. PMC (direct, ~80% success)");
+                    if unpaywall_email.is_some() {
+                        log!("  3. Unpaywall (lookup, ~26% success)");
+                    }
+                    if core_api_key.is_some() {
+                        log!("  4. CORE (lookup, ~9% success)");
+                    }
+                    log!("  5. OpenAIRE URLs (baseline, ~5% success)");
                 }
             }
 
@@ -1314,6 +1338,8 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
                 download_pdfs,
                 max_pdf_size,
                 api_key,
+                unpaywall_email,
+                core_api_key,
                 on_progress,
             ).await?;
 
@@ -2964,6 +2990,26 @@ async fn rebuild_hierarchy_adaptive(
     }
 
     if !quiet { elog!("  {} categories named", named_count); }
+
+    // Step 7.5: Merge binary cascades where AI couldn't differentiate siblings
+    // This runs AFTER naming because it needs to compare the actual generated names
+    if !quiet { elog!("Step 7.5/7: Merging similar binary siblings..."); }
+    let merged = mycelica_lib::dendrogram::merge_similar_binary_siblings(db, 0.75)
+        .map_err(|e| e.to_string())?;
+    if merged > 0 {
+        if !quiet { elog!("  Merged {} redundant binary splits", merged); }
+        // Update parent child counts after merging
+        let all_parents: Vec<String> = db.get_all_nodes(false)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|n| !n.is_item)
+            .map(|n| n.id)
+            .collect();
+        for parent_id in &all_parents {
+            let child_count = db.get_children(parent_id).map_err(|e| e.to_string())?.len();
+            let _ = db.update_child_count(parent_id, child_count as i32);
+        }
+    }
 
     // Step 7: Final-pass orphan assignment using nearest-neighbor
     if !quiet { elog!("Step 7/7: Final-pass orphan assignment..."); }

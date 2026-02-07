@@ -44,6 +44,10 @@ pub struct Settings {
     #[serde(default)]
     pub openaire_api_key: Option<String>,
     #[serde(default)]
+    pub unpaywall_email: Option<String>,
+    #[serde(default)]
+    pub core_api_key: Option<String>,
+    #[serde(default)]
     pub processing_stats: ProcessingStats,
     #[serde(default)]
     pub custom_db_path: Option<String>,
@@ -99,6 +103,8 @@ impl Default for Settings {
             anthropic_api_key: None,
             openai_api_key: None,
             openaire_api_key: None,
+            unpaywall_email: None,
+            core_api_key: None,
             processing_stats: ProcessingStats::default(),
             custom_db_path: None,
             protect_recent_notes: true,
@@ -305,6 +311,116 @@ pub fn set_openaire_api_key(key: String) -> Result<(), String> {
 /// Get masked OpenAIRE API key for display (shows first/last 4 chars)
 pub fn get_masked_openaire_api_key() -> Option<String> {
     get_openaire_api_key().map(|key| {
+        if key.len() > 12 {
+            format!("{}...{}", &key[..8], &key[key.len()-4..])
+        } else {
+            "*".repeat(key.len())
+        }
+    })
+}
+
+// ==================== Unpaywall Email ====================
+
+/// Get the Unpaywall email (checks env var first, then stored setting)
+pub fn get_unpaywall_email() -> Option<String> {
+    // Environment variable takes precedence
+    if let Ok(email) = std::env::var("UNPAYWALL_EMAIL") {
+        if !email.is_empty() {
+            return Some(email);
+        }
+    }
+
+    // Fall back to stored setting
+    let guard = SETTINGS.read().ok()?;
+    let settings = guard.as_ref()?;
+    settings.unpaywall_email.clone()
+}
+
+/// Check if Unpaywall email is available
+pub fn has_unpaywall_email() -> bool {
+    get_unpaywall_email().map(|e| !e.is_empty()).unwrap_or(false)
+}
+
+/// Set and save the Unpaywall email
+pub fn set_unpaywall_email(email: String) -> Result<(), String> {
+    let mut settings_guard = SETTINGS.write()
+        .map_err(|_| "Failed to acquire settings lock")?;
+
+    let settings = settings_guard.get_or_insert_with(Settings::default);
+    settings.unpaywall_email = if email.is_empty() { None } else { Some(email) };
+
+    // Save to disk
+    let config_path = CONFIG_PATH.read()
+        .map_err(|_| "Failed to acquire config path lock")?
+        .clone()
+        .ok_or("Settings not initialized")?;
+
+    settings.save(&config_path)?;
+
+    println!("Unpaywall email saved to settings");
+    Ok(())
+}
+
+/// Get masked Unpaywall email for display (shows first 3 chars + domain)
+pub fn get_masked_unpaywall_email() -> Option<String> {
+    get_unpaywall_email().map(|email| {
+        if let Some(at_pos) = email.find('@') {
+            if at_pos > 3 {
+                format!("{}...{}", &email[..3], &email[at_pos..])
+            } else {
+                format!("***{}", &email[at_pos..])
+            }
+        } else {
+            "*".repeat(email.len())
+        }
+    })
+}
+
+// ==================== CORE API Key ====================
+
+/// Get the CORE API key (checks env var first, then stored setting)
+pub fn get_core_api_key() -> Option<String> {
+    // Environment variable takes precedence
+    if let Ok(key) = std::env::var("CORE_API_KEY") {
+        if !key.is_empty() {
+            return Some(key);
+        }
+    }
+
+    // Fall back to stored setting
+    let guard = SETTINGS.read().ok()?;
+    let settings = guard.as_ref()?;
+    settings.core_api_key.clone()
+}
+
+/// Check if CORE API key is available
+pub fn has_core_api_key() -> bool {
+    get_core_api_key().map(|k| !k.is_empty()).unwrap_or(false)
+}
+
+/// Set and save the CORE API key
+pub fn set_core_api_key(key: String) -> Result<(), String> {
+    let mut settings_guard = SETTINGS.write()
+        .map_err(|_| "Failed to acquire settings lock")?;
+
+    let settings = settings_guard.get_or_insert_with(Settings::default);
+    settings.core_api_key = if key.is_empty() { None } else { Some(key) };
+
+    // Save to disk
+    let config_path = CONFIG_PATH.read()
+        .map_err(|_| "Failed to acquire config path lock")?
+        .clone()
+        .ok_or("Settings not initialized")?;
+
+    settings.save(&config_path)?;
+
+    println!("CORE API key saved to settings");
+    Ok(())
+}
+
+/// Get masked CORE API key for display (shows first/last 4 chars)
+pub fn get_masked_core_api_key() -> Option<String> {
+    get_core_api_key().map(|key| {
         if key.len() > 12 {
             format!("{}...{}", &key[..8], &key[key.len()-4..])
         } else {

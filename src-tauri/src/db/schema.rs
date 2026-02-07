@@ -517,6 +517,21 @@ impl Database {
             eprintln!("Migration: Added source_parent_id and target_parent_id columns to edges for fast view lookups");
         }
 
+        // Migration: Add PDF extraction columns to papers
+        let has_extracted_abstract: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('papers') WHERE name = 'extracted_abstract'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !has_extracted_abstract {
+            conn.execute("ALTER TABLE papers ADD COLUMN extracted_abstract TEXT", [])?;
+            conn.execute("ALTER TABLE papers ADD COLUMN extracted_conclusion TEXT", [])?;
+            conn.execute("ALTER TABLE papers ADD COLUMN extraction_status TEXT DEFAULT 'pending'", [])?;
+            conn.execute("ALTER TABLE papers ADD COLUMN pdf_source TEXT", [])?;
+            eprintln!("Migration: Added PDF extraction columns (extracted_abstract, extracted_conclusion, extraction_status, pdf_source) to papers");
+        }
+
         // Create indexes for dynamic hierarchy columns (after migrations ensure columns exist)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_depth ON nodes(depth)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_is_item ON nodes(is_item)", [])?;
@@ -4438,6 +4453,16 @@ impl Database {
         conn.execute(
             "UPDATE nodes SET pdf_available = 1 WHERE id = ?1",
             params![node_id],
+        )?;
+        Ok(())
+    }
+
+    /// Update the pdf_source field for a paper
+    pub fn update_paper_pdf_source(&self, node_id: &str, source: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE papers SET pdf_source = ?1 WHERE node_id = ?2",
+            params![source, node_id],
         )?;
         Ok(())
     }

@@ -11,6 +11,7 @@ pub mod local_embeddings;
 pub mod classification;
 mod tags;
 pub mod openaire;
+pub mod papers;
 mod format_abstract;
 pub mod code;
 mod holerabbit;
@@ -56,6 +57,10 @@ use commands::{
     get_openai_api_key_status, save_openai_api_key, clear_openai_api_key,
     // OpenAIRE API key commands
     get_openaire_api_key_status, save_openaire_api_key, clear_openaire_api_key,
+    // Unpaywall email commands
+    get_unpaywall_email_status, save_unpaywall_email, clear_unpaywall_email,
+    // CORE API key commands
+    get_core_api_key_status, save_core_api_key, clear_core_api_key,
     // Leaf view commands
     get_leaf_content,
     // Settings panel commands
@@ -400,6 +405,14 @@ pub fn run() {
             get_openaire_api_key_status,
             save_openaire_api_key,
             clear_openaire_api_key,
+            // Unpaywall email
+            get_unpaywall_email_status,
+            save_unpaywall_email,
+            clear_unpaywall_email,
+            // CORE API key
+            get_core_api_key_status,
+            save_core_api_key,
+            clear_core_api_key,
             // Leaf view
             get_leaf_content,
             // Settings panel
