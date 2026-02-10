@@ -1,0 +1,25 @@
+{
+  "productName": "Mycelica Team",
+  "identifier": "com.mycelica.team",
+  "build": {
+    "beforeDevCommand": "cd src-team && npm run dev",
+    "devUrl": "http://localhost:1421",
+    "beforeBuildCommand": "cd src-team && npm run build",
+    "frontendDist": "../src-team/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Mycelica Team",
+        "width": 1400,
+        "height": 900,
+        "minWidth": 900,
+        "minHeight": 600
+      }
+    ]
+  },
+  "bundle": {
+    "externalBin": [],
+    "resources": []
+  }
+}

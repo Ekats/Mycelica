@@ -472,3 +472,46 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[cfg(feature = "team")]
+pub fn run_team() {
+    use commands::team::{
+        TeamState, TeamConfig,
+        team_refresh, team_create_node, team_update_node, team_delete_node,
+        team_create_edge, team_delete_edge, team_search, team_get_node,
+        team_get_orphans, team_get_recent, team_get_settings, team_save_settings,
+        team_create_personal_node, team_create_personal_edge, team_get_personal_data,
+        team_save_positions, team_get_positions,
+    };
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let config = TeamConfig::load();
+            println!("Team client starting — server: {}, author: {}", config.server_url, config.author);
+            let state = TeamState::new(config);
+            app.manage(state);
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            team_refresh,
+            team_create_node,
+            team_update_node,
+            team_delete_node,
+            team_create_edge,
+            team_delete_edge,
+            team_search,
+            team_get_node,
+            team_get_orphans,
+            team_get_recent,
+            team_get_settings,
+            team_save_settings,
+            team_create_personal_node,
+            team_create_personal_edge,
+            team_get_personal_data,
+            team_save_positions,
+            team_get_positions,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running team application");
+}

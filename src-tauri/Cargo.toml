@@ -17,6 +17,7 @@ default = []
 # cuda feature: for CUDA <= 12.x with stable Rust
 # for CUDA 13.x, see patch section at end of file
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+team = []  # Team client GUI mode
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -23,6 +23,11 @@ impl Database {
         self.path.clone()
     }
 
+    /// Get raw access to the connection mutex (for custom schemas like team local.db).
+    pub fn raw_conn(&self) -> &Mutex<Connection> {
+        &self.conn
+    }
+
     /// Create a consistent backup of the database using SQLite's backup API.
     /// Safe to call while the database is open and being written to.
     pub fn backup_to(&self, dest_path: &str) -> Result<()> {
@@ -69,6 +74,16 @@ impl Database {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?.collect::<Result<Vec<_>>>()?;
         Ok(results)
+    }
+
+    pub fn open_readonly<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path_str = path.as_ref().to_string_lossy().to_string();
+        let conn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        Ok(Database { conn: Mutex::new(conn), path: path_str })
     }
 
     #[allow(dead_code)]

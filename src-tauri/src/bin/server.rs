@@ -232,6 +232,9 @@ async fn create_node_handler(
         .map_err(|e| AppError::from(e.to_string()))?
         .ok_or_else(|| AppError(StatusCode::INTERNAL_SERVER_ERROR, "Created node not found".to_string()))?;
 
+    println!("[POST /nodes] Created '{}' by {} (id: {}, edges: {})",
+        node.title, author, &node.id[..8], edges_created.len());
+
     Ok((StatusCode::CREATED, Json(CreateNodeResponse { node, edges_created, ambiguous })))
 }
 
@@ -273,6 +276,13 @@ async fn patch_node_handler(
         .map_err(|e| AppError::from(e.to_string()))?
         .ok_or_else(|| not_found(format!("Node '{}' not found after update", id)))?;
 
+    println!("[PATCH /nodes/{}] Updated by {} (fields: {})",
+        &id[..8], author,
+        [req.title.as_ref().map(|_| "title"), req.content.as_ref().map(|_| "content"),
+         req.tags.as_ref().map(|_| "tags"), req.content_type.as_ref().map(|_| "content_type"),
+         req.parent_id.as_ref().map(|_| "parent_id")]
+            .iter().flatten().copied().collect::<Vec<_>>().join(", "));
+
     Ok(Json(node))
 }
 
@@ -288,6 +298,8 @@ async fn delete_node_handler(
     let deleted_by = settings::get_author_or_default();
     state.db.delete_node_tracked(&id, &deleted_by)
         .map_err(|e| AppError::from(e.to_string()))?;
+
+    println!("[DELETE /nodes/{}] Deleted by {}", &id[..8], deleted_by);
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -364,6 +376,11 @@ async fn create_edge_handler(
     };
 
     state.db.insert_edge(&edge).map_err(|e| AppError::from(e.to_string()))?;
+
+    println!("[POST /edges] {} --{}--> {} by {}",
+        &source_summary.title, edge_type_str, &target_summary.title,
+        edge.author.as_deref().unwrap_or("?"));
+
     Ok((StatusCode::CREATED, Json(CreateEdgeResponse {
         edge,
         source_resolved: source_summary,
@@ -387,6 +404,9 @@ async fn patch_edge_handler(
     state.db.update_edge_fields(&id, req.reason.as_deref(), edge_type, author)
         .map_err(|e| AppError::from(e.to_string()))?;
 
+    println!("[PATCH /edges/{}] Updated by {}",
+        &id[..8], author.unwrap_or("?"));
+
     let edge = state.db.get_edge(&id)
         .map_err(|e| AppError::from(e.to_string()))?
         .ok_or_else(|| not_found(format!("Edge '{}' not found after update", id)))?;
@@ -406,6 +426,8 @@ async fn delete_edge_handler(
     let deleted_by = settings::get_author_or_default();
     state.db.delete_edge_tracked(&id, &deleted_by)
         .map_err(|e| AppError::from(e.to_string()))?;
+
+    println!("[DELETE /edges/{}] Deleted by {}", &id[..8], deleted_by);
 
     Ok(StatusCode::NO_CONTENT)
 }

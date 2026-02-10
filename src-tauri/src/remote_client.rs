@@ -15,7 +15,7 @@ pub struct RemoteClient {
 // Request / Response types (match server's types)
 // ============================================================================
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct CreateNodeRequest {
     pub title: String,
     pub content: Option<String>,
@@ -26,21 +26,21 @@ pub struct CreateNodeRequest {
     pub connects_to: Option<Vec<String>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct CreateNodeResponse {
     pub node: Node,
     pub edges_created: Vec<EdgeSummary>,
     pub ambiguous: Vec<AmbiguousResult>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct EdgeSummary {
     pub edge_id: String,
     pub target_id: String,
     pub target_title: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct AmbiguousResult {
     pub term: String,
     pub candidates: Vec<CandidateNode>,
@@ -52,7 +52,7 @@ pub struct CandidateNode {
     pub title: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct CreateEdgeRequest {
     pub source: String,   // UUID, ID prefix, or title text
     pub target: String,   // UUID, ID prefix, or title text
@@ -68,7 +68,7 @@ pub struct CreateEdgeResponse {
     pub target_resolved: CandidateNode,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct PatchNodeRequest {
     pub title: Option<String>,
     pub content: Option<String>,
@@ -85,7 +85,7 @@ pub struct PatchEdgeRequest {
     pub author: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct NodeWithEdges {
     pub node: Node,
     pub edges: Vec<Edge>,
@@ -110,6 +110,10 @@ impl RemoteClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             client: reqwest::Client::new(),
         }
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     fn url(&self, path: &str) -> String {
