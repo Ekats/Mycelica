@@ -1,7 +1,8 @@
 import { useState, useCallback, useMemo } from "react";
 import { X } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 import { useTeamStore } from "../stores/teamStore";
-import type { ContentType } from "../types";
+import type { ContentType, Node } from "../types";
 
 const CONTENT_TYPES: ContentType[] = [
   "concept", "question", "decision", "reference", "idea",
@@ -13,7 +14,7 @@ const PERSONAL_COLOR = "#14b8a6";
 export default function QuickAdd() {
   const {
     setShowQuickAdd, createNode, updateNode, config,
-    search, searchResults, selectedNodeId, nodes,
+    selectedNodeId, nodes,
   } = useTeamStore();
 
   // If a node is selected, pre-fill connection and detect if it's a category
@@ -34,6 +35,7 @@ export default function QuickAdd() {
     // Pre-fill parent if selected node is a category
     selectedIsCategory && selectedNodeId ? selectedNodeId : null
   );
+  const [connectResults, setConnectResults] = useState<Node[]>([]);
   const [submitting, setSubmitting] = useState(false);
 
   const parentName = useMemo(() => {
@@ -48,12 +50,19 @@ export default function QuickAdd() {
     return n ? (n.aiTitle || n.title) : id.slice(0, 8);
   }, [nodes]);
 
-  const handleConnectSearch = useCallback((value: string) => {
+  const handleConnectSearch = useCallback(async (value: string) => {
     setConnectQuery(value);
-    if (value.trim().length >= 2) {
-      search(value);
+    if (value.trim().length < 2) {
+      setConnectResults([]);
+      return;
     }
-  }, [search]);
+    try {
+      const results = await invoke<Node[]>("team_search", { query: value, limit: 10 });
+      setConnectResults(results);
+    } catch {
+      setConnectResults([]);
+    }
+  }, []);
 
   const handleSubmit = useCallback(async () => {
     if (!title.trim()) return;
@@ -214,9 +223,9 @@ export default function QuickAdd() {
             value={connectQuery}
             onChange={(e) => handleConnectSearch(e.target.value)}
           />
-          {connectQuery && searchResults.length > 0 && (
+          {connectQuery && connectResults.length > 0 && (
             <div className="flex flex-col gap-0.5 max-h-32 overflow-y-auto rounded" style={{ background: "var(--bg-tertiary)" }}>
-              {searchResults.slice(0, 6).map((r) => (
+              {connectResults.slice(0, 6).map((r) => (
                 <button
                   key={r.id}
                   className="text-left text-xs px-2 py-1.5 hover:opacity-80"

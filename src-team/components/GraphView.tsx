@@ -36,7 +36,7 @@ interface GraphLink {
   isPersonal: boolean;
 }
 
-const GRID_SPACING = 120;
+const GRID_SPACING = 220;
 
 // Deterministic grid placement for nodes without saved positions
 function gridPosition(index: number, centerX: number, centerY: number): { x: number; y: number } {
@@ -55,10 +55,19 @@ export default function GraphView() {
   const svgRef = useRef<SVGSVGElement>(null);
   const nodesRef = useRef<GraphNode[]>([]);
 
-  const {
-    getDisplayNodes, getDisplayEdges, selectedNodeId, searchResults, searchQuery,
-    setSelectedNodeId, savePositions, savedPositions,
-  } = useTeamStore();
+  // Subscribe to actual data so effect re-runs when nodes/edges change
+  const nodes = useTeamStore((s) => s.nodes);
+  const edges = useTeamStore((s) => s.edges);
+  const personalNodes = useTeamStore((s) => s.personalNodes);
+  const personalEdges = useTeamStore((s) => s.personalEdges);
+  const selectedNodeId = useTeamStore((s) => s.selectedNodeId);
+  const searchResults = useTeamStore((s) => s.searchResults);
+  const searchQuery = useTeamStore((s) => s.searchQuery);
+  const savedPositions = useTeamStore((s) => s.savedPositions);
+  const setSelectedNodeId = useTeamStore((s) => s.setSelectedNodeId);
+  const savePositions = useTeamStore((s) => s.savePositions);
+  const getDisplayNodes = useTeamStore((s) => s.getDisplayNodes);
+  const getDisplayEdges = useTeamStore((s) => s.getDisplayEdges);
 
   const authorColorMap = useRef(new Map<string, string>());
 
@@ -97,7 +106,7 @@ export default function GraphView() {
 
     // Build nodes with deterministic positions
     let unpositionedIndex = 0;
-    const nodes: GraphNode[] = displayNodes.map((dn) => {
+    const graphNodes: GraphNode[] = displayNodes.map((dn) => {
       // Priority: saved position > previous render > DB position > grid
       const saved = savedPositions.get(dn.id);
       const prev = prevPositions.get(dn.id);
@@ -123,9 +132,9 @@ export default function GraphView() {
       };
     });
 
-    nodesRef.current = nodes;
-    const nodeMap = new Map(nodes.map((n) => [n.id, n]));
-    const nodeIds = new Set(nodes.map((n) => n.id));
+    nodesRef.current = graphNodes;
+    const nodeMap = new Map(graphNodes.map((n) => [n.id, n]));
+    const nodeIds = new Set(graphNodes.map((n) => n.id));
 
     const links: GraphLink[] = displayEdges
       .filter((e) => nodeIds.has(e.source) && nodeIds.has(e.target))
@@ -141,7 +150,46 @@ export default function GraphView() {
     const svgSel = d3.select(svg);
     let g = svgSel.select<SVGGElement>("g.graph-root");
     if (g.empty()) {
+      // Grid pattern defs
+      const defs = svgSel.append("defs");
+
+      const smallGrid = defs.append("pattern")
+        .attr("id", "graph-grid-small")
+        .attr("width", 40)
+        .attr("height", 40)
+        .attr("patternUnits", "userSpaceOnUse");
+      smallGrid.append("path")
+        .attr("d", "M 40 0 L 0 0 0 40")
+        .attr("fill", "none")
+        .attr("stroke", "rgba(255,255,255,0.04)")
+        .attr("stroke-width", 0.5);
+
+      const largeGrid = defs.append("pattern")
+        .attr("id", "graph-grid-large")
+        .attr("width", 200)
+        .attr("height", 200)
+        .attr("patternUnits", "userSpaceOnUse");
+      largeGrid.append("rect")
+        .attr("width", 200)
+        .attr("height", 200)
+        .attr("fill", "url(#graph-grid-small)");
+      largeGrid.append("path")
+        .attr("d", "M 200 0 L 0 0 0 200")
+        .attr("fill", "none")
+        .attr("stroke", "rgba(255,255,255,0.08)")
+        .attr("stroke-width", 1);
+
       g = svgSel.append("g").attr("class", "graph-root");
+
+      // Grid background (inside g so it transforms with zoom/pan)
+      g.append("rect")
+        .attr("class", "grid-background")
+        .attr("x", -50000)
+        .attr("y", -50000)
+        .attr("width", 100000)
+        .attr("height", 100000)
+        .attr("fill", "url(#graph-grid-large)");
+
       const zoom = d3.zoom<SVGSVGElement, unknown>()
         .scaleExtent([0.1, 4])
         .on("zoom", (event) => g.attr("transform", event.transform));
@@ -167,7 +215,7 @@ export default function GraphView() {
     // Nodes
     const nodeSel = g
       .selectAll<SVGGElement, GraphNode>("g.node")
-      .data(nodes, (d) => d.id);
+      .data(graphNodes, (d) => d.id);
     nodeSel.exit().remove();
 
     const nodeEnter = nodeSel.enter().append("g").attr("class", "node").style("cursor", "pointer");
@@ -176,7 +224,7 @@ export default function GraphView() {
       .attr("dy", "0.35em")
       .attr("text-anchor", "middle")
       .style("fill", "#f9fafb")
-      .style("font-size", "10px")
+      .style("font-size", "20px")
       .style("pointer-events", "none");
 
     const nodeMerge = nodeEnter.merge(nodeSel);
@@ -184,7 +232,7 @@ export default function GraphView() {
     nodeMerge.attr("transform", (d) => `translate(${d.x},${d.y})`);
 
     nodeMerge.select("circle")
-      .attr("r", (d) => Math.min(8 + d.edgeCount * 1.5, 20))
+      .attr("r", (d) => Math.min(64 + d.edgeCount * 4, 96))
       .attr("fill", (d) => (d.isPersonal ? PERSONAL_COLOR : getAuthorColor(d.author)))
       .attr("fill-opacity", (d) => (d.isPersonal ? 0.6 : 0.85))
       .attr("stroke", (d) => {
@@ -197,7 +245,8 @@ export default function GraphView() {
 
     nodeMerge.select("text")
       .text((d) => truncate(d.title, 14))
-      .attr("y", (d) => Math.min(8 + d.edgeCount * 1.5, 20) + 12);
+      .style("font-size", "20px")
+      .attr("y", (d) => Math.min(64 + d.edgeCount * 4, 96) + 16);
 
     // Search highlight
     if (searchQuery && searchResults.length > 0) {
@@ -216,17 +265,15 @@ export default function GraphView() {
         });
     }
 
-    // Click
-    nodeMerge.on("click", (_event, d) => {
-      setSelectedNodeId(d.id === selectedNodeId ? null : d.id);
-    });
-
-    // Drag — moves node directly, no physics
+    // Drag + click (drag swallows click, so detect click as drag with no movement)
+    let dragMoved = false;
     const drag = d3.drag<SVGGElement, GraphNode>()
       .on("start", function () {
+        dragMoved = false;
         d3.select(this).raise();
       })
       .on("drag", function (event, d) {
+        dragMoved = true;
         d.x = event.x;
         d.y = event.y;
         d3.select(this).attr("transform", `translate(${d.x},${d.y})`);
@@ -238,12 +285,17 @@ export default function GraphView() {
           .attr("x2", d.x).attr("y2", d.y);
       })
       .on("end", (_event, d) => {
-        savePositions([{ node_id: d.id, x: d.x, y: d.y }]);
+        if (dragMoved) {
+          savePositions([{ node_id: d.id, x: d.x, y: d.y }]);
+        } else {
+          // Click (no drag movement) — toggle selection
+          setSelectedNodeId(d.id === selectedNodeId ? null : d.id);
+        }
       });
 
     nodeMerge.call(drag);
 
-  }, [getDisplayNodes, getDisplayEdges, selectedNodeId, searchResults, searchQuery, savedPositions, setSelectedNodeId, savePositions, getAuthorColor]);
+  }, [nodes, edges, personalNodes, personalEdges, selectedNodeId, searchResults, searchQuery, savedPositions, getDisplayNodes, getDisplayEdges, setSelectedNodeId, savePositions, getAuthorColor]);
 
   const handleSvgClick = useCallback((e: React.MouseEvent) => {
     if ((e.target as Element).tagName === "svg") {

@@ -29,7 +29,7 @@ pub struct TeamConfig {
 impl TeamConfig {
     fn config_dir() -> PathBuf {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        home.join(".mycelica-team")
+        home.join(".local/share/com.mycelica.app/team")
     }
 
     fn config_path() -> PathBuf {
@@ -302,8 +302,89 @@ pub async fn team_search(
     query: String,
     limit: Option<u32>,
 ) -> Result<Vec<Node>, String> {
-    let client = state.make_client()?;
-    client.search(&query, limit.unwrap_or(20)).await
+    let limit = limit.unwrap_or(20) as usize;
+    let mut results: Vec<Node> = Vec::new();
+
+    // Search local snapshot (team nodes)
+    {
+        let db_guard = state.snapshot_db.lock().map_err(|e| e.to_string())?;
+        if let Some(ref db) = *db_guard {
+            if let Ok(nodes) = db.search_nodes(&query) {
+                if !nodes.is_empty() {
+                    results.extend(nodes);
+                } else if let Ok(nodes) = db.search_nodes_by_title_substring(&query, limit as i32) {
+                    results.extend(nodes);
+                }
+            }
+        }
+    }
+
+    // Search personal nodes (local.db)
+    {
+        let pattern = format!("%{}%", query);
+        let conn = state.local_db.raw_conn().lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(
+            "SELECT id, title, content, content_type, tags, created_at, updated_at
+             FROM personal_nodes
+             WHERE title LIKE ?1 COLLATE NOCASE
+             ORDER BY updated_at DESC LIMIT ?2"
+        ).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![pattern, limit as i32], |row| {
+            Ok(Node {
+                id: row.get(0)?,
+                node_type: crate::db::NodeType::Thought,
+                title: row.get(1)?,
+                url: None,
+                content: row.get(2)?,
+                position: crate::db::Position { x: 0.0, y: 0.0 },
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+                cluster_id: None,
+                cluster_label: None,
+                depth: 0,
+                is_item: true,
+                is_universe: false,
+                parent_id: None,
+                child_count: 0,
+                ai_title: None,
+                summary: None,
+                tags: row.get(4)?,
+                emoji: None,
+                is_processed: false,
+                conversation_id: None,
+                sequence_index: None,
+                is_pinned: false,
+                last_accessed_at: None,
+                latest_child_date: None,
+                is_private: None,
+                privacy_reason: None,
+                source: Some("personal".to_string()),
+                pdf_available: None,
+                content_type: row.get::<_, Option<String>>(3)?,
+                associated_idea_id: None,
+                privacy: None,
+                human_edited: None,
+                human_created: true,
+                author: None,
+            })
+        }).map_err(|e| e.to_string())?;
+        for row in rows {
+            if let Ok(node) = row {
+                results.push(node);
+            }
+        }
+    }
+
+    // Fall back to server if no snapshot and no personal matches
+    if results.is_empty() {
+        let client = state.make_client()?;
+        if let Ok(server_results) = client.search(&query, limit as u32).await {
+            results = server_results;
+        }
+    }
+
+    results.truncate(limit);
+    Ok(results)
 }
 
 #[tauri::command]

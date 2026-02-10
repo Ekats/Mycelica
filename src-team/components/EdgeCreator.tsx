@@ -1,7 +1,8 @@
 import { useState, useCallback } from "react";
 import { X } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 import { useTeamStore } from "../stores/teamStore";
-import type { EdgeType } from "../types";
+import type { EdgeType, Node } from "../types";
 
 const EDGE_TYPES: EdgeType[] = [
   "related", "reference", "because", "contains",
@@ -14,21 +15,29 @@ interface Props {
 }
 
 export default function EdgeCreator({ sourceId, onClose }: Props) {
-  const { createEdge, createPersonalEdge, search, searchResults, config } = useTeamStore();
+  const { createEdge, createPersonalEdge, config } = useTeamStore();
 
   const [mode, setMode] = useState<"team" | "personal">("team");
   const [edgeType, setEdgeType] = useState<EdgeType>("related");
   const [reason, setReason] = useState("");
   const [targetQuery, setTargetQuery] = useState("");
   const [targetId, setTargetId] = useState<string | null>(null);
+  const [results, setResults] = useState<Node[]>([]);
   const [submitting, setSubmitting] = useState(false);
 
-  const handleSearch = useCallback((value: string) => {
+  const handleSearch = useCallback(async (value: string) => {
     setTargetQuery(value);
-    if (value.trim().length >= 2) {
-      search(value);
+    if (value.trim().length < 2) {
+      setResults([]);
+      return;
     }
-  }, [search]);
+    try {
+      const nodes = await invoke<Node[]>("team_search", { query: value, limit: 10 });
+      setResults(nodes);
+    } catch {
+      setResults([]);
+    }
+  }, []);
 
   const handleSubmit = useCallback(async () => {
     if (!targetId) return;
@@ -87,9 +96,9 @@ export default function EdgeCreator({ sourceId, onClose }: Props) {
         style={{ padding: "4px 6px" }}
       />
 
-      {targetQuery && searchResults.length > 0 && (
+      {targetQuery && results.length > 0 && (
         <div className="flex flex-col gap-0.5 max-h-24 overflow-y-auto rounded mb-2" style={{ background: "var(--bg-tertiary)" }}>
-          {searchResults.slice(0, 5).map((r) => (
+          {results.filter((r) => r.id !== sourceId).slice(0, 5).map((r) => (
             <button
               key={r.id}
               className="text-left text-xs px-2 py-1 hover:opacity-80"
