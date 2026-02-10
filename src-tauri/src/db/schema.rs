@@ -36,22 +36,26 @@ impl Database {
     /// Get all nodes updated after a timestamp (for delta sync).
     pub fn get_nodes_updated_since(&self, since_ms: i64) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(&format!(
+        let sql = format!(
             "SELECT {} FROM nodes WHERE updated_at > ?1 ORDER BY updated_at ASC",
             Self::NODE_COLUMNS
-        ))?;
-        let nodes = stmt.query_map(params![since_ms], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![since_ms], Self::row_to_node)?;
+        let nodes = rows.collect::<Result<Vec<_>>>()?;
         Ok(nodes)
     }
 
     /// Get all edges updated after a timestamp (for delta sync).
     pub fn get_edges_updated_since(&self, since_ms: i64) -> Result<Vec<Edge>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(&format!(
+        let sql = format!(
             "SELECT {} FROM edges WHERE updated_at > ?1 ORDER BY updated_at ASC",
             Self::EDGE_COLUMNS
-        ))?;
-        let edges = stmt.query_map(params![since_ms], Self::row_to_edge)?.collect::<Result<Vec<_>>>()?;
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![since_ms], Self::row_to_edge)?;
+        let edges = rows.collect::<Result<Vec<_>>>()?;
         Ok(edges)
     }
 
