@@ -2,6 +2,7 @@ use rusqlite::{Connection, Result, params, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 use super::models::{Node, Edge, NodeType, EdgeType, Position, Tag, Paper};
 
 pub struct Database {
@@ -20,6 +21,50 @@ impl Database {
 
     pub fn get_path(&self) -> String {
         self.path.clone()
+    }
+
+    /// Create a consistent backup of the database using SQLite's backup API.
+    /// Safe to call while the database is open and being written to.
+    pub fn backup_to(&self, dest_path: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let mut dest = Connection::open(dest_path)?;
+        let backup = rusqlite::backup::Backup::new(&conn, &mut dest)?;
+        backup.run_to_completion(5, Duration::from_millis(250), None)?;
+        Ok(())
+    }
+
+    /// Get all nodes updated after a timestamp (for delta sync).
+    pub fn get_nodes_updated_since(&self, since_ms: i64) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE updated_at > ?1 ORDER BY updated_at ASC",
+            Self::NODE_COLUMNS
+        ))?;
+        let nodes = stmt.query_map(params![since_ms], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
+        Ok(nodes)
+    }
+
+    /// Get all edges updated after a timestamp (for delta sync).
+    pub fn get_edges_updated_since(&self, since_ms: i64) -> Result<Vec<Edge>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM edges WHERE updated_at > ?1 ORDER BY updated_at ASC",
+            Self::EDGE_COLUMNS
+        ))?;
+        let edges = stmt.query_map(params![since_ms], Self::row_to_edge)?.collect::<Result<Vec<_>>>()?;
+        Ok(edges)
+    }
+
+    /// Get items deleted after a timestamp (for delta sync).
+    pub fn get_deleted_since(&self, since_ms: i64) -> Result<Vec<(String, i64, Option<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT original_id, deleted_at, deleted_by FROM deleted_items WHERE deleted_at > ?1"
+        )?;
+        let results = stmt.query_map(params![since_ms], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?.collect::<Result<Vec<_>>>()?;
+        Ok(results)
     }
 
     #[allow(dead_code)]
@@ -969,6 +1014,60 @@ impl Database {
         Ok(())
     }
 
+    /// Update specific node fields and mark each as human_edited.
+    /// All work done within a single lock hold (no re-acquisition).
+    pub fn patch_node_fields(&self, id: &str, title: Option<&str>, content: Option<&str>,
+                              tags: Option<&str>, content_type: Option<&str>,
+                              parent_id: Option<&str>, author: Option<&str>) -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let conn = self.conn.lock().unwrap();
+
+        if let Some(t) = title {
+            conn.execute("UPDATE nodes SET title = ?2, updated_at = ?3 WHERE id = ?1", params![id, t, now])?;
+        }
+        if let Some(c) = content {
+            conn.execute("UPDATE nodes SET content = ?2, updated_at = ?3 WHERE id = ?1", params![id, c, now])?;
+        }
+        if let Some(tg) = tags {
+            conn.execute("UPDATE nodes SET tags = ?2, updated_at = ?3 WHERE id = ?1", params![id, tg, now])?;
+        }
+        if let Some(ct) = content_type {
+            conn.execute("UPDATE nodes SET content_type = ?2, updated_at = ?3 WHERE id = ?1", params![id, ct, now])?;
+        }
+        if let Some(p) = parent_id {
+            conn.execute("UPDATE nodes SET parent_id = ?2, updated_at = ?3 WHERE id = ?1", params![id, p, now])?;
+        }
+        if let Some(a) = author {
+            conn.execute("UPDATE nodes SET author = ?2 WHERE id = ?1", params![id, a])?;
+        }
+
+        // Mark human_edited — inline JSON array manipulation within same lock
+        let changed_fields: Vec<&str> = [
+            title.map(|_| "title"), content.map(|_| "content"), tags.map(|_| "tags"),
+            content_type.map(|_| "content_type"), parent_id.map(|_| "parent_id"),
+        ].into_iter().flatten().collect();
+
+        if !changed_fields.is_empty() {
+            let existing: Option<String> = conn.query_row(
+                "SELECT human_edited FROM nodes WHERE id = ?1", params![id], |row| row.get(0),
+            ).optional()?.flatten();
+            let mut fields: Vec<String> = existing
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            for f in changed_fields {
+                if !fields.contains(&f.to_string()) {
+                    fields.push(f.to_string());
+                }
+            }
+            let json = serde_json::to_string(&fields).unwrap();
+            conn.execute(
+                "UPDATE nodes SET human_edited = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, json, now],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Update just the content of a node (simpler API for editing)
     pub fn update_node_content(&self, node_id: &str, content: &str) -> Result<()> {
         {
@@ -994,6 +1093,21 @@ impl Database {
 
     pub fn delete_node(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM nodes WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Delete a node and track the deletion in deleted_items table.
+    /// Also deletes associated edges and clears parent references.
+    pub fn delete_node_tracked(&self, id: &str, deleted_by: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute("DELETE FROM edges WHERE source_id = ?1 OR target_id = ?1", params![id])?;
+        conn.execute("UPDATE nodes SET parent_id = NULL WHERE parent_id = ?1", params![id])?;
+        conn.execute(
+            "INSERT OR REPLACE INTO deleted_items (original_id, deleted_at, deleted_by) VALUES (?1, ?2, ?3)",
+            params![id, now, deleted_by],
+        )?;
         conn.execute("DELETE FROM nodes WHERE id = ?1", params![id])?;
         Ok(())
     }
@@ -1816,6 +1930,43 @@ impl Database {
 
     pub fn delete_edge(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM edges WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Get a single edge by ID
+    pub fn get_edge(&self, id: &str) -> Result<Option<Edge>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM edges WHERE id = ?1", Self::EDGE_COLUMNS
+        ))?;
+        let mut rows = stmt.query(params![id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::row_to_edge(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Update edge fields (reason, type, author). Only provided fields are changed.
+    pub fn update_edge_fields(&self, id: &str, reason: Option<&str>, edge_type: Option<&str>, author: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE edges SET reason = COALESCE(?2, reason), type = COALESCE(?3, type),
+             author = COALESCE(?4, author), updated_at = ?5 WHERE id = ?1",
+            params![id, reason, edge_type, author, now],
+        )?;
+        Ok(())
+    }
+
+    /// Delete an edge and track the deletion in deleted_items table.
+    pub fn delete_edge_tracked(&self, id: &str, deleted_by: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT OR REPLACE INTO deleted_items (original_id, deleted_at, deleted_by) VALUES (?1, ?2, ?3)",
+            params![id, now, deleted_by],
+        )?;
         conn.execute("DELETE FROM edges WHERE id = ?1", params![id])?;
         Ok(())
     }
@@ -3471,6 +3622,13 @@ impl Database {
         let topics: usize = conn.query_row(
             "SELECT COUNT(*) FROM nodes WHERE is_item = 0 AND is_universe = 0 AND depth > 0", [], |r| r.get(0))?;
         Ok((total_nodes, total_items, processed, with_embeddings, unprocessed, unclustered, orphan_items, topics))
+    }
+
+    /// Get total edge count.
+    pub fn get_edge_count(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count: usize = conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
+        Ok(count)
     }
 
     // ==================== Hierarchy Flattening Operations ====================

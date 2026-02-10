@@ -226,6 +226,10 @@ struct Cli {
     #[arg(long, short, global = true)]
     verbose: bool,
 
+    /// Remote server URL (route commands to team server instead of local DB)
+    #[arg(long, global = true)]
+    remote: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -1111,6 +1115,11 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         return Ok(());
     }
 
+    // If --remote is set, route remotable commands through RemoteClient
+    if let Some(remote_url) = cli.remote.clone() {
+        return run_remote(cli, &remote_url).await;
+    }
+
     // Find database
     let db_path = cli.db.map(PathBuf::from).unwrap_or_else(find_database);
 
@@ -1148,6 +1157,170 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Orphans { limit } => handle_orphans(limit, &db, cli.json).await,
         Commands::Tui => run_tui(&db).await,
         Commands::Completions { .. } => unreachable!(),
+    }
+}
+
+/// Route commands through RemoteClient when --remote is set.
+async fn run_remote(cli: Cli, remote_url: &str) -> Result<(), String> {
+    use mycelica_lib::remote_client::{RemoteClient, CreateNodeRequest, CreateEdgeRequest};
+
+    let client = RemoteClient::new(remote_url);
+    let json = cli.json;
+    let author = Some(settings::get_author_or_default());
+
+    match cli.command {
+        Commands::Search { query, limit, .. } => {
+            let nodes = client.search(&query, limit).await?;
+            if json {
+                println!("{}", serde_json::to_string(&nodes).unwrap_or_default());
+            } else {
+                for node in &nodes {
+                    println!("{} {} [{}]",
+                        &node.id[..8.min(node.id.len())],
+                        node.ai_title.as_ref().unwrap_or(&node.title),
+                        node.content_type.as_deref().unwrap_or("?"));
+                }
+                if !json { eprintln!("{} results", nodes.len()); }
+            }
+            Ok(())
+        }
+        Commands::Add { url, note, tag, connects_to } => {
+            let req = CreateNodeRequest {
+                title: note.clone().unwrap_or_else(|| url.clone()),
+                content: Some(format!("{}\n\n{}", url, note.as_deref().unwrap_or(""))),
+                url: Some(url),
+                content_type: Some("reference".to_string()),
+                tags: tag.map(|t| {
+                    let tags: Vec<&str> = t.split(',').map(|s| s.trim()).collect();
+                    serde_json::to_string(&tags).unwrap_or_default()
+                }),
+                author,
+                connects_to,
+            };
+            let resp = client.create_node(&req).await?;
+            if json {
+                println!("{}", serde_json::to_string(&resp.node).unwrap_or_default());
+            } else {
+                println!("Added: {} {}", &resp.node.id[..8], resp.node.title);
+                for edge in &resp.edges_created {
+                    println!("  Linked to: {} {}", &edge.target_id[..8.min(edge.target_id.len())], edge.target_title);
+                }
+                for amb in &resp.ambiguous {
+                    eprintln!("  Ambiguous '{}': {} candidates", amb.term, amb.candidates.len());
+                }
+            }
+            Ok(())
+        }
+        Commands::Ask { question, connects_to } => {
+            let req = CreateNodeRequest {
+                title: question,
+                content: None,
+                url: None,
+                content_type: Some("question".to_string()),
+                tags: None,
+                author,
+                connects_to,
+            };
+            let resp = client.create_node(&req).await?;
+            if json {
+                println!("{}", serde_json::to_string(&resp.node).unwrap_or_default());
+            } else {
+                println!("Asked: {} {}", &resp.node.id[..8], resp.node.title);
+            }
+            Ok(())
+        }
+        Commands::Concept { title, note, connects_to } => {
+            let req = CreateNodeRequest {
+                title,
+                content: note,
+                url: None,
+                content_type: Some("concept".to_string()),
+                tags: None,
+                author,
+                connects_to,
+            };
+            let resp = client.create_node(&req).await?;
+            if json {
+                println!("{}", serde_json::to_string(&resp.node).unwrap_or_default());
+            } else {
+                println!("Concept: {} {}", &resp.node.id[..8], resp.node.title);
+            }
+            Ok(())
+        }
+        Commands::Decide { title, reason, connects_to } => {
+            let req = CreateNodeRequest {
+                title,
+                content: reason,
+                url: None,
+                content_type: Some("decision".to_string()),
+                tags: None,
+                author,
+                connects_to,
+            };
+            let resp = client.create_node(&req).await?;
+            if json {
+                println!("{}", serde_json::to_string(&resp.node).unwrap_or_default());
+            } else {
+                println!("Decision: {} {}", &resp.node.id[..8], resp.node.title);
+            }
+            Ok(())
+        }
+        Commands::Link { source, target, edge_type, reason } => {
+            let req = CreateEdgeRequest {
+                source: source,
+                target: target,
+                edge_type: Some(edge_type),
+                reason,
+                author,
+            };
+            let resp = client.create_edge(&req).await?;
+            if json {
+                println!("{}", serde_json::to_string(&resp).unwrap_or_default());
+            } else {
+                println!("Linked: {} ({}) -> {} ({}) [{}]",
+                    &resp.source_resolved.id[..8.min(resp.source_resolved.id.len())],
+                    resp.source_resolved.title,
+                    &resp.target_resolved.id[..8.min(resp.target_resolved.id.len())],
+                    resp.target_resolved.title,
+                    resp.edge.edge_type.as_str());
+            }
+            Ok(())
+        }
+        Commands::Orphans { limit } => {
+            let nodes = client.get_orphans(limit).await?;
+            if json {
+                println!("{}", serde_json::to_string(&nodes).unwrap_or_default());
+            } else {
+                for node in &nodes {
+                    println!("{} {} [{}]",
+                        &node.id[..8.min(node.id.len())],
+                        node.ai_title.as_ref().unwrap_or(&node.title),
+                        node.content_type.as_deref().unwrap_or("?"));
+                }
+                eprintln!("{} orphans", nodes.len());
+            }
+            Ok(())
+        }
+        Commands::Recent { cmd } => {
+            match cmd {
+                RecentCommands::List { limit, .. } => {
+                    let nodes = client.get_recent(limit as u32).await?;
+                    if json {
+                        println!("{}", serde_json::to_string(&nodes).unwrap_or_default());
+                    } else {
+                        for node in &nodes {
+                            println!("{} {} [{}]",
+                                &node.id[..8.min(node.id.len())],
+                                node.ai_title.as_ref().unwrap_or(&node.title),
+                                node.content_type.as_deref().unwrap_or("?"));
+                        }
+                    }
+                    Ok(())
+                }
+                _ => Err("This recent subcommand is not available in remote mode".to_string()),
+            }
+        }
+        _ => Err(format!("This command is not available in remote mode. Run without --remote for local operations.")),
     }
 }
 
@@ -5518,6 +5691,7 @@ async fn handle_search(query: &str, type_filter: &str, author_filter: Option<Str
 // ============================================================================
 
 /// Create a node with proper sovereignty fields set. Returns the new node ID.
+/// Delegates to team::create_human_node with CLI-specific defaults.
 fn create_human_node(
     db: &Database,
     title: &str,
@@ -5526,121 +5700,28 @@ fn create_human_node(
     content_type: &str,
     tags_json: Option<&str>,
 ) -> Result<String, String> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = Utc::now().timestamp_millis();
     let author = settings::get_author_or_default();
-
-    let node = Node {
-        id: id.clone(),
-        node_type: NodeType::Thought,
-        title: title.to_string(),
-        url: url.map(|s| s.to_string()),
-        content: content.map(|s| s.to_string()),
-        position: mycelica_lib::db::Position { x: 0.0, y: 0.0 },
-        created_at: now,
-        updated_at: now,
-        cluster_id: None,
-        cluster_label: None,
-        depth: 0,
-        is_item: true,
-        is_universe: false,
-        parent_id: None,
-        child_count: 0,
-        ai_title: None,
-        summary: None,
-        tags: tags_json.map(|s| s.to_string()),
-        emoji: None,
-        is_processed: false,
-        conversation_id: None,
-        sequence_index: None,
-        is_pinned: false,
-        last_accessed_at: Some(now),
-        latest_child_date: None,
-        is_private: None,
-        privacy_reason: None,
-        privacy: None,
-        source: Some("cli".to_string()),
-        pdf_available: None,
-        content_type: Some(content_type.to_string()),
-        associated_idea_id: None,
-        human_edited: None,
-        human_created: true,
-        author: Some(author),
-    };
-
-    db.insert_node(&node).map_err(|e| e.to_string())?;
-
-    // Generate embedding so node is immediately searchable
-    let embed_text = format!("{}\n{}", title, content.unwrap_or(""));
-    let embed_text = &embed_text[..embed_text.len().min(2000)];
-    match mycelica_lib::local_embeddings::generate(embed_text) {
-        Ok(embedding) => {
-            db.update_node_embedding(&id, &embedding).ok();
-        }
-        Err(e) => {
-            eprintln!("Warning: failed to generate embedding: {}", e);
-        }
-    }
-
-    Ok(id)
+    mycelica_lib::team::create_human_node(db, title, content, url, content_type, tags_json, &author, "cli")
 }
 
 /// Resolve a node reference (UUID, ID prefix, or title text).
+/// Wraps team::resolve_node with CLI-friendly error formatting.
 fn resolve_node(db: &Database, reference: &str) -> Result<Node, String> {
-    // Try exact ID match
-    if let Ok(Some(node)) = db.get_node(reference) {
-        return Ok(node);
-    }
-
-    // Try ID prefix match (looks like hex/uuid chars)
-    if reference.len() >= 6 && reference.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
-        if let Ok(matches) = db.search_nodes_by_id_prefix(reference, 10) {
-            match matches.len() {
-                1 => return Ok(matches.into_iter().next().unwrap()),
-                n if n > 1 => {
-                    let names: Vec<String> = matches.iter().map(|n| {
-                        format!("  {} {}", &n.id[..8], n.ai_title.as_ref().unwrap_or(&n.title))
-                    }).collect();
-                    return Err(format!("Ambiguous ID prefix '{}'. {} matches:\n{}", reference, matches.len(), names.join("\n")));
-                }
-                _ => {}
-            }
+    use mycelica_lib::team::ResolveResult;
+    match mycelica_lib::team::resolve_node(db, reference) {
+        ResolveResult::Found(node) => Ok(node),
+        ResolveResult::Ambiguous(candidates) => {
+            let names: Vec<String> = candidates.iter().map(|c| {
+                format!("  {} {}", &c.id[..8.min(c.id.len())], c.title)
+            }).collect();
+            Err(format!("Ambiguous reference '{}'. {} matches:\n{}\nUse a node ID instead.", reference, candidates.len(), names.join("\n")))
         }
+        ResolveResult::NotFound(msg) => Err(msg),
     }
-
-    // Try FTS search
-    if let Ok(fts_results) = db.search_nodes(reference) {
-        let items: Vec<_> = fts_results.into_iter().filter(|n| n.is_item).collect();
-        match items.len() {
-            1 => return Ok(items.into_iter().next().unwrap()),
-            n if n > 1 => {
-                let names: Vec<String> = items.iter().take(10).map(|n| {
-                    format!("  {} {}", &n.id[..8], n.ai_title.as_ref().unwrap_or(&n.title))
-                }).collect();
-                return Err(format!("Ambiguous term '{}'. {} matches:\n{}\nUse a node ID instead.", reference, items.len(), names.join("\n")));
-            }
-            _ => {}
-        }
-    }
-
-    // Fallback: title substring LIKE
-    if let Ok(substr_results) = db.search_nodes_by_title_substring(reference, 10) {
-        match substr_results.len() {
-            1 => return Ok(substr_results.into_iter().next().unwrap()),
-            n if n > 1 => {
-                let names: Vec<String> = substr_results.iter().map(|n| {
-                    format!("  {} {}", &n.id[..8], n.ai_title.as_ref().unwrap_or(&n.title))
-                }).collect();
-                return Err(format!("Ambiguous term '{}'. {} matches:\n{}\nUse a node ID instead.", reference, substr_results.len(), names.join("\n")));
-            }
-            _ => {}
-        }
-    }
-
-    Err(format!("No node found matching '{}'", reference))
 }
 
 /// Process --connects-to terms: search for each, create Related edges.
+/// Wraps team::create_connects_to_edges with CLI output formatting.
 fn handle_connects_to(
     db: &Database,
     source_node_id: &str,
@@ -5648,35 +5729,25 @@ fn handle_connects_to(
     json: bool,
 ) -> Result<(), String> {
     let author = settings::get_author_or_default();
-    let now = Utc::now().timestamp_millis();
-
-    for term in terms {
-        match resolve_node(db, term) {
-            Ok(target) => {
-                let edge_id = uuid::Uuid::new_v4().to_string();
-                let edge = Edge {
-                    id: edge_id,
-                    source: source_node_id.to_string(),
-                    target: target.id.clone(),
-                    edge_type: EdgeType::Related,
-                    label: None,
-                    weight: Some(1.0),
-                    edge_source: Some("user".to_string()),
-                    evidence_id: None,
-                    confidence: Some(1.0),
-                    created_at: now,
-                    updated_at: Some(now),
-                    author: Some(author.clone()),
-                    reason: Some(format!("Connected via --connects-to '{}'", term)),
-                };
-                db.insert_edge(&edge).map_err(|e| e.to_string())?;
+    let results = mycelica_lib::team::create_connects_to_edges(db, source_node_id, terms, &author);
+    for result in results {
+        match result {
+            mycelica_lib::team::ConnectResult::Linked { target, .. } => {
                 if !json {
-                    println!("  Linked to: {} {}", &target.id[..8], target.ai_title.as_ref().unwrap_or(&target.title));
+                    println!("  Linked to: {} {}", &target.id[..8.min(target.id.len())], target.title);
                 }
             }
-            Err(e) => {
+            mycelica_lib::team::ConnectResult::Ambiguous { term, candidates } => {
                 if !json {
-                    eprintln!("  Warning ({}): {}", term, e);
+                    let names: Vec<String> = candidates.iter().map(|c| {
+                        format!("    {} {}", &c.id[..8.min(c.id.len())], c.title)
+                    }).collect();
+                    eprintln!("  Warning ({}): Ambiguous, {} matches:\n{}", term, candidates.len(), names.join("\n"));
+                }
+            }
+            mycelica_lib::team::ConnectResult::NotFound { term } => {
+                if !json {
+                    eprintln!("  Warning: no node found for '{}'", term);
                 }
             }
         }

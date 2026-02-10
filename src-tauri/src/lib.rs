@@ -17,6 +17,7 @@ pub mod code;
 mod holerabbit;
 pub mod dendrogram;
 pub mod remote_client;
+pub mod team;
 
 use commands::{
     AppState,
