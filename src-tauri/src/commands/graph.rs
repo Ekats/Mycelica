@@ -1636,9 +1636,6 @@ pub fn get_similar_nodes(
             }
 
             if let Ok(Some(node)) = db.get_node(&related_id) {
-                if !node.is_item {
-                    continue;
-                }
                 seen_ids.insert(related_id.clone());
                 results.push(SimilarNode {
                     id: node.id,
@@ -1653,16 +1650,12 @@ pub fn get_similar_nodes(
     }
     drop(db);
 
-    // Then add embedding-based similar nodes
+    // Then add embedding-based similar nodes (includes both items and categories)
     for (id, sim_score) in similar {
         if seen_ids.contains(&id) {
             continue; // Skip if already added via edge
         }
         if let Ok(Some(node)) = state.db.read().map_err(|e| format!("DB lock error: {}", e))?.get_node(&id) {
-            // Skip non-item nodes (categories, clusters) - they shouldn't open in leaf view
-            if !node.is_item {
-                continue;
-            }
             results.push(SimilarNode {
                 id: node.id,
                 title: node.ai_title.unwrap_or(node.title),

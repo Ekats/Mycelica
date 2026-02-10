@@ -12,6 +12,7 @@ releases/
 # ===================
 data/
 archive/
+binaries/
 docs/private/
 docs/implementation/
 *.db
