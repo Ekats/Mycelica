@@ -123,8 +123,9 @@ fn build_edge_graph_bulk(
     // Convert to Vec<&str> for the DB method
     let ids_vec: Vec<&str> = node_ids.iter().map(|s| s.as_str()).collect();
 
-    // Bulk fetch all edges involving these nodes
-    let edges = db.get_edges_for_nodes_bulk(&ids_vec).map_err(|e| e.to_string())?;
+    // Bulk fetch semantic edges only (allowlist: related, belongs_to, sibling, reference, because, contains)
+    // Excludes structural, navigational, and epistemic team edges that would pollute clustering
+    let edges = db.get_semantic_edges_for_nodes_bulk(&ids_vec).map_err(|e| e.to_string())?;
 
     // Build graph - only include edges where BOTH endpoints are in our set
     let mut graph: EdgeGraph = HashMap::new();
@@ -285,6 +286,9 @@ pub fn create_category_edges_from_cross_counts(
                 evidence_id: None,
                 confidence: None,
                 created_at: now,
+                updated_at: Some(now),
+                author: None,
+                reason: None,
             }).map_err(|e| e.to_string())?;
 
             created += 1;
@@ -416,6 +420,9 @@ async fn split_leaf_category_by_connectivity(
             content_type: None,
             associated_idea_id: None,
             privacy: None,
+            human_edited: None,
+            human_created: false,
+            author: None,
         }).map_err(|e| e.to_string())?;
 
         // Move papers into new subcategory
@@ -884,6 +891,9 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
             content_type: None,
             associated_idea_id: None,
             privacy: None,
+            human_edited: None,
+            human_created: false,
+            author: None,
         };
 
         db.insert_node(&topic_node).map_err(|e| e.to_string())?;
@@ -963,6 +973,9 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
             content_type: None,
             associated_idea_id: None,
             privacy: Some(0.0), // Category is private since it contains private items
+            human_edited: None,
+            human_created: false,
+            author: None,
         };
 
         db.insert_node(&personal_node).map_err(|e| e.to_string())?;
@@ -1023,6 +1036,9 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
             content_type: None,
             associated_idea_id: None,
             privacy: Some(0.5), // Notes are semi-private by default
+            human_edited: None,
+            human_created: false,
+            author: None,
         };
 
         db.insert_node(&notes_node).map_err(|e| e.to_string())?;
@@ -1076,6 +1092,9 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
             content_type: None,
             associated_idea_id: None,
             privacy: Some(0.5),
+            human_edited: None,
+            human_created: false,
+            author: None,
         };
 
         db.insert_node(&holerabbit_node).map_err(|e| e.to_string())?;
@@ -1172,6 +1191,9 @@ fn ensure_import_containers_exist(
             content_type: Some("import-container".to_string()),
             associated_idea_id: None,
             privacy: Some(1.0),
+            human_edited: None,
+            human_created: false,
+            author: None,
         };
 
         db.insert_node(&node).map_err(|e| e.to_string())?;
@@ -1246,6 +1268,9 @@ fn create_universe(db: &Database, child_ids: &[String]) -> Result<String, String
         content_type: None,
         associated_idea_id: None,
         privacy: None,
+        human_edited: None,
+        human_created: false,
+        author: None,
     };
 
     db.insert_node(&universe_node).map_err(|e| e.to_string())?;

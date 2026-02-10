@@ -58,6 +58,12 @@ pub enum EdgeType {
     SessionItem, // session -> web page (belongs to session)
     // Category relationships
     Sibling,     // category -> category (sibling relationship based on paper cross-edges)
+    // Team mode epistemic edges
+    Prerequisite,  // A must be understood before B
+    Contradicts,   // A contradicts B (tension edge)
+    Supports,      // A provides evidence for B
+    EvolvedFrom,   // B is a refined version of A
+    Questions,     // A raises a question about B
 }
 
 impl EdgeType {
@@ -79,6 +85,11 @@ impl EdgeType {
             EdgeType::Backtracked => "backtracked",
             EdgeType::SessionItem => "session_item",
             EdgeType::Sibling => "sibling",
+            EdgeType::Prerequisite => "prerequisite",
+            EdgeType::Contradicts => "contradicts",
+            EdgeType::Supports => "supports",
+            EdgeType::EvolvedFrom => "evolved_from",
+            EdgeType::Questions => "questions",
         }
     }
 
@@ -100,6 +111,11 @@ impl EdgeType {
             "backtracked" => Some(EdgeType::Backtracked),
             "session_item" => Some(EdgeType::SessionItem),
             "sibling" => Some(EdgeType::Sibling),
+            "prerequisite" => Some(EdgeType::Prerequisite),
+            "contradicts" => Some(EdgeType::Contradicts),
+            "supports" => Some(EdgeType::Supports),
+            "evolved_from" => Some(EdgeType::EvolvedFrom),
+            "questions" => Some(EdgeType::Questions),
             _ => None,
         }
     }
@@ -186,6 +202,14 @@ pub struct Node {
 
     // Privacy scoring (continuous scale)
     pub privacy: Option<f64>,             // 0.0 = private, 1.0 = public, NULL = unscored
+
+    // Sovereignty tracking (team mode)
+    /// JSON array of field names manually edited, e.g. '["title","parent_id"]'. NULL = never edited.
+    #[serde(rename = "humanEdited")]
+    pub human_edited: Option<String>,
+    #[serde(rename = "humanCreated")]
+    pub human_created: bool,              // 1 = manually created by human, never deleted by rebuild
+    pub author: Option<String>,           // Who created/last edited this node
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,6 +234,12 @@ pub struct Edge {
     pub confidence: Option<f64>,      // How certain we are (0.0-1.0), distinct from weight
     #[serde(rename = "createdAt")]
     pub created_at: i64,
+
+    // Team mode fields
+    #[serde(rename = "updatedAt")]
+    pub updated_at: Option<i64>,
+    pub author: Option<String>,
+    pub reason: Option<String>,            // Why this edge exists (provenance)
 }
 
 /// Persistent tag for guiding clustering across rebuilds

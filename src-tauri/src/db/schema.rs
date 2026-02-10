@@ -69,7 +69,11 @@ impl Database {
                 -- Hierarchy date propagation
                 latest_child_date INTEGER,  -- MAX(children's created_at), bubbled up
                 -- Import source tracking
-                source TEXT  -- e.g. claude, googlekeep, markdown
+                source TEXT,  -- e.g. claude, googlekeep, markdown
+                -- Sovereignty tracking (team mode)
+                human_edited TEXT,
+                human_created INTEGER NOT NULL DEFAULT 0,
+                author TEXT
             );
 
             -- Learned emoji mappings from AI
@@ -89,7 +93,11 @@ impl Database {
                 edge_source TEXT,  -- 'ai', 'user', or NULL for legacy - tracks origin for re-clustering
                 evidence_id TEXT,  -- References nodes(id), explains edge reasoning
                 confidence REAL,   -- Certainty about this edge (0.0-1.0)
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                -- Team mode fields
+                updated_at INTEGER,          -- Last modification timestamp (millis)
+                author TEXT,                 -- Who created this edge
+                reason TEXT                  -- Why this edge exists (provenance)
             );
 
             -- Persistent tags for guiding clustering across rebuilds
@@ -532,6 +540,73 @@ impl Database {
             eprintln!("Migration: Added PDF extraction columns (extracted_abstract, extracted_conclusion, extraction_status, pdf_source) to papers");
         }
 
+        // Migration: Add sovereignty tracking columns to nodes (team mode)
+        let has_human_edited: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('nodes') WHERE name = 'human_edited'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !has_human_edited {
+            conn.execute("ALTER TABLE nodes ADD COLUMN human_edited TEXT", [])?;
+            conn.execute("ALTER TABLE nodes ADD COLUMN human_created INTEGER NOT NULL DEFAULT 0", [])?;
+            conn.execute("ALTER TABLE nodes ADD COLUMN author TEXT", [])?;
+            eprintln!("Migration: Added sovereignty columns (human_edited, human_created, author) to nodes");
+        }
+
+        // Migration: Add team mode columns to edges
+        let has_edge_updated_at: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('edges') WHERE name = 'updated_at'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !has_edge_updated_at {
+            conn.execute("ALTER TABLE edges ADD COLUMN updated_at INTEGER", [])?;
+            conn.execute("ALTER TABLE edges ADD COLUMN author TEXT", [])?;
+            conn.execute("ALTER TABLE edges ADD COLUMN reason TEXT", [])?;
+            // Backfill updated_at from created_at
+            conn.execute("UPDATE edges SET updated_at = created_at WHERE updated_at IS NULL", [])?;
+            eprintln!("Migration: Added team mode columns (updated_at, author, reason) to edges");
+        }
+
+        // Migration: Create deleted_items table for tracking manual deletions
+        conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS deleted_items (
+                original_id TEXT PRIMARY KEY,
+                deleted_at INTEGER,
+                deleted_by TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS merged_items (
+                original_id TEXT PRIMARY KEY,
+                merged_into_id TEXT NOT NULL,
+                merged_at INTEGER,
+                merged_by TEXT
+            );
+        ")?;
+
+        // Migration: Add updated_at triggers (INTEGER millis, not datetime)
+        conn.execute_batch("
+            CREATE TRIGGER IF NOT EXISTS nodes_updated_at_trigger
+            AFTER UPDATE ON nodes
+            FOR EACH ROW
+            WHEN NEW.updated_at = OLD.updated_at OR NEW.updated_at IS NULL
+            BEGIN
+                UPDATE nodes SET updated_at = CAST(strftime('%s','now') AS INTEGER) * 1000
+                WHERE id = NEW.id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS edges_updated_at_trigger
+            AFTER UPDATE ON edges
+            FOR EACH ROW
+            WHEN NEW.updated_at = OLD.updated_at OR NEW.updated_at IS NULL
+            BEGIN
+                UPDATE edges SET updated_at = CAST(strftime('%s','now') AS INTEGER) * 1000
+                WHERE id = NEW.id;
+            END;
+        ")?;
+
         // Create indexes for dynamic hierarchy columns (after migrations ensure columns exist)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_depth ON nodes(depth)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_is_item ON nodes(is_item)", [])?;
@@ -548,6 +623,9 @@ impl Database {
         conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_view ON edges(source_parent_id, target_parent_id)", [])?;
         // Index for paper deduplication by content hash
         conn.execute("CREATE INDEX IF NOT EXISTS idx_papers_content_hash ON papers(content_hash)", [])?;
+        // Indexes for team mode delta sync
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_updated_at ON nodes(updated_at)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_updated_at ON edges(updated_at)", [])?;
 
         // Rebuild FTS index to fix any corruption from interrupted writes (e.g., HMR during dev)
         // This is safe to run on every startup - it rebuilds from the content table
@@ -558,12 +636,73 @@ impl Database {
         Ok(())
     }
 
-    // Node operations
+    // === Sovereignty helpers ===
+
+    /// Check if a specific field was human-edited (JSON array check).
+    /// human_edited stores '["title","parent_id"]' or NULL.
+    pub fn is_field_human_edited(&self, node_id: &str, field: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let human_edited: Option<String> = conn.query_row(
+            "SELECT human_edited FROM nodes WHERE id = ?1",
+            params![node_id],
+            |row| row.get(0),
+        ).optional()?.flatten();
+        Ok(human_edited
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .map(|fields| fields.contains(&field.to_string()))
+            .unwrap_or(false))
+    }
+
+    /// Check if node has ANY human edits (human_edited is non-NULL).
+    pub fn has_human_edits(&self, node_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let human_edited: Option<String> = conn.query_row(
+            "SELECT human_edited FROM nodes WHERE id = ?1",
+            params![node_id],
+            |row| row.get(0),
+        ).optional()?.flatten();
+        Ok(human_edited.is_some())
+    }
+
+    /// Check if a node is human-created (deletion protection).
+    pub fn is_human_created(&self, node_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let result: Option<i32> = conn.query_row(
+            "SELECT human_created FROM nodes WHERE id = ?1",
+            params![node_id],
+            |row| row.get(0),
+        ).optional()?;
+        Ok(result.unwrap_or(0) != 0)
+    }
+
+    /// Mark a field as human-edited (merges into existing JSON array).
+    pub fn mark_field_human_edited(&self, node_id: &str, field: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn.query_row(
+            "SELECT human_edited FROM nodes WHERE id = ?1",
+            params![node_id],
+            |row| row.get(0),
+        ).optional()?.flatten();
+        let mut fields: Vec<String> = existing
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        if !fields.contains(&field.to_string()) {
+            fields.push(field.to_string());
+        }
+        let json = serde_json::to_string(&fields).unwrap();
+        conn.execute(
+            "UPDATE nodes SET human_edited = ?2, updated_at = ?3 WHERE id = ?1",
+            params![node_id, json, chrono::Utc::now().timestamp_millis()],
+        )?;
+        Ok(())
+    }
+
+    // === Node operations ===
     pub fn insert_node(&self, node: &Node) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO nodes (id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, source, pdf_available, content_type, associated_idea_id, privacy)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
+            "INSERT INTO nodes (id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, source, pdf_available, content_type, associated_idea_id, privacy, human_edited, human_created, author)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)",
             params![
                 node.id,
                 node.node_type.as_str(),
@@ -595,6 +734,9 @@ impl Database {
                 node.content_type,
                 node.associated_idea_id,
                 node.privacy,
+                node.human_edited,
+                node.human_created,
+                node.author,
             ],
         )?;
         Ok(())
@@ -758,11 +900,14 @@ impl Database {
             content_type: row.get(30)?,
             associated_idea_id: row.get(31)?,
             privacy: row.get(32)?,
+            human_edited: row.get(33)?,
+            human_created: row.get::<_, i32>(34).unwrap_or(0) != 0,
+            author: row.get(35)?,
         })
     }
 
     /// Standard SELECT columns for nodes (excludes embedding - use dedicated functions)
-    const NODE_COLUMNS: &'static str = "id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date, is_private, privacy_reason, source, pdf_available, content_type, associated_idea_id, privacy";
+    const NODE_COLUMNS: &'static str = "id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date, is_private, privacy_reason, source, pdf_available, content_type, associated_idea_id, privacy, human_edited, human_created, author";
 
     /// Get all nodes for graph view - no content_type filtering
     /// All nodes are always shown; filtering is handled by frontend if needed
@@ -786,7 +931,8 @@ impl Database {
              ai_title = ?11, summary = ?12, tags = ?13, emoji = ?14, is_processed = ?15,
              depth = ?16, is_item = ?17, is_universe = ?18, parent_id = ?19, child_count = ?20,
              conversation_id = ?21, sequence_index = ?22, is_pinned = ?23, last_accessed_at = ?24,
-             content_type = ?25, associated_idea_id = ?26, privacy = ?27 WHERE id = ?1",
+             content_type = ?25, associated_idea_id = ?26, privacy = ?27,
+             human_edited = ?28, human_created = ?29, author = ?30 WHERE id = ?1",
             params![
                 node.id,
                 node.node_type.as_str(),
@@ -815,6 +961,9 @@ impl Database {
                 node.content_type,
                 node.associated_idea_id,
                 node.privacy,
+                node.human_edited,
+                node.human_created,
+                node.author,
             ],
         )?;
         Ok(())
@@ -822,11 +971,14 @@ impl Database {
 
     /// Update just the content of a node (simpler API for editing)
     pub fn update_node_content(&self, node_id: &str, content: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE nodes SET content = ?2, updated_at = ?3 WHERE id = ?1",
-            params![node_id, content, chrono::Utc::now().timestamp_millis()],
-        )?;
+        {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE nodes SET content = ?2, updated_at = ?3 WHERE id = ?1",
+                params![node_id, content, chrono::Utc::now().timestamp_millis()],
+            )?;
+        }
+        self.mark_field_human_edited(node_id, "content")?;
         Ok(())
     }
 
@@ -852,8 +1004,9 @@ impl Database {
         let conn = self.conn.lock().unwrap();
 
         // First get IDs to delete (needed for edge cleanup)
+        // Sovereignty: protect human-created/edited nodes
         let mut stmt = conn.prepare(
-            "SELECT id FROM nodes WHERE JSON_EXTRACT(tags, '$.file_path') = ?1"
+            "SELECT id FROM nodes WHERE JSON_EXTRACT(tags, '$.file_path') = ?1 AND human_created = 0 AND human_edited IS NULL"
         )?;
         let ids: Vec<String> = stmt.query_map([file_path], |row| row.get(0))?
             .filter_map(|r| r.ok())
@@ -865,8 +1018,9 @@ impl Database {
         }
 
         // Delete the nodes
+        // Sovereignty: protect human-created/edited nodes
         let deleted = conn.execute(
-            "DELETE FROM nodes WHERE JSON_EXTRACT(tags, '$.file_path') = ?1",
+            "DELETE FROM nodes WHERE JSON_EXTRACT(tags, '$.file_path') = ?1 AND human_created = 0 AND human_edited IS NULL",
             params![file_path],
         )?;
 
@@ -888,8 +1042,9 @@ impl Database {
     /// Delete edges by source and edge type
     pub fn delete_edges_by_source_and_type(&self, source_id: &str, edge_type: &str) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
+        // Sovereignty: preserve user-created edges
         let deleted = conn.execute(
-            "DELETE FROM edges WHERE source_id = ?1 AND type = ?2",
+            "DELETE FROM edges WHERE source_id = ?1 AND type = ?2 AND (edge_source = 'ai' OR edge_source IS NULL)",
             params![source_id, edge_type],
         )?;
         Ok(deleted)
@@ -898,8 +1053,9 @@ impl Database {
     /// Delete all edges of a specific type
     pub fn delete_edges_by_type(&self, edge_type: &str) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
+        // Sovereignty: preserve user-created edges
         let deleted = conn.execute(
-            "DELETE FROM edges WHERE type = ?1",
+            "DELETE FROM edges WHERE type = ?1 AND (edge_source = 'ai' OR edge_source IS NULL)",
             params![edge_type],
         )?;
         Ok(deleted)
@@ -922,7 +1078,7 @@ impl Database {
     pub fn update_privacy_score(&self, node_id: &str, privacy: f64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE nodes SET privacy = ?2 WHERE id = ?1",
+            "UPDATE nodes SET privacy = ?2 WHERE id = ?1 AND is_private IS NULL",
             params![node_id, privacy],
         )?;
         Ok(())
@@ -1202,8 +1358,8 @@ impl Database {
     pub fn insert_edge(&self, edge: &Edge) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO edges (id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO edges (id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at, updated_at, author, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 edge.id,
                 edge.source,
@@ -1215,6 +1371,9 @@ impl Database {
                 edge.evidence_id,
                 edge.confidence,
                 edge.created_at,
+                edge.updated_at,
+                edge.author,
+                edge.reason,
             ],
         )?;
         Ok(())
@@ -1231,8 +1390,8 @@ impl Database {
 
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT OR IGNORE INTO edges (id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+                "INSERT OR IGNORE INTO edges (id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at, updated_at, author, reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
             )?;
 
             for edge in edges {
@@ -1247,6 +1406,9 @@ impl Database {
                     &edge.evidence_id,
                     &edge.confidence,
                     &edge.created_at,
+                    &edge.updated_at,
+                    &edge.author,
+                    &edge.reason,
                 ])?;
             }
         }
@@ -1255,26 +1417,33 @@ impl Database {
         Ok(edges.len())
     }
 
+    const EDGE_COLUMNS: &'static str = "id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at, updated_at, author, reason";
+
+    fn row_to_edge(row: &rusqlite::Row) -> Result<Edge> {
+        Ok(Edge {
+            id: row.get(0)?,
+            source: row.get(1)?,
+            target: row.get(2)?,
+            edge_type: EdgeType::from_str(&row.get::<_, String>(3)?).unwrap_or(EdgeType::Related),
+            label: row.get(4)?,
+            weight: row.get(5)?,
+            edge_source: row.get(6)?,
+            evidence_id: row.get(7)?,
+            confidence: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
+            author: row.get(11)?,
+            reason: row.get(12)?,
+        })
+    }
+
     pub fn get_all_edges(&self) -> Result<Vec<Edge>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at FROM edges"
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM edges", Self::EDGE_COLUMNS
+        ))?;
 
-        let edges = stmt.query_map([], |row| {
-            Ok(Edge {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                target: row.get(2)?,
-                edge_type: EdgeType::from_str(&row.get::<_, String>(3)?).unwrap_or(EdgeType::Related),
-                label: row.get(4)?,
-                weight: row.get(5)?,
-                edge_source: row.get(6)?,
-                evidence_id: row.get(7)?,
-                confidence: row.get(8)?,
-                created_at: row.get(9)?,
-            })
-        })?.collect::<Result<Vec<_>>>()?;
+        let edges = stmt.query_map([], Self::row_to_edge)?.collect::<Result<Vec<_>>>()?;
 
         Ok(edges)
     }
@@ -1307,25 +1476,12 @@ impl Database {
 
     pub fn get_edges_for_node(&self, node_id: &str) -> Result<Vec<Edge>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at
-             FROM edges WHERE source_id = ?1 OR target_id = ?1"
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM edges WHERE source_id = ?1 OR target_id = ?1",
+            Self::EDGE_COLUMNS
+        ))?;
 
-        let edges = stmt.query_map(params![node_id], |row| {
-            Ok(Edge {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                target: row.get(2)?,
-                edge_type: EdgeType::from_str(&row.get::<_, String>(3)?).unwrap_or(EdgeType::Related),
-                label: row.get(4)?,
-                weight: row.get(5)?,
-                edge_source: row.get(6)?,
-                evidence_id: row.get(7)?,
-                confidence: row.get(8)?,
-                created_at: row.get(9)?,
-            })
-        })?.collect::<Result<Vec<_>>>()?;
+        let edges = stmt.query_map(params![node_id], Self::row_to_edge)?.collect::<Result<Vec<_>>>()?;
 
         Ok(edges)
     }
@@ -1353,6 +1509,47 @@ impl Database {
         let mut stmt = conn.prepare(&query)?;
 
         // Build params (need to bind twice for both IN clauses)
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        for id in node_ids {
+            params.push(id);
+        }
+        for id in node_ids {
+            params.push(id);
+        }
+
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<f64>>(2)?.unwrap_or(1.0),
+            ))
+        })?;
+
+        rows.collect()
+    }
+
+    /// Get edges for hierarchy building — ALLOWLIST of semantic edge types only.
+    /// Excludes structural (calls, defined_in, etc.), navigational (clicked, backtracked),
+    /// and epistemic team edges (contradicts, supports, etc.) which would pollute clustering.
+    pub fn get_semantic_edges_for_nodes_bulk(&self, node_ids: &[&str]) -> Result<Vec<(String, String, f64)>> {
+        if node_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let conn = self.conn.lock().unwrap();
+
+        let placeholders: Vec<&str> = node_ids.iter().map(|_| "?").collect();
+        let in_clause = placeholders.join(",");
+
+        let query = format!(
+            "SELECT source_id, target_id, weight FROM edges
+             WHERE (source_id IN ({}) OR target_id IN ({}))
+             AND type IN ('related', 'belongs_to', 'sibling', 'reference', 'because', 'contains')",
+            in_clause, in_clause
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+
         let mut params: Vec<&dyn rusqlite::ToSql> = Vec::new();
         for id in node_ids {
             params.push(id);
@@ -1408,9 +1605,9 @@ impl Database {
             return Ok(HashMap::new());
         }
 
-        // Step 3: Get all edges involving these papers
+        // Step 3: Get semantic edges only (filtered for hierarchy)
         let all_paper_ids: Vec<&str> = paper_to_topic.keys().map(|s| s.as_str()).collect();
-        let edges = self.get_edges_for_nodes_bulk(&all_paper_ids)?;
+        let edges = self.get_semantic_edges_for_nodes_bulk(&all_paper_ids)?;
 
         // Step 4: Count cross-edges between topic pairs
         let mut cross_edge_counts: HashMap<(String, String), usize> = HashMap::new();
@@ -1476,6 +1673,7 @@ impl Database {
                AND n1.parent_id != n2.parent_id
                AND EXISTS (SELECT 1 FROM nodes p1 WHERE p1.id = n1.parent_id AND p1.parent_id = ?1)
                AND EXISTS (SELECT 1 FROM nodes p2 WHERE p2.id = n2.parent_id AND p2.parent_id = ?1)
+               AND e.type IN ('related', 'belongs_to', 'sibling', 'reference', 'because', 'contains')
              GROUP BY n1.parent_id, n2.parent_id
              HAVING COUNT(*) >= 1"
         )?;
@@ -1650,24 +1848,11 @@ impl Database {
     /// Get edges from a source with specific type
     pub fn get_edges_by_source_and_type(&self, source_id: &str, edge_type: &str) -> Result<Vec<Edge>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at
-             FROM edges WHERE source_id = ?1 AND type = ?2"
-        )?;
-        let edges = stmt.query_map(params![source_id, edge_type], |row| {
-            Ok(Edge {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                target: row.get(2)?,
-                edge_type: EdgeType::from_str(&row.get::<_, String>(3)?).unwrap_or(EdgeType::Related),
-                label: row.get(4)?,
-                weight: row.get(5)?,
-                edge_source: row.get(6)?,
-                evidence_id: row.get(7)?,
-                confidence: row.get(8)?,
-                created_at: row.get(9)?,
-            })
-        })?.collect::<Result<Vec<_>>>()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM edges WHERE source_id = ?1 AND type = ?2",
+            Self::EDGE_COLUMNS
+        ))?;
+        let edges = stmt.query_map(params![source_id, edge_type], Self::row_to_edge)?.collect::<Result<Vec<_>>>()?;
         Ok(edges)
     }
 
@@ -1683,11 +1868,14 @@ impl Database {
 
     /// Update node title
     pub fn update_node_title(&self, node_id: &str, title: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE nodes SET title = ?2 WHERE id = ?1",
-            params![node_id, title],
-        )?;
+        {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE nodes SET title = ?2 WHERE id = ?1",
+                params![node_id, title],
+            )?;
+        }
+        self.mark_field_human_edited(node_id, "title")?;
         Ok(())
     }
 
@@ -1712,27 +1900,12 @@ impl Database {
     /// Uses indexed lookup on (source_parent_id, target_parent_id) for O(1) performance
     pub fn get_edges_for_view(&self, parent_id: &str) -> Result<Vec<Edge>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, source_id, target_id, type, label, weight,
-                    edge_source, evidence_id, confidence, created_at
-             FROM edges
-             WHERE source_parent_id = ?1 AND target_parent_id = ?1"
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM edges WHERE source_parent_id = ?1 AND target_parent_id = ?1",
+            Self::EDGE_COLUMNS
+        ))?;
 
-        let edges = stmt.query_map([parent_id], |row| {
-            Ok(Edge {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                target: row.get(2)?,
-                edge_type: EdgeType::from_str(&row.get::<_, String>(3)?).unwrap_or(EdgeType::Related),
-                label: row.get(4)?,
-                weight: row.get(5)?,
-                edge_source: row.get(6)?,
-                evidence_id: row.get(7)?,
-                confidence: row.get(8)?,
-                created_at: row.get(9)?,
-            })
-        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let edges = stmt.query_map([parent_id], Self::row_to_edge)?.collect::<std::result::Result<Vec<_>, _>>()?;
 
         Ok(edges)
     }
@@ -1740,15 +1913,48 @@ impl Database {
     // Search
     pub fn search_nodes(&self, query: &str) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT n.id, n.type, n.title, n.url, n.content, n.position_x, n.position_y, n.created_at, n.updated_at, n.cluster_id, n.cluster_label, n.ai_title, n.summary, n.tags, n.emoji, n.is_processed, n.depth, n.is_item, n.is_universe, n.parent_id, n.child_count, n.conversation_id, n.sequence_index, n.is_pinned, n.last_accessed_at, n.latest_child_date, n.is_private, n.privacy_reason, n.source, n.pdf_available, n.content_type, n.associated_idea_id, n.privacy
-             FROM nodes n
+        let prefixed_columns = Self::NODE_COLUMNS
+            .split(", ")
+            .map(|c| format!("n.{}", c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {} FROM nodes n
              JOIN nodes_fts fts ON n.rowid = fts.rowid
              WHERE nodes_fts MATCH ?1
-             ORDER BY rank"
-        )?;
+             ORDER BY rank",
+            prefixed_columns
+        );
+        let mut stmt = conn.prepare(&sql)?;
 
         let nodes = stmt.query_map(params![query], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
+        Ok(nodes)
+    }
+
+    /// Search nodes by ID prefix (for short ID resolution).
+    pub fn search_nodes_by_id_prefix(&self, prefix: &str, limit: i32) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let pattern = format!("{}%", prefix);
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE id LIKE ?1 LIMIT ?2",
+            Self::NODE_COLUMNS
+        ))?;
+        let nodes = stmt.query_map(params![pattern, limit], Self::row_to_node)?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(nodes)
+    }
+
+    /// Substring search on title/ai_title (case-insensitive). Fallback when FTS returns nothing.
+    pub fn search_nodes_by_title_substring(&self, substring: &str, limit: i32) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let pattern = format!("%{}%", substring);
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE is_item = 1 AND (title LIKE ?1 COLLATE NOCASE OR ai_title LIKE ?1 COLLATE NOCASE)
+             ORDER BY created_at DESC LIMIT ?2",
+            Self::NODE_COLUMNS
+        ))?;
+        let nodes = stmt.query_map(params![pattern, limit], Self::row_to_node)?
+            .collect::<Result<Vec<_>>>()?;
         Ok(nodes)
     }
 
@@ -1765,6 +1971,10 @@ impl Database {
 
     // Update AI processing results for a node
     pub fn update_node_ai(&self, node_id: &str, ai_title: &str, summary: &str, tags: &str, content_type: &str) -> Result<()> {
+        // Sovereignty: skip AI overwrite for human-edited nodes
+        if self.has_human_edits(node_id)? {
+            return Ok(());
+        }
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE nodes SET ai_title = ?2, summary = ?3, tags = ?4, content_type = ?5, is_processed = 1 WHERE id = ?1",
@@ -1775,6 +1985,10 @@ impl Database {
 
     // Update only ai_title and summary (preserves tags, content_type) - for code items
     pub fn update_node_ai_summary_only(&self, node_id: &str, ai_title: &str, summary: &str) -> Result<()> {
+        // Sovereignty: skip AI overwrite for human-edited nodes
+        if self.has_human_edits(node_id)? {
+            return Ok(());
+        }
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE nodes SET ai_title = ?2, summary = ?3, is_processed = 1 WHERE id = ?1",
@@ -1876,7 +2090,7 @@ impl Database {
     /// SQL fragment for VISIBLE content types (for graph rendering)
     /// Includes: standard visible types + code_* types from code import
     const VISIBLE_CONTENT_TYPES: &'static str =
-        "content_type IS NULL OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper', 'bookmark') OR content_type LIKE 'code_%'";
+        "content_type IS NULL OR content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'concept', 'decision', 'paper', 'bookmark', 'reference') OR content_type LIKE 'code_%'";
 
     /// Get only VISIBLE tier nodes for graph rendering
     /// Categories (is_item = 0) are always included
@@ -1986,7 +2200,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE is_item = 1
-             AND (content_type IN ('insight', 'exploration', 'synthesis', 'question', 'planning', 'paper', 'bookmark')
+             AND (content_type IN ('insight', 'exploration', 'synthesis', 'question', 'planning', 'concept', 'decision', 'paper', 'bookmark')
                   OR content_type LIKE 'code_%')
              ORDER BY created_at DESC",
             Self::NODE_COLUMNS
@@ -2010,6 +2224,10 @@ impl Database {
 
     /// Update a node's parent and depth
     pub fn update_node_hierarchy(&self, node_id: &str, parent_id: Option<&str>, depth: i32) -> Result<()> {
+        // Sovereignty: skip if parent_id was human-edited (pinned node)
+        if self.is_field_human_edited(node_id, "parent_id")? {
+            return Ok(());
+        }
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE nodes SET parent_id = ?2, depth = ?3 WHERE id = ?1",
@@ -2083,16 +2301,18 @@ impl Database {
 
         if protected_ids.is_empty() {
             // No protection - delete all
+            // Sovereignty: protect human-created categories
             let deleted = conn.execute(
-                "DELETE FROM nodes WHERE is_item = 0 AND is_universe = 0",
+                "DELETE FROM nodes WHERE is_item = 0 AND is_universe = 0 AND human_created = 0",
                 [],
             )?;
             Ok(deleted)
         } else {
             // Build exclusion list
             let placeholders: Vec<String> = protected_ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            // Sovereignty: protect human-created categories
             let sql = format!(
-                "DELETE FROM nodes WHERE is_item = 0 AND is_universe = 0 AND id NOT IN ({})",
+                "DELETE FROM nodes WHERE is_item = 0 AND is_universe = 0 AND human_created = 0 AND id NOT IN ({})",
                 placeholders.join(", ")
             );
 
@@ -2262,6 +2482,24 @@ impl Database {
         Ok(nodes)
     }
 
+    /// Get truly orphaned items: is_item=1 nodes whose parent_id is NULL
+    /// or whose parent_id points to a non-existent node. Excludes Universe.
+    pub fn get_orphan_nodes(&self, limit: i32) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes n
+             WHERE n.is_item = 1 AND n.is_universe = 0
+             AND (n.parent_id IS NULL
+                  OR n.parent_id NOT IN (SELECT id FROM nodes))
+             ORDER BY n.created_at DESC
+             LIMIT ?1",
+            Self::NODE_COLUMNS
+        ))?;
+        let nodes = stmt.query_map(params![limit], Self::row_to_node)?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(nodes)
+    }
+
     /// Update a node's parent and depth
     pub fn set_node_parent(&self, node_id: &str, parent_id: &str, depth: i32) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -2389,11 +2627,11 @@ impl Database {
     #[allow(dead_code)]
     pub fn get_user_belongs_to_edges(&self, node_id: &str) -> Result<Vec<Edge>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at
-             FROM edges WHERE source_id = ?1 AND type = 'belongs_to' AND edge_source = 'user'
-             ORDER BY weight DESC"
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM edges WHERE source_id = ?1 AND type = 'belongs_to' AND edge_source = 'user'
+             ORDER BY weight DESC",
+            Self::EDGE_COLUMNS
+        ))?;
 
         let edges = stmt.query_map(params![node_id], |row| {
             Ok(Edge {
@@ -2407,6 +2645,9 @@ impl Database {
                 evidence_id: row.get(7)?,
                 confidence: row.get(8)?,
                 created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+                author: row.get(11)?,
+                reason: row.get(12)?,
             })
         })?.collect::<Result<Vec<_>>>()?;
 
@@ -2443,11 +2684,11 @@ impl Database {
     /// Get all BelongsTo edges for a node (category associations)
     pub fn get_belongs_to_edges(&self, node_id: &str) -> Result<Vec<Edge>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at
-             FROM edges WHERE source_id = ?1 AND type = 'belongs_to'
-             ORDER BY weight DESC"
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM edges WHERE source_id = ?1 AND type = 'belongs_to'
+             ORDER BY weight DESC",
+            Self::EDGE_COLUMNS
+        ))?;
 
         let edges = stmt.query_map(params![node_id], |row| {
             Ok(Edge {
@@ -2461,6 +2702,9 @@ impl Database {
                 evidence_id: row.get(7)?,
                 confidence: row.get(8)?,
                 created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+                author: row.get(11)?,
+                reason: row.get(12)?,
             })
         })?.collect::<Result<Vec<_>>>()?;
 
@@ -2556,6 +2800,10 @@ impl Database {
             println!("[DB] WARNING: Prevented self-referential parent_id for node '{}'", node_id);
             return Ok(());
         }
+        // Sovereignty: skip if parent_id was human-edited (pinned node)
+        if self.is_field_human_edited(node_id, "parent_id")? {
+            return Ok(());
+        }
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE nodes SET parent_id = ?2 WHERE id = ?1",
@@ -2634,6 +2882,9 @@ impl Database {
             content_type: None,
             associated_idea_id: None,
             privacy: None,
+            human_edited: None,
+            human_created: false,
+            author: None,
         };
 
         self.insert_node(&node)
@@ -2785,6 +3036,10 @@ impl Database {
         // Safety: prevent self-referential nodes (causes infinite loops)
         if node_id == new_parent_id {
             println!("[DB] WARNING: Prevented self-referential parent_id for node '{}'", node_id);
+            return Ok(());
+        }
+        // Sovereignty: skip if parent_id was human-edited (pinned node)
+        if self.is_field_human_edited(node_id, "parent_id")? {
             return Ok(());
         }
         let conn = self.conn.lock().unwrap();
@@ -3059,6 +3314,9 @@ impl Database {
                         evidence_id: None,
                         confidence: Some(raw_similarity as f64),
                         created_at: now,
+                        updated_at: Some(now),
+                        author: None,
+                        reason: None,
                     });
                 }
             }
@@ -3141,8 +3399,9 @@ impl Database {
     /// Delete empty items (items with no meaningful content/raw data)
     pub fn delete_empty_items(&self) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
+        // Sovereignty: protect human-created nodes
         let deleted = conn.execute(
-            "DELETE FROM nodes WHERE is_item = 1 AND (
+            "DELETE FROM nodes WHERE is_item = 1 AND human_created = 0 AND (
                 content IS NULL
                 OR TRIM(content) = ''
                 OR LENGTH(TRIM(content)) < 10
@@ -3160,8 +3419,9 @@ impl Database {
     /// - Conversations with "*No response*" placeholder
     pub fn delete_incomplete_conversations(&self) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
+        // Sovereignty: protect human-created nodes
         let deleted = conn.execute(
-            "DELETE FROM nodes WHERE is_item = 1 AND content IS NOT NULL AND (
+            "DELETE FROM nodes WHERE is_item = 1 AND human_created = 0 AND content IS NOT NULL AND (
                 -- Our format: has [H] but no [A]
                 (content LIKE '%[H]%' AND content NOT LIKE '%[A]%')
                 -- Legacy format: has Human: but no Assistant:
@@ -3516,11 +3776,11 @@ impl Database {
                 "SELECT n.id, n.child_count,
                         (SELECT COUNT(*) FROM nodes c
                          WHERE c.parent_id = n.id
-                           AND (c.content_type IS NULL OR c.content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper', 'bookmark') OR c.content_type LIKE 'code_%')) as actual
+                           AND (c.content_type IS NULL OR c.content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'concept', 'decision', 'paper', 'bookmark') OR c.content_type LIKE 'code_%')) as actual
                  FROM nodes n
                  WHERE n.child_count != (SELECT COUNT(*) FROM nodes c
                                          WHERE c.parent_id = n.id
-                                           AND (c.content_type IS NULL OR c.content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'paper', 'bookmark') OR c.content_type LIKE 'code_%'))"
+                                           AND (c.content_type IS NULL OR c.content_type IN ('insight', 'idea', 'exploration', 'synthesis', 'question', 'planning', 'concept', 'decision', 'paper', 'bookmark') OR c.content_type LIKE 'code_%'))"
             )?;
             let results: Vec<_> = stmt.query_map([], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))

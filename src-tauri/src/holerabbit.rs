@@ -98,6 +98,9 @@ fn get_or_create_container(db: &Database) -> String {
         content_type: Some("holerabbit_container".to_string()),
         associated_idea_id: None,
         privacy: None,
+        human_edited: None,
+        human_created: false,
+        author: None,
     };
 
     if let Err(e) = db.insert_node(&node) {
@@ -300,6 +303,9 @@ fn get_or_create_session(
         content_type: Some("session".to_string()),
         associated_idea_id: None,
         privacy: None,
+        human_edited: None,
+        human_created: false,
+        author: None,
     };
 
     db.insert_node(&node).map_err(|e| e.to_string())?;
@@ -374,6 +380,9 @@ fn ensure_session_exists(
         content_type: Some("session".to_string()),
         associated_idea_id: None,
         privacy: None,
+        human_edited: None,
+        human_created: false,
+        author: None,
     };
 
     db.insert_node(&node).map_err(|e| e.to_string())?;
@@ -498,6 +507,9 @@ fn process_visit(db: &Database, req: &VisitRequest) -> Result<VisitResponse, Str
             content_type: Some("web".to_string()),
             associated_idea_id: None,
             privacy: None,
+            human_edited: None,
+            human_created: false,
+            author: None,
         };
 
         db.insert_node(&node).map_err(|e| e.to_string())?;
@@ -562,6 +574,9 @@ fn process_visit(db: &Database, req: &VisitRequest) -> Result<VisitResponse, Str
         evidence_id: None,
         confidence: None,
         created_at: now,
+        updated_at: Some(now),
+        author: None,
+        reason: None,
     };
 
     db.insert_edge(&session_edge).map_err(|e| e.to_string())?;
@@ -595,6 +610,9 @@ fn process_visit(db: &Database, req: &VisitRequest) -> Result<VisitResponse, Str
                 evidence_id: None,
                 confidence: None,
                 created_at: now,
+                updated_at: Some(now),
+                author: None,
+                reason: None,
             };
 
             db.insert_edge(&nav_edge).map_err(|e| e.to_string())?;
@@ -1052,6 +1070,9 @@ fn merge_sessions(db: &Database, source_id: &str, target_id: &str) -> Result<i32
             evidence_id: None,
             confidence: None,
             created_at: now,
+            updated_at: Some(now),
+            author: None,
+            reason: None,
         };
 
         db.insert_edge(&new_edge).map_err(|e| e.to_string())?;

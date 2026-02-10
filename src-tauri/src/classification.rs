@@ -36,6 +36,8 @@ pub enum ContentType {
     Synthesis,     // Summarizing, connecting threads
     Question,      // Inquiry that frames investigation
     Planning,      // Roadmap, TODO, intentions
+    Concept,       // Named idea with definition (manually created, team mode)
+    Decision,      // Decision record with reasoning (manually created, team mode)
     Paper,         // Scientific paper (fixed type, never reclassified)
     Bookmark,      // Web capture from browser extension (fixed type, never reclassified)
 
@@ -68,6 +70,8 @@ impl ContentType {
             ContentType::Synthesis => "synthesis",
             ContentType::Question => "question",
             ContentType::Planning => "planning",
+            ContentType::Concept => "concept",
+            ContentType::Decision => "decision",
             ContentType::Paper => "paper",
             ContentType::Bookmark => "bookmark",
             ContentType::Investigation => "investigation",
@@ -89,6 +93,8 @@ impl ContentType {
             "synthesis" => Some(ContentType::Synthesis),
             "question" => Some(ContentType::Question),
             "planning" => Some(ContentType::Planning),
+            "concept" => Some(ContentType::Concept),
+            "decision" => Some(ContentType::Decision),
             "paper" => Some(ContentType::Paper),
             "bookmark" => Some(ContentType::Bookmark),
             // Supporting
@@ -108,7 +114,8 @@ impl ContentType {
     pub fn visibility(&self) -> VisibilityTier {
         match self {
             ContentType::Insight | ContentType::Exploration | ContentType::Synthesis |
-            ContentType::Question | ContentType::Planning | ContentType::Paper |
+            ContentType::Question | ContentType::Planning | ContentType::Concept |
+            ContentType::Decision | ContentType::Paper |
             ContentType::Bookmark => VisibilityTier::Visible,
 
             ContentType::Investigation | ContentType::Discussion |

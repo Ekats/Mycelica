@@ -6,7 +6,7 @@
 
 use clap::{Parser, Subcommand, CommandFactory};
 use clap_complete::{generate, Shell};
-use mycelica_lib::{db::{Database, Node, NodeType, EdgeType}, settings, import, hierarchy, similarity, openaire, ai_client, utils, classification};
+use mycelica_lib::{db::{Database, Node, NodeType, Edge, EdgeType}, settings, import, hierarchy, similarity, openaire, ai_client, utils, classification};
 use serde_json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -334,11 +334,80 @@ enum Commands {
     Search {
         /// Search query
         query: String,
-        /// Filter by type (item, category, paper, all)
+        /// Filter by type (item, category, paper, concept, question, decision, reference, all)
         #[arg(long, short = 't', default_value = "all")]
         type_filter: String,
+        /// Filter by author name
+        #[arg(long)]
+        author: Option<String>,
+        /// Filter by recency (e.g., "7d", "24h", "30d")
+        #[arg(long)]
+        recent: Option<String>,
         /// Maximum results
         #[arg(long, short, default_value = "20")]
+        limit: u32,
+    },
+    /// Add a link/resource to the knowledge graph
+    Add {
+        /// URL of the resource
+        url: String,
+        /// Optional note/description
+        #[arg(long)]
+        note: Option<String>,
+        /// Comma-separated tags
+        #[arg(long)]
+        tag: Option<String>,
+        /// Connect to existing nodes by term (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        connects_to: Option<Vec<String>>,
+    },
+    /// Record an open question
+    Ask {
+        /// The question text
+        question: String,
+        /// Connect to existing nodes by term (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        connects_to: Option<Vec<String>>,
+    },
+    /// Create a named concept
+    Concept {
+        /// Concept title
+        title: String,
+        /// Optional description/note
+        #[arg(long)]
+        note: Option<String>,
+        /// Connect to existing nodes by term (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        connects_to: Option<Vec<String>>,
+    },
+    /// Record a decision
+    Decide {
+        /// Decision title
+        title: String,
+        /// Reasoning behind the decision
+        #[arg(long)]
+        reason: Option<String>,
+        /// Connect to existing nodes by term (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        connects_to: Option<Vec<String>>,
+    },
+    /// Create a typed edge between existing nodes
+    Link {
+        /// Source node (ID prefix or title substring)
+        source: String,
+        /// Target node (ID prefix or title substring)
+        target: String,
+        /// Edge type: related, contradicts, supports, prerequisite, evolved_from, questions
+        #[arg(long, short = 't', default_value = "related")]
+        edge_type: String,
+        /// Reason for this connection
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// List orphaned nodes (no valid parent)
+    Orphans {
+        /// Maximum results
+        #[arg(long, short, default_value = "50")]
         limit: u32,
     },
     /// Interactive TUI mode
@@ -698,6 +767,9 @@ enum RecentCommands {
         /// Maximum results
         #[arg(long, short, default_value = "20")]
         limit: usize,
+        /// Filter by author name
+        #[arg(long)]
+        author: Option<String>,
     },
     /// Clear recent history
     Clear,
@@ -1067,7 +1139,13 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Export { cmd } => handle_export(cmd, &db, cli.quiet).await,
         Commands::Analyze { cmd } => handle_analyze(cmd, &db, cli.json, cli.quiet).await,
         Commands::Code { cmd } => handle_code(cmd, &db, &db_path).await,
-        Commands::Search { query, type_filter, limit } => handle_search(&query, &type_filter, limit, &db, cli.json).await,
+        Commands::Search { query, type_filter, author, recent, limit } => handle_search(&query, &type_filter, author, recent, limit, &db, cli.json).await,
+        Commands::Add { url, note, tag, connects_to } => handle_add(&url, note, tag, connects_to, &db, cli.json).await,
+        Commands::Ask { question, connects_to } => handle_ask(&question, connects_to, &db, cli.json).await,
+        Commands::Concept { title, note, connects_to } => handle_concept(&title, note, connects_to, &db, cli.json).await,
+        Commands::Decide { title, reason, connects_to } => handle_decide(&title, reason, connects_to, &db, cli.json).await,
+        Commands::Link { source, target, edge_type, reason } => handle_link(&source, &target, &edge_type, reason, &db, cli.json).await,
+        Commands::Orphans { limit } => handle_orphans(limit, &db, cli.json).await,
         Commands::Tui => run_tui(&db).await,
         Commands::Completions { .. } => unreachable!(),
     }
@@ -1562,6 +1640,9 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
                                         evidence_id: None,
                                         confidence: None,
                                         created_at: now,
+                                        updated_at: Some(now),
+                                        author: None,
+                                        reason: None,
                                     };
                                     if db.insert_edge(&edge).is_ok() {
                                         calls_edges_created += 1;
@@ -1773,6 +1854,9 @@ async fn handle_node(cmd: NodeCommands, db: &Database, json: bool) -> Result<(),
                 pdf_available: None,
                 content_type: None,
                 associated_idea_id: None,
+                human_edited: None,
+                human_created: false,
+                author: None,
             };
 
             db.insert_node(&node).map_err(|e| e.to_string())?;
@@ -2269,6 +2353,9 @@ async fn handle_consolidate(db: &Database, json: bool, quiet: bool) -> Result<()
             content_type: None,
             associated_idea_id: None,
             privacy: None,
+            human_edited: None,
+            human_created: false,
+            author: None,
         };
 
         db.insert_node(&uber_node).map_err(|e| e.to_string())?;
@@ -2346,6 +2433,9 @@ async fn handle_consolidate(db: &Database, json: bool, quiet: bool) -> Result<()
                     evidence_id: None,
                     confidence: None,
                     created_at: edge_timestamp,
+                    updated_at: Some(edge_timestamp),
+                    author: None,
+                    reason: None,
                 };
                 if db.insert_edge(&edge).is_ok() {
                     sibling_edges += 1;
@@ -2623,6 +2713,9 @@ async fn rebuild_hierarchy_adaptive(
             associated_idea_id: None,
             latest_child_date: None,
             pdf_available: None,
+            human_edited: None,
+            human_created: false,
+            author: None,
         };
         db.insert_node(&universe).map_err(|e| e.to_string())?;
     }
@@ -2689,6 +2782,9 @@ async fn rebuild_hierarchy_adaptive(
                     associated_idea_id: None,
                     latest_child_date: None,
                     pdf_available: None,
+                    human_edited: None,
+                    human_created: false,
+                    author: None,
                 };
                 db.insert_node(&category).map_err(|e| e.to_string())?;
                 *categories_created += 1;
@@ -2748,6 +2844,9 @@ async fn rebuild_hierarchy_adaptive(
                     associated_idea_id: None,
                     latest_child_date: None,
                     pdf_available: None,
+                    human_edited: None,
+                    human_created: false,
+                    author: None,
                 };
                 db.insert_node(&category).map_err(|e| e.to_string())?;
                 *categories_created += 1;
@@ -2869,6 +2968,9 @@ async fn rebuild_hierarchy_adaptive(
                 evidence_id: None,
                 confidence: Some(1.0),
                 created_at: now,
+                updated_at: Some(now),
+                author: None,
+                reason: None,
             };
             if db.insert_edge(&edge).is_ok() {
                 sibling_edges_created += 1;
@@ -3269,6 +3371,9 @@ async fn rebuild_hierarchy_dendrogram(
         content_type: None,
         associated_idea_id: None,
         privacy: None,
+        human_edited: None,
+        human_created: false,
+        author: None,
     };
     db.insert_node(&universe_node).map_err(|e| e.to_string())?;
 
@@ -3448,6 +3553,9 @@ async fn rebuild_hierarchy_dendrogram(
                 content_type: None,
                 associated_idea_id: None,
                 privacy: None,
+                human_edited: None,
+                human_created: false,
+                author: None,
             };
 
             db.insert_node(&category_node).map_err(|e| e.to_string())?;
@@ -4251,12 +4359,17 @@ fn handle_config(cmd: ConfigCommands, json: bool) -> Result<(), String> {
             let protect = settings::is_recent_notes_protected();
             let tips = settings::show_tips();
 
+            let author = settings::get_author();
+            let remote_url = settings::get_remote_url();
+
             if json {
-                println!(r#"{{"anthropic_api_key":{},"openai_api_key":{},"openaire_api_key":{},"clustering_primary":{},"clustering_secondary":{},"privacy_threshold":{},"local_embeddings":{},"protect_recent_notes":{},"show_tips":{}}}"#,
+                println!(r#"{{"anthropic_api_key":{},"openai_api_key":{},"openaire_api_key":{},"clustering_primary":{},"clustering_secondary":{},"privacy_threshold":{},"local_embeddings":{},"protect_recent_notes":{},"show_tips":{},"author":{},"remote_url":{}}}"#,
                     anthropic, openai, openaire,
                     cluster_p.map(|v| v.to_string()).unwrap_or("null".to_string()),
                     cluster_s.map(|v| v.to_string()).unwrap_or("null".to_string()),
-                    privacy, local_emb, protect, tips);
+                    privacy, local_emb, protect, tips,
+                    author.as_ref().map(|a| format!("\"{}\"", a)).unwrap_or("null".to_string()),
+                    remote_url.as_ref().map(|u| format!("\"{}\"", u)).unwrap_or("null".to_string()));
             } else {
                 println!("anthropic-api-key:    {}", if anthropic { "set" } else { "not set" });
                 println!("openai-api-key:       {}", if openai { "set" } else { "not set" });
@@ -4267,6 +4380,8 @@ fn handle_config(cmd: ConfigCommands, json: bool) -> Result<(), String> {
                 println!("local-embeddings:     {}", local_emb);
                 println!("protect-recent-notes: {}", protect);
                 println!("show-tips:            {}", tips);
+                println!("author:               {}", author.as_deref().unwrap_or("not set"));
+                println!("remote-url:           {}", remote_url.as_deref().unwrap_or("not set"));
             }
         }
         ConfigCommands::Get { key } => {
@@ -4280,6 +4395,8 @@ fn handle_config(cmd: ConfigCommands, json: bool) -> Result<(), String> {
                 "local-embeddings" => settings::use_local_embeddings().to_string(),
                 "protect-recent-notes" => settings::is_recent_notes_protected().to_string(),
                 "show-tips" => settings::show_tips().to_string(),
+                "author" => settings::get_author().unwrap_or_else(|| "not set".to_string()),
+                "remote-url" => settings::get_remote_url().unwrap_or_else(|| "not set".to_string()),
                 _ => return Err(format!("Unknown config key: {}", key)),
             };
 
@@ -4319,6 +4436,12 @@ fn handle_config(cmd: ConfigCommands, json: bool) -> Result<(), String> {
                 "show-tips" => {
                     let v = value.parse::<bool>().map_err(|_| "Invalid boolean (use true/false)")?;
                     settings::set_show_tips(v)?;
+                }
+                "author" => {
+                    settings::set_author(value.clone())?;
+                }
+                "remote-url" => {
+                    settings::set_remote_url(value.clone())?;
                 }
                 _ => return Err(format!("Unknown config key: {}", key)),
             }
@@ -4781,6 +4904,9 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, include_code: bool, al
                         evidence_id: None,
                         confidence: Some(0.8),
                         created_at: chrono::Utc::now().timestamp_millis(),
+                        updated_at: Some(chrono::Utc::now().timestamp_millis()),
+                        author: None,
+                        reason: None,
                     };
 
                     if db.insert_edge(&edge).is_ok() {
@@ -4918,17 +5044,27 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, include_code: bool, al
 
 fn handle_recent(cmd: RecentCommands, db: &Database, json: bool) -> Result<(), String> {
     match cmd {
-        RecentCommands::List { limit } => {
+        RecentCommands::List { limit, author } => {
             let recent = db.get_recent_nodes(limit as i32).map_err(|e| e.to_string())?;
+            let filtered: Vec<_> = if let Some(ref author_filter) = author {
+                recent.into_iter().filter(|n| {
+                    n.author.as_ref().map_or(false, |a| a.to_lowercase().contains(&author_filter.to_lowercase()))
+                }).collect()
+            } else {
+                recent
+            };
 
             if json {
-                let items: Vec<String> = recent.iter().map(|n| {
-                    format!(r#"{{"id":"{}","title":"{}"}}"#, n.id, escape_json(&n.title))
+                let items: Vec<String> = filtered.iter().map(|n| {
+                    format!(r#"{{"id":"{}","title":"{}","author":{}}}"#,
+                        n.id, escape_json(&n.title),
+                        n.author.as_ref().map(|a| format!("\"{}\"", escape_json(a))).unwrap_or("null".to_string()))
                 }).collect();
                 println!("[{}]", items.join(","));
             } else {
-                for node in &recent {
-                    println!("{} {}", &node.id[..8], node.title);
+                for node in &filtered {
+                    let auth = node.author.as_deref().unwrap_or("");
+                    println!("{} {} {}", &node.id[..8], node.title, auth);
                 }
             }
         }
@@ -5309,18 +5445,39 @@ async fn handle_nav(cmd: NavCommands, db: &Database, json: bool) -> Result<(), S
 // Search Command
 // ============================================================================
 
-async fn handle_search(query: &str, type_filter: &str, limit: u32, db: &Database, json: bool) -> Result<(), String> {
+async fn handle_search(query: &str, type_filter: &str, author_filter: Option<String>, recent_filter: Option<String>, limit: u32, db: &Database, json: bool) -> Result<(), String> {
     let results = db.search_nodes(query).map_err(|e| e.to_string())?;
 
-    // Filter by type
+    // Parse recency filter (e.g., "7d", "24h", "30d")
+    let cutoff_ms = recent_filter.as_ref().map(|r| {
+        let now = Utc::now().timestamp_millis();
+        let duration_ms = if r.ends_with('d') {
+            r.trim_end_matches('d').parse::<i64>().unwrap_or(7) * 86_400_000
+        } else if r.ends_with('h') {
+            r.trim_end_matches('h').parse::<i64>().unwrap_or(24) * 3_600_000
+        } else {
+            r.parse::<i64>().unwrap_or(7) * 86_400_000
+        };
+        now - duration_ms
+    });
+
     let filtered: Vec<_> = results.into_iter()
         .filter(|node| {
-            match type_filter {
+            let type_ok = match type_filter {
                 "item" => node.is_item,
                 "category" => !node.is_item,
                 "paper" => node.source.as_deref() == Some("openaire"),
+                "concept" => node.content_type.as_deref() == Some("concept"),
+                "question" => node.content_type.as_deref() == Some("question"),
+                "decision" => node.content_type.as_deref() == Some("decision"),
+                "reference" => node.content_type.as_deref() == Some("reference"),
                 _ => true, // "all"
-            }
+            };
+            let author_ok = author_filter.as_ref().map_or(true, |a| {
+                node.author.as_ref().map_or(false, |na| na.to_lowercase().contains(&a.to_lowercase()))
+            });
+            let recent_ok = cutoff_ms.map_or(true, |cutoff| node.created_at >= cutoff);
+            type_ok && author_ok && recent_ok
         })
         .take(limit as usize)
         .collect();
@@ -5328,10 +5485,12 @@ async fn handle_search(query: &str, type_filter: &str, limit: u32, db: &Database
     if json {
         let items: Vec<String> = filtered.iter().map(|node| {
             format!(
-                r#"{{"id":"{}","title":"{}","type":"{}","depth":{}}}"#,
+                r#"{{"id":"{}","title":"{}","type":"{}","content_type":{},"author":{},"depth":{}}}"#,
                 node.id,
                 escape_json(node.ai_title.as_ref().unwrap_or(&node.title)),
                 if node.is_item { "item" } else { "category" },
+                node.content_type.as_ref().map(|ct| format!("\"{}\"", ct)).unwrap_or("null".to_string()),
+                node.author.as_ref().map(|a| format!("\"{}\"", escape_json(a))).unwrap_or("null".to_string()),
                 node.depth
             )
         }).collect();
@@ -5344,8 +5503,359 @@ async fn handle_search(query: &str, type_filter: &str, limit: u32, db: &Database
             for node in &filtered {
                 let emoji = if node.is_item { "[I]" } else { "[C]" };
                 let title = node.ai_title.as_ref().unwrap_or(&node.title);
-                let type_str = if node.is_item { "item" } else { "cat " };
-                log!("{} {} [{}] {}", emoji, title, type_str, &node.id);
+                let ct = node.content_type.as_deref().unwrap_or("?");
+                let auth = node.author.as_deref().unwrap_or("");
+                log!("{} {} [{}] {} {}", emoji, title, ct, auth, &node.id);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Team Commands (Phase 2)
+// ============================================================================
+
+/// Create a node with proper sovereignty fields set. Returns the new node ID.
+fn create_human_node(
+    db: &Database,
+    title: &str,
+    content: Option<&str>,
+    url: Option<&str>,
+    content_type: &str,
+    tags_json: Option<&str>,
+) -> Result<String, String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now().timestamp_millis();
+    let author = settings::get_author_or_default();
+
+    let node = Node {
+        id: id.clone(),
+        node_type: NodeType::Thought,
+        title: title.to_string(),
+        url: url.map(|s| s.to_string()),
+        content: content.map(|s| s.to_string()),
+        position: mycelica_lib::db::Position { x: 0.0, y: 0.0 },
+        created_at: now,
+        updated_at: now,
+        cluster_id: None,
+        cluster_label: None,
+        depth: 0,
+        is_item: true,
+        is_universe: false,
+        parent_id: None,
+        child_count: 0,
+        ai_title: None,
+        summary: None,
+        tags: tags_json.map(|s| s.to_string()),
+        emoji: None,
+        is_processed: false,
+        conversation_id: None,
+        sequence_index: None,
+        is_pinned: false,
+        last_accessed_at: Some(now),
+        latest_child_date: None,
+        is_private: None,
+        privacy_reason: None,
+        privacy: None,
+        source: Some("cli".to_string()),
+        pdf_available: None,
+        content_type: Some(content_type.to_string()),
+        associated_idea_id: None,
+        human_edited: None,
+        human_created: true,
+        author: Some(author),
+    };
+
+    db.insert_node(&node).map_err(|e| e.to_string())?;
+
+    // Generate embedding so node is immediately searchable
+    let embed_text = format!("{}\n{}", title, content.unwrap_or(""));
+    let embed_text = &embed_text[..embed_text.len().min(2000)];
+    match mycelica_lib::local_embeddings::generate(embed_text) {
+        Ok(embedding) => {
+            db.update_node_embedding(&id, &embedding).ok();
+        }
+        Err(e) => {
+            eprintln!("Warning: failed to generate embedding: {}", e);
+        }
+    }
+
+    Ok(id)
+}
+
+/// Resolve a node reference (UUID, ID prefix, or title text).
+fn resolve_node(db: &Database, reference: &str) -> Result<Node, String> {
+    // Try exact ID match
+    if let Ok(Some(node)) = db.get_node(reference) {
+        return Ok(node);
+    }
+
+    // Try ID prefix match (looks like hex/uuid chars)
+    if reference.len() >= 6 && reference.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        if let Ok(matches) = db.search_nodes_by_id_prefix(reference, 10) {
+            match matches.len() {
+                1 => return Ok(matches.into_iter().next().unwrap()),
+                n if n > 1 => {
+                    let names: Vec<String> = matches.iter().map(|n| {
+                        format!("  {} {}", &n.id[..8], n.ai_title.as_ref().unwrap_or(&n.title))
+                    }).collect();
+                    return Err(format!("Ambiguous ID prefix '{}'. {} matches:\n{}", reference, matches.len(), names.join("\n")));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Try FTS search
+    if let Ok(fts_results) = db.search_nodes(reference) {
+        let items: Vec<_> = fts_results.into_iter().filter(|n| n.is_item).collect();
+        match items.len() {
+            1 => return Ok(items.into_iter().next().unwrap()),
+            n if n > 1 => {
+                let names: Vec<String> = items.iter().take(10).map(|n| {
+                    format!("  {} {}", &n.id[..8], n.ai_title.as_ref().unwrap_or(&n.title))
+                }).collect();
+                return Err(format!("Ambiguous term '{}'. {} matches:\n{}\nUse a node ID instead.", reference, items.len(), names.join("\n")));
+            }
+            _ => {}
+        }
+    }
+
+    // Fallback: title substring LIKE
+    if let Ok(substr_results) = db.search_nodes_by_title_substring(reference, 10) {
+        match substr_results.len() {
+            1 => return Ok(substr_results.into_iter().next().unwrap()),
+            n if n > 1 => {
+                let names: Vec<String> = substr_results.iter().map(|n| {
+                    format!("  {} {}", &n.id[..8], n.ai_title.as_ref().unwrap_or(&n.title))
+                }).collect();
+                return Err(format!("Ambiguous term '{}'. {} matches:\n{}\nUse a node ID instead.", reference, substr_results.len(), names.join("\n")));
+            }
+            _ => {}
+        }
+    }
+
+    Err(format!("No node found matching '{}'", reference))
+}
+
+/// Process --connects-to terms: search for each, create Related edges.
+fn handle_connects_to(
+    db: &Database,
+    source_node_id: &str,
+    terms: &[String],
+    json: bool,
+) -> Result<(), String> {
+    let author = settings::get_author_or_default();
+    let now = Utc::now().timestamp_millis();
+
+    for term in terms {
+        match resolve_node(db, term) {
+            Ok(target) => {
+                let edge_id = uuid::Uuid::new_v4().to_string();
+                let edge = Edge {
+                    id: edge_id,
+                    source: source_node_id.to_string(),
+                    target: target.id.clone(),
+                    edge_type: EdgeType::Related,
+                    label: None,
+                    weight: Some(1.0),
+                    edge_source: Some("user".to_string()),
+                    evidence_id: None,
+                    confidence: Some(1.0),
+                    created_at: now,
+                    updated_at: Some(now),
+                    author: Some(author.clone()),
+                    reason: Some(format!("Connected via --connects-to '{}'", term)),
+                };
+                db.insert_edge(&edge).map_err(|e| e.to_string())?;
+                if !json {
+                    println!("  Linked to: {} {}", &target.id[..8], target.ai_title.as_ref().unwrap_or(&target.title));
+                }
+            }
+            Err(e) => {
+                if !json {
+                    eprintln!("  Warning ({}): {}", term, e);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_add(
+    url: &str,
+    note: Option<String>,
+    tag: Option<String>,
+    connects_to: Option<Vec<String>>,
+    db: &Database,
+    json: bool,
+) -> Result<(), String> {
+    let title = note.as_deref().unwrap_or(url);
+    let content = format!("{}\n\n{}", url, note.as_deref().unwrap_or(""));
+    let tags_json = tag.map(|t| {
+        let tags: Vec<&str> = t.split(',').map(|s| s.trim()).collect();
+        serde_json::to_string(&tags).unwrap_or_default()
+    });
+
+    let id = create_human_node(db, title, Some(&content), Some(url), "reference", tags_json.as_deref())?;
+
+    if json {
+        println!(r#"{{"id":"{}","title":"{}","url":"{}"}}"#, id, escape_json(title), escape_json(url));
+    } else {
+        println!("Added: {} {}", &id[..8], title);
+    }
+
+    if let Some(terms) = connects_to {
+        handle_connects_to(db, &id, &terms, json)?;
+    }
+
+    Ok(())
+}
+
+async fn handle_ask(
+    question: &str,
+    connects_to: Option<Vec<String>>,
+    db: &Database,
+    json: bool,
+) -> Result<(), String> {
+    let id = create_human_node(db, question, None, None, "question", None)?;
+
+    if json {
+        println!(r#"{{"id":"{}","question":"{}"}}"#, id, escape_json(question));
+    } else {
+        println!("Asked: {} {}", &id[..8], question);
+    }
+
+    if let Some(terms) = connects_to {
+        handle_connects_to(db, &id, &terms, json)?;
+    }
+
+    Ok(())
+}
+
+async fn handle_concept(
+    title: &str,
+    note: Option<String>,
+    connects_to: Option<Vec<String>>,
+    db: &Database,
+    json: bool,
+) -> Result<(), String> {
+    let id = create_human_node(db, title, note.as_deref(), None, "concept", None)?;
+
+    if json {
+        println!(r#"{{"id":"{}","title":"{}"}}"#, id, escape_json(title));
+    } else {
+        println!("Concept: {} {}", &id[..8], title);
+    }
+
+    if let Some(terms) = connects_to {
+        handle_connects_to(db, &id, &terms, json)?;
+    }
+
+    Ok(())
+}
+
+async fn handle_decide(
+    title: &str,
+    reason: Option<String>,
+    connects_to: Option<Vec<String>>,
+    db: &Database,
+    json: bool,
+) -> Result<(), String> {
+    let id = create_human_node(db, title, reason.as_deref(), None, "decision", None)?;
+
+    if json {
+        println!(r#"{{"id":"{}","title":"{}"}}"#, id, escape_json(title));
+    } else {
+        println!("Decided: {} {}", &id[..8], title);
+        if let Some(ref r) = reason {
+            println!("  Reason: {}", r);
+        }
+    }
+
+    if let Some(terms) = connects_to {
+        handle_connects_to(db, &id, &terms, json)?;
+    }
+
+    Ok(())
+}
+
+async fn handle_link(
+    source_ref: &str,
+    target_ref: &str,
+    edge_type_str: &str,
+    reason: Option<String>,
+    db: &Database,
+    json: bool,
+) -> Result<(), String> {
+    // Parse edge type (case-insensitive)
+    let edge_type = EdgeType::from_str(&edge_type_str.to_lowercase())
+        .ok_or_else(|| format!(
+            "Unknown edge type: '{}'. Valid: related, contradicts, supports, prerequisite, evolved_from, questions, reference, because",
+            edge_type_str
+        ))?;
+
+    let source = resolve_node(db, source_ref)?;
+    let target = resolve_node(db, target_ref)?;
+
+    let author = settings::get_author_or_default();
+    let now = Utc::now().timestamp_millis();
+    let edge_id = uuid::Uuid::new_v4().to_string();
+
+    let edge = Edge {
+        id: edge_id.clone(),
+        source: source.id.clone(),
+        target: target.id.clone(),
+        edge_type,
+        label: None,
+        weight: Some(1.0),
+        edge_source: Some("user".to_string()),
+        evidence_id: None,
+        confidence: Some(1.0),
+        created_at: now,
+        updated_at: Some(now),
+        author: Some(author),
+        reason,
+    };
+
+    db.insert_edge(&edge).map_err(|e| e.to_string())?;
+
+    if json {
+        println!(r#"{{"id":"{}","source":"{}","target":"{}","type":"{}"}}"#,
+            edge_id, source.id, target.id, edge_type_str.to_lowercase());
+    } else {
+        println!("Linked: {} -> {} [{}]",
+            source.ai_title.as_ref().unwrap_or(&source.title),
+            target.ai_title.as_ref().unwrap_or(&target.title),
+            edge_type_str.to_lowercase());
+    }
+
+    Ok(())
+}
+
+async fn handle_orphans(limit: u32, db: &Database, json: bool) -> Result<(), String> {
+    let orphans = db.get_orphan_nodes(limit as i32).map_err(|e| e.to_string())?;
+
+    if json {
+        let items: Vec<String> = orphans.iter().map(|n| {
+            format!(r#"{{"id":"{}","title":"{}","content_type":{}}}"#,
+                n.id,
+                escape_json(n.ai_title.as_ref().unwrap_or(&n.title)),
+                n.content_type.as_ref().map(|ct| format!("\"{}\"", ct)).unwrap_or("null".to_string()),
+            )
+        }).collect();
+        println!("[{}]", items.join(","));
+    } else {
+        if orphans.is_empty() {
+            println!("No orphaned nodes found.");
+        } else {
+            println!("Orphaned nodes ({}):\n", orphans.len());
+            for node in &orphans {
+                let ct = node.content_type.as_deref().unwrap_or("?");
+                let title = node.ai_title.as_ref().unwrap_or(&node.title);
+                println!("  {} [{}] {}", &node.id[..8], ct, title);
             }
         }
     }
@@ -6225,6 +6735,9 @@ fn analyze_code_edges(
                         evidence_id: None,
                         confidence: Some(0.8), // Heuristic confidence
                         created_at: chrono::Utc::now().timestamp_millis(),
+                        updated_at: Some(chrono::Utc::now().timestamp_millis()),
+                        author: None,
+                        reason: None,
                     };
 
                     if db.insert_edge(&edge).is_ok() {
@@ -6460,6 +6973,9 @@ fn analyze_doc_edges(db: &Database, json: bool, quiet: bool) -> Result<(), Strin
                     evidence_id: None,
                     confidence: Some(0.9),
                     created_at: chrono::Utc::now().timestamp_millis(),
+                    updated_at: Some(chrono::Utc::now().timestamp_millis()),
+                    author: None,
+                    reason: None,
                 };
                 if db.insert_edge(&edge).is_ok() {
                     edges_created += 1;

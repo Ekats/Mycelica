@@ -16,6 +16,7 @@ mod format_abstract;
 pub mod code;
 mod holerabbit;
 pub mod dendrogram;
+pub mod remote_client;
 
 use commands::{
     AppState,

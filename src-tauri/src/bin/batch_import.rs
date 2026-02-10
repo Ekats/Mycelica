@@ -100,6 +100,8 @@ async fn main() {
             DOWNLOAD_PDFS,
             MAX_PDF_SIZE_MB,
             api_key.clone(),
+            None, // unpaywall_email
+            None, // core_api_key
             on_progress,
         ).await {
             Ok(result) => {

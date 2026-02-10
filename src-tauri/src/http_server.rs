@@ -202,6 +202,9 @@ fn handle_capture(db: &Database, body: &str) -> Response<std::io::Cursor<Vec<u8>
         content_type: Some("bookmark".to_string()),
         associated_idea_id: None,
         privacy: None,
+        human_edited: None,
+        human_created: false,
+        author: None,
     };
 
     // Insert node

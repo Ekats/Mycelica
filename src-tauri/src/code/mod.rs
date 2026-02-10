@@ -140,6 +140,9 @@ fn get_or_create_import_container(db: &Database, language: &Language) -> String 
         content_type: Some("import-container".to_string()),
         associated_idea_id: None,
         privacy: Some(1.0),  // Code is public
+        human_edited: None,
+        human_created: false,
+        author: None,
     };
 
     if let Err(e) = db.insert_node(&node) {
@@ -443,6 +446,9 @@ fn process_doc_file(
         content_type: Some("code_doc".to_string()),
         associated_idea_id: None,
         privacy: None,
+        human_edited: None,
+        human_created: false,
+        author: None,
     };
 
     db.insert_node(&node)
@@ -588,6 +594,9 @@ fn create_file_module_node(db: &Database, path: &Path, language: &Language) -> R
         content_type: Some("code_module".to_string()),
         associated_idea_id: None,
         privacy: None,
+        human_edited: None,
+        human_created: false,
+        author: None,
     };
 
     db.insert_node(&node)
@@ -651,6 +660,9 @@ fn create_code_node(db: &Database, item: &CodeItem, node_id: &str) -> Result<(),
         content_type: Some(item.content_type()),
         associated_idea_id: None,
         privacy: None,
+        human_edited: None,
+        human_created: false,
+        author: None,
     };
 
     db.insert_node(&node)
@@ -672,6 +684,9 @@ fn create_defined_in_edge(db: &Database, item_id: &str, module_id: &str) -> Resu
         evidence_id: None,
         confidence: Some(1.0),
         created_at: chrono::Utc::now().timestamp_millis(),
+        updated_at: Some(chrono::Utc::now().timestamp_millis()),
+        author: None,
+        reason: None,
     };
 
     db.insert_edge(&edge)
@@ -828,6 +843,9 @@ fn extract_doc_code_edges(db: &Database) -> usize {
                     evidence_id: None,
                     confidence: Some(0.9),
                     created_at: chrono::Utc::now().timestamp_millis(),
+                    updated_at: Some(chrono::Utc::now().timestamp_millis()),
+                    author: None,
+                    reason: None,
                 };
 
                 if db.insert_edge(&edge).is_ok() {

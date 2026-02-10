@@ -75,6 +75,12 @@ pub struct Settings {
     /// Ollama model name (default: "qwen2.5:7b")
     #[serde(default = "default_ollama_model")]
     pub ollama_model: String,
+    /// Author name for team mode attribution
+    #[serde(default)]
+    pub author: Option<String>,
+    /// Remote server URL for team sync (Phase 3)
+    #[serde(default)]
+    pub remote_url: Option<String>,
 }
 
 fn default_llm_backend() -> String {
@@ -116,6 +122,8 @@ impl Default for Settings {
             show_tips: true, // Show tips by default
             llm_backend: "anthropic".to_string(), // Use Anthropic by default
             ollama_model: "qwen2.5:7b".to_string(), // Default Ollama model
+            author: None,
+            remote_url: None,
         }
     }
 }
@@ -830,5 +838,71 @@ pub fn set_ollama_model(model: String) -> Result<(), String> {
     settings.save(&config_path)?;
 
     println!("Ollama model set to: {}", model);
+    Ok(())
+}
+
+// ==================== Team Mode Author ====================
+
+/// Get configured author name. Checks MYCELICA_AUTHOR env var first, then settings.
+pub fn get_author() -> Option<String> {
+    if let Ok(author) = std::env::var("MYCELICA_AUTHOR") {
+        if !author.is_empty() {
+            return Some(author);
+        }
+    }
+    let guard = SETTINGS.read().ok()?;
+    let settings = guard.as_ref()?;
+    settings.author.clone()
+}
+
+/// Get author, falling back to system username if not configured.
+pub fn get_author_or_default() -> String {
+    get_author().unwrap_or_else(|| {
+        std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "anonymous".to_string())
+    })
+}
+
+/// Set author name for team mode attribution
+pub fn set_author(name: String) -> Result<(), String> {
+    let mut settings_guard = SETTINGS.write()
+        .map_err(|_| "Failed to acquire settings lock")?;
+
+    let settings = settings_guard.get_or_insert_with(Settings::default);
+    settings.author = if name.is_empty() { None } else { Some(name) };
+
+    let config_path = CONFIG_PATH.read()
+        .map_err(|_| "Failed to acquire config path lock")?
+        .clone()
+        .ok_or("Settings not initialized")?;
+
+    settings.save(&config_path)?;
+    Ok(())
+}
+
+// ==================== Remote URL (Phase 3) ====================
+
+/// Get configured remote server URL
+pub fn get_remote_url() -> Option<String> {
+    let guard = SETTINGS.read().ok()?;
+    let settings = guard.as_ref()?;
+    settings.remote_url.clone()
+}
+
+/// Set remote server URL for team mode
+pub fn set_remote_url(url: String) -> Result<(), String> {
+    let mut settings_guard = SETTINGS.write()
+        .map_err(|_| "Failed to acquire settings lock")?;
+
+    let settings = settings_guard.get_or_insert_with(Settings::default);
+    settings.remote_url = if url.is_empty() { None } else { Some(url) };
+
+    let config_path = CONFIG_PATH.read()
+        .map_err(|_| "Failed to acquire config path lock")?
+        .clone()
+        .ok_or("Settings not initialized")?;
+
+    settings.save(&config_path)?;
     Ok(())
 }
