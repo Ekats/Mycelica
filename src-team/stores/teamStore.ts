@@ -29,7 +29,7 @@ interface TeamStore {
   selectedNodeId: string | null;
   searchQuery: string;
   searchResults: Node[];
-  showOrphans: boolean;
+  showRecent: boolean;
   showSettings: boolean;
   showQuickAdd: boolean;
 
@@ -43,8 +43,6 @@ interface TeamStore {
   // Computed
   getDisplayNodes: () => DisplayNode[];
   getDisplayEdges: () => DisplayEdge[];
-  getOrphanCount: () => number;
-
   // Actions
   refresh: () => Promise<void>;
   loadPersonalData: () => Promise<void>;
@@ -64,7 +62,7 @@ interface TeamStore {
   saveSettings: (config: TeamConfig) => Promise<void>;
 
   setSelectedNodeId: (id: string | null) => void;
-  setShowOrphans: (show: boolean) => void;
+  setShowRecent: (show: boolean) => void;
   setShowSettings: (show: boolean) => void;
   setShowQuickAdd: (show: boolean) => void;
   clearError: () => void;
@@ -92,7 +90,7 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
   selectedNodeId: null,
   searchQuery: "",
   searchResults: [],
-  showOrphans: false,
+  showRecent: false,
   showSettings: false,
   showQuickAdd: false,
 
@@ -165,14 +163,6 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
     return display;
   },
 
-  getOrphanCount: () => {
-    const { nodes } = get();
-    let count = 0;
-    for (const n of nodes.values()) {
-      if (!n.parentId && n.isItem) count++;
-    }
-    return count;
-  },
 
   refresh: async () => {
     set({ isRefreshing: true, error: null });
@@ -350,7 +340,7 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
   },
 
   setSelectedNodeId: (id) => set({ selectedNodeId: id }),
-  setShowOrphans: (show) => set({ showOrphans: show }),
+  setShowRecent: (show) => set({ showRecent: show }),
   setShowSettings: (show) => set({ showSettings: show }),
   setShowQuickAdd: (show) => set({ showQuickAdd: show }),
   clearError: () => set({ error: null }),

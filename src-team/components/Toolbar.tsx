@@ -1,16 +1,14 @@
 import { useState, useCallback } from "react";
-import { RefreshCw, Search, Network, Settings, Plus } from "lucide-react";
+import { RefreshCw, Search, Clock, Settings, Plus } from "lucide-react";
 import { useTeamStore } from "../stores/teamStore";
 
 export default function Toolbar() {
   const {
-    isRefreshing, lastRefreshed, connected, nodes, showOrphans,
-    refresh, search, setShowOrphans, setShowSettings, setShowQuickAdd,
-    getOrphanCount,
+    isRefreshing, lastRefreshed, connected, nodes, showRecent,
+    refresh, search, setShowRecent, setShowSettings, setShowQuickAdd,
   } = useTeamStore();
 
   const [searchInput, setSearchInput] = useState("");
-  const orphanCount = getOrphanCount();
 
   const handleSearch = useCallback((value: string) => {
     setSearchInput(value);
@@ -48,19 +46,13 @@ export default function Toolbar() {
         />
       </div>
 
-      {/* Orphan badge */}
+      {/* Recent */}
       <button
-        className={`flex items-center gap-1.5 ${showOrphans ? "btn-primary" : "btn-secondary"}`}
-        onClick={() => setShowOrphans(!showOrphans)}
+        className={`flex items-center gap-1.5 ${showRecent ? "btn-primary" : "btn-secondary"}`}
+        onClick={() => setShowRecent(!showRecent)}
       >
-        <Network size={14} />
-        Orphans
-        {orphanCount > 0 && (
-          <span className="inline-flex items-center justify-center rounded-full text-xs font-bold min-w-5 h-5 px-1"
-            style={{ background: "#f59e0b", color: "#111827" }}>
-            {orphanCount}
-          </span>
-        )}
+        <Clock size={14} />
+        Recent
       </button>
 
       {/* Quick add */}

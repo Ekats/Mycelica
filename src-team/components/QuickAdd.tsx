@@ -186,7 +186,7 @@ export default function QuickAdd() {
               </div>
             ) : (
               <p className="text-xs italic" style={{ color: "var(--text-secondary)" }}>
-                None (orphan) — select a category node before opening Quick Add to pre-fill
+                None — select a category node before opening Quick Add to pre-fill
               </p>
             )}
           </div>

@@ -2,14 +2,14 @@ import { useEffect } from "react";
 import { useTeamStore } from "./stores/teamStore";
 import Toolbar from "./components/Toolbar";
 import GraphView from "./components/GraphView";
-import OrphanPanel from "./components/OrphanPanel";
+import RecentPanel from "./components/RecentPanel";
 import NodePopup from "./components/NodePopup";
 import QuickAdd from "./components/QuickAdd";
 import Settings from "./components/Settings";
 
 export default function App() {
   const {
-    showOrphans, showSettings, showQuickAdd, selectedNodeId, error,
+    showRecent, showSettings, showQuickAdd, selectedNodeId, error,
     loadSettings, loadPositions, loadPersonalData, refresh,
     setShowQuickAdd, clearError,
   } = useTeamStore();
@@ -56,7 +56,7 @@ export default function App() {
       )}
 
       <div className="flex flex-1 overflow-hidden">
-        {showOrphans && <OrphanPanel />}
+        {showRecent && <RecentPanel />}
         <GraphView />
       </div>
 
