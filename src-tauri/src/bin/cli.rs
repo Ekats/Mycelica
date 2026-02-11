@@ -618,6 +618,9 @@ enum HierarchyCommands {
         /// Use keyword extraction instead of LLM for category naming (faster but lower quality)
         #[arg(long)]
         keywords_only: bool,
+        /// Fresh rebuild: delete all algorithm-generated categories, rebuild from scratch (preserves human modifications)
+        #[arg(long)]
+        fresh: bool,
     },
     /// Flatten single-child chains
     Flatten,
@@ -2072,11 +2075,11 @@ async fn handle_hierarchy(cmd: HierarchyCommands, db: &Database, json: bool, qui
                 log!("Hierarchy built successfully");
             }
         }
-        HierarchyCommands::Rebuild { algorithm, levels, method, min_size, thresholds, cohesion_threshold, delta_min, tight_threshold, auto, keywords_only } => {
+        HierarchyCommands::Rebuild { algorithm, levels, method, min_size, thresholds, cohesion_threshold, delta_min, tight_threshold, auto, keywords_only, fresh } => {
             match algorithm.as_str() {
                 "adaptive" => {
                     if !quiet { elog!("Rebuilding hierarchy with adaptive v2 algorithm..."); }
-                    let result = rebuild_hierarchy_adaptive(db, min_size, tight_threshold, cohesion_threshold, delta_min, auto, json, quiet, keywords_only).await?;
+                    let result = rebuild_hierarchy_adaptive(db, min_size, tight_threshold, cohesion_threshold, delta_min, auto, json, quiet, keywords_only, fresh).await?;
                     if json {
                         log!(r#"{{"status":"ok","categories":{},"papers_assigned":{},"sibling_edges":{},"bridges":{}}}"#,
                             result.categories, result.papers_assigned, result.sibling_edges, result.bridges);
@@ -2764,6 +2767,7 @@ async fn rebuild_hierarchy_adaptive(
     _json: bool,
     quiet: bool,
     keywords_only: bool,
+    fresh: bool,
 ) -> Result<AdaptiveRebuildResult, String> {
     use mycelica_lib::dendrogram::{build_adaptive_tree, auto_config, AdaptiveTreeConfig, TreeNode};
     use mycelica_lib::ai_client;
@@ -2775,7 +2779,13 @@ async fn rebuild_hierarchy_adaptive(
     let now = chrono::Utc::now().timestamp_millis();
 
     // Step 1: Clear existing hierarchy
-    if !quiet { elog!("Step 1/7: Clearing existing hierarchy..."); }
+    if !quiet {
+        if fresh {
+            elog!("Step 1/7: Fresh rebuild — clearing algorithm-generated categories (preserving human modifications)...");
+        } else {
+            elog!("Step 1/7: Clearing existing hierarchy...");
+        }
+    }
     db.delete_hierarchy_nodes().map_err(|e| e.to_string())?;
 
     // Step 2: Load edges and check threshold
@@ -2794,14 +2804,23 @@ async fn rebuild_hierarchy_adaptive(
         }
     }
 
-    // Extract unique paper IDs
+    // Sovereignty: extract pinned items (human-edited parent_id)
+    let pinned_items = db.get_pinned_items().map_err(|e| e.to_string())?;
+    let pinned_ids: HashSet<String> = pinned_items.iter().map(|(id, _)| id.clone()).collect();
+    if !pinned_ids.is_empty() && !quiet {
+        elog!("  {} pinned items excluded from clustering (human-edited parent_id)", pinned_ids.len());
+    }
+
+    // Extract unique paper IDs, filtering out pinned items
     let mut paper_set = HashSet::new();
     for (source, target, _) in &edges {
         paper_set.insert(source.clone());
         paper_set.insert(target.clone());
     }
-    let papers: Vec<String> = paper_set.into_iter().collect();
-    if !quiet { elog!("  {} unique papers", papers.len()); }
+    let papers: Vec<String> = paper_set.into_iter()
+        .filter(|id| !pinned_ids.contains(id))
+        .collect();
+    if !quiet { elog!("  {} unique papers (after excluding pinned)", papers.len()); }
 
     // Always compute edge statistics for dynamic scaling
     let auto_cfg = auto_config(&edges, papers.len());
@@ -3156,6 +3175,17 @@ async fn rebuild_hierarchy_adaptive(
     }
 
     if !quiet { elog!("  {} sibling edges created", sibling_edges_created); }
+
+    // Sovereignty: validate pinned parents still exist (follow merges, orphan if deleted)
+    if !pinned_ids.is_empty() {
+        let warnings = db.validate_pinned_parents().map_err(|e| e.to_string())?;
+        for w in &warnings {
+            if !quiet { elog!("  Warning: {}", w); }
+        }
+        if warnings.is_empty() && !quiet {
+            elog!("  {} pinned items validated — parents intact", pinned_ids.len());
+        }
+    }
 
     // Step 6: Name categories (bottom-up)
     // Use LLM by default for better quality names, --keywords-only for faster but lower quality
@@ -4999,6 +5029,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, include_code: bool, al
             false,  // json
             quiet,
             keywords_only,
+            false,  // fresh = false (setup preserves existing state)
         ).await {
             Ok(result) => {
                 log!("");

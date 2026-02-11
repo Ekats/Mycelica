@@ -739,6 +739,75 @@ impl Database {
         Ok(result.unwrap_or(0) != 0)
     }
 
+    /// Get all items with parent_id in human_edited (pinned to their parent).
+    /// Returns (item_id, parent_id) pairs.
+    pub fn get_pinned_items(&self) -> Result<Vec<(String, Option<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, parent_id FROM nodes WHERE is_item = 1 AND human_edited LIKE '%parent_id%'"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?.collect::<Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Get all human-created categories (deletion-protected).
+    pub fn get_human_created_categories(&self) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE is_item = 0 AND human_created = 1",
+            Self::NODE_COLUMNS
+        ))?;
+        let nodes = stmt.query_map([], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
+        Ok(nodes)
+    }
+
+    /// After rebuild, validate pinned items' parents still exist.
+    /// Follows merges, orphans if parent was deleted. Returns warnings.
+    pub fn validate_pinned_parents(&self) -> Result<Vec<String>> {
+        let pinned = self.get_pinned_items()?;
+        let conn = self.conn.lock().unwrap();
+        let mut warnings = Vec::new();
+
+        for (item_id, parent_id) in &pinned {
+            let Some(pid) = parent_id else { continue };
+
+            // Check if parent still exists
+            let exists: bool = conn.query_row(
+                "SELECT COUNT(*) > 0 FROM nodes WHERE id = ?1",
+                params![pid],
+                |row| row.get(0),
+            )?;
+            if exists { continue; }
+
+            // Check if parent was merged into another node
+            let merged_into: Option<String> = conn.query_row(
+                "SELECT merged_into_id FROM merged_items WHERE original_id = ?1",
+                params![pid],
+                |row| row.get(0),
+            ).optional()?.flatten();
+
+            if let Some(new_parent) = merged_into {
+                // Follow the merge
+                conn.execute(
+                    "UPDATE nodes SET parent_id = ?2 WHERE id = ?1",
+                    params![item_id, new_parent],
+                )?;
+                warnings.push(format!("Item {} parent merged: {} -> {}", item_id, pid, new_parent));
+            } else {
+                // Parent was deleted — orphan the item (but keep human_edited flag)
+                conn.execute(
+                    "UPDATE nodes SET parent_id = NULL WHERE id = ?1",
+                    params![item_id],
+                )?;
+                warnings.push(format!("Item {} orphaned: parent {} no longer exists", item_id, pid));
+            }
+        }
+
+        Ok(warnings)
+    }
+
     /// Mark a field as human-edited (merges into existing JSON array).
     pub fn mark_field_human_edited(&self, node_id: &str, field: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -2140,30 +2209,110 @@ impl Database {
     }
 
     // Update AI processing results for a node
+    // Sovereignty: per-field — only updates fields NOT in human_edited
     pub fn update_node_ai(&self, node_id: &str, ai_title: &str, summary: &str, tags: &str, content_type: &str) -> Result<()> {
-        // Sovereignty: skip AI overwrite for human-edited nodes
-        if self.has_human_edits(node_id)? {
-            return Ok(());
-        }
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE nodes SET ai_title = ?2, summary = ?3, tags = ?4, content_type = ?5, is_processed = 1 WHERE id = ?1",
-            params![node_id, ai_title, summary, tags, content_type],
-        )?;
+
+        // Read human_edited in same lock scope
+        let human_edited: Option<String> = conn.query_row(
+            "SELECT human_edited FROM nodes WHERE id = ?1",
+            params![node_id],
+            |row| row.get(0),
+        ).optional()?.flatten();
+
+        let edited_fields: Vec<String> = human_edited
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+        // Build SET clause dynamically, skipping human-edited fields
+        let mut sets = Vec::new();
+        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut param_idx = 2; // ?1 is node_id
+
+        if !edited_fields.contains(&"title".to_string()) {
+            sets.push(format!("ai_title = ?{}", param_idx));
+            values.push(Box::new(ai_title.to_string()));
+            param_idx += 1;
+        }
+        if !edited_fields.contains(&"content".to_string()) && !edited_fields.contains(&"summary".to_string()) {
+            sets.push(format!("summary = ?{}", param_idx));
+            values.push(Box::new(summary.to_string()));
+            param_idx += 1;
+        }
+        if !edited_fields.contains(&"tags".to_string()) {
+            sets.push(format!("tags = ?{}", param_idx));
+            values.push(Box::new(tags.to_string()));
+            param_idx += 1;
+        }
+        if !edited_fields.contains(&"content_type".to_string()) {
+            sets.push(format!("content_type = ?{}", param_idx));
+            values.push(Box::new(content_type.to_string()));
+            // param_idx += 1; // not needed after last
+        }
+
+        // Always mark as processed so node isn't re-queued
+        sets.push("is_processed = 1".to_string());
+
+        if sets.len() == 1 {
+            // Only is_processed = 1, all AI fields were human-edited
+            conn.execute(
+                "UPDATE nodes SET is_processed = 1 WHERE id = ?1",
+                params![node_id],
+            )?;
+        } else {
+            let sql = format!("UPDATE nodes SET {} WHERE id = ?1", sets.join(", "));
+            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            all_params.push(Box::new(node_id.to_string()));
+            all_params.extend(values);
+            conn.execute(&sql, rusqlite::params_from_iter(all_params.iter().map(|v| v.as_ref())))?;
+        }
         Ok(())
     }
 
     // Update only ai_title and summary (preserves tags, content_type) - for code items
+    // Sovereignty: per-field — only updates fields NOT in human_edited
     pub fn update_node_ai_summary_only(&self, node_id: &str, ai_title: &str, summary: &str) -> Result<()> {
-        // Sovereignty: skip AI overwrite for human-edited nodes
-        if self.has_human_edits(node_id)? {
-            return Ok(());
-        }
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE nodes SET ai_title = ?2, summary = ?3, is_processed = 1 WHERE id = ?1",
-            params![node_id, ai_title, summary],
-        )?;
+
+        let human_edited: Option<String> = conn.query_row(
+            "SELECT human_edited FROM nodes WHERE id = ?1",
+            params![node_id],
+            |row| row.get(0),
+        ).optional()?.flatten();
+
+        let edited_fields: Vec<String> = human_edited
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+        let mut sets = Vec::new();
+        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut param_idx = 2;
+
+        if !edited_fields.contains(&"title".to_string()) {
+            sets.push(format!("ai_title = ?{}", param_idx));
+            values.push(Box::new(ai_title.to_string()));
+            param_idx += 1;
+        }
+        if !edited_fields.contains(&"content".to_string()) && !edited_fields.contains(&"summary".to_string()) {
+            sets.push(format!("summary = ?{}", param_idx));
+            values.push(Box::new(summary.to_string()));
+            // param_idx += 1;
+        }
+
+        sets.push("is_processed = 1".to_string());
+
+        if sets.len() == 1 {
+            conn.execute(
+                "UPDATE nodes SET is_processed = 1 WHERE id = ?1",
+                params![node_id],
+            )?;
+        } else {
+            let sql = format!("UPDATE nodes SET {} WHERE id = ?1", sets.join(", "));
+            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            all_params.push(Box::new(node_id.to_string()));
+            all_params.extend(values);
+            conn.execute(&sql, rusqlite::params_from_iter(all_params.iter().map(|v| v.as_ref())))?;
+        }
         Ok(())
     }
 
@@ -2505,16 +2654,16 @@ impl Database {
         let conn = self.conn.lock().unwrap();
 
         if protected_ids.is_empty() {
-            // No protection - clear all
+            // No protection - clear all (sovereignty: preserve pinned parents)
             conn.execute(
-                "UPDATE nodes SET parent_id = NULL WHERE is_item = 1",
+                "UPDATE nodes SET parent_id = NULL WHERE is_item = 1 AND (human_edited IS NULL OR human_edited NOT LIKE '%parent_id%')",
                 [],
             )?;
         } else {
-            // Build exclusion list
+            // Build exclusion list (sovereignty: preserve pinned parents)
             let placeholders: Vec<String> = protected_ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
             let sql = format!(
-                "UPDATE nodes SET parent_id = NULL WHERE is_item = 1 AND id NOT IN ({})",
+                "UPDATE nodes SET parent_id = NULL WHERE is_item = 1 AND (human_edited IS NULL OR human_edited NOT LIKE '%parent_id%') AND id NOT IN ({})",
                 placeholders.join(", ")
             );
 
