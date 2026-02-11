@@ -88,9 +88,10 @@ export default function NodePopup() {
     setCategoryQuery(value);
     if (value.trim().length < 2) { setCategoryResults([]); return; }
     try {
+      const { localCategories } = useTeamStore.getState();
       const results = await invoke<Node[]>("team_search", { query: value, limit: 10 });
       // Only show categories (not items), exclude self
-      setCategoryResults(results.filter((r) => !r.isItem && r.id !== selectedNodeId));
+      setCategoryResults(results.filter((r) => (!r.isItem || localCategories.has(r.id)) && r.id !== selectedNodeId));
     } catch { setCategoryResults([]); }
   }, [selectedNodeId]);
 
