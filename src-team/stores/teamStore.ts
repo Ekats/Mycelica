@@ -17,6 +17,14 @@ interface TeamStore {
   personalEdges: PersonalEdge[];
   savedPositions: Map<string, { x: number; y: number }>;
 
+  // In-memory positions (updated by GraphView after each render, NOT persisted)
+  currentPositions: Map<string, { x: number; y: number }>;
+  setCurrentPositions: (positions: Map<string, { x: number; y: number }>) => void;
+
+  // Local category overrides (node IDs created as categories, survives refresh)
+  localCategories: Set<string>;
+  addLocalCategory: (id: string) => void;
+
   // UI
   selectedNodeId: string | null;
   searchQuery: string;
@@ -60,6 +68,9 @@ interface TeamStore {
   setShowSettings: (show: boolean) => void;
   setShowQuickAdd: (show: boolean) => void;
   clearError: () => void;
+
+  panToNodeId: string | null;
+  setPanToNodeId: (id: string | null) => void;
 }
 
 export const useTeamStore = create<TeamStore>((set, get) => ({
@@ -69,6 +80,14 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
   personalNodes: new Map(),
   personalEdges: [],
   savedPositions: new Map(),
+  currentPositions: new Map(),
+  setCurrentPositions: (positions) => set({ currentPositions: positions }),
+  localCategories: new Set(),
+  addLocalCategory: (id) => set((s) => {
+    const lc = new Set(s.localCategories);
+    lc.add(id);
+    return { localCategories: lc };
+  }),
 
   selectedNodeId: null,
   searchQuery: "",
@@ -84,7 +103,7 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
   error: null,
 
   getDisplayNodes: () => {
-    const { nodes, personalNodes } = get();
+    const { nodes, personalNodes, localCategories } = get();
     const display: DisplayNode[] = [];
     for (const n of nodes.values()) {
       display.push({
@@ -95,6 +114,7 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
         tags: n.tags,
         author: n.author,
         isPersonal: false,
+        isItem: localCategories.has(n.id) ? false : n.isItem,
         createdAt: n.createdAt,
         updatedAt: n.updatedAt,
         x: n.x,
@@ -110,6 +130,7 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
         tags: pn.tags,
         author: undefined,
         isPersonal: true,
+        isItem: true,
         createdAt: pn.createdAt,
         updatedAt: pn.updatedAt,
       });
@@ -226,6 +247,8 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
         nodes.set(result.node.id, result.node);
         return { nodes };
       });
+      // Auto-refresh to pick up server-created edges (from connects_to)
+      get().refresh();
       return result.node.id;
     } catch (e) {
       set({ error: String(e) });
@@ -264,6 +287,7 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
     try {
       const result = await invoke<{ edge: Edge }>("team_create_edge", { req });
       set((s) => ({ edges: [...s.edges, result.edge] }));
+      get().refresh();
     } catch (e) {
       set({ error: String(e) });
     }
@@ -330,4 +354,7 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
   setShowSettings: (show) => set({ showSettings: show }),
   setShowQuickAdd: (show) => set({ showQuickAdd: show }),
   clearError: () => set({ error: null }),
+
+  panToNodeId: null,
+  setPanToNodeId: (id) => set({ panToNodeId: id }),
 }));

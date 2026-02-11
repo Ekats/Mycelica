@@ -73,6 +73,7 @@ struct CreateNodeRequest {
     tags: Option<String>,
     author: Option<String>,
     connects_to: Option<Vec<String>>,
+    is_item: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -203,7 +204,7 @@ async fn create_node_handler(
 
     let node_id = team::create_human_node(
         &state.db, &req.title, req.content.as_deref(), req.url.as_deref(),
-        content_type, req.tags.as_deref(), &author, "server",
+        content_type, req.tags.as_deref(), &author, "server", req.is_item,
     ).map_err(AppError::from)?;
 
     let mut edges_created = Vec::new();

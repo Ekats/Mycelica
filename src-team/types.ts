@@ -74,6 +74,7 @@ export interface CreateNodeRequest {
   tags?: string;
   author?: string;
   connects_to?: string[];
+  is_item?: boolean;
 }
 
 export interface PatchNodeRequest {
@@ -113,6 +114,7 @@ export interface DisplayNode {
   tags?: string;
   author?: string;
   isPersonal: boolean;
+  isItem: boolean;
   createdAt: number;
   updatedAt: number;
   x?: number;

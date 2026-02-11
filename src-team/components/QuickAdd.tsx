@@ -22,6 +22,7 @@ export default function QuickAdd() {
   const selectedIsCategory = selectedNode ? !selectedNode.isItem && selectedNode.childCount >= 0 : false;
 
   const [mode, setMode] = useState<"team" | "personal">("team");
+  const [isCategory, setIsCategory] = useState(false);
   const [title, setTitle] = useState("");
   const [content, setContent] = useState("");
   const [contentType, setContentType] = useState<ContentType>("concept");
@@ -68,17 +69,22 @@ export default function QuickAdd() {
     if (!title.trim()) return;
     setSubmitting(true);
     try {
+      let newNodeId: string | null = null;
       if (mode === "team") {
-        const newId = await createNode({
+        newNodeId = await createNode({
           title: title.trim(),
           content: content.trim() || undefined,
           content_type: contentType,
           tags: tags.trim() || undefined,
           author: config?.author,
           connects_to: connectTo.length > 0 ? connectTo : undefined,
+          is_item: !isCategory ? true : false,
         });
-        if (parentId && newId) {
-          await updateNode(newId, { parent_id: parentId, author: config?.author });
+        if (isCategory && newNodeId) {
+          useTeamStore.getState().addLocalCategory(newNodeId);
+        }
+        if (parentId && newNodeId) {
+          await updateNode(newNodeId, { parent_id: parentId, author: config?.author });
         }
       } else {
         const { createPersonalNode, createPersonalEdge } = useTeamStore.getState();
@@ -88,15 +94,37 @@ export default function QuickAdd() {
           contentType,
           tags.trim() || undefined,
         );
+        newNodeId = node.id;
         for (const targetId of connectTo) {
           await createPersonalEdge(node.id, targetId, "related");
         }
+      }
+
+      // Place new node near its connections
+      if (newNodeId && connectTo.length > 0) {
+        const { currentPositions, savePositions } = useTeamStore.getState();
+        const positions = connectTo
+          .map((id) => currentPositions.get(id))
+          .filter((p): p is { x: number; y: number } => p != null);
+        if (positions.length > 0) {
+          const avgX = positions.reduce((s, p) => s + p.x, 0) / positions.length;
+          const avgY = positions.reduce((s, p) => s + p.y, 0) / positions.length;
+          const angle = Math.random() * Math.PI * 2;
+          const dist = 200 + Math.random() * 150;
+          await savePositions([{ node_id: newNodeId, x: avgX + Math.cos(angle) * dist, y: avgY + Math.sin(angle) * dist }]);
+        }
+      }
+
+      if (newNodeId) {
+        const store = useTeamStore.getState();
+        store.setSelectedNodeId(newNodeId);
+        store.setPanToNodeId(newNodeId);
       }
       setShowQuickAdd(false);
     } finally {
       setSubmitting(false);
     }
-  }, [mode, title, content, contentType, tags, connectTo, parentId, config, createNode, updateNode, setShowQuickAdd]);
+  }, [mode, isCategory, title, content, contentType, tags, connectTo, parentId, config, createNode, updateNode, setShowQuickAdd]);
 
   return (
     <div className="modal-overlay" onClick={(e) => e.target === e.currentTarget && setShowQuickAdd(false)}>
@@ -125,6 +153,24 @@ export default function QuickAdd() {
             Personal
           </button>
         </div>
+
+        {/* Item / Category toggle */}
+        {mode === "team" && (
+          <div className="flex gap-1 mb-4 p-1 rounded-lg" style={{ background: "var(--bg-tertiary)" }}>
+            <button
+              className={`flex-1 py-1.5 rounded text-sm font-medium ${!isCategory ? "btn-primary" : ""}`}
+              onClick={() => setIsCategory(false)}
+            >
+              Item
+            </button>
+            <button
+              className={`flex-1 py-1.5 rounded text-sm font-medium ${isCategory ? "btn-primary" : ""}`}
+              onClick={() => setIsCategory(true)}
+            >
+              Category
+            </button>
+          </div>
+        )}
 
         {/* Parent category */}
         {mode === "team" && (

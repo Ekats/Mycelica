@@ -2,7 +2,8 @@ import { useEffect, useRef, useCallback } from "react";
 import * as d3 from "d3";
 import { useTeamStore } from "../stores/teamStore";
 
-const AUTHOR_COLORS = ["#f59e0b", "#10b981", "#6366f1", "#ef4444", "#8b5cf6", "#06b6d4", "#ec4899", "#84cc16"];
+const TEAM_COLOR = "#60a5fa";
+const CATEGORY_COLOR = "#ef4444";
 const PERSONAL_COLOR = "#14b8a6";
 
 const EDGE_COLORS: Record<string, string> = {
@@ -21,6 +22,7 @@ interface GraphNode {
   id: string;
   title: string;
   isPersonal: boolean;
+  isItem: boolean;
   author?: string;
   contentType?: string;
   edgeCount: number;
@@ -54,6 +56,7 @@ function gridPosition(index: number, centerX: number, centerY: number): { x: num
 export default function GraphView() {
   const svgRef = useRef<SVGSVGElement>(null);
   const nodesRef = useRef<GraphNode[]>([]);
+  const zoomRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
 
   // Subscribe to actual data so effect re-runs when nodes/edges change
   const nodes = useTeamStore((s) => s.nodes);
@@ -66,18 +69,10 @@ export default function GraphView() {
   const savedPositions = useTeamStore((s) => s.savedPositions);
   const setSelectedNodeId = useTeamStore((s) => s.setSelectedNodeId);
   const savePositions = useTeamStore((s) => s.savePositions);
+  const setCurrentPositions = useTeamStore((s) => s.setCurrentPositions);
   const getDisplayNodes = useTeamStore((s) => s.getDisplayNodes);
   const getDisplayEdges = useTeamStore((s) => s.getDisplayEdges);
 
-  const authorColorMap = useRef(new Map<string, string>());
-
-  const getAuthorColor = useCallback((author?: string) => {
-    if (!author) return "#6b7280";
-    if (!authorColorMap.current.has(author)) {
-      authorColorMap.current.set(author, AUTHOR_COLORS[authorColorMap.current.size % AUTHOR_COLORS.length]);
-    }
-    return authorColorMap.current.get(author)!;
-  }, []);
 
   useEffect(() => {
     const svg = svgRef.current;
@@ -104,10 +99,9 @@ export default function GraphView() {
       prevPositions.set(n.id, { x: n.x, y: n.y });
     }
 
-    // Build nodes with deterministic positions
+    // Build nodes — position priority: saved (local.db) > previous render > DB > grid
     let unpositionedIndex = 0;
     const graphNodes: GraphNode[] = displayNodes.map((dn) => {
-      // Priority: saved position > previous render > DB position > grid
       const saved = savedPositions.get(dn.id);
       const prev = prevPositions.get(dn.id);
       let x: number, y: number;
@@ -125,6 +119,7 @@ export default function GraphView() {
         id: dn.id,
         title: dn.title,
         isPersonal: dn.isPersonal,
+        isItem: dn.isItem,
         author: dn.author,
         contentType: dn.contentType,
         edgeCount: edgeCounts.get(dn.id) || 0,
@@ -133,6 +128,11 @@ export default function GraphView() {
     });
 
     nodesRef.current = graphNodes;
+
+    // Publish all current positions to store (in-memory only, for QuickAdd etc.)
+    const posMap = new Map(graphNodes.map((n) => [n.id, { x: n.x, y: n.y }]));
+    setCurrentPositions(posMap);
+
     const nodeMap = new Map(graphNodes.map((n) => [n.id, n]));
     const nodeIds = new Set(graphNodes.map((n) => n.id));
 
@@ -193,6 +193,7 @@ export default function GraphView() {
       const zoom = d3.zoom<SVGSVGElement, unknown>()
         .scaleExtent([0.1, 4])
         .on("zoom", (event) => g.attr("transform", event.transform));
+      zoomRef.current = zoom;
       svgSel.call(zoom);
     }
 
@@ -233,14 +234,14 @@ export default function GraphView() {
 
     nodeMerge.select("circle")
       .attr("r", (d) => Math.min(64 + d.edgeCount * 4, 96))
-      .attr("fill", (d) => (d.isPersonal ? PERSONAL_COLOR : getAuthorColor(d.author)))
+      .attr("fill", (d) => d.isPersonal ? PERSONAL_COLOR : !d.isItem ? CATEGORY_COLOR : TEAM_COLOR)
       .attr("fill-opacity", (d) => (d.isPersonal ? 0.6 : 0.85))
       .attr("stroke", (d) => {
         if (d.id === selectedNodeId) return "#f59e0b";
         if (d.isPersonal) return PERSONAL_COLOR;
         return "#f9fafb";
       })
-      .attr("stroke-width", (d) => (d.id === selectedNodeId ? 3 : 1.5))
+      .attr("stroke-width", (d) => (d.id === selectedNodeId ? 6 : 1.5))
       .attr("stroke-dasharray", (d) => (d.isPersonal ? "3,2" : "none"));
 
     nodeMerge.select("text")
@@ -259,8 +260,8 @@ export default function GraphView() {
           return "#f9fafb";
         })
         .attr("stroke-width", (d) => {
-          if (d.id === selectedNodeId) return 3;
-          if (resultIds.has(d.id)) return 2.5;
+          if (d.id === selectedNodeId) return 6;
+          if (resultIds.has(d.id)) return 4;
           return 1.5;
         });
     }
@@ -295,7 +296,23 @@ export default function GraphView() {
 
     nodeMerge.call(drag);
 
-  }, [nodes, edges, personalNodes, personalEdges, selectedNodeId, searchResults, searchQuery, savedPositions, getDisplayNodes, getDisplayEdges, setSelectedNodeId, savePositions, getAuthorColor]);
+  }, [nodes, edges, personalNodes, personalEdges, selectedNodeId, searchResults, searchQuery, savedPositions, getDisplayNodes, getDisplayEdges, setSelectedNodeId, savePositions]);
+
+  // Pan to node when requested
+  const panToNodeId = useTeamStore((s) => s.panToNodeId);
+  const setPanToNodeId = useTeamStore((s) => s.setPanToNodeId);
+  useEffect(() => {
+    if (!panToNodeId || !svgRef.current || !zoomRef.current) return;
+    const node = nodesRef.current.find((n) => n.id === panToNodeId);
+    if (!node) return;
+    const svg = svgRef.current;
+    const width = svg.clientWidth;
+    const height = svg.clientHeight;
+    const svgSel = d3.select(svg);
+    const transform = d3.zoomIdentity.translate(width / 2 - node.x, height / 2 - node.y);
+    svgSel.transition().duration(500).call(zoomRef.current.transform, transform);
+    setPanToNodeId(null);
+  }, [panToNodeId, setPanToNodeId]);
 
   const handleSvgClick = useCallback((e: React.MouseEvent) => {
     if ((e.target as Element).tagName === "svg") {

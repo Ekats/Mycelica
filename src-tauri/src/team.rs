@@ -41,6 +41,7 @@ pub fn create_human_node(
     tags_json: Option<&str>,
     author: &str,
     source: &str,
+    is_item: Option<bool>,
 ) -> Result<String, String> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp_millis();
@@ -57,7 +58,7 @@ pub fn create_human_node(
         cluster_id: None,
         cluster_label: None,
         depth: 0,
-        is_item: true,
+        is_item: is_item.unwrap_or(true),
         is_universe: false,
         parent_id: None,
         child_count: 0,

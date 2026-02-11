@@ -1196,6 +1196,7 @@ async fn run_remote(cli: Cli, remote_url: &str) -> Result<(), String> {
                 }),
                 author,
                 connects_to,
+                is_item: None,
             };
             let resp = client.create_node(&req).await?;
             if json {
@@ -1220,6 +1221,7 @@ async fn run_remote(cli: Cli, remote_url: &str) -> Result<(), String> {
                 tags: None,
                 author,
                 connects_to,
+                is_item: None,
             };
             let resp = client.create_node(&req).await?;
             if json {
@@ -1238,6 +1240,7 @@ async fn run_remote(cli: Cli, remote_url: &str) -> Result<(), String> {
                 tags: None,
                 author,
                 connects_to,
+                is_item: None,
             };
             let resp = client.create_node(&req).await?;
             if json {
@@ -1256,6 +1259,7 @@ async fn run_remote(cli: Cli, remote_url: &str) -> Result<(), String> {
                 tags: None,
                 author,
                 connects_to,
+                is_item: None,
             };
             let resp = client.create_node(&req).await?;
             if json {
@@ -5701,7 +5705,7 @@ fn create_human_node(
     tags_json: Option<&str>,
 ) -> Result<String, String> {
     let author = settings::get_author_or_default();
-    mycelica_lib::team::create_human_node(db, title, content, url, content_type, tags_json, &author, "cli")
+    mycelica_lib::team::create_human_node(db, title, content, url, content_type, tags_json, &author, "cli", None)
 }
 
 /// Resolve a node reference (UUID, ID prefix, or title text).

@@ -24,6 +24,7 @@ pub struct CreateNodeRequest {
     pub tags: Option<String>,
     pub author: Option<String>,
     pub connects_to: Option<Vec<String>>,
+    pub is_item: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize)]
