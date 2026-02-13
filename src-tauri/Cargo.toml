@@ -123,6 +123,17 @@ path = "src/bin/cli.rs"
 name = "mycelica-server"
 path = "src/bin/server.rs"
 
+[package.metadata.deb]
+name = "mycelica-server"
+maintainer = "Ekats"
+copyright = "2024-2026 Ekats"
+depends = "$auto, libssl3"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/mycelica-server", "usr/bin/", "755"],
+]
+
 # =============================================================================
 # Build Instructions
 # =============================================================================

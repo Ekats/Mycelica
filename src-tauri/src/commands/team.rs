@@ -477,6 +477,84 @@ pub fn team_create_personal_edge(
 }
 
 #[tauri::command]
+pub fn team_delete_personal_node(
+    state: State<'_, TeamState>,
+    id: String,
+) -> Result<(), String> {
+    let conn = state.local_db.raw_conn();
+    let conn = conn.lock().map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM personal_edges WHERE source_id = ?1 OR target_id = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM personal_nodes WHERE id = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn team_update_personal_node(
+    state: State<'_, TeamState>,
+    id: String,
+    title: Option<String>,
+    content: Option<String>,
+    content_type: Option<String>,
+    tags: Option<String>,
+) -> Result<PersonalNode, String> {
+    let conn = state.local_db.raw_conn();
+    let conn = conn.lock().map_err(|e| e.to_string())?;
+    let now = chrono::Utc::now().timestamp_millis();
+
+    // Build dynamic UPDATE
+    let mut sets = Vec::new();
+    let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let mut idx = 1;
+
+    if let Some(ref t) = title {
+        idx += 1; sets.push(format!("title = ?{}", idx));
+        values.push(Box::new(t.clone()));
+    }
+    if let Some(ref c) = content {
+        idx += 1; sets.push(format!("content = ?{}", idx));
+        values.push(Box::new(c.clone()));
+    }
+    if let Some(ref ct) = content_type {
+        idx += 1; sets.push(format!("content_type = ?{}", idx));
+        values.push(Box::new(ct.clone()));
+    }
+    if let Some(ref tg) = tags {
+        idx += 1; sets.push(format!("tags = ?{}", idx));
+        values.push(Box::new(tg.clone()));
+    }
+
+    if !sets.is_empty() {
+        idx += 1;
+        sets.push(format!("updated_at = ?{}", idx));
+        values.push(Box::new(now));
+
+        let sql = format!("UPDATE personal_nodes SET {} WHERE id = ?1", sets.join(", "));
+        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        all_params.push(Box::new(id.clone()));
+        all_params.extend(values);
+        conn.execute(&sql, rusqlite::params_from_iter(all_params.iter().map(|v| v.as_ref())))
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Return updated node
+    conn.query_row(
+        "SELECT id, title, content, content_type, tags, created_at, updated_at FROM personal_nodes WHERE id = ?1",
+        params![id],
+        |row| Ok(PersonalNode {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            content: row.get(2)?,
+            content_type: row.get(3)?,
+            tags: row.get(4)?,
+            created_at: row.get(5)?,
+            updated_at: row.get(6)?,
+        }),
+    ).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn team_get_personal_data(state: State<'_, TeamState>) -> Result<PersonalData, String> {
     let conn = state.local_db.raw_conn();
     let conn = conn.lock().map_err(|e| e.to_string())?;

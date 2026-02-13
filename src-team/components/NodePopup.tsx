@@ -1,14 +1,20 @@
 import { useState, useEffect, useCallback } from "react";
-import { X, Trash2, Link, FolderInput } from "lucide-react";
+import { X, Trash2, Link, FolderInput, FolderOpen, Pencil } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useTeamStore } from "../stores/teamStore";
 import EdgeCreator from "./EdgeCreator";
-import type { DisplayEdge, Node } from "../types";
+import type { ContentType, DisplayEdge, Node } from "../types";
+
+const CONTENT_TYPES: ContentType[] = [
+  "concept", "question", "decision", "reference", "idea",
+  "insight", "exploration", "synthesis", "planning",
+];
 
 export default function NodePopup() {
   const {
     nodes, personalNodes, selectedNodeId, edges, personalEdges,
-    setSelectedNodeId, updateNode, deleteNode,
+    setSelectedNodeId, updateNode, deleteNode, deletePersonalNode, updatePersonalNode,
+    navigateToCategory,
   } = useTeamStore();
 
   const [editingTitle, setEditingTitle] = useState(false);
@@ -19,6 +25,7 @@ export default function NodePopup() {
   const [showCategoryAssigner, setShowCategoryAssigner] = useState(false);
   const [categoryQuery, setCategoryQuery] = useState("");
   const [categoryResults, setCategoryResults] = useState<Node[]>([]);
+  const [showEditModal, setShowEditModal] = useState(false);
 
   const teamNode = selectedNodeId ? nodes.get(selectedNodeId) : null;
   const personalNode = selectedNodeId ? personalNodes.get(selectedNodeId) : null;
@@ -39,6 +46,7 @@ export default function NodePopup() {
     setShowCategoryAssigner(false);
     setCategoryQuery("");
     setCategoryResults([]);
+    setShowEditModal(false);
   }, [selectedNodeId, teamNode, personalNode]);
 
   // Gather edges for this node
@@ -80,28 +88,49 @@ export default function NodePopup() {
   }, [selectedNodeId, teamNode, contentDraft, updateNode]);
 
   const handleDelete = useCallback(async () => {
-    if (!selectedNodeId || isPersonal) return;
-    await deleteNode(selectedNodeId);
-  }, [selectedNodeId, isPersonal, deleteNode]);
+    if (!selectedNodeId) return;
+    if (isPersonal) {
+      await deletePersonalNode(selectedNodeId);
+    } else {
+      await deleteNode(selectedNodeId);
+    }
+  }, [selectedNodeId, isPersonal, deleteNode, deletePersonalNode]);
+
+  const loadAllCategories = useCallback(() => {
+    const { nodes: allNodes, localCategories } = useTeamStore.getState();
+    const cats: Node[] = [];
+    for (const n of allNodes.values()) {
+      if ((!n.isItem || localCategories.has(n.id)) && n.id !== selectedNodeId) {
+        cats.push(n);
+      }
+    }
+    cats.sort((a, b) => (a.aiTitle || a.title).localeCompare(b.aiTitle || b.title));
+    setCategoryResults(cats.slice(0, 100));
+  }, [selectedNodeId]);
 
   const handleCategorySearch = useCallback(async (value: string) => {
     setCategoryQuery(value);
-    if (value.trim().length < 2) { setCategoryResults([]); return; }
+    if (!value.trim()) { loadAllCategories(); return; }
     try {
       const { localCategories } = useTeamStore.getState();
-      const results = await invoke<Node[]>("team_search", { query: value, limit: 10 });
-      // Only show categories (not items), exclude self
+      const results = await invoke<Node[]>("team_search", { query: value, limit: 100 });
       setCategoryResults(results.filter((r) => (!r.isItem || localCategories.has(r.id)) && r.id !== selectedNodeId));
     } catch { setCategoryResults([]); }
-  }, [selectedNodeId]);
+  }, [selectedNodeId, loadAllCategories]);
 
   const handleAssignCategory = useCallback(async (categoryId: string) => {
     if (!selectedNodeId) return;
-    await updateNode(selectedNodeId, { parent_id: categoryId, author: useTeamStore.getState().config?.author });
+    if (isPersonal) {
+      // Personal nodes can't be PATCHed on server — create a "contains" edge instead
+      const { createPersonalEdge } = useTeamStore.getState();
+      await createPersonalEdge(categoryId, selectedNodeId, "contains");
+    } else {
+      await updateNode(selectedNodeId, { parent_id: categoryId, author: useTeamStore.getState().config?.author });
+    }
     setShowCategoryAssigner(false);
     setCategoryQuery("");
     setCategoryResults([]);
-  }, [selectedNodeId, updateNode]);
+  }, [selectedNodeId, isPersonal, updateNode]);
 
   if (!node) return null;
 
@@ -109,6 +138,7 @@ export default function NodePopup() {
   const content = teamNode ? teamNode.content : personalNode!.content;
   const author = teamNode?.author;
   const contentType = teamNode?.contentType || personalNode?.contentType;
+  const nodeTags = teamNode?.tags || personalNode?.tags;
 
   // Resolve edge target/source names
   const resolveNodeName = (id: string): string => {
@@ -162,7 +192,7 @@ export default function NodePopup() {
           <h2
             className="text-lg font-semibold cursor-pointer hover:opacity-80"
             onClick={() => !isPersonal && setEditingTitle(true)}
-            title={isPersonal ? "Personal nodes are local-only" : "Click to edit"}
+            title={isPersonal ? "Use Edit to modify personal nodes" : "Click to edit"}
           >
             {title}
           </h2>
@@ -192,6 +222,18 @@ export default function NodePopup() {
             onClick={() => !isPersonal && setEditingContent(true)}>
             {isPersonal ? "No content" : "Click to add content..."}
           </p>
+        )}
+
+        {/* Tags */}
+        {nodeTags && (
+          <div className="flex flex-wrap gap-1 mt-3">
+            {nodeTags.split(",").map((tag) => tag.trim()).filter(Boolean).map((tag) => (
+              <span key={tag} className="text-[11px] px-2 py-0.5 rounded-full"
+                style={{ background: "var(--bg-tertiary)", color: "var(--text-secondary)" }}>
+                {tag}
+              </span>
+            ))}
+          </div>
         )}
 
         {/* Edges */}
@@ -229,25 +271,33 @@ export default function NodePopup() {
       </div>
 
       {/* Footer */}
-      <div className="flex items-center gap-2 px-4 py-3 border-t" style={{ borderColor: "var(--border)" }}>
+      <div className="flex items-center gap-2 px-4 py-3 border-t flex-wrap" style={{ borderColor: "var(--border)" }}>
+        {teamNode && !teamNode.isItem && (
+          <button className="btn-secondary flex items-center gap-1 text-xs"
+            onClick={() => { if (selectedNodeId) navigateToCategory(selectedNodeId); }}>
+            <FolderOpen size={12} />
+            Drill In{teamNode.childCount > 0 ? ` (${teamNode.childCount})` : ""}
+          </button>
+        )}
         <button className="btn-secondary flex items-center gap-1 text-xs"
           onClick={() => { setShowEdgeCreator(!showEdgeCreator); setShowCategoryAssigner(false); }}>
           <Link size={12} />
           Add Edge
         </button>
-        {!isPersonal && (
-          <button className="btn-secondary flex items-center gap-1 text-xs"
-            onClick={() => { setShowCategoryAssigner(!showCategoryAssigner); setShowEdgeCreator(false); }}>
-            <FolderInput size={12} />
-            Assign Category
-          </button>
-        )}
-        {!isPersonal && (
-          <button className="btn-danger flex items-center gap-1 text-xs ml-auto" onClick={handleDelete}>
-            <Trash2 size={12} />
-            Delete
-          </button>
-        )}
+        <button className="btn-secondary flex items-center gap-1 text-xs"
+          onClick={() => setShowEditModal(true)}>
+          <Pencil size={12} />
+          Edit
+        </button>
+        <button className="btn-secondary flex items-center gap-1 text-xs"
+          onClick={() => { setShowCategoryAssigner(!showCategoryAssigner); setShowEdgeCreator(false); }}>
+          <FolderInput size={12} />
+          Assign Category
+        </button>
+        <button className="btn-danger flex items-center gap-1 text-xs ml-auto" onClick={handleDelete}>
+          <Trash2 size={12} />
+          Delete
+        </button>
       </div>
 
       {showEdgeCreator && selectedNodeId && (
@@ -268,15 +318,16 @@ export default function NodePopup() {
           <input
             type="text"
             className="w-full mb-1 text-xs"
-            placeholder="Search categories..."
+            placeholder="Search or browse categories..."
             value={categoryQuery}
             onChange={(e) => handleCategorySearch(e.target.value)}
+            onFocus={() => { if (!categoryQuery && categoryResults.length === 0) loadAllCategories(); }}
             style={{ padding: "4px 6px" }}
             autoFocus
           />
-          {categoryQuery && categoryResults.length > 0 && (
-            <div className="flex flex-col gap-0.5 max-h-24 overflow-y-auto rounded" style={{ background: "var(--bg-tertiary)" }}>
-              {categoryResults.slice(0, 5).map((r) => (
+          {categoryResults.length > 0 && (
+            <div className="flex flex-col gap-0.5 max-h-48 overflow-y-auto rounded" style={{ background: "var(--bg-tertiary)" }}>
+              {categoryResults.slice(0, 100).map((r) => (
                 <button
                   key={r.id}
                   className="text-left text-xs px-2 py-1 hover:opacity-80"
@@ -293,6 +344,127 @@ export default function NodePopup() {
           )}
         </div>
       )}
+
+      {/* Edit Node Modal */}
+      {showEditModal && selectedNodeId && node && (
+        <EditNodeModal
+          node={{
+            title: title,
+            content: content || undefined,
+            contentType: contentType || undefined,
+            tags: nodeTags || undefined,
+          }}
+          nodeId={selectedNodeId}
+          isPersonal={isPersonal}
+          onClose={() => setShowEditModal(false)}
+          onSavePersonal={updatePersonalNode}
+          onSaveTeam={updateNode}
+        />
+      )}
+    </div>
+  );
+}
+
+function EditNodeModal({ node, nodeId, isPersonal, onClose, onSavePersonal, onSaveTeam }: {
+  node: { title: string; content?: string; contentType?: string; tags?: string };
+  nodeId: string;
+  isPersonal: boolean;
+  onClose: () => void;
+  onSavePersonal: (id: string, updates: { title?: string; content?: string; contentType?: string; tags?: string }) => Promise<void>;
+  onSaveTeam: (id: string, req: { title?: string; content?: string; tags?: string; content_type?: string; author?: string }) => Promise<void>;
+}) {
+  const [title, setTitle] = useState(node.title);
+  const [content, setContent] = useState(node.content || "");
+  const [contentType, setContentType] = useState(node.contentType || "concept");
+  const [tags, setTags] = useState(node.tags || "");
+  const [saving, setSaving] = useState(false);
+
+  const handleSave = useCallback(async () => {
+    setSaving(true);
+    try {
+      if (isPersonal) {
+        await onSavePersonal(nodeId, {
+          title: title.trim() || undefined,
+          content: content.trim() || undefined,
+          contentType: contentType || undefined,
+          tags: tags.trim() || undefined,
+        });
+      } else {
+        await onSaveTeam(nodeId, {
+          title: title.trim() || undefined,
+          content: content.trim() || undefined,
+          content_type: contentType || undefined,
+          tags: tags.trim() || undefined,
+          author: useTeamStore.getState().config?.author,
+        });
+      }
+      onClose();
+    } finally {
+      setSaving(false);
+    }
+  }, [nodeId, isPersonal, title, content, contentType, tags, onSavePersonal, onSaveTeam, onClose]);
+
+  return (
+    <div className="modal-overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
+      <div className="modal-content">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-lg font-semibold">Edit {isPersonal ? "Personal" : "Team"} Node</h2>
+          <button className="btn-secondary p-1" onClick={onClose}>
+            <X size={16} />
+          </button>
+        </div>
+
+        <div className="mb-3">
+          <label className="block text-xs mb-1" style={{ color: "var(--text-secondary)" }}>Type</label>
+          <select value={contentType} onChange={(e) => setContentType(e.target.value)} className="w-full">
+            {CONTENT_TYPES.map((t) => (
+              <option key={t} value={t}>{t}</option>
+            ))}
+          </select>
+        </div>
+
+        <div className="mb-3">
+          <label className="block text-xs mb-1" style={{ color: "var(--text-secondary)" }}>Title *</label>
+          <input
+            type="text"
+            className="w-full"
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleSave()}
+            autoFocus
+          />
+        </div>
+
+        <div className="mb-3">
+          <label className="block text-xs mb-1" style={{ color: "var(--text-secondary)" }}>Note</label>
+          <textarea
+            className="w-full h-20 resize-none"
+            value={content}
+            onChange={(e) => setContent(e.target.value)}
+          />
+        </div>
+
+        <div className="mb-4">
+          <label className="block text-xs mb-1" style={{ color: "var(--text-secondary)" }}>Tags (comma-separated)</label>
+          <input
+            type="text"
+            className="w-full"
+            value={tags}
+            onChange={(e) => setTags(e.target.value)}
+          />
+        </div>
+
+        <div className="flex justify-end gap-2">
+          <button className="btn-secondary" onClick={onClose}>Cancel</button>
+          <button
+            className="btn-primary"
+            onClick={handleSave}
+            disabled={!title.trim() || saving}
+          >
+            {saving ? "Saving..." : "Save"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

@@ -5,7 +5,7 @@ import { useTeamStore } from "../stores/teamStore";
 import type { Node } from "../types";
 
 export default function RecentPanel() {
-  const { setShowRecent, setSelectedNodeId, setPanToNodeId } = useTeamStore();
+  const { setShowRecent, navigateToNodeParent } = useTeamStore();
   const [recent, setRecent] = useState<Node[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -52,10 +52,7 @@ export default function RecentPanel() {
               key={node.id}
               className="px-3 py-2 border-b cursor-pointer hover:opacity-80"
               style={{ borderColor: "var(--bg-tertiary)" }}
-              onClick={() => {
-                setSelectedNodeId(node.id);
-                setPanToNodeId(node.id);
-              }}
+              onClick={() => navigateToNodeParent(node.id)}
             >
               <p className="text-sm truncate">{node.aiTitle || node.title}</p>
               <div className="flex items-center gap-2 mt-0.5">

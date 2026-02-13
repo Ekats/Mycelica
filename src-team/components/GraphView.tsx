@@ -23,6 +23,7 @@ interface GraphNode {
   title: string;
   isPersonal: boolean;
   isItem: boolean;
+  childCount: number;
   author?: string;
   contentType?: string;
   edgeCount: number;
@@ -36,6 +37,7 @@ interface GraphLink {
   targetId: string;
   type: string;
   isPersonal: boolean;
+  isHuman: boolean;
 }
 
 const GRID_SPACING = 220;
@@ -57,6 +59,7 @@ export default function GraphView() {
   const svgRef = useRef<SVGSVGElement>(null);
   const nodesRef = useRef<GraphNode[]>([]);
   const zoomRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
+  const lastClickRef = useRef<{ time: number; id: string }>({ time: 0, id: "" });
 
   // Subscribe to actual data so effect re-runs when nodes/edges change
   const nodes = useTeamStore((s) => s.nodes);
@@ -67,11 +70,13 @@ export default function GraphView() {
   const searchResults = useTeamStore((s) => s.searchResults);
   const searchQuery = useTeamStore((s) => s.searchQuery);
   const savedPositions = useTeamStore((s) => s.savedPositions);
+  const currentParentId = useTeamStore((s) => s.currentParentId);
   const setSelectedNodeId = useTeamStore((s) => s.setSelectedNodeId);
   const savePositions = useTeamStore((s) => s.savePositions);
   const setCurrentPositions = useTeamStore((s) => s.setCurrentPositions);
   const getDisplayNodes = useTeamStore((s) => s.getDisplayNodes);
   const getDisplayEdges = useTeamStore((s) => s.getDisplayEdges);
+  const navigateToCategory = useTeamStore((s) => s.navigateToCategory);
 
 
   useEffect(() => {
@@ -120,6 +125,7 @@ export default function GraphView() {
         title: dn.title,
         isPersonal: dn.isPersonal,
         isItem: dn.isItem,
+        childCount: dn.childCount,
         author: dn.author,
         contentType: dn.contentType,
         edgeCount: edgeCounts.get(dn.id) || 0,
@@ -136,6 +142,7 @@ export default function GraphView() {
     const nodeMap = new Map(graphNodes.map((n) => [n.id, n]));
     const nodeIds = new Set(graphNodes.map((n) => n.id));
 
+    const AI_SOURCES = new Set(["ai", "adaptive", "semantic"]);
     const links: GraphLink[] = displayEdges
       .filter((e) => nodeIds.has(e.source) && nodeIds.has(e.target))
       .map((e) => ({
@@ -144,6 +151,7 @@ export default function GraphView() {
         targetId: e.target,
         type: e.type,
         isPersonal: e.isPersonal,
+        isHuman: e.isPersonal || !AI_SOURCES.has(e.edgeSource || ""),
       }));
 
     // D3 rendering
@@ -204,9 +212,9 @@ export default function GraphView() {
     linkSel.exit().remove();
     const linkMerge = linkSel.enter().append("line").attr("class", "edge").merge(linkSel);
     linkMerge
-      .attr("stroke", (d) => EDGE_COLORS[d.type] || "#4b5563")
-      .attr("stroke-width", 1.5)
-      .attr("stroke-opacity", (d) => (d.isPersonal ? 0.5 : 0.6))
+      .attr("stroke", (d) => d.isHuman ? "#facc15" : (EDGE_COLORS[d.type] || "#4b5563"))
+      .attr("stroke-width", (d) => d.isHuman ? 6 : 1.5)
+      .attr("stroke-opacity", (d) => d.isHuman ? 0.9 : (d.isPersonal ? 0.5 : 0.6))
       .attr("stroke-dasharray", (d) => (d.isPersonal ? "4,3" : "none"))
       .attr("x1", (d) => nodeMap.get(d.sourceId)?.x ?? 0)
       .attr("y1", (d) => nodeMap.get(d.sourceId)?.y ?? 0)
@@ -222,6 +230,7 @@ export default function GraphView() {
     const nodeEnter = nodeSel.enter().append("g").attr("class", "node").style("cursor", "pointer");
     nodeEnter.append("circle");
     nodeEnter.append("text")
+      .attr("class", "label")
       .attr("dy", "0.35em")
       .attr("text-anchor", "middle")
       .style("fill", "#f9fafb")
@@ -244,10 +253,24 @@ export default function GraphView() {
       .attr("stroke-width", (d) => (d.id === selectedNodeId ? 6 : 1.5))
       .attr("stroke-dasharray", (d) => (d.isPersonal ? "3,2" : "none"));
 
-    nodeMerge.select("text")
+    nodeMerge.select("text.label")
       .text((d) => truncate(d.title, 14))
       .style("font-size", "20px")
       .attr("y", (d) => Math.min(64 + d.edgeCount * 4, 96) + 16);
+
+    // Child count indicator inside category nodes
+    nodeMerge.selectAll("text.child-count").remove();
+    nodeMerge
+      .filter((d) => !d.isItem && d.childCount > 0)
+      .append("text")
+      .attr("class", "child-count")
+      .attr("dy", "0.35em")
+      .attr("text-anchor", "middle")
+      .style("fill", "#f9fafb")
+      .style("font-size", "13px")
+      .style("pointer-events", "none")
+      .style("opacity", 0.7)
+      .text((d) => `${d.childCount}`);
 
     // Search highlight
     if (searchQuery && searchResults.length > 0) {
@@ -266,7 +289,9 @@ export default function GraphView() {
         });
     }
 
-    // Drag + click (drag swallows click, so detect click as drag with no movement)
+    // Drag + click + double-click
+    // No timer — first click selects immediately, second click within 400ms drills in.
+    // lastClickRef survives effect re-runs (useRef, not local variable).
     let dragMoved = false;
     const drag = d3.drag<SVGGElement, GraphNode>()
       .on("start", function () {
@@ -289,14 +314,25 @@ export default function GraphView() {
         if (dragMoved) {
           savePositions([{ node_id: d.id, x: d.x, y: d.y }]);
         } else {
-          // Click (no drag movement) — toggle selection
-          setSelectedNodeId(d.id === selectedNodeId ? null : d.id);
+          const now = Date.now();
+          const last = lastClickRef.current;
+          if (last.id === d.id && now - last.time < 400) {
+            // Double-click — drill into category
+            lastClickRef.current = { time: 0, id: "" };
+            if (!d.isItem) {
+              navigateToCategory(d.id);
+            }
+          } else {
+            // Single click — select immediately, record for double-click detection
+            lastClickRef.current = { time: now, id: d.id };
+            setSelectedNodeId(d.id === selectedNodeId ? null : d.id);
+          }
         }
       });
 
     nodeMerge.call(drag);
 
-  }, [nodes, edges, personalNodes, personalEdges, selectedNodeId, searchResults, searchQuery, savedPositions, getDisplayNodes, getDisplayEdges, setSelectedNodeId, savePositions]);
+  }, [nodes, edges, personalNodes, personalEdges, selectedNodeId, searchResults, searchQuery, savedPositions, currentParentId, getDisplayNodes, getDisplayEdges, setSelectedNodeId, savePositions, navigateToCategory]);
 
   // Pan to node when requested
   const panToNodeId = useTeamStore((s) => s.panToNodeId);
@@ -313,6 +349,13 @@ export default function GraphView() {
     svgSel.transition().duration(500).call(zoomRef.current.transform, transform);
     setPanToNodeId(null);
   }, [panToNodeId, setPanToNodeId]);
+
+  // Reset viewport when drill-down view changes
+  useEffect(() => {
+    if (!svgRef.current || !zoomRef.current) return;
+    d3.select(svgRef.current).transition().duration(300)
+      .call(zoomRef.current.transform, d3.zoomIdentity);
+  }, [currentParentId]);
 
   const handleSvgClick = useCallback((e: React.MouseEvent) => {
     if ((e.target as Element).tagName === "svg") {

@@ -18,6 +18,7 @@ export interface Node {
   humanEdited?: string;
   parentId?: string;
   isItem: boolean;
+  isUniverse?: boolean;
   childCount: number;
   createdAt: number;
   updatedAt: number;
@@ -115,6 +116,8 @@ export interface DisplayNode {
   author?: string;
   isPersonal: boolean;
   isItem: boolean;
+  parentId?: string;
+  childCount: number;
   createdAt: number;
   updatedAt: number;
   x?: number;
@@ -129,5 +132,11 @@ export interface DisplayEdge {
   type: string;
   reason?: string;
   author?: string;
+  edgeSource?: string;
   isPersonal: boolean;
+}
+
+export interface BreadcrumbEntry {
+  id: string;
+  title: string;
 }

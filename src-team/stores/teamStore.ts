@@ -4,6 +4,7 @@ import type {
   Node, Edge, PersonalNode, PersonalEdge, TeamConfig,
   CreateNodeRequest, PatchNodeRequest, CreateEdgeRequest,
   DisplayNode, DisplayEdge, PersonalData, SavedPosition,
+  BreadcrumbEntry,
 } from "../types";
 
 interface TeamStore {
@@ -24,6 +25,16 @@ interface TeamStore {
   // Local category overrides (node IDs created as categories, survives refresh)
   localCategories: Set<string>;
   addLocalCategory: (id: string) => void;
+
+  // Navigation (view layers)
+  universeId: string | null;
+  currentParentId: string | null;   // null = root view (children of universe)
+  breadcrumbs: BreadcrumbEntry[];
+  navigateToCategory: (nodeId: string) => void;
+  navigateBack: () => void;
+  navigateToRoot: () => void;
+  navigateToBreadcrumb: (nodeId: string) => void;
+  navigateToNodeParent: (nodeId: string) => void;
 
   // UI
   selectedNodeId: string | null;
@@ -56,6 +67,8 @@ interface TeamStore {
   search: (query: string) => Promise<void>;
 
   createPersonalNode: (title: string, content?: string, contentType?: string, tags?: string) => Promise<PersonalNode>;
+  deletePersonalNode: (id: string) => Promise<void>;
+  updatePersonalNode: (id: string, updates: { title?: string; content?: string; contentType?: string; tags?: string }) => Promise<void>;
   createPersonalEdge: (sourceId: string, targetId: string, edgeType?: string, reason?: string) => Promise<PersonalEdge>;
 
   savePositions: (positions: Array<{ node_id: string; x: number; y: number }>) => Promise<void>;
@@ -87,6 +100,73 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
     return { localCategories: lc };
   }),
 
+  universeId: null,
+  currentParentId: null,
+  breadcrumbs: [],
+
+  navigateToCategory: (nodeId) => {
+    const { nodes, localCategories } = get();
+    const node = nodes.get(nodeId);
+    if (!node) return;
+    const isItem = localCategories.has(node.id) ? false : node.isItem;
+    if (isItem) return;
+    const title = node.aiTitle || node.title;
+    set((s) => ({
+      currentParentId: nodeId,
+      breadcrumbs: [...s.breadcrumbs, { id: nodeId, title }],
+      selectedNodeId: null,
+    }));
+  },
+
+  navigateBack: () => {
+    const { breadcrumbs } = get();
+    if (breadcrumbs.length === 0) return;
+    const newBreadcrumbs = breadcrumbs.slice(0, -1);
+    const newParentId = newBreadcrumbs.length > 0
+      ? newBreadcrumbs[newBreadcrumbs.length - 1].id
+      : null;
+    set({ currentParentId: newParentId, breadcrumbs: newBreadcrumbs, selectedNodeId: null });
+  },
+
+  navigateToRoot: () => {
+    set({ currentParentId: null, breadcrumbs: [], selectedNodeId: null });
+  },
+
+  navigateToBreadcrumb: (nodeId) => {
+    const { breadcrumbs } = get();
+    const index = breadcrumbs.findIndex((b) => b.id === nodeId);
+    if (index === -1) return;
+    const newBreadcrumbs = breadcrumbs.slice(0, index + 1);
+    set({ currentParentId: nodeId, breadcrumbs: newBreadcrumbs, selectedNodeId: null });
+  },
+
+  navigateToNodeParent: (nodeId) => {
+    const { nodes, universeId } = get();
+    const node = nodes.get(nodeId);
+    if (!node) return;
+
+    // Build breadcrumb trail by walking up the parentId chain
+    const trail: BreadcrumbEntry[] = [];
+    let cur = node.parentId ? nodes.get(node.parentId) : null;
+    const ancestors: Node[] = [];
+    while (cur && cur.id !== universeId) {
+      ancestors.unshift(cur);
+      cur = cur.parentId ? nodes.get(cur.parentId) : null;
+    }
+    for (const a of ancestors) {
+      trail.push({ id: a.id, title: a.aiTitle || a.title });
+    }
+
+    // Navigate to the node's parent (or root if parentId is universe/null)
+    const targetParent = node.parentId === universeId ? null : (node.parentId || null);
+    set({
+      currentParentId: targetParent,
+      breadcrumbs: trail,
+      selectedNodeId: nodeId,
+      panToNodeId: nodeId,
+    });
+  },
+
   selectedNodeId: null,
   searchQuery: "",
   searchResults: [],
@@ -101,9 +181,25 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
   error: null,
 
   getDisplayNodes: () => {
-    const { nodes, personalNodes, localCategories } = get();
+    const { nodes, personalNodes, localCategories, currentParentId, universeId } = get();
     const display: DisplayNode[] = [];
+
     for (const n of nodes.values()) {
+      // Skip the universe node itself — it's structural
+      if (n.isUniverse) continue;
+
+      // Filter by current view level
+      if (currentParentId !== null) {
+        // Drilled into a category: show its direct children
+        if ((n.parentId || null) !== currentParentId) continue;
+      } else if (universeId) {
+        // Root view with hierarchy: show children of universe
+        if (n.parentId !== universeId) continue;
+      } else {
+        // No universe: show top-level nodes (no parent, or parent not in graph)
+        if (n.parentId && nodes.has(n.parentId)) continue;
+      }
+
       display.push({
         id: n.id,
         title: n.aiTitle || n.title,
@@ -113,12 +209,16 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
         author: n.author,
         isPersonal: false,
         isItem: localCategories.has(n.id) ? false : n.isItem,
+        parentId: n.parentId,
+        childCount: n.childCount,
         createdAt: n.createdAt,
         updatedAt: n.updatedAt,
         x: n.x,
         y: n.y,
       });
     }
+
+    // Personal nodes: always visible at every level
     for (const pn of personalNodes.values()) {
       display.push({
         id: pn.id,
@@ -129,6 +229,8 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
         author: undefined,
         isPersonal: true,
         isItem: true,
+        parentId: undefined,
+        childCount: 0,
         createdAt: pn.createdAt,
         updatedAt: pn.updatedAt,
       });
@@ -138,8 +240,11 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
 
   getDisplayEdges: () => {
     const { edges, personalEdges } = get();
+    // Only include edges where both endpoints are visible
+    const visibleIds = new Set(get().getDisplayNodes().map((n) => n.id));
     const display: DisplayEdge[] = [];
     for (const e of edges) {
+      if (!visibleIds.has(e.source) || !visibleIds.has(e.target)) continue;
       display.push({
         id: e.id,
         source: e.source,
@@ -147,10 +252,12 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
         type: e.type,
         reason: e.reason,
         author: e.author,
+        edgeSource: e.edgeSource,
         isPersonal: false,
       });
     }
     for (const pe of personalEdges) {
+      if (!visibleIds.has(pe.sourceId) || !visibleIds.has(pe.targetId)) continue;
       display.push({
         id: pe.id,
         source: pe.sourceId,
@@ -185,10 +292,17 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
         }
       }
 
+      // Cache universe node ID — only trust the explicit isUniverse flag
+      let uId: string | null = null;
+      for (const n of nodeMap.values()) {
+        if (n.isUniverse) { uId = n.id; break; }
+      }
+
       set({
         nodes: nodeMap,
         edges: snapshot.edges,
         authors: Array.from(authorSet),
+        universeId: uId,
         lastRefreshed: new Date(),
         isRefreshing: false,
         connected: true,
@@ -307,6 +421,39 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
       return { personalNodes };
     });
     return node;
+  },
+
+  deletePersonalNode: async (id) => {
+    try {
+      await invoke("team_delete_personal_node", { id });
+      set((s) => {
+        const personalNodes = new Map(s.personalNodes);
+        personalNodes.delete(id);
+        const personalEdges = s.personalEdges.filter((e) => e.sourceId !== id && e.targetId !== id);
+        return { personalNodes, personalEdges, selectedNodeId: s.selectedNodeId === id ? null : s.selectedNodeId };
+      });
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+
+  updatePersonalNode: async (id, updates) => {
+    try {
+      const node = await invoke<PersonalNode>("team_update_personal_node", {
+        id,
+        title: updates.title,
+        content: updates.content,
+        contentType: updates.contentType,
+        tags: updates.tags,
+      });
+      set((s) => {
+        const personalNodes = new Map(s.personalNodes);
+        personalNodes.set(node.id, node);
+        return { personalNodes };
+      });
+    } catch (e) {
+      set({ error: String(e) });
+    }
   },
 
   createPersonalEdge: async (sourceId, targetId, edgeType, reason) => {

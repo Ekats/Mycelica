@@ -14,7 +14,7 @@ const PERSONAL_COLOR = "#14b8a6";
 export default function QuickAdd() {
   const {
     setShowQuickAdd, createNode, updateNode, config,
-    selectedNodeId, nodes,
+    selectedNodeId, nodes, currentParentId,
   } = useTeamStore();
 
   // If a node is selected, pre-fill connection and detect if it's a category
@@ -33,8 +33,8 @@ export default function QuickAdd() {
     selectedNodeId && !selectedIsCategory ? [selectedNodeId] : []
   );
   const [parentId, setParentId] = useState<string | null>(
-    // Pre-fill parent if selected node is a category
-    selectedIsCategory && selectedNodeId ? selectedNodeId : null
+    // Pre-fill parent: selected category > current drill-down view > null
+    selectedIsCategory && selectedNodeId ? selectedNodeId : currentParentId
   );
   const [connectResults, setConnectResults] = useState<Node[]>([]);
   const [submitting, setSubmitting] = useState(false);
@@ -51,19 +51,26 @@ export default function QuickAdd() {
     return n ? (n.aiTitle || n.title) : id.slice(0, 8);
   }, [nodes]);
 
+  const loadAllNodes = useCallback(() => {
+    const { nodes: allNodes } = useTeamStore.getState();
+    const items: Node[] = [];
+    for (const n of allNodes.values()) {
+      items.push(n);
+    }
+    items.sort((a, b) => b.updatedAt - a.updatedAt);
+    setConnectResults(items.slice(0, 100));
+  }, []);
+
   const handleConnectSearch = useCallback(async (value: string) => {
     setConnectQuery(value);
-    if (value.trim().length < 2) {
-      setConnectResults([]);
-      return;
-    }
+    if (!value.trim()) { loadAllNodes(); return; }
     try {
-      const results = await invoke<Node[]>("team_search", { query: value, limit: 10 });
+      const results = await invoke<Node[]>("team_search", { query: value, limit: 100 });
       setConnectResults(results);
     } catch {
       setConnectResults([]);
     }
-  }, []);
+  }, [loadAllNodes]);
 
   const handleSubmit = useCallback(async () => {
     if (!title.trim()) return;
@@ -265,13 +272,14 @@ export default function QuickAdd() {
           <input
             type="text"
             className="w-full mb-1"
-            placeholder="Search existing nodes..."
+            placeholder="Search or browse nodes..."
             value={connectQuery}
             onChange={(e) => handleConnectSearch(e.target.value)}
+            onFocus={() => { if (!connectQuery && connectResults.length === 0) loadAllNodes(); }}
           />
-          {connectQuery && connectResults.length > 0 && (
-            <div className="flex flex-col gap-0.5 max-h-32 overflow-y-auto rounded" style={{ background: "var(--bg-tertiary)" }}>
-              {connectResults.slice(0, 6).map((r) => (
+          {connectResults.length > 0 && (
+            <div className="flex flex-col gap-0.5 max-h-48 overflow-y-auto rounded" style={{ background: "var(--bg-tertiary)" }}>
+              {connectResults.slice(0, 100).map((r) => (
                 <button
                   key={r.id}
                   className="text-left text-xs px-2 py-1.5 hover:opacity-80"

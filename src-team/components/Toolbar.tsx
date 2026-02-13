@@ -4,8 +4,9 @@ import { useTeamStore } from "../stores/teamStore";
 
 export default function Toolbar() {
   const {
-    isRefreshing, lastRefreshed, connected, nodes, showRecent,
+    isRefreshing, lastRefreshed, connected, nodes, showRecent, searchResults,
     refresh, search, setShowRecent, setShowSettings, setShowQuickAdd,
+    navigateToNodeParent,
   } = useTeamStore();
 
   const [searchInput, setSearchInput] = useState("");
@@ -34,7 +35,7 @@ export default function Toolbar() {
       </button>
 
       {/* Search */}
-      <div className="flex items-center gap-1.5 flex-1 max-w-md">
+      <div className="flex items-center gap-1.5 flex-1 max-w-md relative">
         <Search size={14} style={{ color: "var(--text-secondary)" }} />
         <input
           type="text"
@@ -44,6 +45,25 @@ export default function Toolbar() {
           className="flex-1"
           style={{ fontSize: "13px", padding: "4px 8px" }}
         />
+        {searchInput && searchResults.length > 0 && (
+          <div className="absolute top-full left-0 right-0 mt-1 rounded border overflow-y-auto max-h-60 z-50"
+            style={{ background: "var(--bg-secondary)", borderColor: "var(--border)" }}>
+            {searchResults.slice(0, 10).map((node) => (
+              <button
+                key={node.id}
+                className="w-full text-left px-3 py-2 text-sm hover:opacity-80 border-b"
+                style={{ borderColor: "var(--bg-tertiary)" }}
+                onClick={() => {
+                  navigateToNodeParent(node.id);
+                  setSearchInput("");
+                  search("");
+                }}
+              >
+                {node.aiTitle || node.title}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Recent */}

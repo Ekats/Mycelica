@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { useTeamStore } from "./stores/teamStore";
 import Toolbar from "./components/Toolbar";
+import Breadcrumb from "./components/Breadcrumb";
 import GraphView from "./components/GraphView";
 import RecentPanel from "./components/RecentPanel";
 import NodePopup from "./components/NodePopup";
@@ -11,16 +12,20 @@ export default function App() {
   const {
     showRecent, showSettings, showQuickAdd, selectedNodeId, error,
     loadSettings, loadPositions, loadPersonalData, refresh,
-    setShowQuickAdd, clearError,
+    setShowQuickAdd, clearError, navigateBack, breadcrumbs,
   } = useTeamStore();
 
   useEffect(() => {
-    loadSettings();
+    // Load settings first, then refresh (settings are async — config must be ready before refresh)
+    loadSettings().then(() => {
+      const { config } = useTeamStore.getState();
+      if (config?.server_url) refresh();
+    });
     loadPositions();
     loadPersonalData();
-  }, [loadSettings, loadPositions, loadPersonalData]);
+  }, [loadSettings, loadPositions, loadPersonalData, refresh]);
 
-  // Ctrl+N for quick-add
+  // Ctrl+N for quick-add, Backspace to navigate back
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.key === "n") {
@@ -30,18 +35,15 @@ export default function App() {
       if (e.key === "Escape") {
         setShowQuickAdd(false);
       }
+      if (e.key === "Backspace" && breadcrumbs.length > 0 &&
+          !(e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLSelectElement)) {
+        e.preventDefault();
+        navigateBack();
+      }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [setShowQuickAdd]);
-
-  // Auto-refresh on startup (connection failure is silent — shown via status dot)
-  useEffect(() => {
-    const { config } = useTeamStore.getState();
-    if (config?.server_url) {
-      refresh();
-    }
-  }, [refresh]);
+  }, [setShowQuickAdd, navigateBack, breadcrumbs.length]);
 
   return (
     <div className="flex flex-col h-screen">
@@ -54,6 +56,8 @@ export default function App() {
           <button className="btn-secondary text-xs" onClick={clearError}>Dismiss</button>
         </div>
       )}
+
+      <Breadcrumb />
 
       <div className="flex flex-1 overflow-hidden">
         {showRecent && <RecentPanel />}

@@ -481,6 +481,7 @@ pub fn run_team() {
         team_create_edge, team_delete_edge, team_search, team_get_node,
         team_get_orphans, team_get_recent, team_get_settings, team_save_settings,
         team_create_personal_node, team_create_personal_edge, team_get_personal_data,
+        team_delete_personal_node, team_update_personal_node,
         team_save_positions, team_get_positions,
     };
 
@@ -509,6 +510,8 @@ pub fn run_team() {
             team_create_personal_node,
             team_create_personal_edge,
             team_get_personal_data,
+            team_delete_personal_node,
+            team_update_personal_node,
             team_save_positions,
             team_get_positions,
         ])
