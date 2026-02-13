@@ -101,6 +101,9 @@ fn get_or_create_container(db: &Database) -> String {
         human_edited: None,
         human_created: false,
         author: None,
+        agent_id: None,
+        node_class: None,
+        meta_type: None,
     };
 
     if let Err(e) = db.insert_node(&node) {
@@ -306,6 +309,9 @@ fn get_or_create_session(
         human_edited: None,
         human_created: false,
         author: None,
+        agent_id: None,
+        node_class: None,
+        meta_type: None,
     };
 
     db.insert_node(&node).map_err(|e| e.to_string())?;
@@ -383,6 +389,9 @@ fn ensure_session_exists(
         human_edited: None,
         human_created: false,
         author: None,
+        agent_id: None,
+        node_class: None,
+        meta_type: None,
     };
 
     db.insert_node(&node).map_err(|e| e.to_string())?;
@@ -510,6 +519,9 @@ fn process_visit(db: &Database, req: &VisitRequest) -> Result<VisitResponse, Str
             human_edited: None,
             human_created: false,
             author: None,
+            agent_id: None,
+            node_class: None,
+            meta_type: None,
         };
 
         db.insert_node(&node).map_err(|e| e.to_string())?;
@@ -577,6 +589,10 @@ fn process_visit(db: &Database, req: &VisitRequest) -> Result<VisitResponse, Str
         updated_at: Some(now),
         author: None,
         reason: None,
+        content: None,
+        agent_id: None,
+        superseded_by: None,
+        metadata: None,
     };
 
     db.insert_edge(&session_edge).map_err(|e| e.to_string())?;
@@ -613,6 +629,10 @@ fn process_visit(db: &Database, req: &VisitRequest) -> Result<VisitResponse, Str
                 updated_at: Some(now),
                 author: None,
                 reason: None,
+                content: None,
+                agent_id: None,
+                superseded_by: None,
+                metadata: None,
             };
 
             db.insert_edge(&nav_edge).map_err(|e| e.to_string())?;
@@ -1073,6 +1093,10 @@ fn merge_sessions(db: &Database, source_id: &str, target_id: &str) -> Result<i32
             updated_at: Some(now),
             author: None,
             reason: None,
+            content: None,
+            agent_id: None,
+            superseded_by: None,
+            metadata: None,
         };
 
         db.insert_edge(&new_edge).map_err(|e| e.to_string())?;

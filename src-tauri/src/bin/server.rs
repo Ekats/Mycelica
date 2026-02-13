@@ -374,6 +374,10 @@ async fn create_edge_handler(
         updated_at: Some(now),
         author: Some(author),
         reason: req.reason,
+        content: None,
+        agent_id: Some("human".to_string()),
+        superseded_by: None,
+        metadata: None,
     };
 
     state.db.insert_edge(&edge).map_err(|e| AppError::from(e.to_string()))?;

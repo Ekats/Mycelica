@@ -137,7 +137,11 @@ impl Database {
                 -- Sovereignty tracking (team mode)
                 human_edited TEXT,
                 human_created INTEGER NOT NULL DEFAULT 0,
-                author TEXT
+                author TEXT,
+                -- Spore agent coordination
+                agent_id TEXT,
+                node_class TEXT DEFAULT 'knowledge',
+                meta_type TEXT
             );
 
             -- Learned emoji mappings from AI
@@ -161,7 +165,12 @@ impl Database {
                 -- Team mode fields
                 updated_at INTEGER,          -- Last modification timestamp (millis)
                 author TEXT,                 -- Who created this edge
-                reason TEXT                  -- Why this edge exists (provenance)
+                reason TEXT,                 -- Why this edge exists (short provenance)
+                -- Spore agent coordination
+                content TEXT,                -- Full reasoning/explanation for this edge
+                agent_id TEXT,               -- Which agent created this edge
+                superseded_by TEXT,          -- Edge ID that replaced this one
+                metadata TEXT                -- JSON blob for extensible properties
             );
 
             -- Persistent tags for guiding clustering across rebuilds
@@ -634,6 +643,41 @@ impl Database {
             eprintln!("Migration: Added team mode columns (updated_at, author, reason) to edges");
         }
 
+        // Migration: Add Spore agent coordination columns to nodes
+        let has_node_agent_id: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('nodes') WHERE name = 'agent_id'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !has_node_agent_id {
+            conn.execute("ALTER TABLE nodes ADD COLUMN agent_id TEXT", [])?;
+            conn.execute("ALTER TABLE nodes ADD COLUMN node_class TEXT DEFAULT 'knowledge'", [])?;
+            conn.execute("ALTER TABLE nodes ADD COLUMN meta_type TEXT", [])?;
+            // Backfill: existing nodes are human-created knowledge
+            conn.execute("UPDATE nodes SET agent_id = 'human' WHERE agent_id IS NULL", [])?;
+            conn.execute("UPDATE nodes SET node_class = 'knowledge' WHERE node_class IS NULL", [])?;
+            eprintln!("Migration: Added Spore columns (agent_id, node_class, meta_type) to nodes");
+        }
+
+        // Migration: Add Spore agent coordination columns to edges
+        let has_edge_content: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('edges') WHERE name = 'content'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !has_edge_content {
+            conn.execute("ALTER TABLE edges ADD COLUMN content TEXT", [])?;
+            conn.execute("ALTER TABLE edges ADD COLUMN agent_id TEXT", [])?;
+            conn.execute("ALTER TABLE edges ADD COLUMN superseded_by TEXT", [])?;
+            conn.execute("ALTER TABLE edges ADD COLUMN metadata TEXT", [])?;
+            // Backfill: copy reason to content for existing edges, mark as human
+            conn.execute("UPDATE edges SET content = reason WHERE content IS NULL AND reason IS NOT NULL", [])?;
+            conn.execute("UPDATE edges SET agent_id = 'human' WHERE agent_id IS NULL", [])?;
+            eprintln!("Migration: Added Spore columns (content, agent_id, superseded_by, metadata) to edges");
+        }
+
         // Migration: Create deleted_items table for tracking manual deletions
         conn.execute_batch("
             CREATE TABLE IF NOT EXISTS deleted_items (
@@ -690,6 +734,13 @@ impl Database {
         // Indexes for team mode delta sync
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_updated_at ON nodes(updated_at)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_updated_at ON edges(updated_at)", [])?;
+        // Spore indexes
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_agent_id ON nodes(agent_id)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_node_class ON nodes(node_class)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_meta_type ON nodes(meta_type)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_agent_id ON edges(agent_id)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_superseded ON edges(superseded_by)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_type_conf_time ON edges(type, confidence DESC, created_at DESC)", [])?;
 
         // Rebuild FTS index to fix any corruption from interrupted writes (e.g., HMR during dev)
         // This is safe to run on every startup - it rebuilds from the content table
@@ -834,8 +885,8 @@ impl Database {
     pub fn insert_node(&self, node: &Node) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO nodes (id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, source, pdf_available, content_type, associated_idea_id, privacy, human_edited, human_created, author)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)",
+            "INSERT INTO nodes (id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, source, pdf_available, content_type, associated_idea_id, privacy, human_edited, human_created, author, agent_id, node_class, meta_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)",
             params![
                 node.id,
                 node.node_type.as_str(),
@@ -870,6 +921,9 @@ impl Database {
                 node.human_edited,
                 node.human_created,
                 node.author,
+                node.agent_id,
+                node.node_class,
+                node.meta_type,
             ],
         )?;
         Ok(())
@@ -1036,11 +1090,15 @@ impl Database {
             human_edited: row.get(33)?,
             human_created: row.get::<_, i32>(34).unwrap_or(0) != 0,
             author: row.get(35)?,
+            // Spore fields
+            agent_id: row.get(36)?,
+            node_class: row.get(37)?,
+            meta_type: row.get(38)?,
         })
     }
 
     /// Standard SELECT columns for nodes (excludes embedding - use dedicated functions)
-    const NODE_COLUMNS: &'static str = "id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date, is_private, privacy_reason, source, pdf_available, content_type, associated_idea_id, privacy, human_edited, human_created, author";
+    const NODE_COLUMNS: &'static str = "id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, latest_child_date, is_private, privacy_reason, source, pdf_available, content_type, associated_idea_id, privacy, human_edited, human_created, author, agent_id, node_class, meta_type";
 
     /// Get all nodes for graph view - no content_type filtering
     /// All nodes are always shown; filtering is handled by frontend if needed
@@ -1065,7 +1123,8 @@ impl Database {
              depth = ?16, is_item = ?17, is_universe = ?18, parent_id = ?19, child_count = ?20,
              conversation_id = ?21, sequence_index = ?22, is_pinned = ?23, last_accessed_at = ?24,
              content_type = ?25, associated_idea_id = ?26, privacy = ?27,
-             human_edited = ?28, human_created = ?29, author = ?30 WHERE id = ?1",
+             human_edited = ?28, human_created = ?29, author = ?30,
+             agent_id = ?31, node_class = ?32, meta_type = ?33 WHERE id = ?1",
             params![
                 node.id,
                 node.node_type.as_str(),
@@ -1097,6 +1156,9 @@ impl Database {
                 node.human_edited,
                 node.human_created,
                 node.author,
+                node.agent_id,
+                node.node_class,
+                node.meta_type,
             ],
         )?;
         Ok(())
@@ -1560,8 +1622,8 @@ impl Database {
     pub fn insert_edge(&self, edge: &Edge) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO edges (id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at, updated_at, author, reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO edges (id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at, updated_at, author, reason, content, agent_id, superseded_by, metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 edge.id,
                 edge.source,
@@ -1576,6 +1638,10 @@ impl Database {
                 edge.updated_at,
                 edge.author,
                 edge.reason,
+                edge.content,
+                edge.agent_id,
+                edge.superseded_by,
+                edge.metadata,
             ],
         )?;
         Ok(())
@@ -1592,8 +1658,8 @@ impl Database {
 
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT OR IGNORE INTO edges (id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at, updated_at, author, reason)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+                "INSERT OR IGNORE INTO edges (id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at, updated_at, author, reason, content, agent_id, superseded_by, metadata)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
             )?;
 
             for edge in edges {
@@ -1611,6 +1677,10 @@ impl Database {
                     &edge.updated_at,
                     &edge.author,
                     &edge.reason,
+                    &edge.content,
+                    &edge.agent_id,
+                    &edge.superseded_by,
+                    &edge.metadata,
                 ])?;
             }
         }
@@ -1619,7 +1689,7 @@ impl Database {
         Ok(edges.len())
     }
 
-    const EDGE_COLUMNS: &'static str = "id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at, updated_at, author, reason";
+    const EDGE_COLUMNS: &'static str = "id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at, updated_at, author, reason, content, agent_id, superseded_by, metadata";
 
     fn row_to_edge(row: &rusqlite::Row) -> Result<Edge> {
         Ok(Edge {
@@ -1636,6 +1706,11 @@ impl Database {
             updated_at: row.get(10)?,
             author: row.get(11)?,
             reason: row.get(12)?,
+            // Spore fields
+            content: row.get(13)?,
+            agent_id: row.get(14)?,
+            superseded_by: row.get(15)?,
+            metadata: row.get(16)?,
         })
     }
 
@@ -2967,6 +3042,10 @@ impl Database {
                 updated_at: row.get(10)?,
                 author: row.get(11)?,
                 reason: row.get(12)?,
+                content: None,
+                agent_id: None,
+                superseded_by: None,
+                metadata: None,
             })
         })?.collect::<Result<Vec<_>>>()?;
 
@@ -3024,6 +3103,10 @@ impl Database {
                 updated_at: row.get(10)?,
                 author: row.get(11)?,
                 reason: row.get(12)?,
+                content: None,
+                agent_id: None,
+                superseded_by: None,
+                metadata: None,
             })
         })?.collect::<Result<Vec<_>>>()?;
 
@@ -3204,6 +3287,9 @@ impl Database {
             human_edited: None,
             human_created: false,
             author: None,
+            agent_id: None,
+            node_class: None,
+            meta_type: None,
         };
 
         self.insert_node(&node)
@@ -3636,6 +3722,10 @@ impl Database {
                         updated_at: Some(now),
                         author: None,
                         reason: None,
+                        content: None,
+                        agent_id: None,
+                        superseded_by: None,
+                        metadata: None,
                     });
                 }
             }

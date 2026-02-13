@@ -82,6 +82,9 @@ pub fn create_human_node(
         human_edited: None,
         human_created: true,
         author: Some(author.to_string()),
+        agent_id: Some("human".to_string()),
+        node_class: Some("knowledge".to_string()),
+        meta_type: None,
     };
 
     db.insert_node(&node).map_err(|e| e.to_string())?;
@@ -191,6 +194,10 @@ pub fn create_connects_to_edges(
                     updated_at: Some(now),
                     author: Some(author.to_string()),
                     reason: Some(format!("Connected via --connects-to '{}'", term)),
+                    content: None,
+                    agent_id: Some("human".to_string()),
+                    superseded_by: None,
+                    metadata: None,
                 };
                 if db.insert_edge(&edge).is_ok() {
                     results.push(ConnectResult::Linked {

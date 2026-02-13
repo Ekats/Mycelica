@@ -143,6 +143,9 @@ pub fn import_claude_conversations(db: &Database, json_content: &str) -> Result<
             human_edited: None,
             human_created: false,
             author: None,
+            agent_id: None,
+            node_class: None,
+            meta_type: None,
         };
 
         if let Err(e) = db.insert_node(&container) {
@@ -201,6 +204,9 @@ pub fn import_claude_conversations(db: &Database, json_content: &str) -> Result<
                 human_edited: None,
                 human_created: false,
                 author: None,
+                agent_id: None,
+                node_class: None,
+                meta_type: None,
             };
 
             if let Err(e) = db.insert_node(&exchange_node) {
@@ -276,6 +282,9 @@ pub fn import_markdown_files(db: &Database, file_paths: &[String]) -> Result<Imp
             human_edited: None,
             human_created: false,
             author: None,
+            agent_id: None,
+            node_class: None,
+            meta_type: None,
         };
         if let Err(e) = db.insert_node(&container) {
             result.errors.push(format!("Failed to create Recent Notes container: {}", e));
@@ -347,6 +356,9 @@ pub fn import_markdown_files(db: &Database, file_paths: &[String]) -> Result<Imp
             human_edited: None,
             human_created: false,
             author: None,
+            agent_id: None,
+            node_class: None,
+            meta_type: None,
         };
 
         if let Err(e) = db.insert_node(&note) {
@@ -606,6 +618,9 @@ pub fn import_google_keep(db: &Database, zip_path: &str) -> Result<GoogleKeepImp
             human_edited: None,
             human_created: false,
             author: None,
+            agent_id: None,
+            node_class: None,
+            meta_type: None,
         };
 
         if let Err(e) = db.insert_node(&node) {
@@ -835,6 +850,9 @@ pub fn import_chatgpt_conversations(db: &Database, json_content: &str) -> Result
             human_edited: None,
             human_created: false,
             author: None,
+            agent_id: None,
+            node_class: None,
+            meta_type: None,
         };
 
         if let Err(e) = db.insert_node(&container) {
@@ -890,6 +908,9 @@ pub fn import_chatgpt_conversations(db: &Database, json_content: &str) -> Result
                 human_edited: None,
                 human_created: false,
                 author: None,
+                agent_id: None,
+                node_class: None,
+                meta_type: None,
             };
 
             if let Err(e) = db.insert_node(&exchange_node) {
@@ -1421,6 +1442,9 @@ async fn import_single_paper(
         human_edited: None,
         human_created: false,
         author: None,
+        agent_id: None,
+        node_class: None,
+        meta_type: None,
     };
 
     db.insert_node(&node).map_err(|e| e.to_string())?;

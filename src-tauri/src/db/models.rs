@@ -64,6 +64,12 @@ pub enum EdgeType {
     Supports,      // A provides evidence for B
     EvolvedFrom,   // B is a refined version of A
     Questions,     // A raises a question about B
+    // Spore meta edges
+    Summarizes,    // summary covers these nodes
+    Tracks,        // status node tracks workstream
+    Flags,         // contradiction flag on nodes
+    Resolves,      // decision resolving a contradiction
+    DerivesFrom,   // content derived from source
 }
 
 impl EdgeType {
@@ -90,6 +96,11 @@ impl EdgeType {
             EdgeType::Supports => "supports",
             EdgeType::EvolvedFrom => "evolved_from",
             EdgeType::Questions => "questions",
+            EdgeType::Summarizes => "summarizes",
+            EdgeType::Tracks => "tracks",
+            EdgeType::Flags => "flags",
+            EdgeType::Resolves => "resolves",
+            EdgeType::DerivesFrom => "derives_from",
         }
     }
 
@@ -116,6 +127,11 @@ impl EdgeType {
             "supports" => Some(EdgeType::Supports),
             "evolved_from" => Some(EdgeType::EvolvedFrom),
             "questions" => Some(EdgeType::Questions),
+            "summarizes" => Some(EdgeType::Summarizes),
+            "tracks" => Some(EdgeType::Tracks),
+            "flags" => Some(EdgeType::Flags),
+            "resolves" => Some(EdgeType::Resolves),
+            "derives_from" => Some(EdgeType::DerivesFrom),
             _ => None,
         }
     }
@@ -210,6 +226,14 @@ pub struct Node {
     #[serde(rename = "humanCreated")]
     pub human_created: bool,              // 1 = manually created by human, never deleted by rebuild
     pub author: Option<String>,           // Who created/last edited this node
+
+    // Spore agent coordination fields
+    #[serde(rename = "agentId")]
+    pub agent_id: Option<String>,         // 'human', 'spore:summarizer', 'spore:ingestor', etc.
+    #[serde(rename = "nodeClass")]
+    pub node_class: Option<String>,       // 'knowledge' | 'meta' | 'operational'
+    #[serde(rename = "metaType")]
+    pub meta_type: Option<String>,        // For meta nodes: 'summary' | 'contradiction' | 'status'
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,7 +263,15 @@ pub struct Edge {
     #[serde(rename = "updatedAt")]
     pub updated_at: Option<i64>,
     pub author: Option<String>,
-    pub reason: Option<String>,            // Why this edge exists (provenance)
+    pub reason: Option<String>,            // Why this edge exists (short provenance)
+
+    // Spore agent coordination fields
+    pub content: Option<String>,           // Full reasoning/explanation for this edge
+    #[serde(rename = "agentId")]
+    pub agent_id: Option<String>,          // 'human', 'spore:synthesizer', etc.
+    #[serde(rename = "supersededBy")]
+    pub superseded_by: Option<String>,     // Edge ID that replaced this one
+    pub metadata: Option<String>,          // JSON blob for extensible properties
 }
 
 /// Persistent tag for guiding clustering across rebuilds

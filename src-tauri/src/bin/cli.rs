@@ -414,6 +414,11 @@ enum Commands {
         #[arg(long, short, default_value = "50")]
         limit: u32,
     },
+    /// Run schema migrations
+    Migrate {
+        #[command(subcommand)]
+        cmd: MigrateCommands,
+    },
     /// Interactive TUI mode
     Tui,
     /// Generate shell completions
@@ -427,6 +432,16 @@ enum Commands {
 // ============================================================================
 // Subcommand Enums
 // ============================================================================
+
+#[derive(Subcommand)]
+enum MigrateCommands {
+    /// Run Spore schema migration (adds agent_id, node_class, meta_type to nodes; content, agent_id, superseded_by, metadata to edges)
+    SporeSchema {
+        /// Skip creating a backup before migration
+        #[arg(long)]
+        no_backup: bool,
+    },
+}
 
 #[derive(Subcommand)]
 enum DbCommands {
@@ -1130,6 +1145,17 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         eprintln!("[verbose] Using database: {:?}", db_path);
     }
 
+    // Pre-migration backup: must happen BEFORE Database::new() triggers auto-migration
+    if let Commands::Migrate { cmd: MigrateCommands::SporeSchema { no_backup } } = &cli.command {
+        if !no_backup {
+            let backup_path = db_path.with_extension("db.pre-spore-backup");
+            eprintln!("Creating backup at {:?}...", backup_path);
+            std::fs::copy(&db_path, &backup_path)
+                .map_err(|e| format!("Failed to create backup: {}", e))?;
+            eprintln!("Backup created.");
+        }
+    }
+
     let db = Arc::new(Database::new(&db_path).map_err(|e| format!("Failed to open database: {}", e))?);
 
 
@@ -1158,6 +1184,7 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Decide { title, reason, connects_to } => handle_decide(&title, reason, connects_to, &db, cli.json).await,
         Commands::Link { source, target, edge_type, reason } => handle_link(&source, &target, &edge_type, reason, &db, cli.json).await,
         Commands::Orphans { limit } => handle_orphans(limit, &db, cli.json).await,
+        Commands::Migrate { cmd } => handle_migrate(cmd, &db, &db_path, cli.json),
         Commands::Tui => run_tui(&db).await,
         Commands::Completions { .. } => unreachable!(),
     }
@@ -1823,6 +1850,10 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
                                         updated_at: Some(now),
                                         author: None,
                                         reason: None,
+                                        content: None,
+                                        agent_id: None,
+                                        superseded_by: None,
+                                        metadata: None,
                                     };
                                     if db.insert_edge(&edge).is_ok() {
                                         calls_edges_created += 1;
@@ -2037,6 +2068,9 @@ async fn handle_node(cmd: NodeCommands, db: &Database, json: bool) -> Result<(),
                 human_edited: None,
                 human_created: false,
                 author: None,
+                agent_id: None,
+                node_class: None,
+                meta_type: None,
             };
 
             db.insert_node(&node).map_err(|e| e.to_string())?;
@@ -2536,6 +2570,9 @@ async fn handle_consolidate(db: &Database, json: bool, quiet: bool) -> Result<()
             human_edited: None,
             human_created: false,
             author: None,
+            agent_id: None,
+            node_class: None,
+            meta_type: None,
         };
 
         db.insert_node(&uber_node).map_err(|e| e.to_string())?;
@@ -2616,6 +2653,10 @@ async fn handle_consolidate(db: &Database, json: bool, quiet: bool) -> Result<()
                     updated_at: Some(edge_timestamp),
                     author: None,
                     reason: None,
+                    content: None,
+                    agent_id: None,
+                    superseded_by: None,
+                    metadata: None,
                 };
                 if db.insert_edge(&edge).is_ok() {
                     sibling_edges += 1;
@@ -2912,6 +2953,9 @@ async fn rebuild_hierarchy_adaptive(
             human_edited: None,
             human_created: false,
             author: None,
+            agent_id: None,
+            node_class: None,
+            meta_type: None,
         };
         db.insert_node(&universe).map_err(|e| e.to_string())?;
     }
@@ -2981,6 +3025,9 @@ async fn rebuild_hierarchy_adaptive(
                     human_edited: None,
                     human_created: false,
                     author: None,
+                    agent_id: None,
+                    node_class: None,
+                    meta_type: None,
                 };
                 db.insert_node(&category).map_err(|e| e.to_string())?;
                 *categories_created += 1;
@@ -3043,6 +3090,9 @@ async fn rebuild_hierarchy_adaptive(
                     human_edited: None,
                     human_created: false,
                     author: None,
+                    agent_id: None,
+                    node_class: None,
+                    meta_type: None,
                 };
                 db.insert_node(&category).map_err(|e| e.to_string())?;
                 *categories_created += 1;
@@ -3167,6 +3217,10 @@ async fn rebuild_hierarchy_adaptive(
                 updated_at: Some(now),
                 author: None,
                 reason: None,
+                content: None,
+                agent_id: None,
+                superseded_by: None,
+                metadata: None,
             };
             if db.insert_edge(&edge).is_ok() {
                 sibling_edges_created += 1;
@@ -3581,6 +3635,9 @@ async fn rebuild_hierarchy_dendrogram(
         human_edited: None,
         human_created: false,
         author: None,
+        agent_id: None,
+        node_class: None,
+        meta_type: None,
     };
     db.insert_node(&universe_node).map_err(|e| e.to_string())?;
 
@@ -3763,6 +3820,9 @@ async fn rebuild_hierarchy_dendrogram(
                 human_edited: None,
                 human_created: false,
                 author: None,
+                agent_id: None,
+                node_class: None,
+                meta_type: None,
             };
 
             db.insert_node(&category_node).map_err(|e| e.to_string())?;
@@ -5115,6 +5175,10 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, include_code: bool, al
                         updated_at: Some(chrono::Utc::now().timestamp_millis()),
                         author: None,
                         reason: None,
+                        content: None,
+                        agent_id: None,
+                        superseded_by: None,
+                        metadata: None,
                     };
 
                     if db.insert_edge(&edge).is_ok() {
@@ -5888,6 +5952,70 @@ async fn handle_decide(
     Ok(())
 }
 
+fn handle_migrate(cmd: MigrateCommands, db: &Database, _db_path: &Path, json: bool) -> Result<(), String> {
+    match cmd {
+        MigrateCommands::SporeSchema { .. } => {
+            // Backup already created in run_cli() before Database::new() triggered auto-migration.
+            // Just validate the columns exist.
+            let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+
+            let node_columns: Vec<String> = conn.prepare("SELECT name FROM pragma_table_info('nodes')")
+                .map_err(|e| e.to_string())?
+                .query_map([], |row| row.get(0))
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            let edge_columns: Vec<String> = conn.prepare("SELECT name FROM pragma_table_info('edges')")
+                .map_err(|e| e.to_string())?
+                .query_map([], |row| row.get(0))
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            let required_node_cols = ["agent_id", "node_class", "meta_type"];
+            let required_edge_cols = ["content", "agent_id", "superseded_by", "metadata"];
+
+            let mut missing = Vec::new();
+            for col in &required_node_cols {
+                if !node_columns.iter().any(|c| c == col) {
+                    missing.push(format!("nodes.{}", col));
+                }
+            }
+            for col in &required_edge_cols {
+                if !edge_columns.iter().any(|c| c == col) {
+                    missing.push(format!("edges.{}", col));
+                }
+            }
+
+            if !missing.is_empty() {
+                return Err(format!("Migration failed — missing columns: {}", missing.join(", ")));
+            }
+
+            // Step 3: Report stats
+            let node_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM nodes WHERE agent_id IS NOT NULL", [], |row| row.get(0)
+            ).unwrap_or(0);
+            let edge_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM edges WHERE agent_id IS NOT NULL", [], |row| row.get(0)
+            ).unwrap_or(0);
+
+            if json {
+                println!("{{\"status\":\"ok\",\"node_columns\":{:?},\"edge_columns\":{:?},\"nodes_with_agent\":{},\"edges_with_agent\":{}}}",
+                    required_node_cols, required_edge_cols, node_count, edge_count);
+            } else {
+                eprintln!("Spore schema migration complete.");
+                eprintln!("  Node columns added: {}", required_node_cols.join(", "));
+                eprintln!("  Edge columns added: {}", required_edge_cols.join(", "));
+                eprintln!("  Nodes with agent_id: {}", node_count);
+                eprintln!("  Edges with agent_id: {}", edge_count);
+            }
+
+            Ok(())
+        }
+    }
+}
+
 async fn handle_link(
     source_ref: &str,
     target_ref: &str,
@@ -5924,6 +6052,10 @@ async fn handle_link(
         updated_at: Some(now),
         author: Some(author),
         reason,
+        content: None,
+        agent_id: Some("human".to_string()),
+        superseded_by: None,
+        metadata: None,
     };
 
     db.insert_edge(&edge).map_err(|e| e.to_string())?;
@@ -6844,6 +6976,10 @@ fn analyze_code_edges(
                         updated_at: Some(chrono::Utc::now().timestamp_millis()),
                         author: None,
                         reason: None,
+                        content: None,
+                        agent_id: None,
+                        superseded_by: None,
+                        metadata: None,
                     };
 
                     if db.insert_edge(&edge).is_ok() {
@@ -7082,6 +7218,10 @@ fn analyze_doc_edges(db: &Database, json: bool, quiet: bool) -> Result<(), Strin
                     updated_at: Some(chrono::Utc::now().timestamp_millis()),
                     author: None,
                     reason: None,
+                    content: None,
+                    agent_id: None,
+                    superseded_by: None,
+                    metadata: None,
                 };
                 if db.insert_edge(&edge).is_ok() {
                     edges_created += 1;

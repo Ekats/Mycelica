@@ -205,6 +205,9 @@ fn handle_capture(db: &Database, body: &str) -> Response<std::io::Cursor<Vec<u8>
         human_edited: None,
         human_created: false,
         author: None,
+        agent_id: None,
+        node_class: None,
+        meta_type: None,
     };
 
     // Insert node

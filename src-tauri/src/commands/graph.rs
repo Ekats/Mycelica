@@ -424,6 +424,9 @@ pub fn add_note(state: State<AppState>, title: String, content: String) -> Resul
             human_edited: None,
             human_created: false,
             author: None,
+            agent_id: None,
+            node_class: None,
+            meta_type: None,
         };
         state.db.read().map_err(|e| format!("DB lock error: {}", e))?.insert_node(&container_node).map_err(|e| e.to_string())?;
 
@@ -476,6 +479,9 @@ pub fn add_note(state: State<AppState>, title: String, content: String) -> Resul
         human_edited: None,
         human_created: false,
         author: None,
+        agent_id: None,
+        node_class: None,
+        meta_type: None,
     };
 
     state.db.read().map_err(|e| format!("DB lock error: {}", e))?.insert_node(&note).map_err(|e| e.to_string())?;
@@ -2058,6 +2064,9 @@ pub async fn consolidate_root(state: State<'_, AppState>) -> Result<ConsolidateR
             human_edited: None,
             human_created: false,
             author: None,
+            agent_id: None,
+            node_class: None,
+            meta_type: None,
         };
 
         state.db.read().map_err(|e| format!("DB lock error: {}", e))?.insert_node(&uber_node).map_err(|e| e.to_string())?;
@@ -2139,6 +2148,10 @@ pub async fn consolidate_root(state: State<'_, AppState>) -> Result<ConsolidateR
                     updated_at: Some(edge_timestamp),
                     author: None,
                     reason: None,
+                    content: None,
+                    agent_id: None,
+                    superseded_by: None,
+                    metadata: None,
                 };
                 if db.insert_edge(&edge).is_ok() {
                     sibling_edges_created += 1;

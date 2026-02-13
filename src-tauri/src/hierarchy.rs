@@ -289,6 +289,10 @@ pub fn create_category_edges_from_cross_counts(
                 updated_at: Some(now),
                 author: None,
                 reason: None,
+                content: None,
+                agent_id: None,
+                superseded_by: None,
+                metadata: None,
             }).map_err(|e| e.to_string())?;
 
             created += 1;
@@ -423,6 +427,9 @@ async fn split_leaf_category_by_connectivity(
             human_edited: None,
             human_created: false,
             author: None,
+            agent_id: None,
+            node_class: None,
+            meta_type: None,
         }).map_err(|e| e.to_string())?;
 
         // Move papers into new subcategory
@@ -894,6 +901,9 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
             human_edited: None,
             human_created: false,
             author: None,
+            agent_id: None,
+            node_class: None,
+            meta_type: None,
         };
 
         db.insert_node(&topic_node).map_err(|e| e.to_string())?;
@@ -976,6 +986,9 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
             human_edited: None,
             human_created: false,
             author: None,
+            agent_id: None,
+            node_class: None,
+            meta_type: None,
         };
 
         db.insert_node(&personal_node).map_err(|e| e.to_string())?;
@@ -1039,6 +1052,9 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
             human_edited: None,
             human_created: false,
             author: None,
+            agent_id: None,
+            node_class: None,
+            meta_type: None,
         };
 
         db.insert_node(&notes_node).map_err(|e| e.to_string())?;
@@ -1095,6 +1111,9 @@ pub fn build_hierarchy(db: &Database) -> Result<HierarchyResult, String> {
             human_edited: None,
             human_created: false,
             author: None,
+            agent_id: None,
+            node_class: None,
+            meta_type: None,
         };
 
         db.insert_node(&holerabbit_node).map_err(|e| e.to_string())?;
@@ -1194,6 +1213,9 @@ fn ensure_import_containers_exist(
             human_edited: None,
             human_created: false,
             author: None,
+            agent_id: None,
+            node_class: None,
+            meta_type: None,
         };
 
         db.insert_node(&node).map_err(|e| e.to_string())?;
@@ -1271,6 +1293,9 @@ fn create_universe(db: &Database, child_ids: &[String]) -> Result<String, String
         human_edited: None,
         human_created: false,
         author: None,
+        agent_id: None,
+        node_class: None,
+        meta_type: None,
     };
 
     db.insert_node(&universe_node).map_err(|e| e.to_string())?;

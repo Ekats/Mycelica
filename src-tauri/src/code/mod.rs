@@ -143,6 +143,9 @@ fn get_or_create_import_container(db: &Database, language: &Language) -> String 
         human_edited: None,
         human_created: false,
         author: None,
+        agent_id: None,
+        node_class: None,
+        meta_type: None,
     };
 
     if let Err(e) = db.insert_node(&node) {
@@ -449,6 +452,9 @@ fn process_doc_file(
         human_edited: None,
         human_created: false,
         author: None,
+        agent_id: None,
+        node_class: None,
+        meta_type: None,
     };
 
     db.insert_node(&node)
@@ -597,6 +603,9 @@ fn create_file_module_node(db: &Database, path: &Path, language: &Language) -> R
         human_edited: None,
         human_created: false,
         author: None,
+        agent_id: None,
+        node_class: None,
+        meta_type: None,
     };
 
     db.insert_node(&node)
@@ -663,6 +672,9 @@ fn create_code_node(db: &Database, item: &CodeItem, node_id: &str) -> Result<(),
         human_edited: None,
         human_created: false,
         author: None,
+        agent_id: None,
+        node_class: None,
+        meta_type: None,
     };
 
     db.insert_node(&node)
@@ -687,6 +699,10 @@ fn create_defined_in_edge(db: &Database, item_id: &str, module_id: &str) -> Resu
         updated_at: Some(chrono::Utc::now().timestamp_millis()),
         author: None,
         reason: None,
+        content: None,
+        agent_id: None,
+        superseded_by: None,
+        metadata: None,
     };
 
     db.insert_edge(&edge)
@@ -846,6 +862,10 @@ fn extract_doc_code_edges(db: &Database) -> usize {
                     updated_at: Some(chrono::Utc::now().timestamp_millis()),
                     author: None,
                     reason: None,
+                    content: None,
+                    agent_id: None,
+                    superseded_by: None,
+                    metadata: None,
                 };
 
                 if db.insert_edge(&edge).is_ok() {
