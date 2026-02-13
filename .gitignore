@@ -15,6 +15,7 @@ archive/
 binaries/
 docs/private/
 docs/implementation/
+docs/spore/
 *.db
 !.mycelica.db
 mycelica-openAIRE-preview.db
