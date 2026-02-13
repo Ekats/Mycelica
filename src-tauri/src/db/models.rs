@@ -274,6 +274,45 @@ pub struct Edge {
     pub metadata: Option<String>,          // JSON blob for extensible properties
 }
 
+/// Edge with joined source and target node data (for query-edges results)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeWithNodes {
+    #[serde(flatten)]
+    pub edge: Edge,
+    #[serde(rename = "sourceTitle")]
+    pub source_title: Option<String>,
+    #[serde(rename = "sourceContent")]
+    pub source_content: Option<String>,
+    #[serde(rename = "targetTitle")]
+    pub target_title: Option<String>,
+    #[serde(rename = "targetContent")]
+    pub target_content: Option<String>,
+}
+
+/// Full edge explanation with surrounding context
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeExplanation {
+    pub edge: Edge,
+    #[serde(rename = "sourceNode")]
+    pub source_node: Node,
+    #[serde(rename = "targetNode")]
+    pub target_node: Node,
+    #[serde(rename = "adjacentEdges")]
+    pub adjacent_edges: Vec<Edge>,
+    #[serde(rename = "supersessionChain")]
+    pub supersession_chain: Vec<Edge>,
+}
+
+/// Single hop in a path between two nodes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathHop {
+    pub edge: Edge,
+    #[serde(rename = "nodeId")]
+    pub node_id: String,
+    #[serde(rename = "nodeTitle")]
+    pub node_title: String,
+}
+
 /// Persistent tag for guiding clustering across rebuilds
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tag {

@@ -6,7 +6,7 @@
 
 use clap::{Parser, Subcommand, CommandFactory};
 use clap_complete::{generate, Shell};
-use mycelica_lib::{db::{Database, Node, NodeType, Edge, EdgeType}, settings, import, hierarchy, similarity, openaire, ai_client, utils, classification};
+use mycelica_lib::{db::{Database, Node, NodeType, Edge, EdgeType, Position}, settings, import, hierarchy, similarity, openaire, ai_client, utils, classification};
 use serde_json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -404,9 +404,21 @@ enum Commands {
         /// Edge type: related, contradicts, supports, prerequisite, evolved_from, questions
         #[arg(long, short = 't', default_value = "related")]
         edge_type: String,
-        /// Reason for this connection
+        /// Reason for this connection (short provenance)
         #[arg(long)]
         reason: Option<String>,
+        /// Full reasoning/explanation text
+        #[arg(long)]
+        content: Option<String>,
+        /// Agent attribution (default: human)
+        #[arg(long, default_value = "human")]
+        agent: String,
+        /// Confidence score (0.0-1.0)
+        #[arg(long)]
+        confidence: Option<f64>,
+        /// Edge ID to supersede
+        #[arg(long)]
+        supersedes: Option<String>,
     },
     /// List orphaned nodes (no valid parent)
     Orphans {
@@ -427,11 +439,120 @@ enum Commands {
         #[arg(value_enum)]
         shell: Shell,
     },
+    /// Spore agent coordination commands
+    Spore {
+        #[command(subcommand)]
+        cmd: SporeCommands,
+    },
 }
 
 // ============================================================================
 // Subcommand Enums
 // ============================================================================
+
+#[derive(Subcommand)]
+enum SporeCommands {
+    /// Query edges with multi-filter (type, agent, confidence, recency)
+    QueryEdges {
+        /// Filter by edge type
+        #[arg(long = "type", short = 't')]
+        edge_type: Option<String>,
+        /// Filter by agent_id
+        #[arg(long)]
+        agent: Option<String>,
+        /// Minimum confidence threshold (0.0-1.0)
+        #[arg(long)]
+        confidence_min: Option<f64>,
+        /// Only edges created after this date (YYYY-MM-DD)
+        #[arg(long)]
+        since: Option<String>,
+        /// Exclude superseded edges
+        #[arg(long)]
+        not_superseded: bool,
+        /// Maximum results
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Explain an edge with full context (nodes, adjacents, supersession chain)
+    ExplainEdge {
+        /// Edge ID
+        id: String,
+        /// Depth of adjacent edge exploration (1 or 2)
+        #[arg(long, default_value = "1")]
+        depth: usize,
+    },
+    /// Find all paths between two nodes
+    PathBetween {
+        /// Source node (ID prefix or title substring)
+        from: String,
+        /// Target node (ID prefix or title substring)
+        to: String,
+        /// Maximum hops
+        #[arg(long, default_value = "5")]
+        max_hops: usize,
+        /// Comma-separated edge types to follow (e.g. "contradicts,derives_from")
+        #[arg(long = "edge-types")]
+        edge_types: Option<String>,
+    },
+    /// Get the most relevant edges for a node, ranked by composite score
+    EdgesForContext {
+        /// Node ID prefix or title substring
+        id: String,
+        /// Number of top edges to return
+        #[arg(long, default_value = "10")]
+        top: usize,
+        /// Exclude superseded edges
+        #[arg(long)]
+        not_superseded: bool,
+    },
+    /// Create a meta node (summary/contradiction/status) with edges to existing nodes
+    CreateMeta {
+        /// Meta type: summary, contradiction, status
+        #[arg(long = "type", short = 't')]
+        meta_type: String,
+        /// Title for the meta node
+        #[arg(long)]
+        title: String,
+        /// Content/body for the meta node
+        #[arg(long)]
+        content: Option<String>,
+        /// Agent attribution
+        #[arg(long, default_value = "human")]
+        agent: String,
+        /// Node IDs to connect to
+        #[arg(long = "connects-to", num_args = 1..)]
+        connects_to: Vec<String>,
+        /// Edge type for connections (default: summarizes)
+        #[arg(long = "edge-type", default_value = "summarizes")]
+        edge_type: String,
+    },
+    /// Update an existing meta node
+    UpdateMeta {
+        /// Meta node ID
+        id: String,
+        /// New content
+        #[arg(long)]
+        content: Option<String>,
+        /// New title
+        #[arg(long)]
+        title: Option<String>,
+        /// Agent attribution
+        #[arg(long, default_value = "human")]
+        agent: String,
+        /// Additional node IDs to connect to
+        #[arg(long = "add-connects", num_args = 1..)]
+        add_connects: Vec<String>,
+        /// Edge type for new connections
+        #[arg(long = "edge-type", default_value = "summarizes")]
+        edge_type: String,
+    },
+    /// Spore status dashboard
+    Status {
+        /// Show all details (meta nodes, edge breakdown, contradictions)
+        #[arg(long)]
+        all: bool,
+    },
+}
 
 #[derive(Subcommand)]
 enum MigrateCommands {
@@ -1182,9 +1303,10 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Ask { question, connects_to } => handle_ask(&question, connects_to, &db, cli.json).await,
         Commands::Concept { title, note, connects_to } => handle_concept(&title, note, connects_to, &db, cli.json).await,
         Commands::Decide { title, reason, connects_to } => handle_decide(&title, reason, connects_to, &db, cli.json).await,
-        Commands::Link { source, target, edge_type, reason } => handle_link(&source, &target, &edge_type, reason, &db, cli.json).await,
+        Commands::Link { source, target, edge_type, reason, content, agent, confidence, supersedes } => handle_link(&source, &target, &edge_type, reason, content, &agent, confidence, supersedes, &db, cli.json).await,
         Commands::Orphans { limit } => handle_orphans(limit, &db, cli.json).await,
         Commands::Migrate { cmd } => handle_migrate(cmd, &db, &db_path, cli.json),
+        Commands::Spore { cmd } => handle_spore(cmd, &db, cli.json).await,
         Commands::Tui => run_tui(&db).await,
         Commands::Completions { .. } => unreachable!(),
     }
@@ -1299,7 +1421,7 @@ async fn run_remote(cli: Cli, remote_url: &str) -> Result<(), String> {
             }
             Ok(())
         }
-        Commands::Link { source, target, edge_type, reason } => {
+        Commands::Link { source, target, edge_type, reason, content: _, agent: _, confidence: _, supersedes: _ } => {
             let req = CreateEdgeRequest {
                 source: source,
                 target: target,
@@ -6016,18 +6138,480 @@ fn handle_migrate(cmd: MigrateCommands, db: &Database, _db_path: &Path, json: bo
     }
 }
 
+// ============================================================================
+// Spore Commands
+// ============================================================================
+
+async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(), String> {
+    match cmd {
+        SporeCommands::QueryEdges { edge_type, agent, confidence_min, since, not_superseded, limit } => {
+            // Parse --since date string to epoch millis
+            let since_millis = if let Some(ref date_str) = since {
+                let date = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+                    .map_err(|e| format!("Invalid date '{}': {}. Use YYYY-MM-DD format.", date_str, e))?;
+                let dt = date.and_hms_opt(0, 0, 0).unwrap();
+                Some(dt.and_utc().timestamp_millis())
+            } else {
+                None
+            };
+
+            let results = db.query_edges(
+                edge_type.as_deref(),
+                agent.as_deref(),
+                confidence_min,
+                since_millis,
+                not_superseded,
+                limit,
+            ).map_err(|e| e.to_string())?;
+
+            if json {
+                println!("{}", serde_json::to_string(&results).unwrap_or_default());
+            } else {
+                if results.is_empty() {
+                    println!("No matching edges found.");
+                } else {
+                    for ewn in &results {
+                        let e = &ewn.edge;
+                        let src = ewn.source_title.as_deref().unwrap_or(&e.source[..8.min(e.source.len())]);
+                        let tgt = ewn.target_title.as_deref().unwrap_or(&e.target[..8.min(e.target.len())]);
+                        let conf = e.confidence.map(|c| format!("{:.0}%", c * 100.0)).unwrap_or_else(|| "?".to_string());
+                        let agent_str = e.agent_id.as_deref().unwrap_or("?");
+                        let date = chrono::DateTime::from_timestamp_millis(e.created_at)
+                            .map(|d| d.format("%Y-%m-%d").to_string())
+                            .unwrap_or_else(|| "?".to_string());
+                        println!("{} {} {} → {} [{}] agent:{} {}",
+                            &e.id[..8.min(e.id.len())],
+                            e.edge_type.as_str(),
+                            src, tgt, conf, agent_str, date);
+                    }
+                    println!("\n{} edge(s)", results.len());
+                }
+            }
+            Ok(())
+        }
+
+        SporeCommands::ExplainEdge { id, depth } => {
+            let explanation = db.explain_edge(&id, depth).map_err(|e| e.to_string())?;
+            match explanation {
+                None => {
+                    if json {
+                        println!("null");
+                    } else {
+                        println!("Edge not found: {}", id);
+                    }
+                }
+                Some(exp) => {
+                    if json {
+                        println!("{}", serde_json::to_string(&exp).unwrap_or_default());
+                    } else {
+                        let e = &exp.edge;
+                        println!("Edge: {} [{}]", e.id, e.edge_type.as_str());
+                        println!("  Confidence: {}", e.confidence.map(|c| format!("{:.0}%", c * 100.0)).unwrap_or_else(|| "?".to_string()));
+                        println!("  Agent: {}", e.agent_id.as_deref().unwrap_or("?"));
+                        if let Some(ref reason) = e.reason {
+                            println!("  Reason: {}", reason);
+                        }
+                        if let Some(ref content) = e.content {
+                            println!("  Content: {}", &content[..200.min(content.len())]);
+                        }
+                        if e.superseded_by.is_some() {
+                            println!("  [SUPERSEDED by {}]", e.superseded_by.as_deref().unwrap_or("?"));
+                        }
+                        println!("\nSource: {} ({})", exp.source_node.ai_title.as_ref().unwrap_or(&exp.source_node.title), &exp.source_node.id[..8.min(exp.source_node.id.len())]);
+                        if let Some(ref summary) = exp.source_node.summary {
+                            println!("  {}", &summary[..200.min(summary.len())]);
+                        }
+                        println!("\nTarget: {} ({})", exp.target_node.ai_title.as_ref().unwrap_or(&exp.target_node.title), &exp.target_node.id[..8.min(exp.target_node.id.len())]);
+                        if let Some(ref summary) = exp.target_node.summary {
+                            println!("  {}", &summary[..200.min(summary.len())]);
+                        }
+
+                        if !exp.adjacent_edges.is_empty() {
+                            println!("\nAdjacent edges ({}):", exp.adjacent_edges.len());
+                            for ae in &exp.adjacent_edges {
+                                println!("  {} {} {} → {}",
+                                    &ae.id[..8.min(ae.id.len())],
+                                    ae.edge_type.as_str(),
+                                    &ae.source[..8.min(ae.source.len())],
+                                    &ae.target[..8.min(ae.target.len())]);
+                            }
+                        }
+
+                        if !exp.supersession_chain.is_empty() {
+                            println!("\nSupersession chain ({}):", exp.supersession_chain.len());
+                            for se in &exp.supersession_chain {
+                                let status = if se.superseded_by.is_some() { "superseded" } else { "current" };
+                                println!("  {} [{}] {}", &se.id[..8.min(se.id.len())], se.edge_type.as_str(), status);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        SporeCommands::PathBetween { from, to, max_hops, edge_types } => {
+            let source = resolve_node(db, &from)?;
+            let target = resolve_node(db, &to)?;
+
+            let type_list: Option<Vec<String>> = edge_types.map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
+            let type_refs: Option<Vec<&str>> = type_list.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+
+            let paths = db.path_between(&source.id, &target.id, max_hops, type_refs.as_deref())
+                .map_err(|e| e.to_string())?;
+
+            if json {
+                println!("{}", serde_json::to_string(&paths).unwrap_or_default());
+            } else {
+                if paths.is_empty() {
+                    println!("No paths found between {} and {} (max {} hops)",
+                        source.ai_title.as_ref().unwrap_or(&source.title),
+                        target.ai_title.as_ref().unwrap_or(&target.title),
+                        max_hops);
+                } else {
+                    let src_name = source.ai_title.as_ref().unwrap_or(&source.title);
+                    for (i, path) in paths.iter().enumerate() {
+                        let mut display = format!("{}", src_name);
+                        for hop in path {
+                            display.push_str(&format!(" →[{}]→ {}", hop.edge.edge_type.as_str(), hop.node_title));
+                        }
+                        println!("Path {}: {}", i + 1, display);
+                    }
+                    println!("\n{} path(s) found", paths.len());
+                }
+            }
+            Ok(())
+        }
+
+        SporeCommands::EdgesForContext { id, top, not_superseded } => {
+            let node = resolve_node(db, &id)?;
+
+            let edges = db.edges_for_context(&node.id, top, not_superseded)
+                .map_err(|e| e.to_string())?;
+
+            if json {
+                println!("{}", serde_json::to_string(&edges).unwrap_or_default());
+            } else {
+                if edges.is_empty() {
+                    println!("No edges found for {}", node.ai_title.as_ref().unwrap_or(&node.title));
+                } else {
+                    println!("Top {} edges for: {}", edges.len(), node.ai_title.as_ref().unwrap_or(&node.title));
+                    for (i, e) in edges.iter().enumerate() {
+                        let other_id = if e.source == node.id { &e.target } else { &e.source };
+                        let other_name = db.get_node(other_id).ok().flatten()
+                            .map(|n| n.ai_title.unwrap_or(n.title))
+                            .unwrap_or_else(|| other_id[..8.min(other_id.len())].to_string());
+                        let conf = e.confidence.map(|c| format!(" {:.0}%", c * 100.0)).unwrap_or_default();
+                        let dir = if e.source == node.id { "→" } else { "←" };
+                        println!("  {}. {} {} {} [{}]{}",
+                            i + 1, dir, e.edge_type.as_str(), other_name, &e.id[..8.min(e.id.len())], conf);
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        SporeCommands::CreateMeta { meta_type, title, content, agent, connects_to, edge_type } => {
+            // Validate meta_type
+            let valid_types = ["summary", "contradiction", "status"];
+            if !valid_types.contains(&meta_type.as_str()) {
+                return Err(format!("Invalid meta type: '{}'. Must be one of: summary, contradiction, status", meta_type));
+            }
+
+            // Validate edge_type
+            let et = EdgeType::from_str(&edge_type.to_lowercase())
+                .ok_or_else(|| format!("Unknown edge type: '{}'", edge_type))?;
+
+            // Find universe node for parent_id
+            let universe_id = {
+                let all_nodes = db.get_all_nodes(true).map_err(|e| e.to_string())?;
+                all_nodes.iter().find(|n| n.is_universe).map(|n| n.id.clone())
+                    .ok_or_else(|| "No universe node found. Run 'mycelica-cli hierarchy build' first.".to_string())?
+            };
+
+            let author = settings::get_author_or_default();
+            let now = Utc::now().timestamp_millis();
+            let node_id = uuid::Uuid::new_v4().to_string();
+
+            let node = Node {
+                id: node_id.clone(),
+                node_type: NodeType::Thought,
+                title: title.clone(),
+                url: None,
+                content,
+                position: Position { x: 0.0, y: 0.0 },
+                created_at: now,
+                updated_at: now,
+                cluster_id: None,
+                cluster_label: None,
+                depth: 1,
+                is_item: false,
+                is_universe: false,
+                parent_id: Some(universe_id),
+                child_count: 0,
+                ai_title: None,
+                summary: None,
+                tags: None,
+                emoji: None,
+                is_processed: false,
+                conversation_id: None,
+                sequence_index: None,
+                is_pinned: false,
+                last_accessed_at: None,
+                latest_child_date: None,
+                is_private: None,
+                privacy_reason: None,
+                source: Some("spore".to_string()),
+                pdf_available: None,
+                content_type: None,
+                associated_idea_id: None,
+                privacy: None,
+                human_edited: None,
+                human_created: true,
+                author: Some(author.clone()),
+                agent_id: Some(agent.clone()),
+                node_class: Some("meta".to_string()),
+                meta_type: Some(meta_type.clone()),
+            };
+
+            let mut edges = Vec::new();
+            for target_id in &connects_to {
+                edges.push(Edge {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    source: node_id.clone(),
+                    target: target_id.clone(),
+                    edge_type: et.clone(),
+                    label: None,
+                    weight: Some(1.0),
+                    edge_source: Some("user".to_string()),
+                    evidence_id: None,
+                    confidence: Some(1.0),
+                    created_at: now,
+                    updated_at: Some(now),
+                    author: Some(author.clone()),
+                    reason: None,
+                    content: None,
+                    agent_id: Some(agent.clone()),
+                    superseded_by: None,
+                    metadata: None,
+                });
+            }
+
+            db.create_meta_node_with_edges(&node, &edges).map_err(|e| e.to_string())?;
+
+            if json {
+                println!(r#"{{"id":"{}","type":"{}","title":"{}","edges":{}}}"#,
+                    node_id, meta_type, escape_json(&title), edges.len());
+            } else {
+                println!("Created meta node: {} [{}] \"{}\"", &node_id[..8], meta_type, title);
+                if !connects_to.is_empty() {
+                    println!("  {} {} edge(s) created", connects_to.len(), edge_type);
+                }
+            }
+            Ok(())
+        }
+
+        SporeCommands::UpdateMeta { id, content, title, agent, add_connects, edge_type } => {
+            let mut node = db.get_node(&id).map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("Node not found: {}", id))?;
+
+            // Verify it's a meta node
+            if node.node_class.as_deref() != Some("meta") {
+                return Err(format!("Node {} is not a meta node (class: {:?})", id, node.node_class));
+            }
+
+            let author = settings::get_author_or_default();
+            let now = Utc::now().timestamp_millis();
+
+            // Update fields
+            if let Some(new_content) = content {
+                node.content = Some(new_content);
+            }
+            if let Some(new_title) = title {
+                node.title = new_title;
+            }
+            node.updated_at = now;
+            node.author = Some(author.clone());
+            node.agent_id = Some(agent.clone());
+
+            db.update_node(&node).map_err(|e| e.to_string())?;
+
+            // Add new edges if specified
+            if !add_connects.is_empty() {
+                let et = EdgeType::from_str(&edge_type.to_lowercase())
+                    .ok_or_else(|| format!("Unknown edge type: '{}'", edge_type))?;
+
+                let mut edges = Vec::new();
+                for target_id in &add_connects {
+                    edges.push(Edge {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        source: node.id.clone(),
+                        target: target_id.clone(),
+                        edge_type: et.clone(),
+                        label: None,
+                        weight: Some(1.0),
+                        edge_source: Some("user".to_string()),
+                        evidence_id: None,
+                        confidence: Some(1.0),
+                        created_at: now,
+                        updated_at: Some(now),
+                        author: Some(author.clone()),
+                        reason: None,
+                        content: None,
+                        agent_id: Some(agent.clone()),
+                        superseded_by: None,
+                        metadata: None,
+                    });
+                }
+                db.insert_edges_batch(&edges).map_err(|e| e.to_string())?;
+            }
+
+            if json {
+                println!(r#"{{"id":"{}","updated":true,"newEdges":{}}}"#, id, add_connects.len());
+            } else {
+                println!("Updated meta node: {} \"{}\"", &id[..8.min(id.len())], node.title);
+                if !add_connects.is_empty() {
+                    println!("  {} new {} edge(s)", add_connects.len(), edge_type);
+                }
+            }
+            Ok(())
+        }
+
+        SporeCommands::Status { all } => {
+            // Meta nodes by type
+            let meta_nodes = db.get_meta_nodes(None).map_err(|e| e.to_string())?;
+            let summaries = meta_nodes.iter().filter(|n| n.meta_type.as_deref() == Some("summary")).count();
+            let contradictions_meta = meta_nodes.iter().filter(|n| n.meta_type.as_deref() == Some("contradiction")).count();
+            let statuses = meta_nodes.iter().filter(|n| n.meta_type.as_deref() == Some("status")).count();
+
+            // Edge stats
+            let all_edges = db.get_all_edges().map_err(|e| e.to_string())?;
+            let now = Utc::now().timestamp_millis();
+            let day_ago = now - 86_400_000;
+            let week_ago = now - 7 * 86_400_000;
+
+            let edges_24h = all_edges.iter().filter(|e| e.created_at >= day_ago).count();
+            let edges_7d = all_edges.iter().filter(|e| e.created_at >= week_ago).count();
+
+            // Unresolved contradictions (contradiction edges not superseded)
+            let unresolved = all_edges.iter()
+                .filter(|e| e.edge_type == EdgeType::Contradicts && e.superseded_by.is_none())
+                .count();
+
+            // Coverage: knowledge nodes referenced by summarizes edges
+            let all_nodes = db.get_all_nodes(true).map_err(|e| e.to_string())?;
+            let knowledge_nodes = all_nodes.iter().filter(|n| n.node_class.as_deref() != Some("meta") && n.is_item).count();
+            let summarized_targets: std::collections::HashSet<&str> = all_edges.iter()
+                .filter(|e| e.edge_type == EdgeType::Summarizes && e.superseded_by.is_none())
+                .map(|e| e.target.as_str())
+                .collect();
+            let coverage = if knowledge_nodes > 0 {
+                summarized_targets.len() as f64 / knowledge_nodes as f64
+            } else {
+                0.0
+            };
+
+            // Coherence
+            let active_edges = all_edges.iter().filter(|e| e.superseded_by.is_none()).count();
+            let coherence = if active_edges > 0 {
+                1.0 - (unresolved as f64 / active_edges as f64)
+            } else {
+                1.0
+            };
+
+            if json {
+                println!(r#"{{"metaNodes":{{"summary":{},"contradiction":{},"status":{}}},"edges":{{"last24h":{},"last7d":{},"total":{}}},"unresolvedContradictions":{},"coverage":{:.4},"coherence":{:.6}}}"#,
+                    summaries, contradictions_meta, statuses,
+                    edges_24h, edges_7d, all_edges.len(),
+                    unresolved, coverage, coherence);
+            } else {
+                println!("=== Spore Status ===\n");
+                println!("Meta nodes: {} total", meta_nodes.len());
+                println!("  Summaries:      {}", summaries);
+                println!("  Contradictions: {}", contradictions_meta);
+                println!("  Status nodes:   {}", statuses);
+
+                println!("\nEdge activity:");
+                println!("  Last 24h: {}", edges_24h);
+                println!("  Last 7d:  {}", edges_7d);
+                println!("  Total:    {}", all_edges.len());
+
+                println!("\nUnresolved contradictions: {}", unresolved);
+                println!("Coverage: {:.1}% ({} / {} knowledge nodes summarized)", coverage * 100.0, summarized_targets.len(), knowledge_nodes);
+                println!("Coherence: {:.4}", coherence);
+
+                if all {
+                    // Agent breakdown
+                    let mut agent_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                    for e in all_edges.iter().filter(|e| e.created_at >= week_ago) {
+                        let agent_key = e.agent_id.as_deref().unwrap_or("unknown").to_string();
+                        *agent_counts.entry(agent_key).or_insert(0) += 1;
+                    }
+                    if !agent_counts.is_empty() {
+                        println!("\nEdges by agent (last 7d):");
+                        let mut sorted: Vec<_> = agent_counts.into_iter().collect();
+                        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                        for (agent_name, count) in sorted {
+                            println!("  {}: {}", agent_name, count);
+                        }
+                    }
+
+                    // List unresolved contradictions
+                    if unresolved > 0 {
+                        println!("\nUnresolved contradiction edges:");
+                        for e in all_edges.iter()
+                            .filter(|e| e.edge_type == EdgeType::Contradicts && e.superseded_by.is_none())
+                            .take(10)
+                        {
+                            let src_name = db.get_node(&e.source).ok().flatten()
+                                .map(|n| n.ai_title.unwrap_or(n.title))
+                                .unwrap_or_else(|| e.source[..8.min(e.source.len())].to_string());
+                            let tgt_name = db.get_node(&e.target).ok().flatten()
+                                .map(|n| n.ai_title.unwrap_or(n.title))
+                                .unwrap_or_else(|| e.target[..8.min(e.target.len())].to_string());
+                            println!("  {} contradicts {}", src_name, tgt_name);
+                        }
+                        if unresolved > 10 {
+                            println!("  ... and {} more", unresolved - 10);
+                        }
+                    }
+
+                    // List meta nodes
+                    if !meta_nodes.is_empty() {
+                        println!("\nMeta nodes:");
+                        for mn in &meta_nodes {
+                            let mt = mn.meta_type.as_deref().unwrap_or("?");
+                            let agent_name = mn.agent_id.as_deref().unwrap_or("?");
+                            println!("  [{}] {} (agent: {}, {})",
+                                mt, mn.title, agent_name, &mn.id[..8.min(mn.id.len())]);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 async fn handle_link(
     source_ref: &str,
     target_ref: &str,
     edge_type_str: &str,
     reason: Option<String>,
+    content: Option<String>,
+    agent: &str,
+    confidence: Option<f64>,
+    supersedes: Option<String>,
     db: &Database,
     json: bool,
 ) -> Result<(), String> {
     // Parse edge type (case-insensitive)
     let edge_type = EdgeType::from_str(&edge_type_str.to_lowercase())
         .ok_or_else(|| format!(
-            "Unknown edge type: '{}'. Valid: related, contradicts, supports, prerequisite, evolved_from, questions, reference, because",
+            "Unknown edge type: '{}'. Valid types include: related, reference, because, contains, \
+             belongs_to, calls, uses_type, implements, defined_in, imports, tests, documents, \
+             prerequisite, contradicts, supports, evolved_from, questions, \
+             summarizes, tracks, flags, resolves, derives_from",
             edge_type_str
         ))?;
 
@@ -6047,27 +6631,38 @@ async fn handle_link(
         weight: Some(1.0),
         edge_source: Some("user".to_string()),
         evidence_id: None,
-        confidence: Some(1.0),
+        confidence: Some(confidence.unwrap_or(1.0)),
         created_at: now,
         updated_at: Some(now),
         author: Some(author),
         reason,
-        content: None,
-        agent_id: Some("human".to_string()),
+        content,
+        agent_id: Some(agent.to_string()),
         superseded_by: None,
         metadata: None,
     };
 
     db.insert_edge(&edge).map_err(|e| e.to_string())?;
 
+    // If superseding another edge, mark the old one
+    if let Some(ref old_edge_id) = supersedes {
+        db.supersede_edge(old_edge_id, &edge_id).map_err(|e| e.to_string())?;
+    }
+
     if json {
-        println!(r#"{{"id":"{}","source":"{}","target":"{}","type":"{}"}}"#,
-            edge_id, source.id, target.id, edge_type_str.to_lowercase());
+        println!(r#"{{"id":"{}","source":"{}","target":"{}","type":"{}","agent":"{}","confidence":{}}}"#,
+            edge_id, source.id, target.id, edge_type_str.to_lowercase(), agent, confidence.unwrap_or(1.0));
     } else {
-        println!("Linked: {} -> {} [{}]",
+        let conf_str = confidence.map(|c| format!(" ({:.0}%)", c * 100.0)).unwrap_or_default();
+        println!("Linked: {} -> {} [{}]{} (agent: {})",
             source.ai_title.as_ref().unwrap_or(&source.title),
             target.ai_title.as_ref().unwrap_or(&target.title),
-            edge_type_str.to_lowercase());
+            edge_type_str.to_lowercase(),
+            conf_str,
+            agent);
+        if let Some(ref old_id) = supersedes {
+            println!("  Superseded edge: {}", &old_id[..8.min(old_id.len())]);
+        }
     }
 
     Ok(())

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
-use super::models::{Node, Edge, NodeType, EdgeType, Position, Tag, Paper};
+use super::models::{Node, Edge, NodeType, EdgeType, Position, Tag, Paper, EdgeWithNodes, EdgeExplanation, PathHop};
 
 pub struct Database {
     conn: Mutex<Connection>,
@@ -5310,6 +5310,522 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         // Cascade will handle papers table due to foreign key
         conn.execute("DELETE FROM nodes WHERE id = ?1", params![node_id])?;
+        Ok(())
+    }
+
+    // ===================== Spore Phase 2: Edge-centric query methods =====================
+
+    /// Query edges with dynamic multi-filter, JOINing source+target nodes for context.
+    pub fn query_edges(
+        &self,
+        edge_type: Option<&str>,
+        agent_id: Option<&str>,
+        confidence_min: Option<f64>,
+        since: Option<i64>,
+        not_superseded: bool,
+        limit: usize,
+    ) -> Result<Vec<EdgeWithNodes>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut conditions: Vec<String> = Vec::new();
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut param_idx = 1;
+
+        if let Some(et) = edge_type {
+            conditions.push(format!("e.type = ?{}", param_idx));
+            param_values.push(Box::new(et.to_string()));
+            param_idx += 1;
+        }
+        if let Some(aid) = agent_id {
+            conditions.push(format!("e.agent_id = ?{}", param_idx));
+            param_values.push(Box::new(aid.to_string()));
+            param_idx += 1;
+        }
+        if let Some(cmin) = confidence_min {
+            conditions.push(format!("e.confidence >= ?{}", param_idx));
+            param_values.push(Box::new(cmin));
+            param_idx += 1;
+        }
+        if let Some(ts) = since {
+            conditions.push(format!("e.created_at >= ?{}", param_idx));
+            param_values.push(Box::new(ts));
+            param_idx += 1;
+        }
+        if not_superseded {
+            conditions.push("e.superseded_by IS NULL".to_string());
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let sql = format!(
+            "SELECT e.id, e.source_id, e.target_id, e.type, e.label, e.weight, e.edge_source, e.evidence_id, e.confidence, e.created_at, e.updated_at, e.author, e.reason, e.content, e.agent_id, e.superseded_by, e.metadata, s.title, s.content, t.title, t.content
+             FROM edges e
+             JOIN nodes s ON e.source_id = s.id
+             JOIN nodes t ON e.target_id = t.id
+             {}
+             ORDER BY e.created_at DESC
+             LIMIT ?{}",
+            where_clause, param_idx
+        );
+
+        param_values.push(Box::new(limit as i64));
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+
+        let results = stmt.query_map(params_refs.as_slice(), |row| {
+            let edge = Edge {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                target: row.get(2)?,
+                edge_type: EdgeType::from_str(&row.get::<_, String>(3)?).unwrap_or(EdgeType::Related),
+                label: row.get(4)?,
+                weight: row.get(5)?,
+                edge_source: row.get(6)?,
+                evidence_id: row.get(7)?,
+                confidence: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+                author: row.get(11)?,
+                reason: row.get(12)?,
+                content: row.get(13)?,
+                agent_id: row.get(14)?,
+                superseded_by: row.get(15)?,
+                metadata: row.get(16)?,
+            };
+            Ok(EdgeWithNodes {
+                edge,
+                source_title: row.get(17)?,
+                source_content: row.get(18)?,
+                target_title: row.get(19)?,
+                target_content: row.get(20)?,
+            })
+        })?.collect::<Result<Vec<_>>>()?;
+
+        Ok(results)
+    }
+
+    /// Get a single edge by ID.
+    pub fn get_edge_by_id(&self, edge_id: &str) -> Result<Option<Edge>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM edges WHERE id = ?1",
+            Self::EDGE_COLUMNS
+        ))?;
+        let mut rows = stmt.query(params![edge_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(Self::row_to_edge(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Explain an edge: returns the edge with source/target nodes, adjacent edges, and supersession chain.
+    pub fn explain_edge(&self, edge_id: &str, depth: usize) -> Result<Option<EdgeExplanation>> {
+        let edge = match self.get_edge_by_id(edge_id)? {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+
+        let source_node = self.get_node(&edge.source)?.unwrap_or_else(|| Node {
+            id: edge.source.clone(),
+            node_type: NodeType::Thought,
+            title: "(deleted)".to_string(),
+            url: None, content: None,
+            position: Position { x: 0.0, y: 0.0 },
+            created_at: 0, updated_at: 0,
+            cluster_id: None, cluster_label: None,
+            depth: 0, is_item: false, is_universe: false,
+            parent_id: None, child_count: 0,
+            ai_title: None, summary: None, tags: None, emoji: None, is_processed: false,
+            conversation_id: None, sequence_index: None,
+            is_pinned: false, last_accessed_at: None, latest_child_date: None,
+            is_private: None, privacy_reason: None,
+            source: None, pdf_available: None,
+            content_type: None, associated_idea_id: None,
+            privacy: None, human_edited: None, human_created: false, author: None,
+            agent_id: None, node_class: None, meta_type: None,
+        });
+
+        let target_node = self.get_node(&edge.target)?.unwrap_or_else(|| Node {
+            id: edge.target.clone(),
+            node_type: NodeType::Thought,
+            title: "(deleted)".to_string(),
+            url: None, content: None,
+            position: Position { x: 0.0, y: 0.0 },
+            created_at: 0, updated_at: 0,
+            cluster_id: None, cluster_label: None,
+            depth: 0, is_item: false, is_universe: false,
+            parent_id: None, child_count: 0,
+            ai_title: None, summary: None, tags: None, emoji: None, is_processed: false,
+            conversation_id: None, sequence_index: None,
+            is_pinned: false, last_accessed_at: None, latest_child_date: None,
+            is_private: None, privacy_reason: None,
+            source: None, pdf_available: None,
+            content_type: None, associated_idea_id: None,
+            privacy: None, human_edited: None, human_created: false, author: None,
+            agent_id: None, node_class: None, meta_type: None,
+        });
+
+        // Collect adjacent edges (limit 10 per side)
+        let mut adjacent_edges = Vec::new();
+        let source_edges = self.get_edges_for_node(&edge.source)?;
+        for e in source_edges.into_iter().filter(|e| e.id != edge.id).take(10) {
+            adjacent_edges.push(e);
+        }
+        let target_edges = self.get_edges_for_node(&edge.target)?;
+        let existing_ids: std::collections::HashSet<String> = adjacent_edges.iter().map(|e| e.id.clone()).collect();
+        let target_filtered: Vec<Edge> = target_edges.into_iter()
+            .filter(|e| e.id != edge.id && !existing_ids.contains(&e.id))
+            .take(10).collect();
+        adjacent_edges.extend(target_filtered);
+
+        // Depth 2: include adjacents of adjacent nodes (cap total at 50)
+        if depth >= 2 {
+            let mut depth2_node_ids: Vec<String> = Vec::new();
+            for ae in &adjacent_edges {
+                if ae.source != edge.source && ae.source != edge.target && !depth2_node_ids.contains(&ae.source) {
+                    depth2_node_ids.push(ae.source.clone());
+                }
+                if ae.target != edge.source && ae.target != edge.target && !depth2_node_ids.contains(&ae.target) {
+                    depth2_node_ids.push(ae.target.clone());
+                }
+            }
+            for nid in depth2_node_ids.iter().take(10) {
+                if adjacent_edges.len() >= 50 { break; }
+                let extra = self.get_edges_for_node(nid)?;
+                let existing_ids: std::collections::HashSet<String> = adjacent_edges.iter().map(|e| e.id.clone()).collect();
+                let extra_filtered: Vec<Edge> = extra.into_iter()
+                    .filter(|e| e.id != edge.id && !existing_ids.contains(&e.id))
+                    .take(5).collect();
+                adjacent_edges.extend(extra_filtered);
+            }
+        }
+
+        let supersession_chain = self.get_supersession_chain(edge_id)?;
+
+        Ok(Some(EdgeExplanation {
+            edge,
+            source_node,
+            target_node,
+            adjacent_edges,
+            supersession_chain,
+        }))
+    }
+
+    /// Get the N most relevant edges for a node, ranked by composite score.
+    pub fn edges_for_context(&self, node_id: &str, top_n: usize, not_superseded: bool) -> Result<Vec<Edge>> {
+        let all_edges = self.get_edges_for_node(node_id)?;
+
+        let mut edges: Vec<Edge> = if not_superseded {
+            all_edges.into_iter().filter(|e| e.superseded_by.is_none()).collect()
+        } else {
+            all_edges
+        };
+
+        if edges.is_empty() {
+            return Ok(edges);
+        }
+
+        // Compute time range for recency normalization
+        let oldest = edges.iter().map(|e| e.created_at).min().unwrap_or(0);
+        let newest = edges.iter().map(|e| e.created_at).max().unwrap_or(0);
+        let time_range = (newest - oldest) as f64;
+
+        // Score each edge
+        let mut scored: Vec<(f64, Edge)> = edges.drain(..).map(|e| {
+            let recency = if time_range > 0.0 {
+                (e.created_at - oldest) as f64 / time_range
+            } else {
+                1.0
+            };
+            let confidence = e.confidence.unwrap_or(0.5);
+            let type_priority = match e.edge_type {
+                EdgeType::Contradicts | EdgeType::Flags => 1.0,
+                EdgeType::DerivesFrom | EdgeType::Summarizes | EdgeType::Resolves => 0.7,
+                EdgeType::Supports | EdgeType::Questions | EdgeType::Prerequisite | EdgeType::EvolvedFrom => 0.5,
+                _ => 0.3,
+            };
+            let score = 0.3 * recency + 0.3 * confidence + 0.4 * type_priority;
+            (score, e)
+        }).collect();
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_n);
+
+        Ok(scored.into_iter().map(|(_, e)| e).collect())
+    }
+
+    /// Find all simple paths between two nodes via DFS with per-path visited set.
+    pub fn path_between(
+        &self,
+        node_a: &str,
+        node_b: &str,
+        max_hops: usize,
+        edge_types: Option<&[&str]>,
+    ) -> Result<Vec<Vec<PathHop>>> {
+        let mut all_paths: Vec<Vec<PathHop>> = Vec::new();
+        let mut current_path: Vec<PathHop> = Vec::new();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        visited.insert(node_a.to_string());
+
+        self.dfs_paths(node_a, node_b, max_hops, edge_types, &mut visited, &mut current_path, &mut all_paths)?;
+
+        Ok(all_paths)
+    }
+
+    fn dfs_paths(
+        &self,
+        current: &str,
+        target: &str,
+        remaining_hops: usize,
+        edge_types: Option<&[&str]>,
+        visited: &mut std::collections::HashSet<String>,
+        current_path: &mut Vec<PathHop>,
+        all_paths: &mut Vec<Vec<PathHop>>,
+    ) -> Result<()> {
+        if all_paths.len() >= 20 {
+            return Ok(());
+        }
+        if remaining_hops == 0 {
+            return Ok(());
+        }
+
+        let edges = self.get_edges_for_node(current)?;
+
+        for edge in edges {
+            // Determine the neighbor node
+            let neighbor = if edge.source == current {
+                &edge.target
+            } else {
+                &edge.source
+            };
+
+            // Filter by edge type if specified
+            if let Some(types) = edge_types {
+                if !types.contains(&edge.edge_type.as_str()) {
+                    continue;
+                }
+            }
+
+            // Skip already-visited nodes (cycle prevention)
+            if visited.contains(neighbor.as_str()) {
+                continue;
+            }
+
+            // Get neighbor node title
+            let node_title = self.get_node(neighbor)?
+                .map(|n| n.ai_title.unwrap_or(n.title))
+                .unwrap_or_else(|| neighbor[..8.min(neighbor.len())].to_string());
+
+            current_path.push(PathHop {
+                edge: edge.clone(),
+                node_id: neighbor.clone(),
+                node_title: node_title.clone(),
+            });
+
+            if neighbor == target {
+                // Found a path
+                all_paths.push(current_path.clone());
+                current_path.pop();
+                if all_paths.len() >= 20 {
+                    return Ok(());
+                }
+                continue;
+            }
+
+            // Recurse
+            visited.insert(neighbor.clone());
+            self.dfs_paths(neighbor, target, remaining_hops - 1, edge_types, visited, current_path, all_paths)?;
+            visited.remove(neighbor.as_str());
+            current_path.pop();
+
+            if all_paths.len() >= 20 {
+                return Ok(());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Mark an edge as superseded by another edge.
+    pub fn supersede_edge(&self, old_edge_id: &str, new_edge_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE edges SET superseded_by = ?2 WHERE id = ?1",
+            params![old_edge_id, new_edge_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get the full supersession chain for an edge (predecessors and successors).
+    pub fn get_supersession_chain(&self, edge_id: &str) -> Result<Vec<Edge>> {
+        let conn = self.conn.lock().unwrap();
+        let mut chain: Vec<Edge> = Vec::new();
+
+        // Walk backward: find edges that were superseded by this one
+        let mut backward: Vec<Edge> = Vec::new();
+        let mut current_id = edge_id.to_string();
+        for _ in 0..50 {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {} FROM edges WHERE superseded_by = ?1",
+                Self::EDGE_COLUMNS
+            ))?;
+            let mut rows = stmt.query(params![current_id])?;
+            if let Some(row) = rows.next()? {
+                let e = Self::row_to_edge(row)?;
+                current_id = e.id.clone();
+                backward.push(e);
+            } else {
+                break;
+            }
+        }
+        backward.reverse();
+        chain.append(&mut backward);
+
+        // Walk forward: follow superseded_by links
+        let mut current_id = edge_id.to_string();
+        for _ in 0..50 {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {} FROM edges WHERE id = ?1",
+                Self::EDGE_COLUMNS
+            ))?;
+            let mut rows = stmt.query(params![current_id])?;
+            if let Some(row) = rows.next()? {
+                let e = Self::row_to_edge(row)?;
+                if let Some(ref next) = e.superseded_by {
+                    current_id = next.clone();
+                    // Fetch the superseding edge
+                    let mut stmt2 = conn.prepare(&format!(
+                        "SELECT {} FROM edges WHERE id = ?1",
+                        Self::EDGE_COLUMNS
+                    ))?;
+                    let mut rows2 = stmt2.query(params![current_id])?;
+                    if let Some(row2) = rows2.next()? {
+                        chain.push(Self::row_to_edge(row2)?);
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        Ok(chain)
+    }
+
+    /// Get meta nodes, optionally filtered by meta_type.
+    pub fn get_meta_nodes(&self, meta_type: Option<&str>) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = if let Some(mt) = meta_type {
+            let _ = mt; // used below
+            format!(
+                "SELECT {} FROM nodes WHERE node_class = 'meta' AND meta_type = ?1 ORDER BY created_at DESC",
+                Self::NODE_COLUMNS
+            )
+        } else {
+            format!(
+                "SELECT {} FROM nodes WHERE node_class = 'meta' ORDER BY created_at DESC",
+                Self::NODE_COLUMNS
+            )
+        };
+
+        let mut stmt = conn.prepare(&sql)?;
+        let nodes = if let Some(mt) = meta_type {
+            stmt.query_map(params![mt], Self::row_to_node)?.collect::<Result<Vec<_>>>()?
+        } else {
+            stmt.query_map([], Self::row_to_node)?.collect::<Result<Vec<_>>>()?
+        };
+
+        Ok(nodes)
+    }
+
+    /// Create a meta node and its edges atomically in a transaction.
+    pub fn create_meta_node_with_edges(&self, node: &Node, edges: &[Edge]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        // Insert node
+        tx.execute(
+            "INSERT INTO nodes (id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, source, pdf_available, content_type, associated_idea_id, privacy, human_edited, human_created, author, agent_id, node_class, meta_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)",
+            params![
+                node.id,
+                node.node_type.as_str(),
+                node.title,
+                node.url,
+                node.content,
+                node.position.x,
+                node.position.y,
+                node.created_at,
+                node.updated_at,
+                node.cluster_id,
+                node.cluster_label,
+                node.ai_title,
+                node.summary,
+                node.tags,
+                node.emoji,
+                node.is_processed,
+                node.depth,
+                node.is_item,
+                node.is_universe,
+                node.parent_id,
+                node.child_count,
+                node.conversation_id,
+                node.sequence_index,
+                node.is_pinned,
+                node.last_accessed_at,
+                node.source,
+                node.pdf_available,
+                node.content_type,
+                node.associated_idea_id,
+                node.privacy,
+                node.human_edited,
+                node.human_created,
+                node.author,
+                node.agent_id,
+                node.node_class,
+                node.meta_type,
+            ],
+        )?;
+
+        // Insert edges
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO edges (id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at, updated_at, author, reason, content, agent_id, superseded_by, metadata)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+            )?;
+            for edge in edges {
+                stmt.execute(params![
+                    &edge.id,
+                    &edge.source,
+                    &edge.target,
+                    edge.edge_type.as_str(),
+                    &edge.label,
+                    &edge.weight,
+                    &edge.edge_source,
+                    &edge.evidence_id,
+                    &edge.confidence,
+                    &edge.created_at,
+                    &edge.updated_at,
+                    &edge.author,
+                    &edge.reason,
+                    &edge.content,
+                    &edge.agent_id,
+                    &edge.superseded_by,
+                    &edge.metadata,
+                ])?;
+            }
+        }
+
+        tx.commit()?;
         Ok(())
     }
 }
