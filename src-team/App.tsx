@@ -66,9 +66,14 @@ export default function App() {
       <Breadcrumb />
 
       <div className="flex flex-1 overflow-hidden">
-        {showRecent && <RecentPanel />}
-        <GraphView />
-        {leafViewNodeId && <LeafView nodeId={leafViewNodeId} />}
+        {leafViewNodeId ? (
+          <LeafView nodeId={leafViewNodeId} />
+        ) : (
+          <>
+            {showRecent && <RecentPanel />}
+            <GraphView />
+          </>
+        )}
       </div>
 
       {selectedNodeId && !leafViewNodeId && <NodePopup />}

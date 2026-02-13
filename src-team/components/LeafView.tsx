@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { X, Trash2, Link, FolderInput, Pencil, Globe, RefreshCw, Loader2, ExternalLink } from "lucide-react";
+import { X, Trash2, Link, FolderInput, Pencil, Globe, RefreshCw, Loader2, ExternalLink, ArrowLeft } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import { invoke } from "@tauri-apps/api/core";
 import { useTeamStore } from "../stores/teamStore";
@@ -151,12 +151,12 @@ export default function LeafView({ nodeId }: LeafViewProps) {
 
   if (!node) {
     return (
-      <div className="flex flex-col border-l leaf-view-panel" style={{
-        width: 380, minWidth: 380, background: "var(--bg-secondary)", borderColor: "var(--border)",
+      <div className="flex flex-col flex-1 leaf-view-panel" style={{
+        background: "var(--bg-secondary)",
       }}>
         <div className="flex items-center justify-between px-4 py-3 border-b" style={{ borderColor: "var(--border)" }}>
-          <span className="text-sm" style={{ color: "var(--text-secondary)" }}>Node not found</span>
-          <button className="btn-secondary p-1" onClick={closeLeafView}><X size={16} /></button>
+          <button className="btn-secondary p-1 mr-2" onClick={closeLeafView}><ArrowLeft size={16} /></button>
+          <span className="text-sm flex-1" style={{ color: "var(--text-secondary)" }}>Node not found</span>
         </div>
       </div>
     );
@@ -175,11 +175,14 @@ export default function LeafView({ nodeId }: LeafViewProps) {
   const isFetchingThis = isFetching === nodeId;
 
   return (
-    <div className="flex flex-col border-l overflow-hidden leaf-view-panel" style={{
-      width: 380, minWidth: 380, background: "var(--bg-secondary)", borderColor: "var(--border)",
+    <div className="flex flex-col flex-1 overflow-hidden leaf-view-panel" style={{
+      background: "var(--bg-secondary)",
     }}>
       {/* Header */}
       <div className="flex items-center gap-2 px-4 py-3 border-b" style={{ borderColor: "var(--border)" }}>
+        <button className="btn-secondary p-1 mr-1" onClick={closeLeafView} title="Back to graph">
+          <ArrowLeft size={16} />
+        </button>
         <div className="flex items-center gap-2 flex-1 min-w-0">
           {author && (
             <span className="text-xs px-2 py-0.5 rounded-full" style={{ background: "#374151", color: "#f59e0b" }}>
@@ -227,7 +230,7 @@ export default function LeafView({ nodeId }: LeafViewProps) {
       </div>
 
       {/* Content area */}
-      <div className="flex-1 overflow-y-auto px-4 py-3">
+      <div className="flex-1 overflow-y-auto px-4 py-3 mx-auto w-full" style={{ maxWidth: 800 }}>
         {/* Content text */}
         {editingContent ? (
           <textarea
@@ -292,7 +295,7 @@ export default function LeafView({ nodeId }: LeafViewProps) {
               srcDoc={`<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:system-ui,sans-serif;font-size:14px;line-height:1.6;color:#222;background:#fff;padding:12px;margin:0}img{max-width:100%;height:auto}pre{overflow-x:auto;background:#f5f5f5;padding:8px;border-radius:4px}a{color:#2563eb}</style></head><body>${cachedContent.html}</body></html>`}
               sandbox=""
               className="w-full rounded border"
-              style={{ height: 300, borderColor: "var(--border)", background: "#fff" }}
+              style={{ height: 600, borderColor: "var(--border)", background: "#fff" }}
               title="Fetched content"
             />
             {cachedContent.textContent.length < 50 && (

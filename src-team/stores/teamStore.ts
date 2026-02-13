@@ -36,7 +36,7 @@ interface TeamStore {
   navigateToBreadcrumb: (nodeId: string) => void;
   navigateToNodeParent: (nodeId: string) => void;
 
-  // LeafView
+  // LeafView (full-page detail view)
   leafViewNodeId: string | null;
   openLeafView: (nodeId: string) => void;
   closeLeafView: () => void;

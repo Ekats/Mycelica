@@ -1,8 +1,10 @@
 import { useState, useEffect, useCallback } from "react";
-import { X, Trash2, Link, FolderInput, FolderOpen, Pencil, Maximize2 } from "lucide-react";
+import { X, Trash2, Link, FolderInput, FolderOpen, Pencil, Maximize2, Globe, RefreshCw, Loader2, ExternalLink } from "lucide-react";
+import ReactMarkdown from "react-markdown";
 import { invoke } from "@tauri-apps/api/core";
 import { useTeamStore } from "../stores/teamStore";
 import EdgeCreator from "./EdgeCreator";
+import { ConversationRenderer, isConversationContent } from "./ConversationRenderer";
 import type { ContentType, DisplayEdge, Node } from "../types";
 
 const CONTENT_TYPES: ContentType[] = [
@@ -15,6 +17,7 @@ export default function NodePopup() {
     nodes, personalNodes, selectedNodeId, edges, personalEdges,
     setSelectedNodeId, updateNode, deleteNode, deletePersonalNode, updatePersonalNode,
     navigateToCategory, openLeafView,
+    fetchedContent, isFetching, fetchUrlContent, loadFetchedContent,
   } = useTeamStore();
 
   const [editingTitle, setEditingTitle] = useState(false);
@@ -48,6 +51,11 @@ export default function NodePopup() {
     setCategoryResults([]);
     setShowEditModal(false);
   }, [selectedNodeId, teamNode, personalNode]);
+
+  // Load cached fetched content
+  useEffect(() => {
+    if (selectedNodeId) loadFetchedContent(selectedNodeId);
+  }, [selectedNodeId, loadFetchedContent]);
 
   // Gather edges for this node
   const nodeEdges: DisplayEdge[] = [];
@@ -140,6 +148,20 @@ export default function NodePopup() {
   const contentType = teamNode?.contentType || personalNode?.contentType;
   const nodeTags = teamNode?.tags || personalNode?.tags;
 
+  // URL detection + fetched content
+  const allText = `${title} ${content || ""}`;
+  const detectedUrls: string[] = allText.match(/https?:\/\/[^\s<>"')\]]+/g) || [];
+  const cachedContent = selectedNodeId ? fetchedContent.get(selectedNodeId) : undefined;
+  const isFetchingThis = isFetching === selectedNodeId;
+
+  const formatTime = (ts: number) => {
+    const diff = Math.floor((Date.now() - ts) / 1000);
+    if (diff < 60) return "just now";
+    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+    return new Date(ts).toLocaleDateString();
+  };
+
   // Resolve edge target/source names
   const resolveNodeName = (id: string): string => {
     const n = nodes.get(id);
@@ -209,20 +231,105 @@ export default function NodePopup() {
             onBlur={handleContentSave}
             autoFocus
           />
+        ) : content && isConversationContent(content) ? (
+          <ConversationRenderer content={content} />
         ) : content ? (
-          <p
-            className="text-sm whitespace-pre-wrap cursor-pointer hover:opacity-80"
-            style={{ color: "var(--text-secondary)" }}
+          <div
+            className="prose prose-invert prose-sm max-w-none cursor-pointer hover:opacity-90
+              prose-headings:text-white prose-headings:font-semibold prose-headings:mt-3 prose-headings:mb-1
+              prose-p:text-gray-300 prose-p:leading-relaxed prose-p:my-2
+              prose-a:text-amber-400 prose-a:no-underline hover:prose-a:underline
+              prose-strong:text-white prose-em:text-gray-200
+              prose-code:text-amber-300 prose-code:bg-gray-950 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:text-xs prose-code:font-mono prose-code:border prose-code:border-gray-700
+              prose-pre:bg-gray-950 prose-pre:border prose-pre:border-gray-600 prose-pre:rounded-lg prose-pre:my-3 prose-pre:p-3 prose-pre:overflow-x-auto
+              [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-green-400 [&_pre_code]:border-0
+              prose-blockquote:border-l-2 prose-blockquote:border-amber-500/50 prose-blockquote:bg-gray-800/30 prose-blockquote:py-1 prose-blockquote:px-3 prose-blockquote:my-3 prose-blockquote:italic prose-blockquote:text-gray-400
+              prose-ul:my-2 prose-ul:pl-4 prose-ol:my-2 prose-ol:pl-4
+              prose-li:text-gray-300 prose-li:my-0.5
+              prose-hr:border-gray-700 prose-hr:my-4"
             onClick={() => !isPersonal && setEditingContent(true)}
           >
-            {content}
-          </p>
+            <ReactMarkdown>{content}</ReactMarkdown>
+          </div>
         ) : (
           <p className="text-sm italic" style={{ color: "var(--text-secondary)" }}
             onClick={() => !isPersonal && setEditingContent(true)}>
             {isPersonal ? "No content" : "Click to add content..."}
           </p>
         )}
+
+        {/* Fetched URL content */}
+        {cachedContent && selectedNodeId && (
+          <div className="mt-3">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-[11px] uppercase font-medium" style={{ color: "var(--text-secondary)" }}>
+                Fetched Content
+              </span>
+              <div className="flex items-center gap-1">
+                <span className="text-[10px]" style={{ color: "var(--text-secondary)" }}>
+                  {formatTime(cachedContent.fetchedAt)}
+                </span>
+                <button
+                  className="btn-secondary p-0.5"
+                  title="Refresh"
+                  onClick={() => fetchUrlContent(selectedNodeId, cachedContent.url)}
+                  disabled={isFetchingThis}
+                >
+                  {isFetchingThis ? <Loader2 size={10} className="animate-spin" /> : <RefreshCw size={10} />}
+                </button>
+              </div>
+            </div>
+            {cachedContent.title && (
+              <p className="text-xs font-medium mb-1">{cachedContent.title}</p>
+            )}
+            <iframe
+              srcDoc={`<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:system-ui,sans-serif;font-size:14px;line-height:1.6;color:#222;background:#fff;padding:12px;margin:0}img{max-width:100%;height:auto}pre{overflow-x:auto;background:#f5f5f5;padding:8px;border-radius:4px}a{color:#2563eb}</style></head><body>${cachedContent.html}</body></html>`}
+              sandbox=""
+              className="w-full rounded border"
+              style={{ height: 250, borderColor: "var(--border)", background: "#fff" }}
+              title="Fetched content"
+            />
+            {cachedContent.textContent.length < 50 && (
+              <p className="text-[10px] mt-1 italic" style={{ color: "var(--text-secondary)" }}>
+                Content may require a browser (JavaScript-rendered page)
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* Fetch URL button(s) */}
+        {!cachedContent && detectedUrls.length > 0 && selectedNodeId && (() => {
+          const primaryUrl = detectedUrls[0];
+          let hostname = primaryUrl;
+          try { hostname = new URL(primaryUrl).hostname; } catch {}
+          return (
+            <div className="mt-3 flex flex-col gap-1">
+              <button
+                className="btn-secondary flex items-center gap-1.5 text-xs w-full justify-center"
+                onClick={() => fetchUrlContent(selectedNodeId, primaryUrl)}
+                disabled={isFetchingThis}
+              >
+                {isFetchingThis ? (
+                  <Loader2 size={12} className="animate-spin" />
+                ) : (
+                  <Globe size={12} />
+                )}
+                {isFetchingThis ? "Fetching..." : `Fetch content from ${hostname}`}
+              </button>
+              {detectedUrls.slice(1).map((url) => (
+                <button
+                  key={url}
+                  className="text-[11px] hover:underline text-left truncate"
+                  style={{ color: "var(--accent)" }}
+                  onClick={() => fetchUrlContent(selectedNodeId, url)}
+                  disabled={isFetchingThis}
+                >
+                  {url}
+                </button>
+              ))}
+            </div>
+          );
+        })()}
 
         {/* Tags */}
         {nodeTags && (
@@ -299,6 +406,15 @@ export default function NodePopup() {
           <FolderInput size={12} />
           Assign Category
         </button>
+        {detectedUrls.length > 0 && (
+          <button className="btn-secondary flex items-center gap-1 text-xs"
+            onClick={async () => {
+              const { openUrl } = await import("@tauri-apps/plugin-opener");
+              openUrl(detectedUrls[0]);
+            }}>
+            <ExternalLink size={12} /> Open URL
+          </button>
+        )}
         <button className="btn-danger flex items-center gap-1 text-xs ml-auto" onClick={handleDelete}>
           <Trash2 size={12} />
           Delete
