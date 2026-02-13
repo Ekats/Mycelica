@@ -483,6 +483,7 @@ pub fn run_team() {
         team_create_personal_node, team_create_personal_edge, team_get_personal_data,
         team_delete_personal_node, team_update_personal_node,
         team_save_positions, team_get_positions,
+        team_fetch_url, team_get_fetched_content,
     };
 
     tauri::Builder::default()
@@ -514,6 +515,8 @@ pub fn run_team() {
             team_update_personal_node,
             team_save_positions,
             team_get_positions,
+            team_fetch_url,
+            team_get_fetched_content,
         ])
         .run(tauri::generate_context!())
         .expect("error while running team application");

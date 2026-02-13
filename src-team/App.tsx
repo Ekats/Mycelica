@@ -5,12 +5,14 @@ import Breadcrumb from "./components/Breadcrumb";
 import GraphView from "./components/GraphView";
 import RecentPanel from "./components/RecentPanel";
 import NodePopup from "./components/NodePopup";
+import LeafView from "./components/LeafView";
 import QuickAdd from "./components/QuickAdd";
 import Settings from "./components/Settings";
 
 export default function App() {
   const {
     showRecent, showSettings, showQuickAdd, selectedNodeId, error,
+    leafViewNodeId,
     loadSettings, loadPositions, loadPersonalData, refresh,
     setShowQuickAdd, clearError, navigateBack, breadcrumbs,
   } = useTeamStore();
@@ -33,6 +35,10 @@ export default function App() {
         setShowQuickAdd(true);
       }
       if (e.key === "Escape") {
+        if (useTeamStore.getState().leafViewNodeId) {
+          useTeamStore.getState().closeLeafView();
+          return;
+        }
         setShowQuickAdd(false);
       }
       if (e.key === "Backspace" && breadcrumbs.length > 0 &&
@@ -62,9 +68,10 @@ export default function App() {
       <div className="flex flex-1 overflow-hidden">
         {showRecent && <RecentPanel />}
         <GraphView />
+        {leafViewNodeId && <LeafView nodeId={leafViewNodeId} />}
       </div>
 
-      {selectedNodeId && <NodePopup />}
+      {selectedNodeId && !leafViewNodeId && <NodePopup />}
       {showQuickAdd && <QuickAdd />}
       {showSettings && <Settings />}
     </div>

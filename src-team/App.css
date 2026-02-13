@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@plugin "@tailwindcss/typography";
 
 :root {
   --bg-primary: #111827;
@@ -110,4 +111,14 @@ button {
   width: 90%;
   max-height: 80vh;
   overflow-y: auto;
+}
+
+/* LeafView slide-in */
+@keyframes slide-in-right {
+  from { transform: translateX(100%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+.leaf-view-panel {
+  animation: slide-in-right 0.2s ease-out;
 }

@@ -77,6 +77,7 @@ export default function GraphView() {
   const getDisplayNodes = useTeamStore((s) => s.getDisplayNodes);
   const getDisplayEdges = useTeamStore((s) => s.getDisplayEdges);
   const navigateToCategory = useTeamStore((s) => s.navigateToCategory);
+  const openLeafView = useTeamStore((s) => s.openLeafView);
 
 
   useEffect(() => {
@@ -321,6 +322,8 @@ export default function GraphView() {
             lastClickRef.current = { time: 0, id: "" };
             if (!d.isItem) {
               navigateToCategory(d.id);
+            } else {
+              openLeafView(d.id);
             }
           } else {
             // Single click — select immediately, record for double-click detection
@@ -332,7 +335,7 @@ export default function GraphView() {
 
     nodeMerge.call(drag);
 
-  }, [nodes, edges, personalNodes, personalEdges, selectedNodeId, searchResults, searchQuery, savedPositions, currentParentId, getDisplayNodes, getDisplayEdges, setSelectedNodeId, savePositions, navigateToCategory]);
+  }, [nodes, edges, personalNodes, personalEdges, selectedNodeId, searchResults, searchQuery, savedPositions, currentParentId, getDisplayNodes, getDisplayEdges, setSelectedNodeId, savePositions, navigateToCategory, openLeafView]);
 
   // Pan to node when requested
   const panToNodeId = useTeamStore((s) => s.panToNodeId);
@@ -360,6 +363,9 @@ export default function GraphView() {
   const handleSvgClick = useCallback((e: React.MouseEvent) => {
     if ((e.target as Element).tagName === "svg") {
       setSelectedNodeId(null);
+      if (useTeamStore.getState().leafViewNodeId) {
+        useTeamStore.setState({ leafViewNodeId: null });
+      }
     }
   }, [setSelectedNodeId]);
 

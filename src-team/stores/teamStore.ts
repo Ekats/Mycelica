@@ -4,7 +4,7 @@ import type {
   Node, Edge, PersonalNode, PersonalEdge, TeamConfig,
   CreateNodeRequest, PatchNodeRequest, CreateEdgeRequest,
   DisplayNode, DisplayEdge, PersonalData, SavedPosition,
-  BreadcrumbEntry,
+  BreadcrumbEntry, FetchedContent,
 } from "../types";
 
 interface TeamStore {
@@ -35,6 +35,17 @@ interface TeamStore {
   navigateToRoot: () => void;
   navigateToBreadcrumb: (nodeId: string) => void;
   navigateToNodeParent: (nodeId: string) => void;
+
+  // LeafView
+  leafViewNodeId: string | null;
+  openLeafView: (nodeId: string) => void;
+  closeLeafView: () => void;
+
+  // URL fetching
+  fetchedContent: Map<string, FetchedContent>;
+  isFetching: string | null;
+  fetchUrlContent: (nodeId: string, url: string) => Promise<void>;
+  loadFetchedContent: (nodeId: string) => Promise<void>;
 
   // UI
   selectedNodeId: string | null;
@@ -165,6 +176,40 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
       selectedNodeId: nodeId,
       panToNodeId: nodeId,
     });
+  },
+
+  leafViewNodeId: null,
+  openLeafView: (nodeId) => set({ leafViewNodeId: nodeId, selectedNodeId: null }),
+  closeLeafView: () => set({ leafViewNodeId: null }),
+
+  fetchedContent: new Map(),
+  isFetching: null,
+  fetchUrlContent: async (nodeId, url) => {
+    set({ isFetching: nodeId });
+    try {
+      const result = await invoke<FetchedContent>("team_fetch_url", { nodeId, url });
+      set((s) => {
+        const fc = new Map(s.fetchedContent);
+        fc.set(nodeId, result);
+        return { fetchedContent: fc, isFetching: null };
+      });
+    } catch (e) {
+      set({ isFetching: null, error: String(e) });
+    }
+  },
+  loadFetchedContent: async (nodeId) => {
+    try {
+      const result = await invoke<FetchedContent | null>("team_get_fetched_content", { nodeId });
+      if (result) {
+        set((s) => {
+          const fc = new Map(s.fetchedContent);
+          fc.set(nodeId, result);
+          return { fetchedContent: fc };
+        });
+      }
+    } catch {
+      // silently ignore — no cached content
+    }
   },
 
   selectedNodeId: null,

@@ -140,3 +140,12 @@ export interface BreadcrumbEntry {
   id: string;
   title: string;
 }
+
+export interface FetchedContent {
+  nodeId: string;
+  url: string;
+  html: string;
+  textContent: string;
+  title?: string;
+  fetchedAt: number;
+}

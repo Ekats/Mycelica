@@ -146,6 +146,15 @@ fn init_local_schema(db: &Database) {
             y REAL NOT NULL,
             updated_at INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS fetched_content (
+            node_id TEXT PRIMARY KEY,
+            url TEXT NOT NULL,
+            html TEXT NOT NULL,
+            text_content TEXT NOT NULL,
+            title TEXT,
+            fetched_at INTEGER NOT NULL
+        );
         ",
     )
     .expect("Failed to init local schema");
@@ -690,4 +699,200 @@ pub fn team_save_settings(
     }
 
     Ok(())
+}
+
+// ============================================================================
+// URL content fetching (local.db cache)
+// ============================================================================
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct FetchedContent {
+    #[serde(rename = "nodeId")]
+    pub node_id: String,
+    pub url: String,
+    pub html: String,
+    #[serde(rename = "textContent")]
+    pub text_content: String,
+    pub title: Option<String>,
+    #[serde(rename = "fetchedAt")]
+    pub fetched_at: i64,
+}
+
+#[tauri::command]
+pub async fn team_fetch_url(
+    state: State<'_, TeamState>,
+    node_id: String,
+    url: String,
+) -> Result<FetchedContent, String> {
+    // Fetch the URL
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .user_agent("Mycelica/0.9")
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Fetch error: {}", e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {}: {}", status.as_u16(), status.canonical_reason().unwrap_or("error")));
+    }
+
+    // Check content type
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    if !content_type.contains("text/html") && !content_type.contains("text/xhtml") && !content_type.contains("application/xhtml") {
+        return Err(format!("Not HTML content (got: {})", content_type));
+    }
+
+    // Read body (truncate at 1MB)
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("Read body error: {}", e))?;
+    let body = if body.len() > 1_048_576 {
+        body[..1_048_576].to_string()
+    } else {
+        body
+    };
+
+    // Extract readable content and sanitize
+    let (html, text_content, title) = extract_and_sanitize(&body, &url)?;
+
+    let now = chrono::Utc::now().timestamp_millis();
+
+    // Store in local.db
+    {
+        let conn = state.local_db.raw_conn();
+        let conn = conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT OR REPLACE INTO fetched_content (node_id, url, html, text_content, title, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![node_id, url, html, text_content, title, now],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    Ok(FetchedContent {
+        node_id,
+        url,
+        html,
+        text_content,
+        title,
+        fetched_at: now,
+    })
+}
+
+#[cfg(feature = "team")]
+fn extract_and_sanitize(raw_html: &str, base_url: &str) -> Result<(String, String, Option<String>), String> {
+    use scraper::{Html, Selector};
+
+    let document = Html::parse_document(raw_html);
+
+    // Extract title
+    let title = Selector::parse("title")
+        .ok()
+        .and_then(|sel| document.select(&sel).next())
+        .map(|el| el.text().collect::<String>().trim().to_string())
+        .filter(|t| !t.is_empty());
+
+    // Try readability selectors in order
+    let selectors = [
+        "article",
+        "[role=main]",
+        "main",
+        "#content",
+        ".post-content",
+        ".article-body",
+        ".entry-content",
+    ];
+
+    let mut inner_html = None;
+    for sel_str in &selectors {
+        if let Ok(sel) = Selector::parse(sel_str) {
+            if let Some(el) = document.select(&sel).next() {
+                inner_html = Some(el.inner_html());
+                break;
+            }
+        }
+    }
+
+    // Fall back to body
+    if inner_html.is_none() {
+        if let Ok(sel) = Selector::parse("body") {
+            if let Some(el) = document.select(&sel).next() {
+                inner_html = Some(el.inner_html());
+            }
+        }
+    }
+
+    let inner_html = inner_html.unwrap_or_else(|| raw_html.to_string());
+
+    // Extract plain text from the content
+    let content_doc = Html::parse_fragment(&inner_html);
+    let text_content: String = content_doc.root_element().text().collect::<Vec<_>>().join(" ");
+    let text_content = text_content
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // Sanitize with ammonia
+    let base = url::Url::parse(base_url).ok();
+    let clean_html = ammonia::Builder::new()
+        .tags(std::collections::HashSet::from([
+            "p", "h1", "h2", "h3", "h4", "h5", "h6",
+            "a", "img", "ul", "ol", "li",
+            "blockquote", "pre", "code", "em", "strong",
+            "table", "thead", "tbody", "tr", "td", "th",
+            "br", "hr", "div", "span",
+            "figure", "figcaption", "sup", "sub",
+        ]))
+        .link_rel(Some("noopener noreferrer"))
+        .url_relative(if let Some(ref base) = base {
+            ammonia::UrlRelative::RewriteWithBase(base.clone())
+        } else {
+            ammonia::UrlRelative::Deny
+        })
+        .clean(&inner_html)
+        .to_string();
+
+    Ok((clean_html, text_content, title))
+}
+
+#[tauri::command]
+pub fn team_get_fetched_content(
+    state: State<'_, TeamState>,
+    node_id: String,
+) -> Result<Option<FetchedContent>, String> {
+    let conn = state.local_db.raw_conn();
+    let conn = conn.lock().map_err(|e| e.to_string())?;
+    let result = conn.query_row(
+        "SELECT node_id, url, html, text_content, title, fetched_at
+         FROM fetched_content WHERE node_id = ?1",
+        params![node_id],
+        |row| {
+            Ok(FetchedContent {
+                node_id: row.get(0)?,
+                url: row.get(1)?,
+                html: row.get(2)?,
+                text_content: row.get(3)?,
+                title: row.get(4)?,
+                fetched_at: row.get(5)?,
+            })
+        },
+    );
+    match result {
+        Ok(fc) => Ok(Some(fc)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
 }

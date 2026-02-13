@@ -17,7 +17,7 @@ default = []
 # cuda feature: for CUDA <= 12.x with stable Rust
 # for CUDA 13.x, see patch section at end of file
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-team = []  # Team client GUI mode
+team = ["dep:scraper", "dep:ammonia"]  # Team client GUI mode
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -83,6 +83,10 @@ tree-sitter-c = "0.23"
 
 # PDF text extraction
 pdf-extract = "0.7"
+
+# HTML readability + sanitization (team mode URL fetching)
+scraper = { version = "0.22", optional = true }
+ammonia = { version = "4", optional = true }
 
 # HTTP API server (team mode)
 axum = "0.8"
