@@ -17,7 +17,7 @@ docs/private/
 docs/implementation/
 docs/spore/
 *.db
-*.hnsw
+*hnsw*
 mycelica-openAIRE-preview.db
 src-tauri/resources/mycelica-testing-preview.
 mycelica-somatic-neuroscience.db
