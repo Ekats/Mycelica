@@ -18,6 +18,8 @@ mod holerabbit;
 pub mod dendrogram;
 pub mod remote_client;
 pub mod team;
+#[cfg(feature = "signal")]
+pub mod signal;
 
 use commands::{
     AppState,

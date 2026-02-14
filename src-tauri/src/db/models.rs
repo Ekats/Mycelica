@@ -70,6 +70,10 @@ pub enum EdgeType {
     Flags,         // contradiction flag on nodes
     Resolves,      // decision resolving a contradiction
     DerivesFrom,   // content derived from source
+    // Signal messaging relationships
+    RepliesTo,       // message -> message it quotes
+    SharesLink,      // message -> link node (URL shared in message)
+    TemporalThread,  // consecutive messages within temporal window
 }
 
 impl EdgeType {
@@ -101,6 +105,9 @@ impl EdgeType {
             EdgeType::Flags => "flags",
             EdgeType::Resolves => "resolves",
             EdgeType::DerivesFrom => "derives_from",
+            EdgeType::RepliesTo => "replies_to",
+            EdgeType::SharesLink => "shares_link",
+            EdgeType::TemporalThread => "temporal_thread",
         }
     }
 
@@ -132,6 +139,9 @@ impl EdgeType {
             "flags" => Some(EdgeType::Flags),
             "resolves" => Some(EdgeType::Resolves),
             "derives_from" => Some(EdgeType::DerivesFrom),
+            "replies_to" => Some(EdgeType::RepliesTo),
+            "shares_link" => Some(EdgeType::SharesLink),
+            "temporal_thread" => Some(EdgeType::TemporalThread),
             _ => None,
         }
     }

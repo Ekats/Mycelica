@@ -656,6 +656,28 @@ enum ImportCommands {
         #[arg(long, short)]
         update: bool,
     },
+    /// Import messages from Signal Desktop (requires --features signal)
+    #[cfg(feature = "signal")]
+    Signal {
+        /// Signal conversation ID. Use --list to discover IDs.
+        #[arg(long)]
+        conversation_id: Option<String>,
+        /// List available conversations and exit
+        #[arg(long)]
+        list: bool,
+        /// Map phone numbers to names: "+372xxx=E,+1xxx=F,+372yyy=M"
+        #[arg(long)]
+        author_map: Option<String>,
+        /// Path to Signal database (default: ~/.config/Signal/sql/db.sqlite)
+        #[arg(long)]
+        db_path: Option<String>,
+        /// Generate embeddings for imported nodes
+        #[arg(long)]
+        embed: bool,
+        /// Allow importing into a database inside a git repository
+        #[arg(long)]
+        allow_repo_db: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2025,6 +2047,176 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
                     if result.errors.len() > 5 {
                         elog!("  ... and {} more", result.errors.len() - 5);
                     }
+                }
+            }
+        }
+        #[cfg(feature = "signal")]
+        ImportCommands::Signal { conversation_id, list, author_map, db_path, embed, allow_repo_db } => {
+            use mycelica_lib::signal;
+
+            // Determine Signal DB path
+            let signal_db = db_path.unwrap_or_else(|| {
+                dirs::config_dir()
+                    .map(|p| p.join("Signal/sql/db.sqlite"))
+                    .unwrap_or_else(|| std::path::PathBuf::from(
+                        format!("{}/.config/Signal/sql/db.sqlite", std::env::var("HOME").unwrap_or_default())
+                    ))
+                    .to_string_lossy()
+                    .to_string()
+            });
+
+            // Derive config.json path from DB path
+            let config_path = std::path::PathBuf::from(&signal_db)
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.join("config.json"))
+                .unwrap_or_else(|| {
+                    dirs::config_dir()
+                        .map(|p| p.join("Signal/config.json"))
+                        .unwrap_or_else(|| std::path::PathBuf::from(
+                            format!("{}/.config/Signal/config.json", std::env::var("HOME").unwrap_or_default())
+                        ))
+                });
+
+            if !quiet {
+                log!("[Signal] Reading key from {:?}", config_path);
+            }
+
+            let signal_key = signal::read_signal_key(&config_path.to_string_lossy())?;
+
+            // List mode
+            if list {
+                let conversations = signal::list_signal_conversations(&signal_db, &signal_key)?;
+                if json {
+                    let items: Vec<serde_json::Value> = conversations.iter()
+                        .map(|(id, name, count)| serde_json::json!({
+                            "id": id,
+                            "name": name,
+                            "message_count": count
+                        }))
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&items).unwrap_or_default());
+                } else {
+                    log!("Available Signal conversations:");
+                    for (id, name, count) in &conversations {
+                        log!("  {} — {} ({} messages)", id, name, count);
+                    }
+                }
+                return Ok(());
+            }
+
+            // Guard: refuse to import into a database inside a git repo
+            if !allow_repo_db {
+                let db_abs = std::fs::canonicalize(db.get_path()).unwrap_or_else(|_| std::path::PathBuf::from(db.get_path()));
+                let mut check_dir = db_abs.parent();
+                while let Some(dir) = check_dir {
+                    if dir.join(".git").exists() {
+                        return Err(format!(
+                            "Refusing to import Signal messages into {} — it is inside a git repository ({}).\n\
+                             Private messages could be pushed to a remote.\n\
+                             Use --db <path> to target a database outside the repo, or --allow-repo-db to override.",
+                            db.get_path(), dir.display()
+                        ));
+                    }
+                    check_dir = dir.parent();
+                }
+            }
+
+            // First-run warning: Signal messages stored unencrypted
+            {
+                let ack_path = dirs::data_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share"))
+                    .join("com.mycelica.app/signal-ack");
+                if !ack_path.exists() {
+                    let db_display = db.get_path();
+                    eprintln!("Signal messages will be stored unencrypted in Mycelica's database at {}.", db_display);
+                    eprintln!("They may be included in system backups.");
+                    eprint!("Continue? [y/N] ");
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input)
+                        .map_err(|e| format!("Failed to read input: {}", e))?;
+                    if !input.trim().eq_ignore_ascii_case("y") {
+                        return Err("Aborted.".to_string());
+                    }
+                    if let Some(parent) = ack_path.parent() {
+                        std::fs::create_dir_all(parent).ok();
+                    }
+                    std::fs::write(&ack_path, "acknowledged\n").ok();
+                }
+            }
+
+            // Require conversation_id for actual import
+            let conv_id = conversation_id
+                .ok_or_else(|| "--conversation-id is required (use --list to find IDs)".to_string())?;
+
+            // Parse author map
+            let authors = author_map.as_deref()
+                .map(signal::parse_author_map)
+                .unwrap_or_default();
+
+            if !quiet {
+                log!("[Signal] Importing conversation {}...", conv_id);
+                if !authors.is_empty() {
+                    log!("[Signal] Author map: {} entries", authors.len());
+                }
+            }
+
+            let result = signal::import_signal_conversation(db, &signal_db, &signal_key, &conv_id, &authors)?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?);
+            } else {
+                log!("[Signal] Import complete:");
+                log!("  Messages processed: {}", result.messages_processed);
+                log!("  Nodes created: {}", result.nodes_created);
+                if result.nodes_skipped_dedup > 0 { log!("  Nodes skipped (dedup): {}", result.nodes_skipped_dedup); }
+                if result.nodes_skipped_filter > 0 { log!("  Nodes skipped (filter): {}", result.nodes_skipped_filter); }
+                if result.metadata_attached > 0 { log!("  Reactions attached: {}", result.metadata_attached); }
+                if result.edits_detected > 0 { log!("  Edits detected: {}", result.edits_detected); }
+                log!("  Edges created: {}", result.edges_created);
+                if result.replies_found > 0 { log!("  Replies: {}", result.replies_found); }
+                if result.links_found > 0 { log!("  URLs found: {}", result.links_found); }
+                if result.link_nodes_created > 0 { log!("  Link nodes: {}", result.link_nodes_created); }
+                if result.temporal_threads > 0 { log!("  Temporal threads: {}", result.temporal_threads); }
+                if result.decisions_detected > 0 { log!("  Decisions detected: {}", result.decisions_detected); }
+                if !result.errors.is_empty() {
+                    elog!("  Errors: {}", result.errors.len());
+                    for err in &result.errors[..result.errors.len().min(5)] {
+                        elog!("    {}", err);
+                    }
+                }
+            }
+
+            // Optional embedding generation
+            if embed && result.nodes_created > 0 {
+                use mycelica_lib::ai_client;
+
+                if !quiet {
+                    log!("[Signal] Generating embeddings for {} new nodes...", result.nodes_created);
+                }
+
+                let mut embeddings_generated = 0;
+                // Get all signal nodes from this conversation that lack embeddings
+                if let Ok(items) = db.get_items() {
+                    let signal_nodes: Vec<_> = items.into_iter()
+                        .filter(|n| n.source.as_deref() == Some("signal")
+                            && n.conversation_id.as_deref() == Some(&format!("signal-conv-{}", &conv_id[..conv_id.len().min(8)])))
+                        .collect();
+
+                    for node in &signal_nodes {
+                        if db.get_node_embedding(&node.id).ok().flatten().is_none() {
+                            let text = format!("{}\n{}", node.title, node.content.as_deref().unwrap_or(""));
+                            let embed_text = mycelica_lib::utils::safe_truncate(&text, 1000);
+                            if let Ok(embedding) = ai_client::generate_embedding(embed_text).await {
+                                db.update_node_embedding(&node.id, &embedding).ok();
+                                embeddings_generated += 1;
+                            }
+                        }
+                    }
+                }
+
+                if !quiet {
+                    log!("[Signal] Generated {} embeddings", embeddings_generated);
                 }
             }
         }

@@ -18,6 +18,7 @@ default = []
 # for CUDA 13.x, see patch section at end of file
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 team = ["dep:scraper", "dep:ammonia"]  # Team client GUI mode
+signal = ["rusqlite/bundled-sqlcipher-vendored-openssl"]  # Signal Desktop encrypted DB import
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
