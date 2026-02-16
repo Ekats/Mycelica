@@ -2500,6 +2500,46 @@ impl Database {
         Ok(nodes)
     }
 
+    /// Get all descendants of a parent node recursively.
+    pub fn get_descendants(&self, parent_id: &str, node_class: Option<&str>, items_only: bool, limit: usize) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut filters = Vec::new();
+        if items_only {
+            filters.push("is_item = 1".to_string());
+        }
+        if node_class.is_some() {
+            filters.push("node_class = :class".to_string());
+        }
+        let where_clause = if filters.is_empty() {
+            String::new()
+        } else {
+            format!("AND {}", filters.join(" AND "))
+        };
+
+        let sql = format!(
+            "WITH RECURSIVE descendants(id) AS (
+                SELECT id FROM nodes WHERE parent_id = :parent
+                UNION ALL
+                SELECT n.id FROM nodes n JOIN descendants d ON n.parent_id = d.id
+            )
+            SELECT {} FROM nodes WHERE id IN (SELECT id FROM descendants) {} ORDER BY depth, title LIMIT :lim",
+            Self::NODE_COLUMNS, where_clause
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let nodes = stmt.query_map(
+            rusqlite::named_params! {
+                ":parent": parent_id,
+                ":class": node_class,
+                ":lim": limit as i64,
+            },
+            Self::row_to_node,
+        )?.collect::<Result<Vec<_>>>()?;
+
+        Ok(nodes)
+    }
+
     // ==================== Content Visibility Query Methods ====================
     //
     // VISIBLE tier: insight, idea, exploration, synthesis, question, planning, paper
@@ -5573,7 +5613,7 @@ impl Database {
             let confidence = e.confidence.unwrap_or(0.5);
             let type_priority = match e.edge_type {
                 EdgeType::Contradicts | EdgeType::Flags => 1.0,
-                EdgeType::DerivesFrom | EdgeType::Summarizes | EdgeType::Resolves => 0.7,
+                EdgeType::DerivesFrom | EdgeType::Summarizes | EdgeType::Resolves | EdgeType::Supersedes => 0.7,
                 EdgeType::Supports | EdgeType::Questions | EdgeType::Prerequisite | EdgeType::EvolvedFrom => 0.5,
                 _ => 0.3,
             };
@@ -5749,18 +5789,20 @@ impl Database {
     }
 
     /// Get meta nodes, optionally filtered by meta_type.
+    /// Excludes superseded nodes (those that are targets of a `supersedes` edge).
     pub fn get_meta_nodes(&self, meta_type: Option<&str>) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
+        let superseded_filter = "AND id NOT IN (SELECT target_id FROM edges WHERE type = 'supersedes')";
         let sql = if let Some(mt) = meta_type {
             let _ = mt; // used below
             format!(
-                "SELECT {} FROM nodes WHERE node_class = 'meta' AND meta_type = ?1 ORDER BY created_at DESC",
-                Self::NODE_COLUMNS
+                "SELECT {} FROM nodes WHERE node_class = 'meta' AND meta_type = ?1 {} ORDER BY created_at DESC",
+                Self::NODE_COLUMNS, superseded_filter
             )
         } else {
             format!(
-                "SELECT {} FROM nodes WHERE node_class = 'meta' ORDER BY created_at DESC",
-                Self::NODE_COLUMNS
+                "SELECT {} FROM nodes WHERE node_class = 'meta' {} ORDER BY created_at DESC",
+                Self::NODE_COLUMNS, superseded_filter
             )
         };
 

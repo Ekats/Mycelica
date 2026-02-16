@@ -552,6 +552,57 @@ enum SporeCommands {
         #[arg(long)]
         all: bool,
     },
+    /// Create an edge between two existing nodes
+    CreateEdge {
+        /// Source node (ID prefix or title substring)
+        #[arg(long)]
+        from: String,
+        /// Target node (ID prefix or title substring)
+        #[arg(long)]
+        to: String,
+        /// Edge type (e.g. supports, contradicts, derives_from)
+        #[arg(long = "type", short = 't')]
+        edge_type: String,
+        /// Full reasoning/explanation for this edge
+        #[arg(long)]
+        content: Option<String>,
+        /// Short provenance
+        #[arg(long)]
+        reason: Option<String>,
+        /// Agent attribution
+        #[arg(long, default_value = "spore")]
+        agent: String,
+        /// Confidence (0.0-1.0)
+        #[arg(long)]
+        confidence: Option<f64>,
+        /// Edge ID this supersedes
+        #[arg(long)]
+        supersedes: Option<String>,
+    },
+    /// Read full content of a node (no metadata noise)
+    ReadContent {
+        /// Node ID prefix or title substring
+        id: String,
+    },
+    /// List all descendants of a category node
+    ListRegion {
+        /// Parent node ID prefix or title substring
+        id: String,
+        /// Filter by node_class (knowledge, meta, operational)
+        #[arg(long)]
+        class: Option<String>,
+        /// Only show items (is_item=true)
+        #[arg(long)]
+        items_only: bool,
+        /// Maximum results
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+    /// Check if summary meta-nodes are stale relative to summarized nodes
+    CheckFreshness {
+        /// Node ID prefix or title substring
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -704,6 +755,9 @@ enum NodeCommands {
     Get {
         /// Node ID
         id: String,
+        /// Show full content (no truncation) and all spore fields
+        #[arg(long)]
+        full: bool,
     },
     /// Search nodes (full-text)
     Search {
@@ -1328,7 +1382,7 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Ask { question, connects_to } => handle_ask(&question, connects_to, &db, cli.json).await,
         Commands::Concept { title, note, connects_to } => handle_concept(&title, note, connects_to, &db, cli.json).await,
         Commands::Decide { title, reason, connects_to } => handle_decide(&title, reason, connects_to, &db, cli.json).await,
-        Commands::Link { source, target, edge_type, reason, content, agent, confidence, supersedes } => handle_link(&source, &target, &edge_type, reason, content, &agent, confidence, supersedes, &db, cli.json).await,
+        Commands::Link { source, target, edge_type, reason, content, agent, confidence, supersedes } => handle_link(&source, &target, &edge_type, reason, content, &agent, confidence, supersedes, "user", &db, cli.json).await,
         Commands::Orphans { limit } => handle_orphans(limit, &db, cli.json).await,
         Commands::Migrate { cmd } => handle_migrate(cmd, &db, &db_path, cli.json),
         Commands::Spore { cmd } => handle_spore(cmd, &db, cli.json).await,
@@ -2297,12 +2351,12 @@ async fn handle_node(cmd: NodeCommands, db: &Database, json: bool) -> Result<(),
                 log!("\n{} nodes", filtered.len());
             }
         }
-        NodeCommands::Get { id } => {
+        NodeCommands::Get { id, full } => {
             let node = db.get_node(&id).map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("Node not found: {}", id))?;
 
             if json {
-                println!(r#"{{"id":"{}","title":"{}","content":{},"is_item":{},"is_processed":{},"depth":{},"child_count":{},"parent_id":{}}}"#,
+                println!(r#"{{"id":"{}","title":"{}","content":{},"is_item":{},"is_processed":{},"depth":{},"child_count":{},"parent_id":{},"tags":{},"node_class":{},"meta_type":{},"agent_id":{},"source":{}}}"#,
                     node.id,
                     escape_json(&node.title),
                     node.content.as_ref().map(|c| format!("\"{}\"", escape_json(c))).unwrap_or("null".to_string()),
@@ -2310,7 +2364,12 @@ async fn handle_node(cmd: NodeCommands, db: &Database, json: bool) -> Result<(),
                     node.is_processed,
                     node.depth,
                     node.child_count,
-                    node.parent_id.as_ref().map(|p| format!("\"{}\"", p)).unwrap_or("null".to_string())
+                    node.parent_id.as_ref().map(|p| format!("\"{}\"", p)).unwrap_or("null".to_string()),
+                    node.tags.as_ref().map(|t| format!("\"{}\"", escape_json(t))).unwrap_or("null".to_string()),
+                    node.node_class.as_ref().map(|c| format!("\"{}\"", c)).unwrap_or("null".to_string()),
+                    node.meta_type.as_ref().map(|m| format!("\"{}\"", m)).unwrap_or("null".to_string()),
+                    node.agent_id.as_ref().map(|a| format!("\"{}\"", a)).unwrap_or("null".to_string()),
+                    node.source.as_ref().map(|s| format!("\"{}\"", s)).unwrap_or("null".to_string()),
                 );
             } else {
                 log!("ID:       {}", node.id);
@@ -2321,12 +2380,31 @@ async fn handle_node(cmd: NodeCommands, db: &Database, json: bool) -> Result<(),
                 if let Some(ref parent) = node.parent_id {
                     log!("Parent:   {}", parent);
                 }
+                if let Some(ref nc) = node.node_class {
+                    log!("Class:    {}", nc);
+                }
+                if let Some(ref mt) = node.meta_type {
+                    log!("MetaType: {}", mt);
+                }
+                if let Some(ref aid) = node.agent_id {
+                    log!("Agent:    {}", aid);
+                }
+                if let Some(ref src) = node.source {
+                    log!("Source:   {}", src);
+                }
+                if let Some(ref tags) = node.tags {
+                    log!("Tags:     {}", tags);
+                }
                 if let Some(ref summary) = node.summary {
                     log!("\nSummary:\n{}", summary);
                 }
                 if let Some(ref content) = node.content {
-                    let preview = if content.len() > 500 { &content[..500] } else { content };
-                    log!("\nContent:\n{}", preview);
+                    if full {
+                        log!("\nContent:\n{}", content);
+                    } else {
+                        let preview = if content.len() > 500 { &content[..500] } else { content };
+                        log!("\nContent:\n{}", preview);
+                    }
                 }
             }
         }
@@ -6639,45 +6717,132 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
         }
 
         SporeCommands::UpdateMeta { id, content, title, agent, add_connects, edge_type } => {
-            let mut node = db.get_node(&id).map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("Node not found: {}", id))?;
+            let old_node = resolve_node(db, &id)?;
 
             // Verify it's a meta node
-            if node.node_class.as_deref() != Some("meta") {
-                return Err(format!("Node {} is not a meta node (class: {:?})", id, node.node_class));
+            if old_node.node_class.as_deref() != Some("meta") {
+                return Err(format!("Node {} is not a meta node (class: {:?})", id, old_node.node_class));
             }
 
             let author = settings::get_author_or_default();
             let now = Utc::now().timestamp_millis();
+            let new_id = uuid::Uuid::new_v4().to_string();
 
-            // Update fields
-            if let Some(new_content) = content {
-                node.content = Some(new_content);
+            // Create NEW meta node inheriting fields from old
+            let new_node = Node {
+                id: new_id.clone(),
+                node_type: old_node.node_type.clone(),
+                title: title.unwrap_or_else(|| old_node.title.clone()),
+                url: old_node.url.clone(),
+                content: content.or_else(|| old_node.content.clone()),
+                position: Position { x: 0.0, y: 0.0 },
+                created_at: now,
+                updated_at: now,
+                cluster_id: None,
+                cluster_label: None,
+                depth: old_node.depth,
+                is_item: old_node.is_item,
+                is_universe: false,
+                parent_id: old_node.parent_id.clone(),
+                child_count: 0,
+                ai_title: old_node.ai_title.clone(),
+                summary: old_node.summary.clone(),
+                tags: old_node.tags.clone(),
+                emoji: old_node.emoji.clone(),
+                is_processed: old_node.is_processed,
+                conversation_id: None,
+                sequence_index: None,
+                is_pinned: false,
+                last_accessed_at: None,
+                latest_child_date: None,
+                is_private: old_node.is_private,
+                privacy_reason: old_node.privacy_reason.clone(),
+                source: Some("spore".to_string()),
+                pdf_available: None,
+                content_type: old_node.content_type.clone(),
+                associated_idea_id: None,
+                privacy: old_node.privacy,
+                human_edited: None,
+                human_created: true,
+                author: Some(author.clone()),
+                agent_id: Some(agent.clone()),
+                node_class: old_node.node_class.clone(),
+                meta_type: old_node.meta_type.clone(),
+            };
+
+            // Build edges for new node
+            let mut edges = Vec::new();
+
+            // 1. Supersedes edge: new -> old
+            edges.push(Edge {
+                id: uuid::Uuid::new_v4().to_string(),
+                source: new_id.clone(),
+                target: old_node.id.clone(),
+                edge_type: EdgeType::Supersedes,
+                label: None,
+                weight: Some(1.0),
+                edge_source: Some("spore".to_string()),
+                evidence_id: None,
+                confidence: Some(1.0),
+                created_at: now,
+                updated_at: Some(now),
+                author: Some(author.clone()),
+                reason: Some(format!("Supersedes {}", &old_node.id[..8.min(old_node.id.len())])),
+                content: None,
+                agent_id: Some(agent.clone()),
+                superseded_by: None,
+                metadata: None,
+            });
+
+            // 2. Copy old node's outgoing edges (excluding superseded and Supersedes-typed)
+            let old_edges = db.get_edges_for_node(&old_node.id).map_err(|e| e.to_string())?;
+            for old_edge in &old_edges {
+                // Only copy outgoing edges from old node
+                if old_edge.source != old_node.id {
+                    continue;
+                }
+                // Skip edges that have been superseded
+                if old_edge.superseded_by.is_some() {
+                    continue;
+                }
+                // Skip Supersedes-typed edges (avoid false chains)
+                if old_edge.edge_type == EdgeType::Supersedes {
+                    continue;
+                }
+                edges.push(Edge {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    source: new_id.clone(),
+                    target: old_edge.target.clone(),
+                    edge_type: old_edge.edge_type.clone(),
+                    label: old_edge.label.clone(),
+                    weight: old_edge.weight,
+                    edge_source: Some("spore".to_string()),
+                    evidence_id: old_edge.evidence_id.clone(),
+                    confidence: old_edge.confidence,
+                    created_at: now,
+                    updated_at: Some(now),
+                    author: Some(author.clone()),
+                    reason: old_edge.reason.clone(),
+                    content: old_edge.content.clone(),
+                    agent_id: Some(agent.clone()),
+                    superseded_by: None,
+                    metadata: old_edge.metadata.clone(),
+                });
             }
-            if let Some(new_title) = title {
-                node.title = new_title;
-            }
-            node.updated_at = now;
-            node.author = Some(author.clone());
-            node.agent_id = Some(agent.clone());
 
-            db.update_node(&node).map_err(|e| e.to_string())?;
-
-            // Add new edges if specified
+            // 3. New --add-connects edges
             if !add_connects.is_empty() {
                 let et = EdgeType::from_str(&edge_type.to_lowercase())
                     .ok_or_else(|| format!("Unknown edge type: '{}'", edge_type))?;
-
-                let mut edges = Vec::new();
                 for target_id in &add_connects {
                     edges.push(Edge {
                         id: uuid::Uuid::new_v4().to_string(),
-                        source: node.id.clone(),
+                        source: new_id.clone(),
                         target: target_id.clone(),
                         edge_type: et.clone(),
                         label: None,
                         weight: Some(1.0),
-                        edge_source: Some("user".to_string()),
+                        edge_source: Some("spore".to_string()),
                         evidence_id: None,
                         confidence: Some(1.0),
                         created_at: now,
@@ -6690,16 +6855,18 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
                         metadata: None,
                     });
                 }
-                db.insert_edges_batch(&edges).map_err(|e| e.to_string())?;
             }
 
+            let copied_count = edges.len() - 1 - add_connects.len(); // total - supersedes - new
+            db.create_meta_node_with_edges(&new_node, &edges).map_err(|e| e.to_string())?;
+
             if json {
-                println!(r#"{{"id":"{}","updated":true,"newEdges":{}}}"#, id, add_connects.len());
+                println!(r#"{{"newId":"{}","oldId":"{}","copiedEdges":{},"newEdges":{}}}"#,
+                    new_id, old_node.id, copied_count, add_connects.len());
             } else {
-                println!("Updated meta node: {} \"{}\"", &id[..8.min(id.len())], node.title);
-                if !add_connects.is_empty() {
-                    println!("  {} new {} edge(s)", add_connects.len(), edge_type);
-                }
+                println!("Created superseding meta node: {} -> {}",
+                    &new_id[..8.min(new_id.len())], &old_node.id[..8.min(old_node.id.len())]);
+                println!("  Copied {} edge(s), added {} new edge(s)", copied_count, add_connects.len());
             }
             Ok(())
         }
@@ -6817,6 +6984,156 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
             }
             Ok(())
         }
+
+        // Gap 3a: Create edge between existing nodes (delegates to handle_link)
+        SporeCommands::CreateEdge { from, to, edge_type, content, reason, agent, confidence, supersedes } => {
+            handle_link(&from, &to, &edge_type, reason, content, &agent, confidence, supersedes, "spore", db, json).await
+        }
+
+        // Gap 3b: Read full content of a node (no metadata noise)
+        SporeCommands::ReadContent { id } => {
+            let node = resolve_node(db, &id)?;
+            if json {
+                println!(r#"{{"id":"{}","title":"{}","content":{},"tags":{},"content_type":{},"node_class":{},"meta_type":{}}}"#,
+                    node.id,
+                    escape_json(&node.title),
+                    node.content.as_ref().map(|c| format!("\"{}\"", escape_json(c))).unwrap_or("null".to_string()),
+                    node.tags.as_ref().map(|t| format!("\"{}\"", escape_json(t))).unwrap_or("null".to_string()),
+                    node.content_type.as_ref().map(|c| format!("\"{}\"", c)).unwrap_or("null".to_string()),
+                    node.node_class.as_ref().map(|c| format!("\"{}\"", c)).unwrap_or("null".to_string()),
+                    node.meta_type.as_ref().map(|m| format!("\"{}\"", m)).unwrap_or("null".to_string()),
+                );
+            } else {
+                if let Some(ref content) = node.content {
+                    println!("{}", content);
+                } else {
+                    println!("(no content)");
+                }
+            }
+            Ok(())
+        }
+
+        // Gap 3c: List descendants of a category
+        SporeCommands::ListRegion { id, class, items_only, limit } => {
+            let parent = resolve_node(db, &id)?;
+            let descendants = db.get_descendants(&parent.id, class.as_deref(), items_only, limit)
+                .map_err(|e| e.to_string())?;
+
+            if json {
+                let items: Vec<String> = descendants.iter().map(|n| {
+                    format!(r#"{{"id":"{}","title":"{}","depth":{},"is_item":{},"node_class":{},"content_type":{}}}"#,
+                        n.id,
+                        escape_json(&n.title),
+                        n.depth,
+                        n.is_item,
+                        n.node_class.as_ref().map(|c| format!("\"{}\"", c)).unwrap_or("null".to_string()),
+                        n.content_type.as_ref().map(|c| format!("\"{}\"", c)).unwrap_or("null".to_string()),
+                    )
+                }).collect();
+                println!("[{}]", items.join(","));
+            } else {
+                if descendants.is_empty() {
+                    println!("No descendants found for: {} ({})", parent.title, &parent.id[..8.min(parent.id.len())]);
+                } else {
+                    let parent_depth = parent.depth;
+                    for n in &descendants {
+                        let indent = "  ".repeat((n.depth - parent_depth).max(0) as usize);
+                        let marker = if n.is_item { "[I]" } else { "[C]" };
+                        let class_label = n.node_class.as_deref().unwrap_or("");
+                        let ct_label = n.content_type.as_deref().map(|c| format!(" ({})", c)).unwrap_or_default();
+                        println!("{}{} {} {}{}", indent, marker, &n.id[..8.min(n.id.len())], n.title, if class_label.is_empty() { ct_label } else { format!(" [{}]{}", class_label, ct_label) });
+                    }
+                    println!("\n{} descendant(s)", descendants.len());
+                }
+            }
+            Ok(())
+        }
+
+        // Gap 3f: Check freshness of summary meta-nodes
+        SporeCommands::CheckFreshness { id } => {
+            let node = resolve_node(db, &id)?;
+
+            // Find all summarizes edges where this node is the TARGET
+            let edges = db.get_edges_for_node(&node.id).map_err(|e| e.to_string())?;
+            let summary_edges: Vec<&Edge> = edges.iter()
+                .filter(|e| e.edge_type == EdgeType::Summarizes && e.target == node.id && e.superseded_by.is_none())
+                .collect();
+
+            if summary_edges.is_empty() {
+                // Check if this node is itself a summary — look at outgoing summarizes edges
+                let outgoing: Vec<&Edge> = edges.iter()
+                    .filter(|e| e.edge_type == EdgeType::Summarizes && e.source == node.id && e.superseded_by.is_none())
+                    .collect();
+
+                if outgoing.is_empty() {
+                    if json {
+                        println!(r#"{{"id":"{}","summaries":[],"message":"No summarizes edges found"}}"#, node.id);
+                    } else {
+                        println!("No summarizes edges found for: {}", node.title);
+                    }
+                } else {
+                    // This node IS a summary — check if its targets have been updated since
+                    let summary_updated = node.updated_at;
+                    if json {
+                        let items: Vec<String> = outgoing.iter().map(|e| {
+                            let target_node = db.get_node(&e.target).ok().flatten();
+                            let target_updated = target_node.as_ref().map(|n| n.updated_at).unwrap_or(0);
+                            let stale = target_updated > summary_updated;
+                            let target_title = target_node.map(|n| n.title).unwrap_or_else(|| e.target.clone());
+                            format!(r#"{{"targetId":"{}","targetTitle":"{}","stale":{},"targetUpdated":{},"summaryUpdated":{}}}"#,
+                                e.target, escape_json(&target_title), stale, target_updated, summary_updated)
+                        }).collect();
+                        println!(r#"{{"id":"{}","title":"{}","targets":[{}]}}"#, node.id, escape_json(&node.title), items.join(","));
+                    } else {
+                        println!("Summary: {} (updated {})", node.title,
+                            chrono::DateTime::from_timestamp_millis(summary_updated)
+                                .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                                .unwrap_or_else(|| "?".to_string()));
+                        for e in &outgoing {
+                            let target_node = db.get_node(&e.target).ok().flatten();
+                            let target_updated = target_node.as_ref().map(|n| n.updated_at).unwrap_or(0);
+                            let stale = target_updated > summary_updated;
+                            let target_title = target_node.map(|n| n.title).unwrap_or_else(|| e.target.clone());
+                            let status = if stale { "STALE" } else { "fresh" };
+                            println!("  {} {} (updated {})", status, target_title,
+                                chrono::DateTime::from_timestamp_millis(target_updated)
+                                    .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                                    .unwrap_or_else(|| "?".to_string()));
+                        }
+                    }
+                }
+            } else {
+                // Node is summarized BY other nodes — show their freshness
+                if json {
+                    let items: Vec<String> = summary_edges.iter().map(|e| {
+                        let summary_node = db.get_node(&e.source).ok().flatten();
+                        let summary_updated = summary_node.as_ref().map(|n| n.updated_at).unwrap_or(0);
+                        let stale = node.updated_at > summary_updated;
+                        let summary_title = summary_node.map(|n| n.title).unwrap_or_else(|| e.source.clone());
+                        format!(r#"{{"summaryId":"{}","summaryTitle":"{}","stale":{},"summaryUpdated":{},"nodeUpdated":{}}}"#,
+                            e.source, escape_json(&summary_title), stale, summary_updated, node.updated_at)
+                    }).collect();
+                    println!(r#"{{"id":"{}","title":"{}","summaries":[{}]}}"#, node.id, escape_json(&node.title), items.join(","));
+                } else {
+                    println!("Node: {} (updated {})", node.title,
+                        chrono::DateTime::from_timestamp_millis(node.updated_at)
+                            .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                            .unwrap_or_else(|| "?".to_string()));
+                    for e in &summary_edges {
+                        let summary_node = db.get_node(&e.source).ok().flatten();
+                        let summary_updated = summary_node.as_ref().map(|n| n.updated_at).unwrap_or(0);
+                        let stale = node.updated_at > summary_updated;
+                        let summary_title = summary_node.map(|n| n.title).unwrap_or_else(|| e.source.clone());
+                        let status = if stale { "STALE" } else { "fresh" };
+                        println!("  {} {} (updated {})", status, summary_title,
+                            chrono::DateTime::from_timestamp_millis(summary_updated)
+                                .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                                .unwrap_or_else(|| "?".to_string()));
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -6829,6 +7146,7 @@ async fn handle_link(
     agent: &str,
     confidence: Option<f64>,
     supersedes: Option<String>,
+    edge_source: &str,
     db: &Database,
     json: bool,
 ) -> Result<(), String> {
@@ -6838,7 +7156,7 @@ async fn handle_link(
             "Unknown edge type: '{}'. Valid types include: related, reference, because, contains, \
              belongs_to, calls, uses_type, implements, defined_in, imports, tests, documents, \
              prerequisite, contradicts, supports, evolved_from, questions, \
-             summarizes, tracks, flags, resolves, derives_from",
+             summarizes, tracks, flags, resolves, derives_from, supersedes",
             edge_type_str
         ))?;
 
@@ -6856,7 +7174,7 @@ async fn handle_link(
         edge_type,
         label: None,
         weight: Some(1.0),
-        edge_source: Some("user".to_string()),
+        edge_source: Some(edge_source.to_string()),
         evidence_id: None,
         confidence: Some(confidence.unwrap_or(1.0)),
         created_at: now,
@@ -8301,8 +8619,12 @@ async fn handle_code(cmd: CodeCommands, db: &Database, db_path: &PathBuf) -> Res
             #[derive(serde::Deserialize)]
             struct CodeMetadata {
                 file_path: String,
-                line_start: usize,
-                line_end: usize,
+                #[serde(default)]
+                line_start: Option<usize>,
+                #[serde(default)]
+                line_end: Option<usize>,
+                #[serde(default)]
+                language: Option<String>,
             }
 
             // Check if tags looks like an array (regular tags) vs object (code metadata)
@@ -8335,24 +8657,31 @@ async fn handle_code(cmd: CodeCommands, db: &Database, db_path: &PathBuf) -> Res
 
             let lines: Vec<&str> = file_content.lines().collect();
 
+            // Determine line range (whole file if not specified)
+            let line_start = metadata.line_start.unwrap_or(1);
+            let line_end = metadata.line_end.unwrap_or(lines.len());
+
             // Validate line range
-            if metadata.line_start == 0 || metadata.line_start > lines.len() {
-                return Err(format!("Invalid line_start: {} (file has {} lines)", metadata.line_start, lines.len()));
+            if line_start == 0 || line_start > lines.len() {
+                return Err(format!("Invalid line_start: {} (file has {} lines)", line_start, lines.len()));
             }
-            let line_end = metadata.line_end.min(lines.len());
+            let line_end = line_end.min(lines.len());
 
             // Extract the code range (1-indexed to 0-indexed)
-            let code_lines = &lines[metadata.line_start - 1..line_end];
+            let code_lines = &lines[line_start - 1..line_end];
 
             // Print header
             println!("=== {} ===", node.title);
             println!("File: {}", metadata.file_path);
-            println!("Lines: {}-{}", metadata.line_start, line_end);
+            if let Some(ref lang) = metadata.language {
+                println!("Language: {}", lang);
+            }
+            println!("Lines: {}-{}", line_start, line_end);
             println!();
 
             // Print code with line numbers
             for (i, line) in code_lines.iter().enumerate() {
-                let line_num = metadata.line_start + i;
+                let line_num = line_start + i;
                 println!("{:4} | {}", line_num, line);
             }
         }

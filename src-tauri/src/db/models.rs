@@ -76,6 +76,7 @@ pub enum EdgeType {
     Resolves,      // decision resolving a contradiction
     #[serde(rename = "derives_from")]
     DerivesFrom,   // content derived from source
+    Supersedes,    // new node/edge replaces old one
     // Signal messaging relationships
     #[serde(rename = "replies_to")]
     RepliesTo,       // message -> message it quotes
@@ -114,6 +115,7 @@ impl EdgeType {
             EdgeType::Flags => "flags",
             EdgeType::Resolves => "resolves",
             EdgeType::DerivesFrom => "derives_from",
+            EdgeType::Supersedes => "supersedes",
             EdgeType::RepliesTo => "replies_to",
             EdgeType::SharesLink => "shares_link",
             EdgeType::TemporalThread => "temporal_thread",
@@ -148,6 +150,7 @@ impl EdgeType {
             "flags" => Some(EdgeType::Flags),
             "resolves" => Some(EdgeType::Resolves),
             "derives_from" => Some(EdgeType::DerivesFrom),
+            "supersedes" => Some(EdgeType::Supersedes),
             "replies_to" => Some(EdgeType::RepliesTo),
             "shares_link" => Some(EdgeType::SharesLink),
             "temporal_thread" => Some(EdgeType::TemporalThread),
