@@ -135,7 +135,15 @@ fn build_pure_emoji_regex() -> Regex {
 }
 
 fn build_url_regex() -> Regex {
-    Regex::new(r#"https?://[^\s<>"'\)\]\}]+"#).unwrap()
+    // Match URLs in three forms:
+    // 1. Protocol URLs: http(s)://, irc://, ftp://
+    // 2. www. prefix without protocol
+    // 3. Bare domain.tld/path (requires path to avoid false positives)
+    Regex::new(concat!(
+        r#"(?:https?://|irc://|ftp://)[^\s<>"'\)\]\}]+"#,
+        r#"|www\.[^\s<>"'\)\]\}]+"#,
+        r#"|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.(?:com|org|net|io|ai|dev|app|co|ee|fi|se|no|dk|lt|lv|de|uk|eu|me|info|tv|tech|xyz|site|gg|is|to)/[^\s<>"'\)\]\}]*"#,
+    )).unwrap()
 }
 
 fn build_agreement_regex() -> Regex {
@@ -389,6 +397,46 @@ pub fn list_signal_conversations(
     Ok(results)
 }
 
+/// List participant UUIDs (sourceServiceId) for a conversation
+pub fn list_conversation_authors(
+    signal_db_path: &str,
+    signal_key: &str,
+    conversation_id: &str,
+) -> Result<Vec<(String, usize)>, String> {
+    let conn = open_signal_db(signal_db_path, signal_key)?;
+
+    let mut stmt = conn.prepare(
+        "SELECT sourceServiceId, COUNT(*) as cnt
+         FROM messages
+         WHERE conversationId = ?1 AND sourceServiceId IS NOT NULL
+         GROUP BY sourceServiceId
+         ORDER BY cnt DESC"
+    ).map_err(|e| format!("Failed to query authors: {}", e))?;
+
+    let results: Vec<(String, usize)> = stmt.query_map(params![conversation_id], |row| {
+        let uuid: String = row.get(0)?;
+        let count: usize = row.get(1)?;
+        Ok((uuid, count))
+    })
+    .map_err(|e| format!("Failed to iterate authors: {}", e))?
+    .filter_map(|r| r.ok())
+    .collect();
+
+    // Also count outgoing messages (no sourceServiceId)
+    let outgoing: usize = conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE conversationId = ?1 AND type = 'outgoing'",
+        params![conversation_id],
+        |row| row.get(0),
+    ).unwrap_or(0);
+
+    let mut all = results;
+    if outgoing > 0 {
+        all.push(("(self — outgoing, map not needed)".to_string(), outgoing));
+    }
+
+    Ok(all)
+}
+
 // =============================================================================
 // Author mapping
 // =============================================================================
@@ -411,25 +459,33 @@ pub fn parse_author_map(raw: &str) -> AuthorMap {
     map
 }
 
-/// Resolve author from message fields using author map
+/// Resolve author from message fields using author map.
+/// Outgoing messages always use the "self" key — Signal sets sourceServiceId
+/// on outgoing messages too (to the user's own UUID), which would incorrectly
+/// resolve to another participant if their UUID was mapped first.
 fn resolve_author(msg: &SignalMessage, author_map: &AuthorMap) -> String {
-    // Try source (phone number) first
+    // Outgoing messages: always use "self" key, never UUID lookup
+    if msg.msg_type == "outgoing" {
+        if let Some(name) = author_map.get("self") {
+            return name.clone();
+        }
+        return "self".to_string();
+    }
+    // Incoming: try serviceId (UUID) first — preferred key type
+    if let Some(service_id) = &msg.source_service_id {
+        if let Some(name) = author_map.get(service_id) {
+            return name.clone();
+        }
+    }
+    // Try source (phone number) — backwards compat
     if let Some(source) = &msg.source {
         if let Some(name) = author_map.get(source) {
             return name.clone();
         }
     }
-    // Try serviceId
+    // Fallback: truncated serviceId (never store raw phone numbers)
     if let Some(service_id) = &msg.source_service_id {
-        if let Some(name) = author_map.get(service_id) {
-            return name.clone();
-        }
-        // Fallback: first 8 chars of serviceId (never store raw phone numbers)
         return service_id.chars().take(8).collect();
-    }
-    // For outgoing messages without source
-    if msg.msg_type == "outgoing" {
-        return "self".to_string();
     }
     "unknown".to_string()
 }
@@ -484,9 +540,15 @@ fn generate_title(body: &str) -> String {
 // URL extraction & link nodes (spec §3)
 // =============================================================================
 
-/// Normalize URL for dedup: strip trailing punctuation, trailing slash, fragments
+/// Normalize URL for dedup: strip trailing punctuation, trailing slash, fragments.
+/// Bare domains (www. or domain.tld/path) get https:// prepended.
 fn normalize_url(url: &str) -> String {
-    let mut normalized = url.to_string();
+    // Prepend https:// for bare domains without protocol
+    let mut normalized = if !url.contains("://") {
+        format!("https://{}", url)
+    } else {
+        url.to_string()
+    };
     // Strip trailing punctuation commonly captured by regex
     while normalized.ends_with('.') || normalized.ends_with(',')
         || normalized.ends_with(')') || normalized.ends_with(']')
@@ -793,6 +855,30 @@ pub fn import_signal_conversation(
     // Load existing sent_at -> node_id map for edge resolution across imports
     let mut sent_at_to_node_id: HashMap<i64, String> = load_existing_sent_at_map(db, &container_id);
 
+    // Fix orphan nodes from imports before hierarchy support was added
+    if let Ok(conn) = db.raw_conn().lock() {
+        // Fix container's own parent
+        let _ = conn.execute(
+            "UPDATE nodes SET parent_id = (SELECT id FROM nodes WHERE is_universe = 1 LIMIT 1), depth = 1
+             WHERE id = ?1 AND parent_id IS NULL AND is_universe = 0",
+            params![&container_id],
+        );
+        // Fix orphan message/link nodes
+        let fixed = conn.execute(
+            "UPDATE nodes SET parent_id = ?1, depth = 2
+             WHERE source = 'signal' AND conversation_id = ?1 AND parent_id IS NULL AND is_item = 1",
+            params![&container_id],
+        ).unwrap_or(0);
+        if fixed > 0 {
+            eprintln!("[Signal] Fixed {} orphan nodes from previous import", fixed);
+        }
+        // Update child_count on container
+        let _ = conn.execute(
+            "UPDATE nodes SET child_count = (SELECT COUNT(*) FROM nodes WHERE parent_id = ?1) WHERE id = ?1",
+            params![&container_id],
+        );
+    }
+
     // Query messages (incremental if re-importing)
     let messages = query_messages(&signal_conn, conversation_id, last_imported_sent_at)?;
 
@@ -814,6 +900,14 @@ pub fn import_signal_conversation(
             .or(conv_meta.profile_name)
             .unwrap_or_else(|| format!("Signal: {}", conv_id_prefix));
 
+        // Find universe root to parent container under it
+        let universe_id = db.raw_conn().lock().ok()
+            .and_then(|conn| conn.query_row(
+                "SELECT id FROM nodes WHERE is_universe = 1 LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            ).ok());
+
         let container = Node {
             id: container_id.clone(),
             node_type: NodeType::Context,
@@ -827,10 +921,10 @@ pub fn import_signal_conversation(
             updated_at: chrono::Utc::now().timestamp_millis(),
             cluster_id: None,
             cluster_label: None,
-            depth: 0,
+            depth: 1,
             is_item: false,
             is_universe: false,
-            parent_id: None,
+            parent_id: universe_id.clone(),
             child_count: 0,
             ai_title: None,
             summary: None,
@@ -853,7 +947,7 @@ pub fn import_signal_conversation(
             associated_idea_id: None,
             privacy: None,
             human_edited: None,
-            human_created: false,
+            human_created: true,  // Protect from delete_hierarchy_nodes() which deletes is_item=0 AND human_created=0
             author: None,
             agent_id: Some("human".to_string()),
             node_class: Some("knowledge".to_string()),
@@ -1047,10 +1141,10 @@ pub fn import_signal_conversation(
             updated_at: sent_at,
             cluster_id: None,
             cluster_label: None,
-            depth: 0,
+            depth: 2,
             is_item: true,
             is_universe: false,
-            parent_id: None,
+            parent_id: Some(container_id.clone()),
             child_count: 0,
             ai_title: None,
             summary: None,
@@ -1122,47 +1216,62 @@ pub fn import_signal_conversation(
         }
 
         // --- TemporalThread edge (spec §2.2, §2.3) ---
+        // Only create temporal edges within the same thread — cross-thread edges are misleading
         if let (Some(ref p_node_id), Some(p_ts)) = (&prev_node_id, prev_sent_at) {
-            let gap_ms = sent_at - p_ts;
-            let weight = temporal_thread_weight(gap_ms);
-            if weight >= TEMPORAL_THREAD_MIN_WEIGHT {
-                // Burst detection: same author, <30s → weight 1.0
-                let final_weight = if prev_author.as_ref() == Some(&author)
-                    && (gap_ms as f64 / 1000.0) < BURST_MAX_GAP_SECS
-                {
-                    1.0
-                } else {
-                    weight
-                };
+            let same_thread = thread_tracker.thread_map.get(&p_ts)
+                .map(|prev_tid| prev_tid == &thread_id)
+                .unwrap_or(false);
+            if same_thread {
+                let gap_ms = sent_at - p_ts;
+                let weight = temporal_thread_weight(gap_ms);
+                if weight >= TEMPORAL_THREAD_MIN_WEIGHT {
+                    // Burst detection: same author, <30s → weight 1.0
+                    let final_weight = if prev_author.as_ref() == Some(&author)
+                        && (gap_ms as f64 / 1000.0) < BURST_MAX_GAP_SECS
+                    {
+                        1.0
+                    } else {
+                        weight
+                    };
 
-                edges.push(Edge {
-                    id: format!("signal-temporal-{}-{}", &node_id, &p_node_id),
-                    source: p_node_id.clone(),
-                    target: node_id.clone(),
-                    edge_type: EdgeType::TemporalThread,
-                    label: None,
-                    weight: Some(final_weight),
-                    edge_source: Some("import".to_string()),
-                    evidence_id: None,
-                    confidence: Some(final_weight),
-                    created_at: now,
-                    updated_at: None,
-                    author: None,
-                    reason: None,
-                    content: None,
-                    agent_id: Some("human".to_string()),
-                    superseded_by: None,
-                    metadata: None,
-                });
-                result.temporal_threads += 1;
+                    edges.push(Edge {
+                        id: format!("signal-temporal-{}-{}", &node_id, &p_node_id),
+                        source: p_node_id.clone(),
+                        target: node_id.clone(),
+                        edge_type: EdgeType::TemporalThread,
+                        label: None,
+                        weight: Some(final_weight),
+                        edge_source: Some("import".to_string()),
+                        evidence_id: None,
+                        confidence: Some(final_weight),
+                        created_at: now,
+                        updated_at: None,
+                        author: None,
+                        reason: None,
+                        content: None,
+                        agent_id: Some("human".to_string()),
+                        superseded_by: None,
+                        metadata: None,
+                    });
+                    result.temporal_threads += 1;
+                }
             }
         }
 
         // --- Link nodes + SharesLink edges (spec §3) ---
+        // Skip link nodes when message is URL-only (avoids duplicate content)
+        let commentary = extract_commentary(body, &url_re);
+        let is_url_only = commentary.is_empty() && urls.len() == 1;
+
         for raw_url in &urls {
             let normalized = normalize_url(raw_url);
             let ln_id = link_node_id(&normalized);
             result.links_found += 1;
+
+            if is_url_only {
+                // Message IS the link — no separate link node needed
+                continue;
+            }
 
             // Create or reuse link node
             if !link_nodes.contains_key(&normalized) {
@@ -1180,10 +1289,10 @@ pub fn import_signal_conversation(
                         updated_at: sent_at,
                         cluster_id: None,
                         cluster_label: None,
-                        depth: 0,
+                        depth: 2,
                         is_item: true,
                         is_universe: false,
-                        parent_id: None,
+                        parent_id: Some(container_id.clone()),
                         child_count: 0,
                         ai_title: None,
                         summary: None,
@@ -1234,7 +1343,6 @@ pub fn import_signal_conversation(
             }
 
             // Create SharesLink edge
-            let commentary = extract_commentary(body, &url_re);
             edges.push(Edge {
                 id: format!("signal-shares-{}-{}", &node_id, &ln_id),
                 source: node_id.clone(),
@@ -1535,6 +1643,11 @@ mod tests {
         assert_eq!(normalize_url("https://example.com/path."), "https://example.com/path");
         assert_eq!(normalize_url("https://example.com/path#section"), "https://example.com/path");
         assert_eq!(normalize_url("https://example.com/path),"), "https://example.com/path");
+        // Bare domains get https:// prepended
+        assert_eq!(normalize_url("www.fiddler.ai"), "https://www.fiddler.ai");
+        assert_eq!(normalize_url("isikukood.ee/38207162722"), "https://isikukood.ee/38207162722");
+        // Protocol URLs keep their protocol
+        assert_eq!(normalize_url("irc://chat.freenode.net/channel"), "irc://chat.freenode.net/channel");
     }
 
     #[test]
@@ -1555,8 +1668,18 @@ mod tests {
     #[test]
     fn test_url_regex() {
         let re = build_url_regex();
+        // Protocol URLs
         assert!(re.is_match("check https://docs.nats.io/path out"));
         assert!(re.is_match("http://example.com"));
+        assert!(re.is_match("irc://chat.freenode.net/channel"));
+        // www. prefix without protocol
+        assert!(re.is_match("visit www.fiddler.ai for details"));
+        assert!(re.is_match("www.example.com/path"));
+        // Bare domain with path
+        assert!(re.is_match("isikukood.ee/38207162722"));
+        assert!(re.is_match("docs.nats.io/concepts"));
+        // Should NOT match bare domains without path (too many false positives)
+        assert!(!re.is_match("isikukood.ee"));
         assert!(!re.is_match("no urls here"));
     }
 

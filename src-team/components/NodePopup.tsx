@@ -18,6 +18,7 @@ export default function NodePopup() {
     setSelectedNodeId, updateNode, deleteNode, deletePersonalNode, updatePersonalNode,
     navigateToCategory, openLeafView,
     fetchedContent, isFetching, fetchUrlContent, loadFetchedContent,
+    mergedBodies, mergeGroupIds,
   } = useTeamStore();
 
   const [editingTitle, setEditingTitle] = useState(false);
@@ -52,21 +53,34 @@ export default function NodePopup() {
     setShowEditModal(false);
   }, [selectedNodeId, teamNode, personalNode]);
 
-  // Load cached fetched content
+  // Load cached fetched content, auto-fetch if URL present and not cached
   useEffect(() => {
-    if (selectedNodeId) loadFetchedContent(selectedNodeId);
-  }, [selectedNodeId, loadFetchedContent]);
+    if (!selectedNodeId) return;
+    loadFetchedContent(selectedNodeId).then(() => {
+      const { fetchedContent: fc, isFetching: fetching } = useTeamStore.getState();
+      if (fc.has(selectedNodeId) || fetching) return;
+      // Detect URLs in node text
+      const node = useTeamStore.getState().nodes.get(selectedNodeId);
+      const pNode = useTeamStore.getState().personalNodes.get(selectedNodeId);
+      const t = node ? (node.aiTitle || node.title) : pNode?.title || "";
+      const c = node?.content || pNode?.content || "";
+      const urls = `${c} ${t}`.match(/https?:\/\/[^\s<>"')\]]+/g);
+      if (urls?.length) fetchUrlContent(selectedNodeId, urls[0]);
+    });
+  }, [selectedNodeId, loadFetchedContent, fetchUrlContent]);
 
-  // Gather edges for this node
+  // Gather edges for this node (including all IDs in a merge group)
   const nodeEdges: DisplayEdge[] = [];
   if (selectedNodeId) {
+    const groupIds = mergeGroupIds.get(selectedNodeId) || [selectedNodeId];
+    const groupSet = new Set(groupIds);
     for (const e of edges) {
-      if (e.source === selectedNodeId || e.target === selectedNodeId) {
+      if (groupSet.has(e.source) || groupSet.has(e.target)) {
         nodeEdges.push({ ...e, type: e.type, isPersonal: false });
       }
     }
     for (const pe of personalEdges) {
-      if (pe.sourceId === selectedNodeId || pe.targetId === selectedNodeId) {
+      if (groupSet.has(pe.sourceId) || groupSet.has(pe.targetId)) {
         nodeEdges.push({
           id: pe.id,
           source: pe.sourceId,
@@ -143,14 +157,15 @@ export default function NodePopup() {
   if (!node) return null;
 
   const title = teamNode ? (teamNode.aiTitle || teamNode.title) : personalNode!.title;
-  const content = teamNode ? teamNode.content : personalNode!.content;
+  const rawContent = teamNode ? teamNode.content : personalNode!.content;
+  const content = (selectedNodeId && mergedBodies.get(selectedNodeId)) || rawContent;
   const author = teamNode?.author;
   const contentType = teamNode?.contentType || personalNode?.contentType;
   const nodeTags = teamNode?.tags || personalNode?.tags;
 
-  // URL detection + fetched content
-  const allText = `${title} ${content || ""}`;
-  const detectedUrls: string[] = allText.match(/https?:\/\/[^\s<>"')\]]+/g) || [];
+  // URL detection + fetched content (prefer content over truncated title)
+  const allText = `${content || ""} ${title}`;
+  const detectedUrls: string[] = [...new Set(allText.match(/https?:\/\/[^\s<>"')\]]+/g) || [])];
   const cachedContent = selectedNodeId ? fetchedContent.get(selectedNodeId) : undefined;
   const isFetchingThis = isFetching === selectedNodeId;
 
@@ -331,8 +346,8 @@ export default function NodePopup() {
           );
         })()}
 
-        {/* Tags */}
-        {nodeTags && (
+        {/* Tags — skip for signal nodes (tags are JSON metadata, not user-facing) */}
+        {nodeTags && !nodeTags.startsWith("{") && (
           <div className="flex flex-wrap gap-1 mt-3">
             {nodeTags.split(",").map((tag) => tag.trim()).filter(Boolean).map((tag) => (
               <span key={tag} className="text-[11px] px-2 py-0.5 rounded-full"
@@ -343,16 +358,20 @@ export default function NodePopup() {
           </div>
         )}
 
-        {/* Edges */}
-        {nodeEdges.length > 0 && (
+        {/* Edges — sorted by weight descending */}
+        {nodeEdges.length > 0 && (() => {
+          const groupSet = new Set(mergeGroupIds.get(selectedNodeId!) || [selectedNodeId!]);
+          const sorted = [...nodeEdges].sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0));
+          return (
           <div className="mt-4">
             <h3 className="text-xs font-medium uppercase mb-2" style={{ color: "var(--text-secondary)" }}>
-              Connections ({nodeEdges.length})
+              Connections ({sorted.length})
             </h3>
             <div className="flex flex-col gap-1.5">
-              {nodeEdges.map((e) => {
-                const otherId = e.source === selectedNodeId ? e.target : e.source;
-                const direction = e.source === selectedNodeId ? "\u2192" : "\u2190";
+              {sorted.map((e) => {
+                const otherId = groupSet.has(e.source) ? e.target : e.source;
+                const direction = groupSet.has(e.source) ? "\u2192" : "\u2190";
+                const pct = e.weight != null ? `${Math.round(e.weight * 100)}%` : null;
                 return (
                   <div
                     key={e.id}
@@ -365,6 +384,7 @@ export default function NodePopup() {
                   >
                     <span style={{ color: "var(--text-secondary)" }}>{direction}</span>
                     <span className="flex-1 truncate">{resolveNodeName(otherId)}</span>
+                    {pct && <span className="font-mono text-[10px]" style={{ color: "var(--accent)" }}>{pct}</span>}
                     <span style={{ color: "var(--text-secondary)" }}>{e.type}</span>
                     {e.isPersonal && (
                       <span className="text-[10px]" style={{ color: "#14b8a6" }}>(personal)</span>
@@ -374,7 +394,8 @@ export default function NodePopup() {
               })}
             </div>
           </div>
-        )}
+          );
+        })()}
       </div>
 
       {/* Footer */}

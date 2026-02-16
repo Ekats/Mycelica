@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import type {
-  Node, Edge, PersonalNode, PersonalEdge, TeamConfig,
+  Node, Edge, PersonalNode, PersonalEdge, TeamConfig, TeamSnapshot,
   CreateNodeRequest, PatchNodeRequest, CreateEdgeRequest,
   DisplayNode, DisplayEdge, PersonalData, SavedPosition,
   BreadcrumbEntry, FetchedContent,
@@ -21,6 +21,10 @@ interface TeamStore {
   // In-memory positions (updated by GraphView after each render, NOT persisted)
   currentPositions: Map<string, { x: number; y: number }>;
   setCurrentPositions: (positions: Map<string, { x: number; y: number }>) => void;
+  mergedBodies: Map<string, string>;
+  setMergedBodies: (bodies: Map<string, string>) => void;
+  mergeGroupIds: Map<string, string[]>;  // representative ID → all IDs in group
+  setMergeGroupIds: (groups: Map<string, string[]>) => void;
 
   // Local category overrides (node IDs created as categories, survives refresh)
   localCategories: Set<string>;
@@ -68,6 +72,7 @@ interface TeamStore {
   // Actions
   refresh: () => Promise<void>;
   loadPersonalData: () => Promise<void>;
+  loadLocalNodes: () => Promise<void>;
   loadPositions: () => Promise<void>;
   loadSettings: () => Promise<void>;
 
@@ -104,6 +109,10 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
   savedPositions: new Map(),
   currentPositions: new Map(),
   setCurrentPositions: (positions) => set({ currentPositions: positions }),
+  mergedBodies: new Map(),
+  setMergedBodies: (bodies) => set({ mergedBodies: bodies }),
+  mergeGroupIds: new Map(),
+  setMergeGroupIds: (groups) => set({ mergeGroupIds: groups }),
   localCategories: new Set(),
   addLocalCategory: (id) => set((s) => {
     const lc = new Set(s.localCategories);
@@ -260,6 +269,10 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
         updatedAt: n.updatedAt,
         x: n.x,
         y: n.y,
+        source: n.source,
+        sequenceIndex: n.sequenceIndex,
+        nodeClass: n.nodeClass,
+        emoji: n.emoji,
       });
     }
 
@@ -295,6 +308,7 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
         source: e.source,
         target: e.target,
         type: e.type,
+        weight: e.weight,
         reason: e.reason,
         author: e.author,
         edgeSource: e.edgeSource,
@@ -365,6 +379,25 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
       set({ personalNodes: nodeMap, personalEdges: data.edges });
     } catch (e) {
       console.error("Failed to load personal data:", e);
+    }
+  },
+
+  loadLocalNodes: async () => {
+    try {
+      const data = await invoke<TeamSnapshot>("team_get_local_data", {});
+      if (!data.nodes.length) return;
+      set((s) => {
+        const merged = new Map(s.nodes);
+        let uId = s.universeId;
+        for (const n of data.nodes) {
+          merged.set(n.id, n);
+          if (n.isUniverse) uId = n.id;
+        }
+        const mergedEdges = [...s.edges, ...data.edges];
+        return { nodes: merged, edges: mergedEdges, universeId: uId };
+      });
+    } catch (e) {
+      console.error("Failed to load local nodes:", e);
     }
   },
 

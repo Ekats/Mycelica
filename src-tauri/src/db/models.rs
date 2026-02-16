@@ -43,11 +43,14 @@ pub enum EdgeType {
     Because,
     Related,
     Contains,
+    #[serde(rename = "belongs_to")]
     BelongsTo,  // Item belongs to category (multi-path associations)
     // Code relationships
     Calls,      // function -> function it calls
+    #[serde(rename = "uses_type")]
     UsesType,   // function -> struct/enum it references
     Implements, // impl -> trait it implements
+    #[serde(rename = "defined_in")]
     DefinedIn,  // code item -> module/file it's defined in
     Imports,    // module -> module it imports
     Tests,      // test function -> function it tests
@@ -55,6 +58,7 @@ pub enum EdgeType {
     // Holerabbit browsing relationships
     Clicked,     // web page -> web page (followed link)
     Backtracked, // web page -> web page (returned via back button)
+    #[serde(rename = "session_item")]
     SessionItem, // session -> web page (belongs to session)
     // Category relationships
     Sibling,     // category -> category (sibling relationship based on paper cross-edges)
@@ -62,6 +66,7 @@ pub enum EdgeType {
     Prerequisite,  // A must be understood before B
     Contradicts,   // A contradicts B (tension edge)
     Supports,      // A provides evidence for B
+    #[serde(rename = "evolved_from")]
     EvolvedFrom,   // B is a refined version of A
     Questions,     // A raises a question about B
     // Spore meta edges
@@ -69,10 +74,14 @@ pub enum EdgeType {
     Tracks,        // status node tracks workstream
     Flags,         // contradiction flag on nodes
     Resolves,      // decision resolving a contradiction
+    #[serde(rename = "derives_from")]
     DerivesFrom,   // content derived from source
     // Signal messaging relationships
+    #[serde(rename = "replies_to")]
     RepliesTo,       // message -> message it quotes
+    #[serde(rename = "shares_link")]
     SharesLink,      // message -> link node (URL shared in message)
+    #[serde(rename = "temporal_thread")]
     TemporalThread,  // consecutive messages within temporal window
 }
 

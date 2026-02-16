@@ -4,7 +4,8 @@ export type ContentType =
 
 export type EdgeType =
   | 'related' | 'reference' | 'because' | 'contains'
-  | 'prerequisite' | 'contradicts' | 'supports' | 'evolved_from' | 'questions';
+  | 'prerequisite' | 'contradicts' | 'supports' | 'evolved_from' | 'questions'
+  | 'replies_to' | 'shares_link' | 'temporal_thread';
 
 export interface Node {
   id: string;
@@ -24,6 +25,11 @@ export interface Node {
   updatedAt: number;
   x?: number;
   y?: number;
+  source?: string;
+  sequenceIndex?: number;
+  conversationId?: string;
+  nodeClass?: string;
+  emoji?: string;
 }
 
 export interface Edge {
@@ -122,6 +128,10 @@ export interface DisplayNode {
   updatedAt: number;
   x?: number;
   y?: number;
+  source?: string;
+  sequenceIndex?: number;
+  nodeClass?: string;
+  emoji?: string;
 }
 
 // Unified display edge
@@ -130,6 +140,7 @@ export interface DisplayEdge {
   source: string;
   target: string;
   type: string;
+  weight?: number;
   reason?: string;
   author?: string;
   edgeSource?: string;

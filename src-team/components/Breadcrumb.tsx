@@ -1,7 +1,13 @@
 import { ChevronRight, ArrowUp } from "lucide-react";
 import { useTeamStore } from "../stores/teamStore";
 
-export default function Breadcrumb() {
+interface BreadcrumbProps {
+  isSignalContainer?: boolean;
+  signalViewMode?: 'graph' | 'timeline';
+  onToggleSignalView?: () => void;
+}
+
+export default function Breadcrumb({ isSignalContainer, signalViewMode, onToggleSignalView }: BreadcrumbProps) {
   const breadcrumbs = useTeamStore((s) => s.breadcrumbs);
   const navigateToRoot = useTeamStore((s) => s.navigateToRoot);
   const navigateToBreadcrumb = useTeamStore((s) => s.navigateToBreadcrumb);
@@ -68,6 +74,22 @@ export default function Breadcrumb() {
           title="Go up one level"
         >
           <ArrowUp size={14} />
+        </button>
+      )}
+
+      {/* Signal view toggle — only visible inside a signal container */}
+      {isSignalContainer && onToggleSignalView && (
+        <button
+          className="ml-auto px-2.5 py-1 text-xs rounded whitespace-nowrap transition-colors"
+          style={{
+            background: signalViewMode === 'timeline' ? 'var(--accent)' : 'var(--bg-tertiary)',
+            color: signalViewMode === 'timeline' ? '#000' : 'var(--text-secondary)',
+            border: '1px solid var(--border)',
+          }}
+          onClick={onToggleSignalView}
+          title={signalViewMode === 'graph' ? 'Switch to timeline view' : 'Switch to graph view'}
+        >
+          {signalViewMode === 'graph' ? 'Timeline' : 'Graph'}
         </button>
       )}
     </div>

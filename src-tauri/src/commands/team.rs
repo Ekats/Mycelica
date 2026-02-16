@@ -375,6 +375,9 @@ pub async fn team_search(
                 human_edited: None,
                 human_created: true,
                 author: None,
+                agent_id: None,
+                meta_type: None,
+                node_class: Some("knowledge".to_string()),
             })
         }).map_err(|e| e.to_string())?;
         for row in rows {
@@ -421,6 +424,21 @@ pub async fn team_get_recent(
 ) -> Result<Vec<Node>, String> {
     let client = state.make_client()?;
     client.get_recent(limit.unwrap_or(20)).await
+}
+
+// ============================================================================
+// Local graph data (signal imports etc. — reads from local.db's nodes table)
+// ============================================================================
+
+#[tauri::command]
+pub fn team_get_local_data(
+    state: State<'_, TeamState>,
+    source: Option<String>,
+) -> Result<TeamSnapshot, String> {
+    let src = source.as_deref().unwrap_or("signal");
+    let nodes = state.local_db.get_nodes_by_source(src).map_err(|e| e.to_string())?;
+    let edges = state.local_db.get_edges_for_source_nodes(src).map_err(|e| e.to_string())?;
+    Ok(TeamSnapshot { nodes, edges })
 }
 
 // ============================================================================

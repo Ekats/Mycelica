@@ -665,9 +665,12 @@ enum ImportCommands {
         /// List available conversations and exit
         #[arg(long)]
         list: bool,
-        /// Map phone numbers to names: "+372xxx=E,+1xxx=F,+372yyy=M"
+        /// Map sourceServiceId UUIDs to names: "<uuid>=E,<uuid>=F". Use "self=E" to label your own outgoing messages.
         #[arg(long)]
         author_map: Option<String>,
+        /// List participant UUIDs for a conversation (for building --author-map)
+        #[arg(long)]
+        list_authors: bool,
         /// Path to Signal database (default: ~/.config/Signal/sql/db.sqlite)
         #[arg(long)]
         db_path: Option<String>,
@@ -2051,7 +2054,7 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
             }
         }
         #[cfg(feature = "signal")]
-        ImportCommands::Signal { conversation_id, list, author_map, db_path, embed, allow_repo_db } => {
+        ImportCommands::Signal { conversation_id, list, author_map, list_authors, db_path, embed, allow_repo_db } => {
             use mycelica_lib::signal;
 
             // Determine Signal DB path
@@ -2100,6 +2103,38 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
                     log!("Available Signal conversations:");
                     for (id, name, count) in &conversations {
                         log!("  {} — {} ({} messages)", id, name, count);
+                    }
+                }
+                return Ok(());
+            }
+
+            // List authors mode: show sourceServiceId UUIDs for building --author-map
+            if list_authors {
+                let conv_id = conversation_id
+                    .ok_or_else(|| "--conversation-id is required with --list-authors".to_string())?;
+                let authors = signal::list_conversation_authors(&signal_db, &signal_key, &conv_id)?;
+                if json {
+                    let items: Vec<serde_json::Value> = authors.iter()
+                        .map(|(uuid, count)| serde_json::json!({
+                            "sourceServiceId": uuid,
+                            "message_count": count
+                        }))
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&items).unwrap_or_default());
+                } else {
+                    log!("Participants in {}:", conv_id);
+                    for (uuid, count) in &authors {
+                        log!("  {} ({} messages)", uuid, count);
+                    }
+                    let mappable: Vec<&(String, usize)> = authors.iter()
+                        .filter(|(uuid, _)| !uuid.starts_with('('))
+                        .collect();
+                    if !mappable.is_empty() {
+                        log!("\nBuild --author-map with:");
+                        let example: Vec<String> = mappable.iter()
+                            .map(|(uuid, _)| format!("{}=NAME", uuid))
+                            .collect();
+                        log!("  --author-map \"{}\"", example.join(","));
                     }
                 }
                 return Ok(());

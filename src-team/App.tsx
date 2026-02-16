@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useTeamStore } from "./stores/teamStore";
 import Toolbar from "./components/Toolbar";
 import Breadcrumb from "./components/Breadcrumb";
@@ -6,6 +6,7 @@ import GraphView from "./components/GraphView";
 import RecentPanel from "./components/RecentPanel";
 import NodePopup from "./components/NodePopup";
 import LeafView from "./components/LeafView";
+import SignalConversationRenderer from "./components/SignalConversationRenderer";
 import QuickAdd from "./components/QuickAdd";
 import Settings from "./components/Settings";
 
@@ -13,9 +14,23 @@ export default function App() {
   const {
     showRecent, showSettings, showQuickAdd, selectedNodeId, error,
     leafViewNodeId,
-    loadSettings, loadPositions, loadPersonalData, refresh,
+    loadSettings, loadPositions, loadPersonalData, loadLocalNodes, refresh,
     setShowQuickAdd, clearError, navigateBack, breadcrumbs,
+    currentParentId, nodes,
   } = useTeamStore();
+
+  const [signalViewMode, setSignalViewMode] = useState<'graph' | 'timeline'>('graph');
+
+  const isSignalContainer = useMemo(() => {
+    if (!currentParentId) return false;
+    const parent = nodes.get(currentParentId);
+    return parent?.source === 'signal' && !parent?.isItem;
+  }, [currentParentId, nodes]);
+
+  // Reset to graph when leaving a signal container
+  useEffect(() => {
+    if (!isSignalContainer) setSignalViewMode('graph');
+  }, [isSignalContainer]);
 
   useEffect(() => {
     // Load settings first, then refresh (settings are async — config must be ready before refresh)
@@ -25,7 +40,8 @@ export default function App() {
     });
     loadPositions();
     loadPersonalData();
-  }, [loadSettings, loadPositions, loadPersonalData, refresh]);
+    loadLocalNodes();
+  }, [loadSettings, loadPositions, loadPersonalData, loadLocalNodes, refresh]);
 
   // Ctrl+N for quick-add, Backspace to navigate back
   useEffect(() => {
@@ -63,11 +79,17 @@ export default function App() {
         </div>
       )}
 
-      <Breadcrumb />
+      <Breadcrumb
+        isSignalContainer={isSignalContainer}
+        signalViewMode={signalViewMode}
+        onToggleSignalView={() => setSignalViewMode(m => m === 'graph' ? 'timeline' : 'graph')}
+      />
 
       <div className="flex flex-1 overflow-hidden">
         {leafViewNodeId ? (
           <LeafView nodeId={leafViewNodeId} />
+        ) : isSignalContainer && signalViewMode === 'timeline' ? (
+          <SignalConversationRenderer containerId={currentParentId!} />
         ) : (
           <>
             {showRecent && <RecentPanel />}

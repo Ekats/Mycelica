@@ -1,5 +1,6 @@
 {
   "productName": "Mycelica Team",
+  "mainBinaryName": "mycelica-team",
   "identifier": "com.mycelica.team",
   "build": {
     "beforeDevCommand": "cd src-team && npm run dev",

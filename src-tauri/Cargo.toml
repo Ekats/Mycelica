@@ -125,6 +125,15 @@ name = "mycelica-cli"
 path = "src/bin/cli.rs"
 
 [[bin]]
+name = "mycelica"
+path = "src/main.rs"
+
+[[bin]]
+name = "mycelica-team"
+path = "src/main.rs"
+required-features = ["team"]
+
+[[bin]]
 name = "mycelica-server"
 path = "src/bin/server.rs"
 

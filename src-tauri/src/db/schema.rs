@@ -1114,6 +1114,30 @@ impl Database {
         Ok(nodes)
     }
 
+    /// Get all nodes with a specific source (e.g. "signal")
+    pub fn get_nodes_by_source(&self, source: &str) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE source = ?1 ORDER BY sequence_index ASC, created_at ASC",
+            Self::NODE_COLUMNS
+        ))?;
+        let nodes = stmt.query_map(params![source], Self::row_to_node)?.collect::<Result<Vec<_>>>()?;
+        Ok(nodes)
+    }
+
+    /// Get all edges where at least one endpoint has the given source
+    pub fn get_edges_for_source_nodes(&self, source: &str) -> Result<Vec<Edge>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM edges
+             WHERE source_id IN (SELECT id FROM nodes WHERE source = ?1)
+                OR target_id IN (SELECT id FROM nodes WHERE source = ?1)",
+            Self::EDGE_COLUMNS
+        ))?;
+        let edges = stmt.query_map(params![source], Self::row_to_edge)?.collect::<Result<Vec<_>>>()?;
+        Ok(edges)
+    }
+
     pub fn update_node(&self, node: &Node) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -1737,6 +1761,8 @@ impl Database {
              JOIN nodes n2 ON e.target_id = n2.id
              WHERE n1.is_item = 1 AND n2.is_item = 1
                AND e.weight IS NOT NULL
+               AND (n1.source IS NULL OR n1.source != 'signal')
+               AND (n2.source IS NULL OR n2.source != 'signal')
              ORDER BY e.weight DESC"
         )?;
 
@@ -2596,6 +2622,7 @@ impl Database {
             "SELECT {} FROM nodes WHERE is_item = 1
              AND (content_type IN ('insight', 'exploration', 'synthesis', 'question', 'planning', 'concept', 'decision', 'paper', 'bookmark')
                   OR content_type LIKE 'code_%')
+             AND (source IS NULL OR source != 'signal')
              ORDER BY created_at DESC",
             Self::NODE_COLUMNS
         ))?;
