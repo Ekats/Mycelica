@@ -55,18 +55,19 @@ function estimateMsgHeight(text: string): number {
   return Math.min(MSG_AUTHOR_HEIGHT + lines * MSG_LINE_HEIGHT + MSG_PAD * 2, 300);
 }
 
-const AUTHOR_BG: Record<string, string> = {
-  E: "rgba(30, 58, 95, 0.92)",
-  M: "rgba(20, 60, 50, 0.92)",
-  F: "rgba(80, 50, 20, 0.92)",
-  C: "rgba(70, 30, 40, 0.92)",
-};
-const AUTHOR_TEXT: Record<string, string> = {
-  E: "#60a5fa",
-  M: "#34d399",
-  F: "#fbbf24",
-  C: "#f87171",
-};
+// Deterministic author colors from first letter of username
+function authorHue(author: string): number {
+  const code = (author || "?").charCodeAt(0);
+  return (code * 137) % 360; // golden-angle spread
+}
+function authorBg(author: string): string {
+  const h = authorHue(author);
+  return `hsla(${h}, 40%, 22%, 0.92)`;
+}
+function authorText(author: string): string {
+  const h = authorHue(author);
+  return `hsl(${h}, 70%, 65%)`;
+}
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -973,7 +974,7 @@ export default function GraphView() {
         .attr("ry", 8)
         .attr("fill", (d) => {
           if (linkNodeIds.has(d.id)) return "rgba(88, 28, 135, 0.8)";
-          return AUTHOR_BG[d.author || ""] || "rgba(51, 65, 85, 0.9)";
+          return d.author ? authorBg(d.author) : "rgba(51, 65, 85, 0.9)";
         })
         .attr("stroke", (d) => {
           if (d.id === selectedNodeId) return "#f59e0b";
@@ -995,7 +996,7 @@ export default function GraphView() {
         if (div.empty()) {
           div = fo.append("xhtml:div");
         }
-        const authorColor = AUTHOR_TEXT[d.author || ""] || "#9ca3af";
+        const authorColor = d.author ? authorText(d.author) : "#9ca3af";
         const authorHtml = d.author
           ? `<span style="color:${authorColor};font-weight:700;font-size:12px;text-transform:uppercase;letter-spacing:0.05em">${escapeHtml(d.author)}</span><br/>`
           : "";
