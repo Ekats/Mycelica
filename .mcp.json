@@ -2,7 +2,7 @@
   "mcpServers": {
     "mycelica": {
       "command": "mycelica-cli",
-      "args": ["mcp-server", "--stdio", "--agent-role", "coder", "--agent-id", "spore:coder"]
+      "args": ["mcp-server", "--stdio", "--agent-role", "verifier", "--agent-id", "spore:verifier"]
     }
   }
 }
