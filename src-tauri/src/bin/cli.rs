@@ -1618,8 +1618,28 @@ async fn handle_db(cmd: DbCommands, db: &Database, json: bool) -> Result<(), Str
             }
 
             if json {
-                println!(r#"{{"path":"{}","items":{},"categories":{},"edges":{},"processed":{},"embeddings":{}}}"#,
-                    db.get_path(), total_items, categories, edges.len(), processed_items, items_with_embeddings);
+                #[derive(Serialize)]
+                struct DbStatsJson {
+                    path: String,
+                    items: usize,
+                    categories: usize,
+                    edges: usize,
+                    processed: usize,
+                    embeddings: usize,
+                    hierarchy_levels: i32,
+                    hierarchy_root: Option<String>,
+                }
+                let stats = DbStatsJson {
+                    path: db.get_path(),
+                    items: total_items,
+                    categories,
+                    edges: edges.len(),
+                    processed: processed_items,
+                    embeddings: items_with_embeddings,
+                    hierarchy_levels: max_depth,
+                    hierarchy_root: universe.as_ref().map(|u| u.title.clone()),
+                };
+                println!("{}", serde_json::to_string(&stats).unwrap());
             } else {
                 log!("Database:   {}", db.get_path());
                 log!("Items:      {:>6}", total_items);
