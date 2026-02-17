@@ -19,6 +19,7 @@ default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 team = ["dep:scraper", "dep:ammonia"]  # Team client GUI mode
 signal = ["rusqlite/bundled-sqlcipher-vendored-openssl"]  # Signal Desktop encrypted DB import
+mcp = ["dep:rmcp", "dep:schemars"]  # MCP server for agent coordination
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -88,6 +89,10 @@ pdf-extract = "0.7"
 # HTML readability + sanitization (team mode URL fetching)
 scraper = { version = "0.22", optional = true }
 ammonia = { version = "4", optional = true }
+
+# MCP server (agent coordination via Model Context Protocol)
+rmcp = { version = "0.15", features = ["server", "transport-io", "schemars"], optional = true }
+schemars = { version = "1", optional = true }
 
 # HTTP API server (team mode)
 axum = "0.8"

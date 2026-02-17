@@ -1749,6 +1749,46 @@ impl Database {
         Ok(edges)
     }
 
+    pub fn count_edges_by_agent(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(agent_id, 'human'), COUNT(*) FROM edges GROUP BY COALESCE(agent_id, 'human')"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?.collect::<Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn count_nodes_by_class(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(node_class, 'knowledge'), COUNT(*) FROM nodes GROUP BY COALESCE(node_class, 'knowledge')"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?.collect::<Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn count_unresolved_contradictions(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE node_class = 'meta' AND meta_type = 'contradiction'",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    pub fn count_db_stats(&self) -> Result<(i64, i64, i64, i64)> {
+        let conn = self.conn.lock().unwrap();
+        let total_nodes: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
+        let total_edges: i64 = conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
+        let items: i64 = conn.query_row("SELECT COUNT(*) FROM nodes WHERE is_item = 1", [], |r| r.get(0))?;
+        let categories: i64 = conn.query_row("SELECT COUNT(*) FROM nodes WHERE is_item = 0 AND is_universe = 0", [], |r| r.get(0))?;
+        Ok((total_nodes, total_edges, items, categories))
+    }
+
     /// Get all edges between items (papers) sorted by weight descending.
     /// Returns (source_id, target_id, weight) tuples for dendrogram building.
     /// Only includes edges where both endpoints are items (is_item = true).

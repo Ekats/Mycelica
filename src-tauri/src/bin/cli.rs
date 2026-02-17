@@ -444,6 +444,19 @@ enum Commands {
         #[command(subcommand)]
         cmd: SporeCommands,
     },
+    #[cfg(feature = "mcp")]
+    /// Start MCP server for agent coordination
+    McpServer {
+        /// Agent role: human, ingestor, coder, verifier, planner, synthesizer, summarizer, docwriter
+        #[arg(long)]
+        agent_role: String,
+        /// Agent ID for attribution (e.g. spore:coder-1)
+        #[arg(long)]
+        agent_id: String,
+        /// Use stdio transport (required)
+        #[arg(long)]
+        stdio: bool,
+    },
 }
 
 // ============================================================================
@@ -1386,6 +1399,15 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Orphans { limit } => handle_orphans(limit, &db, cli.json).await,
         Commands::Migrate { cmd } => handle_migrate(cmd, &db, &db_path, cli.json),
         Commands::Spore { cmd } => handle_spore(cmd, &db, cli.json).await,
+        #[cfg(feature = "mcp")]
+        Commands::McpServer { agent_role, agent_id, stdio } => {
+            if !stdio {
+                return Err("Only --stdio transport is currently supported".to_string());
+            }
+            let role = mycelica_lib::mcp::AgentRole::from_str(&agent_role)
+                .ok_or_else(|| format!("Unknown role: '{}'. Valid: human, ingestor, coder, verifier, planner, synthesizer, summarizer, docwriter", agent_role))?;
+            mycelica_lib::mcp::run_mcp_server(db.clone(), agent_id, role).await
+        },
         Commands::Tui => run_tui(&db).await,
         Commands::Completions { .. } => unreachable!(),
     }

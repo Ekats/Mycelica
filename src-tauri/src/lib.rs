@@ -20,6 +20,8 @@ pub mod remote_client;
 pub mod team;
 #[cfg(feature = "signal")]
 pub mod signal;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 
 use commands::{
     AppState,
