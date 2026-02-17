@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
-use super::models::{Node, Edge, NodeType, EdgeType, Position, Tag, Paper, EdgeWithNodes, EdgeExplanation, PathHop};
+use super::models::{Node, Edge, NodeType, EdgeType, Position, Tag, Paper, EdgeWithNodes, EdgeExplanation, PathHop, ContextNode};
 
 pub struct Database {
     conn: Mutex<Connection>,
@@ -5631,6 +5631,17 @@ impl Database {
     }
 
     /// Get the N most relevant edges for a node, ranked by composite score.
+    /// Edge type priority for scoring (higher = more important).
+    /// Used by edges_for_context and context_for_task.
+    fn edge_type_priority(edge_type: &EdgeType) -> f64 {
+        match edge_type {
+            EdgeType::Contradicts | EdgeType::Flags => 1.0,
+            EdgeType::DerivesFrom | EdgeType::Summarizes | EdgeType::Resolves | EdgeType::Supersedes => 0.7,
+            EdgeType::Supports | EdgeType::Questions | EdgeType::Prerequisite | EdgeType::EvolvedFrom => 0.5,
+            _ => 0.3,
+        }
+    }
+
     pub fn edges_for_context(&self, node_id: &str, top_n: usize, not_superseded: bool) -> Result<Vec<Edge>> {
         let all_edges = self.get_edges_for_node(node_id)?;
 
@@ -5657,12 +5668,7 @@ impl Database {
                 1.0
             };
             let confidence = e.confidence.unwrap_or(0.5);
-            let type_priority = match e.edge_type {
-                EdgeType::Contradicts | EdgeType::Flags => 1.0,
-                EdgeType::DerivesFrom | EdgeType::Summarizes | EdgeType::Resolves | EdgeType::Supersedes => 0.7,
-                EdgeType::Supports | EdgeType::Questions | EdgeType::Prerequisite | EdgeType::EvolvedFrom => 0.5,
-                _ => 0.3,
-            };
+            let type_priority = Self::edge_type_priority(&e.edge_type);
             let score = 0.3 * recency + 0.3 * confidence + 0.4 * type_priority;
             (score, e)
         }).collect();
@@ -5671,6 +5677,178 @@ impl Database {
         scored.truncate(top_n);
 
         Ok(scored.into_iter().map(|(_, e)| e).collect())
+    }
+
+    /// Dijkstra context retrieval: find the N most relevant nodes by weighted
+    /// graph proximity from a starting node. Edge cost = (1 - confidence) * (1 - 0.5 * type_priority).
+    /// High confidence + important edge type = low cost = preferred path.
+    pub fn context_for_task(
+        &self,
+        source_id: &str,
+        budget: usize,
+        max_hops: Option<usize>,
+        max_cost: Option<f64>,
+        edge_types: Option<&[&str]>,
+        not_superseded: bool,
+        items_only: bool,
+    ) -> Result<Vec<ContextNode>> {
+        use std::collections::{BinaryHeap, HashMap, HashSet};
+
+        let max_h = max_hops.unwrap_or(6);
+        let max_c = max_cost.unwrap_or(3.0);
+
+        // Min-heap entry (smallest distance pops first)
+        struct Entry {
+            distance: f64,
+            node_id: String,
+            hops: usize,
+        }
+        impl PartialEq for Entry {
+            fn eq(&self, other: &Self) -> bool {
+                self.distance.total_cmp(&other.distance) == std::cmp::Ordering::Equal
+            }
+        }
+        impl Eq for Entry {}
+        impl PartialOrd for Entry {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for Entry {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                // Reversed: smaller distance = higher priority
+                other.distance.total_cmp(&self.distance)
+            }
+        }
+
+        let mut dist: HashMap<String, f64> = HashMap::new();
+        let mut prev: HashMap<String, (String, Edge)> = HashMap::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut heap: BinaryHeap<Entry> = BinaryHeap::new();
+        let mut results: Vec<ContextNode> = Vec::new();
+
+        dist.insert(source_id.to_string(), 0.0);
+        heap.push(Entry { distance: 0.0, node_id: source_id.to_string(), hops: 0 });
+
+        while let Some(entry) = heap.pop() {
+            let current = entry.node_id;
+            let current_dist = entry.distance;
+            let current_hops = entry.hops;
+
+            if visited.contains(&current) {
+                continue;
+            }
+            visited.insert(current.clone());
+
+            // Collect this node (skip the source itself)
+            if current != source_id {
+                if let Some(n) = self.get_node(&current)? {
+                    // items_only: skip categories from results but still traverse through them
+                    if !items_only || n.is_item {
+                        let path = Self::reconstruct_path(&prev, source_id, &current, self)?;
+                        results.push(ContextNode {
+                            rank: 0,
+                            node_id: current.clone(),
+                            node_title: n.ai_title.unwrap_or(n.title),
+                            distance: current_dist,
+                            relevance: 1.0 / (1.0 + current_dist),
+                            hops: current_hops,
+                            path,
+                            node_class: n.node_class,
+                            is_item: n.is_item,
+                        });
+                        if results.len() >= budget {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Stop expanding if max hops reached
+            if current_hops >= max_h {
+                continue;
+            }
+
+            // Expand neighbors
+            let edges = self.get_edges_for_node(&current)?;
+
+            for edge in edges {
+                if not_superseded && edge.superseded_by.is_some() {
+                    continue;
+                }
+
+                if let Some(types) = edge_types {
+                    if !types.contains(&edge.edge_type.as_str()) {
+                        continue;
+                    }
+                }
+
+                let neighbor = if edge.source == current {
+                    &edge.target
+                } else {
+                    &edge.source
+                };
+
+                if visited.contains(neighbor.as_str()) {
+                    continue;
+                }
+
+                let confidence = edge.confidence.unwrap_or(0.5);
+                let type_priority = Self::edge_type_priority(&edge.edge_type);
+                let edge_cost = ((1.0 - confidence) * (1.0 - 0.5 * type_priority)).max(0.001);
+
+                let new_dist = current_dist + edge_cost;
+
+                if new_dist > max_c {
+                    continue;
+                }
+
+                if new_dist < *dist.get(neighbor.as_str()).unwrap_or(&f64::INFINITY) {
+                    dist.insert(neighbor.clone(), new_dist);
+                    prev.insert(neighbor.clone(), (current.clone(), edge.clone()));
+                    heap.push(Entry {
+                        distance: new_dist,
+                        node_id: neighbor.clone(),
+                        hops: current_hops + 1,
+                    });
+                }
+            }
+        }
+
+        // Assign ranks
+        for (i, node) in results.iter_mut().enumerate() {
+            node.rank = i + 1;
+        }
+
+        Ok(results)
+    }
+
+    /// Reconstruct path from Dijkstra's prev map
+    fn reconstruct_path(
+        prev: &std::collections::HashMap<String, (String, Edge)>,
+        source: &str,
+        target: &str,
+        db: &Database,
+    ) -> Result<Vec<PathHop>> {
+        let mut path = Vec::new();
+        let mut current = target.to_string();
+        while current != source {
+            if let Some((prev_node, edge)) = prev.get(&current) {
+                let node_title = db.get_node(&current)?
+                    .map(|n| n.ai_title.unwrap_or(n.title))
+                    .unwrap_or_else(|| current[..8.min(current.len())].to_string());
+                path.push(PathHop {
+                    edge: edge.clone(),
+                    node_id: current.clone(),
+                    node_title,
+                });
+                current = prev_node.clone();
+            } else {
+                break;
+            }
+        }
+        path.reverse();
+        Ok(path)
     }
 
     /// Find all simple paths between two nodes via DFS with per-path visited set.

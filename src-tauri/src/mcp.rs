@@ -101,7 +101,7 @@ impl AgentRole {
     }
 }
 
-const READ_TOOLS: [&str; 14] = [
+const READ_TOOLS: [&str; 15] = [
     "mycelica_search",
     "mycelica_node_get",
     "mycelica_read_content",
@@ -112,6 +112,7 @@ const READ_TOOLS: [&str; 14] = [
     "mycelica_explain_edge",
     "mycelica_path_between",
     "mycelica_edges_for_context",
+    "mycelica_context_for_task",
     "mycelica_list_region",
     "mycelica_check_freshness",
     "mycelica_status",
@@ -196,6 +197,24 @@ struct EdgesForContextParams {
     top: Option<usize>,
     /// If true, exclude superseded edges
     not_superseded: Option<bool>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ContextForTaskParams {
+    /// Starting node ID, prefix, or title
+    id: String,
+    /// Maximum number of context nodes to return (default: 20)
+    budget: Option<usize>,
+    /// Maximum hops from source (default: 6)
+    max_hops: Option<usize>,
+    /// Maximum cumulative path cost (default: 3.0)
+    max_cost: Option<f64>,
+    /// Comma-separated edge types to follow
+    edge_types: Option<String>,
+    /// If true, exclude superseded edges
+    not_superseded: Option<bool>,
+    /// If true, only return item nodes (skip categories)
+    items_only: Option<bool>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -721,6 +740,62 @@ impl Tools {
             "node": node.id,
             "edges": slim,
             "count": slim.len(),
+        })))
+    }
+
+    #[tool(description = "Dijkstra context retrieval: find the N most relevant nodes by weighted graph proximity from a starting node. Uses edge confidence and type priority as weights. Returns nodes sorted by relevance — the graph's attention mechanism.")]
+    async fn mycelica_context_for_task(
+        &self,
+        Parameters(p): Parameters<ContextForTaskParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let node = match self.resolve(&p.id) {
+            Ok(n) => n,
+            Err(msg) => return Ok(Self::tool_error(msg)),
+        };
+        let budget = p.budget.unwrap_or(20);
+        let not_superseded = p.not_superseded.unwrap_or(false);
+        let items_only = p.items_only.unwrap_or(false);
+
+        let type_list: Option<Vec<String>> = p.edge_types.map(|s|
+            s.split(',').map(|t| t.trim().to_string()).collect()
+        );
+        let type_refs: Option<Vec<&str>> = type_list.as_ref()
+            .map(|v| v.iter().map(|s| s.as_str()).collect());
+
+        let results = match self.db.context_for_task(
+            &node.id, budget, p.max_hops, p.max_cost,
+            type_refs.as_deref(), not_superseded, items_only,
+        ) {
+            Ok(r) => r,
+            Err(e) => return Ok(Self::tool_error(format!("Context retrieval failed: {}", e))),
+        };
+
+        // Slim output: node info + path with slim edges
+        let slim_results: Vec<serde_json::Value> = results.iter().map(|r| {
+            let slim_path: Vec<serde_json::Value> = r.path.iter().map(|hop| {
+                serde_json::json!({
+                    "node_id": hop.node_id,
+                    "node_title": hop.node_title,
+                    "edge": SlimEdge::from(&hop.edge),
+                })
+            }).collect();
+            serde_json::json!({
+                "rank": r.rank,
+                "node_id": r.node_id,
+                "node_title": r.node_title,
+                "distance": r.distance,
+                "relevance": r.relevance,
+                "hops": r.hops,
+                "node_class": r.node_class,
+                "is_item": r.is_item,
+                "path": slim_path,
+            })
+        }).collect();
+
+        Ok(Self::tool_ok(&serde_json::json!({
+            "source": node.id,
+            "results": slim_results,
+            "count": slim_results.len(),
         })))
     }
 

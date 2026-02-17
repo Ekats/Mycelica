@@ -654,6 +654,29 @@ enum SporeCommands {
         #[arg(long, short)]
         verbose: bool,
     },
+    /// Dijkstra context retrieval: find the N most relevant nodes by weighted graph proximity
+    ContextForTask {
+        /// Starting node (ID prefix, UUID, or title substring)
+        id: String,
+        /// Maximum number of context nodes to return
+        #[arg(long, default_value = "20")]
+        budget: usize,
+        /// Maximum number of hops from source
+        #[arg(long, default_value = "6")]
+        max_hops: usize,
+        /// Maximum cumulative path cost (lower = stricter)
+        #[arg(long, default_value = "3.0")]
+        max_cost: f64,
+        /// Comma-separated edge types to follow (e.g. "supports,derives_from,calls")
+        #[arg(long = "edge-types")]
+        edge_types: Option<String>,
+        /// Exclude superseded edges
+        #[arg(long)]
+        not_superseded: bool,
+        /// Only include item nodes in results (categories still traversed)
+        #[arg(long)]
+        items_only: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -7265,6 +7288,56 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
 
         SporeCommands::Orchestrate { task, max_bounces, max_turns, coder_prompt, verifier_prompt, dry_run, verbose } => {
             handle_orchestrate(db, &task, max_bounces, max_turns, &coder_prompt, &verifier_prompt, dry_run, verbose).await
+        }
+
+        SporeCommands::ContextForTask { id, budget, max_hops, max_cost, edge_types, not_superseded, items_only } => {
+            let source = resolve_node(db, &id)?;
+
+            let type_list: Option<Vec<String>> = edge_types.map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
+            let type_refs: Option<Vec<&str>> = type_list.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+
+            let results = db.context_for_task(
+                &source.id, budget, Some(max_hops), Some(max_cost),
+                type_refs.as_deref(), not_superseded, items_only,
+            ).map_err(|e| e.to_string())?;
+
+            if json {
+                let output = serde_json::json!({
+                    "source": {
+                        "id": source.id,
+                        "title": source.ai_title.as_ref().unwrap_or(&source.title),
+                    },
+                    "budget": budget,
+                    "results": results,
+                    "count": results.len(),
+                });
+                println!("{}", serde_json::to_string(&output).unwrap_or_default());
+            } else {
+                let src_name = source.ai_title.as_ref().unwrap_or(&source.title);
+                if results.is_empty() {
+                    println!("No context nodes found for: {}", src_name);
+                } else {
+                    println!("Context for: {} ({})  budget={}\n",
+                        src_name, &source.id[..8.min(source.id.len())], budget);
+                    for r in &results {
+                        let class_label = r.node_class.as_deref().map(|c| format!(" [{}]", c)).unwrap_or_default();
+                        let marker = if r.is_item { "[I]" } else { "[C]" };
+                        println!("  {:>2}. {} {}{} — dist={:.3} rel={:.0}% hops={}",
+                            r.rank, marker, r.node_title, class_label,
+                            r.distance, r.relevance * 100.0, r.hops);
+                        if !r.path.is_empty() {
+                            let path_str: Vec<String> = r.path.iter()
+                                .map(|hop| format!("→[{}]→ {}",
+                                    hop.edge.edge_type.as_str(),
+                                    &hop.node_title[..hop.node_title.len().min(40)]))
+                                .collect();
+                            println!("      {}", path_str.join(" "));
+                        }
+                    }
+                    println!("\n{} node(s) within budget", results.len());
+                }
+            }
+            Ok(())
         }
     }
 }
