@@ -5833,6 +5833,45 @@ impl Database {
         Ok(results)
     }
 
+    /// Preview a rollback: return (edges, nodes) that would be deleted without deleting anything.
+    pub fn preview_rollback_run(&self, run_id: &str, include_nodes: bool) -> Result<(Vec<Edge>, Vec<Node>)> {
+        let conn = self.conn.lock().unwrap();
+
+        let edges = {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {} FROM edges WHERE json_extract(metadata, '$.run_id') = ?1",
+                Self::EDGE_COLUMNS
+            ))?;
+            let rows = stmt.query_map(params![run_id], |row| Self::row_to_edge(row))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        let mut nodes = Vec::new();
+        if include_nodes && !edges.is_empty() {
+            let (min_time, max_time, agents): (i64, i64, String) = conn.query_row(
+                "SELECT MIN(created_at), MAX(created_at), GROUP_CONCAT(DISTINCT agent_id) \
+                 FROM edges WHERE json_extract(metadata, '$.run_id') = ?1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, Option<String>>(2)?.unwrap_or_default())),
+            )?;
+
+            for agent in agents.split(',') {
+                let agent = agent.trim();
+                if agent.is_empty() { continue; }
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {} FROM nodes WHERE agent_id = ?1 AND created_at BETWEEN ?2 AND ?3 AND node_class = 'operational'",
+                    Self::NODE_COLUMNS
+                ))?;
+                let rows = stmt.query_map(params![agent, min_time, max_time], |row| Self::row_to_node(row))?;
+                for r in rows {
+                    nodes.push(r?);
+                }
+            }
+        }
+
+        Ok((edges, nodes))
+    }
+
     /// Rollback a run: delete edges (and optionally operational nodes) created during the run.
     /// Returns (edges_deleted, nodes_deleted).
     pub fn rollback_run(&self, run_id: &str, delete_nodes: bool) -> Result<(usize, usize)> {

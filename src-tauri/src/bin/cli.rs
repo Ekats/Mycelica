@@ -684,6 +684,9 @@ enum RunCommands {
         /// Skip confirmation prompt
         #[arg(long)]
         force: bool,
+        /// Show what would be deleted without deleting
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -7330,7 +7333,67 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
             Ok(())
         }
 
-        RunCommands::Rollback { run_id, delete_nodes, force } => {
+        RunCommands::Rollback { run_id, delete_nodes, force, dry_run } => {
+            if dry_run {
+                let (edges, nodes) = db.preview_rollback_run(&run_id, delete_nodes)
+                    .map_err(|e| format!("Failed to preview rollback: {}", e))?;
+
+                if json {
+                    let obj = serde_json::json!({
+                        "runId": run_id,
+                        "dryRun": true,
+                        "edgesCount": edges.len(),
+                        "nodesCount": nodes.len(),
+                        "edges": edges,
+                        "nodes": nodes.iter().map(|n| serde_json::json!({
+                            "id": n.id,
+                            "title": n.title,
+                            "nodeClass": n.node_class,
+                            "agentId": n.agent_id,
+                        })).collect::<Vec<_>>(),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&obj).unwrap_or_default());
+                } else if edges.is_empty() {
+                    println!("No edges found for run: {}", run_id);
+                } else {
+                    println!("[dry-run] Run: {}", run_id);
+                    println!("\nEdges that would be deleted ({}):", edges.len());
+                    for e in &edges {
+                        let created = chrono::DateTime::from_timestamp_millis(e.created_at)
+                            .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+                            .unwrap_or_else(|| "?".to_string());
+                        println!("  {} {:?} {} -> {} [{}]",
+                            &e.id[..8.min(e.id.len())],
+                            e.edge_type,
+                            &e.source[..8.min(e.source.len())],
+                            &e.target[..8.min(e.target.len())],
+                            created,
+                        );
+                        if let Some(ref reason) = e.reason {
+                            println!("    reason: {}", reason);
+                        }
+                    }
+                    if delete_nodes {
+                        if nodes.is_empty() {
+                            println!("\nNo operational nodes would be deleted.");
+                        } else {
+                            println!("\nNodes that would be deleted ({}):", nodes.len());
+                            for n in &nodes {
+                                println!("  {} {}",
+                                    &n.id[..8.min(n.id.len())],
+                                    n.title,
+                                );
+                                if let Some(ref agent) = n.agent_id {
+                                    println!("    agent: {}", agent);
+                                }
+                            }
+                        }
+                    }
+                    println!("\nNo changes made. Remove --dry-run and use --force to execute.");
+                }
+                return Ok(());
+            }
+
             // Show what will be deleted first
             let edges = db.get_run_edges(&run_id)
                 .map_err(|e| format!("Failed to get run edges: {}", e))?;
@@ -7344,7 +7407,7 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                 if delete_nodes {
                     println!("Will also delete operational nodes created during this run.");
                 }
-                println!("Use --force to confirm.");
+                println!("Use --force to confirm, or --dry-run to preview details.");
                 return Ok(());
             }
 
