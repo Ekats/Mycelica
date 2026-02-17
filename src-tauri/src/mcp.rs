@@ -1,5 +1,5 @@
 //! MCP (Model Context Protocol) server for Mycelica knowledge graph.
-//! Provides 16 tools for agent coordination: 12 read + 4 write.
+//! Provides 18 tools for agent coordination: 14 read + 4 write.
 //! Launch: `mycelica-cli mcp-server --stdio --agent-role <role> --agent-id <id>`
 //!
 //! ## rmcp v0.15 Parameters<T> gotcha
@@ -101,10 +101,12 @@ impl AgentRole {
     }
 }
 
-const READ_TOOLS: [&str; 12] = [
+const READ_TOOLS: [&str; 14] = [
     "mycelica_search",
     "mycelica_node_get",
     "mycelica_read_content",
+    "mycelica_code_show",
+    "mycelica_nav_folder",
     "mycelica_nav_edges",
     "mycelica_query_edges",
     "mycelica_explain_edge",
@@ -264,6 +266,18 @@ struct UpdateMetaParams {
     add_connects: Option<Vec<String>>,
     /// Edge type for new connections (default: "summarizes")
     edge_type: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct CodeShowParams {
+    /// Node ID, ID prefix, or title text
+    id: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct NavFolderParams {
+    /// Relative directory path (e.g. "src-tauri/src/db/")
+    path: String,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -827,6 +841,148 @@ impl Tools {
             "items": items,
             "categories": categories,
             "total_edges": total_edges,
+        })))
+    }
+
+    #[tool(description = "Show the actual source code for a code node (function, struct, enum, etc).")]
+    async fn mycelica_code_show(
+        &self,
+        Parameters(p): Parameters<CodeShowParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let node = match self.resolve(&p.id) {
+            Ok(n) => n,
+            Err(msg) => return Ok(Self::tool_error(msg)),
+        };
+        if self.should_filter_node(&node) {
+            return Ok(Self::tool_error("Node filtered by role permissions"));
+        }
+
+        // Check if this is a code node
+        let is_code = node.content_type.as_ref()
+            .map(|ct| ct.starts_with("code_"))
+            .unwrap_or(false);
+        if !is_code {
+            return Ok(Self::tool_error(format!(
+                "Node '{}' is not a code node (content_type: {:?}). Use node_get instead.",
+                node.title, node.content_type
+            )));
+        }
+
+        let tags = match node.tags.as_ref() {
+            Some(t) if !t.trim().starts_with('[') => t,
+            _ => return Ok(Self::tool_error("Code node has no source location metadata in tags")),
+        };
+
+        #[derive(serde::Deserialize)]
+        struct CodeMeta {
+            file_path: String,
+            #[serde(default)]
+            line_start: Option<usize>,
+            #[serde(default)]
+            line_end: Option<usize>,
+        }
+
+        let meta: CodeMeta = match serde_json::from_str(tags) {
+            Ok(m) => m,
+            Err(e) => return Ok(Self::tool_error(format!("Failed to parse code metadata: {}", e))),
+        };
+
+        // Resolve relative path from database directory
+        let db_dir = std::path::Path::new(&self.db.get_path())
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+        let file_path = {
+            let p = std::path::PathBuf::from(&meta.file_path);
+            if p.is_relative() { db_dir.join(&p) } else { p }
+        };
+
+        let file_content = match std::fs::read_to_string(&file_path) {
+            Ok(c) => c,
+            Err(e) => return Ok(Self::tool_error(format!("Failed to read '{}': {}", file_path.display(), e))),
+        };
+
+        let lines: Vec<&str> = file_content.lines().collect();
+        let start = meta.line_start.unwrap_or(1).max(1);
+        let end = meta.line_end.unwrap_or(lines.len()).min(lines.len());
+
+        if start > lines.len() {
+            return Ok(Self::tool_error(format!("line_start {} exceeds file length {}", start, lines.len())));
+        }
+
+        let code_lines = &lines[start - 1..end];
+        let mut output = format!("{}:{}-{}\n", meta.file_path, start, end);
+        for (i, line) in code_lines.iter().enumerate() {
+            output.push_str(&format!("{:4} | {}\n", start + i, line));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    #[tool(description = "List files and code nodes in a directory path.")]
+    async fn mycelica_nav_folder(
+        &self,
+        Parameters(p): Parameters<NavFolderParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let items = match self.db.get_items() {
+            Ok(i) => i,
+            Err(e) => return Ok(Self::tool_error(format!("Failed to get items: {}", e))),
+        };
+
+        #[derive(serde::Deserialize)]
+        struct CodeMeta {
+            file_path: Option<String>,
+        }
+
+        // Collect code nodes matching the path filter
+        let path_filter = p.path.trim_end_matches('/');
+
+        use std::collections::BTreeMap;
+        let mut by_file: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+
+        for node in &items {
+            let is_code = node.source.as_ref()
+                .map(|s| s.starts_with("code-"))
+                .unwrap_or(false);
+            if !is_code { continue; }
+
+            let file_path = node.tags.as_ref()
+                .and_then(|t| serde_json::from_str::<CodeMeta>(t).ok())
+                .and_then(|m| m.file_path)
+                .unwrap_or_default();
+
+            if file_path.is_empty() { continue; }
+            if !file_path.starts_with(path_filter) { continue; }
+
+            by_file.entry(file_path).or_default().push(serde_json::json!({
+                "id": &node.id[..8.min(node.id.len())],
+                "title": node.title,
+                "content_type": node.content_type,
+            }));
+        }
+
+        if by_file.is_empty() {
+            return Ok(Self::tool_ok(&serde_json::json!({
+                "path": path_filter,
+                "files": 0,
+                "items": 0,
+                "message": "No code nodes found for this path",
+            })));
+        }
+
+        let total_items: usize = by_file.values().map(|v| v.len()).sum();
+        let result: Vec<serde_json::Value> = by_file.into_iter()
+            .map(|(file, nodes)| serde_json::json!({
+                "file": file,
+                "nodes": nodes,
+            }))
+            .collect();
+
+        Ok(Self::tool_ok(&serde_json::json!({
+            "path": path_filter,
+            "files": result.len(),
+            "items": total_items,
+            "results": result,
         })))
     }
 

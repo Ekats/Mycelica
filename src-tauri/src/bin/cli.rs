@@ -483,7 +483,7 @@ enum SporeCommands {
         /// Minimum confidence threshold (0.0-1.0)
         #[arg(long)]
         confidence_min: Option<f64>,
-        /// Only edges created after this date (YYYY-MM-DD)
+        /// Only edges created after this date (YYYY-MM-DD or relative: 1h, 2d, 1w)
         #[arg(long)]
         since: Option<String>,
         /// Exclude superseded edges
@@ -663,7 +663,7 @@ enum RunCommands {
         /// Filter by agent ID
         #[arg(long)]
         agent: Option<String>,
-        /// Only runs since this date (YYYY-MM-DD)
+        /// Only runs since this date (YYYY-MM-DD or relative: 1h, 2d, 1w)
         #[arg(long)]
         since: Option<String>,
         /// Maximum results
@@ -6565,15 +6565,9 @@ fn handle_migrate(cmd: MigrateCommands, db: &Database, _db_path: &Path, json: bo
 async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(), String> {
     match cmd {
         SporeCommands::QueryEdges { edge_type, agent, target_agent, confidence_min, since, not_superseded, limit, compact } => {
-            // Parse --since date string to epoch millis
-            let since_millis = if let Some(ref date_str) = since {
-                let date = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
-                    .map_err(|e| format!("Invalid date '{}': {}. Use YYYY-MM-DD format.", date_str, e))?;
-                let dt = date.and_hms_opt(0, 0, 0).unwrap();
-                Some(dt.and_utc().timestamp_millis())
-            } else {
-                None
-            };
+            let since_millis = since.as_deref()
+                .map(parse_since_to_millis)
+                .transpose()?;
 
             let results = db.query_edges(
                 edge_type.as_deref(),
@@ -7272,17 +7266,43 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
     }
 }
 
+/// Parse a --since value as either an ISO date (YYYY-MM-DD) or a relative duration (e.g. 30m, 1h, 2d, 1w).
+/// Returns epoch milliseconds.
+fn parse_since_to_millis(s: &str) -> Result<i64, String> {
+    // Try relative duration first: number + unit suffix
+    let s_trimmed = s.trim();
+    if let Some((num_str, unit)) = s_trimmed
+        .strip_suffix('m')
+        .map(|n| (n, 'm'))
+        .or_else(|| s_trimmed.strip_suffix('h').map(|n| (n, 'h')))
+        .or_else(|| s_trimmed.strip_suffix('d').map(|n| (n, 'd')))
+        .or_else(|| s_trimmed.strip_suffix('w').map(|n| (n, 'w')))
+    {
+        if let Ok(num) = num_str.parse::<u64>() {
+            let seconds = match unit {
+                'm' => num * 60,
+                'h' => num * 3600,
+                'd' => num * 86400,
+                'w' => num * 604800,
+                _ => unreachable!(),
+            };
+            let now = chrono::Utc::now().timestamp_millis();
+            return Ok(now - (seconds as i64 * 1000));
+        }
+    }
+    // Fall back to ISO date
+    let date = chrono::NaiveDate::parse_from_str(s_trimmed, "%Y-%m-%d")
+        .map_err(|e| format!("Invalid --since '{}': {}. Use YYYY-MM-DD or relative (1h, 2d, 1w).", s, e))?;
+    let dt = date.and_hms_opt(0, 0, 0).unwrap();
+    Ok(dt.and_utc().timestamp_millis())
+}
+
 fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String> {
     match cmd {
         RunCommands::List { agent, since, limit } => {
-            let since_millis = if let Some(ref date_str) = since {
-                let date = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
-                    .map_err(|e| format!("Invalid date '{}': {}. Use YYYY-MM-DD format.", date_str, e))?;
-                let dt = date.and_hms_opt(0, 0, 0).unwrap();
-                Some(dt.and_utc().timestamp_millis())
-            } else {
-                None
-            };
+            let since_millis = since.as_deref()
+                .map(parse_since_to_millis)
+                .transpose()?;
             let runs = db.list_runs(agent.as_deref(), since_millis, limit)
                 .map_err(|e| format!("Failed to list runs: {}", e))?;
 
@@ -7509,6 +7529,7 @@ fn spawn_claude(
     verbose: bool,
     role: &str,
     allowed_tools: Option<&str>,
+    disallowed_tools: Option<&str>,
 ) -> Result<ClaudeResult, String> {
     use std::process::{Command, Stdio};
 
@@ -7527,6 +7548,9 @@ fn spawn_claude(
 
     if let Some(tools) = allowed_tools {
         cmd.arg("--allowedTools").arg(tools);
+    }
+    if let Some(tools) = disallowed_tools {
+        cmd.arg("--disallowedTools").arg(tools);
     }
 
     let mut child = cmd
@@ -8019,6 +8043,7 @@ async fn handle_orchestrate(
         let coder_result = spawn_claude(
             &coder_prompt, &coder_mcp, max_turns, verbose, "coder",
             Some("Read,Write,Edit,Bash(*),mcp__mycelica__*"),
+            Some("Grep,Glob"),
         )?;
 
         if !coder_result.success {
@@ -8076,6 +8101,7 @@ async fn handle_orchestrate(
         let verifier_result = spawn_claude(
             &verifier_prompt, &verifier_mcp, max_turns, verbose, "verifier",
             Some("Read,Grep,Glob,Bash(cargo:*),Bash(cd:*),Bash(mycelica-cli:*),mcp__mycelica__*"),
+            None,
         )?;
 
         if !verifier_result.success {
