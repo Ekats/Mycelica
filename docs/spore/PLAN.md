@@ -133,23 +133,24 @@ Compares `updated_at` timestamps between summary and source nodes. Reports STALE
 
 ---
 
-## Phase 4: MCP Server
+## Phase 4: MCP Server ✅ COMPLETE
 
-**Goal:** Wrap mycelica-cli as an MCP server so Enterprise agents call graph operations as structured tools.
-
-**Gate: PASSED.** Single-agent test proved the commands produce useful output.
+Committed Feb 17, 2026. ~1370 lines in `src-tauri/src/mcp.rs`. Feature-gated behind `--features mcp`.
 
 ### 4a. Implementation
 
-- Use `rmcp` crate (v0.15, pin exact version) with stdio transport
-- New module: `src-tauri/src/mcp.rs` or subcommand in cli.rs
+- Use `rmcp` crate (v0.15) with stdio transport
+- New module: `src-tauri/src/mcp.rs`, feature-gated behind `mcp`
 - Launch: `mycelica-cli mcp-server --stdio --agent-role <role> --agent-id <id>`
 - Per-agent permission scoping — server only registers tools permitted for role
 - Agent ID injection — server stamps `--agent-id` on all writes automatically
-- Compound operations wrapped in SQLite transactions (`BEGIN IMMEDIATE`/`COMMIT`)
+- Compound operations wrapped in SQLite transactions
 - All responses as structured JSON
+- `Parameters<T>` wrapper required for rmcp v0.15 tool parameter extraction (Axum-style extractor pattern)
+- SQL aggregate queries for status/stats (no full-table scans)
+- SlimNode/SlimEdge output structs to minimize token usage in LLM context windows
 
-### 4b. MCP tools
+### 4b. MCP tools (16 total: 12 read + 4 write)
 
 **Read tools (all agents):**
 
@@ -164,45 +165,60 @@ Compares `updated_at` timestamps between summary and source nodes. Reports STALE
 | `mycelica_path_between` | `spore path-between <a> <b>` |
 | `mycelica_edges_for_context` | `spore edges-for-context <id>` |
 | `mycelica_list_region` | `spore list-region <category-id>` |
-| `mycelica_meta_list` | `spore status --json` |
+| `mycelica_check_freshness` | `spore check-freshness <id>` |
+| `mycelica_status` | `spore status --json` |
 | `mycelica_db_stats` | `db stats --json` |
 
 **Write tools (scoped per role):**
 
 | MCP Tool | Maps To |
 |----------|---------|
-| `mycelica_node_create` | `node create [params]` |
+| `mycelica_create_node` | Node creation with class and optional connections |
 | `mycelica_create_edge` | `spore create-edge [params]` |
-| `mycelica_supersede_edge` | `link --supersedes [params]` |
-| `mycelica_meta_create` | `spore create-meta [params]` |
-| `mycelica_meta_update` | `spore update-meta [params]` |
-| `mycelica_import_code` | `import code <path> --update` |
-| `mycelica_link` | `link [params]` |
+| `mycelica_create_meta` | `spore create-meta [params]` |
+| `mycelica_update_meta` | `spore update-meta [params]` (supersession-based) |
 
 ### 4c. Permission matrix
 
 | Tool Category  | Ingestor | Coder | Verifier | Planner | Synthesizer | Summarizer | DocWriter | Human |
 |----------------|----------|-------|----------|---------|-------------|------------|-----------|-------|
 | Read (all)     | ✓        | ✓     | ✓        | ✓       | ✓           | ✓ (no meta)| ✓         | ✓     |
-| Node create    | ✓        | ✓ (op)| ✓ (op)   | ✓ (op)  |             | ✓ (meta)   |           | ✓     |
-| Edge create    | ✓        | ✓     | ✓        | ✓       | ✓           | ✓          |           | ✓     |
-| Edge supersede |          |       |          |         | ✓           |            |           | ✓     |
-| Meta create    |          |       |          | ✓ (plan)|             | ✓          |           | ✓     |
+| Node create    | ✓        | ✓     | ✓        | ✓       |             |            |           | ✓     |
+| Edge create    | ✓        | ✓     | ✓        | ✓       | ✓           | ✓          | ✓         | ✓     |
+| Meta create    |          |       |          | ✓       |             | ✓          |           | ✓     |
 | Meta update    |          |       |          |         |             | ✓          |           | ✓     |
-| Import         | ✓        |       |          |         |             |            |           | ✓     |
-| File write     |          | ✓     |          |         |             |            | ✓         | ✓     |
-| Bash/test      |          | ✓     | ✓        |         |             |            |           | ✓     |
-| Maintenance    |          |       |          |         |             |            |           | ✓     |
 
-Summarizer's read tools automatically append `WHERE node_class != 'meta'` (recursion guard).
+Summarizer's read tools apply recursion guard: filter meta nodes from results (except contradictions).
+Synthesizer's read tools apply recursion guard: only knowledge/operational items.
 
-### Effort: 6-8 hours
+### Smoke tests passed:
+- initialize → valid JSON-RPC response
+- tools/list → all 16 tools with JSON Schema input schemas
+- tools/call → structured JSON responses
+- Permission filtering → role-specific tool visibility
+- Permission denial → clear error on unauthorized tool calls
+
+### Effort: ~3 hours (including SQL aggregate optimization)
 
 ---
 
-## Phase 5: Agent Definitions
+## Phase 5: Agent Definitions — IN PROGRESS
 
-**Goal:** Define 7 agent roles with system prompts, MCP tool access, and interaction patterns.
+**Goal:** Define agent roles with system prompts, MCP configs, and interaction patterns. Starting with Coder + Verifier only (Concern #10).
+
+### Two-layer agent context model
+
+Agent knowledge exists on two layers:
+
+**Bootstrap layer (`.md` files, static):** Identity, MCP tool list, hard rules, workflow instructions. The minimum an agent needs to connect and start working. Checked into the repo, rarely changes. This is what the agent reads before it can use the graph.
+
+**Runtime context layer (graph nodes, evolves):** Current priorities, project-specific conventions, learned patterns from past bounces, role-specific knowledge accumulated over time. The agent reads these via MCP tools after connecting.
+
+The flow: agent reads `coder.md` (bootstrap) → connects to MCP → calls `mycelica_search("spore:coder context")` → reads runtime context nodes → starts working.
+
+The runtime layer is where agents learn over time. The Summarizer writes "lessons learned" nodes from bounce trails. The Coder reads those next session and avoids repeating mistakes. The graph teaches agents — their instructions evolve without editing `.md` files.
+
+**Bootstrap stays as files because of the chicken-and-egg problem:** the agent needs instructions to know how to use the graph, but those instructions would be in the graph. Static `.md` files break the cycle.
 
 ### Interaction model: bouncing, not pipeline
 
@@ -291,7 +307,24 @@ Recursion guard: `WHERE node_class != 'meta' OR (node_class = 'meta' AND meta_ty
 
 Reads meta-nodes first (high-level state), drills into knowledge layer for details. Validates own output against graph after writing. Flags uncertainty.
 
-### Effort: 1-2 days per agent for system prompts + testing. Start with Coder+Verifier (tightest feedback loop, most testable).
+### Files created (Coder + Verifier only):
+
+| File | Purpose |
+|------|---------|
+| `docs/spore/agents/coder.md` | Coder bootstrap prompt |
+| `docs/spore/agents/verifier.md` | Verifier bootstrap prompt |
+| `docs/spore/agents/mcp-coder.json` | MCP config with `--agent-role coder` |
+| `docs/spore/agents/mcp-verifier.json` | MCP config with `--agent-role verifier` |
+| `docs/spore/agents/README.md` | Launch guide + validation test |
+
+### Lessons from Phase 5 testing:
+
+1. **`--features mcp` must be in install command** — agent ran `cargo install` without it, overwrote MCP-enabled binary. Fixed in CLAUDE.md.
+2. **Graph recording is optional unless enforced** — agents skip "after coding" steps unless rules are emphatic. Fixed: moved graph recording to hard rules with "your work does not exist until recorded."
+3. **Agents default to CLI over MCP tools** — agents use `mycelica-cli` via bash instead of MCP tools unless explicitly told not to. Fixed: rule that MCP tools are mandatory for all graph operations.
+4. **Full path required in MCP config** — Claude Code doesn't inherit shell PATH. Must use full absolute path (e.g. `~/.cargo/bin/mycelica-cli`) not bare `mycelica-cli`.
+
+### Effort: 1-2 days for Coder + Verifier. Remaining agents after bounce loop validates.
 
 ---
 
@@ -354,6 +387,65 @@ New `content_type = 'escalation'` for unresolved bounces. After 3 bounces on the
 
 ---
 
+## Phase 8: Neural Pathway Architecture (Future)
+
+**Goal:** Replace fat sessions with thin sessions. The graph becomes the continuity mechanism, not the context window.
+
+### The problem with fat sessions
+
+The current model runs one long Claude session per agent invocation. The session carries the full 130-line system prompt, all graph reads, code edits, build output, test results, and graph writes. By the time the agent reaches "record your work in the graph" at the end, it's consumed 60-80% of its context window. Instructions at the top suffer attention decay. This is the structural root cause of agents skipping graph recording — not a prompt engineering problem, but a cognitive architecture problem.
+
+### Thin sessions as neural firing
+
+Each Claude session does one focused thing, writes a signal to the graph, and dies. The next session reads that signal and continues. The "thought" is the pathway through the graph, not the state of any single session.
+
+```
+Fat session (current):
+  [prompt + task + 15 graph reads + code edit + build + test + graph write]
+   ← instructions lost here                              still working here →
+
+Thin sessions (target):
+  Session 1: read task node → plan approach → record plan node → exit
+  Session 2: read plan node → edit files → record impl node → exit
+  Session 3: read impl node → cargo check → record verdict → exit
+  Session 4: read verdict → fix if needed → record fix node → exit
+```
+
+### The neural analogy
+
+This maps precisely to how brains process information:
+
+- **Context window** = neuron membrane potential (temporary, local, gone after firing)
+- **Graph node** = neuron body (persistent, stores one unit of meaning)
+- **Graph edge** = synapse (carries type, confidence/weight, reasoning)
+- **`supports` edge at 0.95** = strong excitatory synapse
+- **`contradicts` edge** = inhibitory synapse
+- **Summarizer writing meta-nodes** = memory consolidation (short-term distributed activity → long-term structured memory)
+- **Thin session** = single neural firing (action potential)
+- **Graph pathway** = the thought itself (sequence of activations)
+
+A neuron doesn't hold the whole thought. It fires, passes a signal along a synapse, goes quiet. The next neuron fires. Intelligence emerges from the pathway, not from any single activation. Fat sessions try to make one neuron hold an entire thought. It can't.
+
+### What changes
+
+1. **Orchestrator becomes a scheduler:** Instead of "launch agent, wait 5 minutes, check verdict," it fires micro-sessions along graph paths. Each session gets a 20-line prompt with one job.
+2. **`max_turns` drops to 5-10** instead of 50. Sessions are fast and focused.
+3. **Graph recording becomes the entire point** of each session, not a forgotten cleanup step. The session exists to write one node or edge.
+4. **Agent prompts shrink dramatically.** The graph carries the context. The prompt just says "read node X, do Y, write result."
+5. **More sessions, each cheap.** Tradeoff: more startup overhead, but each session never loses instructions to attention decay.
+
+### The Mycelica thesis completes
+
+The graph structure already mirrors neural architecture — nodes are neurons, edges are weighted synapses. What was missing was the activation pattern. Thin sessions firing along graph paths IS neural firing. The orchestrator becomes the action potential propagation mechanism. Spore becomes the brain's executive function, deciding which pathways to activate next.
+
+### Prerequisites
+
+- Phase 6 orchestrator stable and tested
+- Measured startup-overhead per Claude Code invocation (if >10s, thin sessions have a latency cost)
+- Graph path query primitives (follow a chain of edges efficiently)
+
+---
+
 ## Implementation Order
 
 | Order | Phase | Status | Effort |
@@ -361,15 +453,16 @@ New `content_type = 'escalation'` for unresolved bounces. After 3 bounces on the
 | 1 | Phase 1: Schema Evolution | ✅ Complete | ~1h |
 | 2 | Phase 2: Edge CLI Commands | ✅ Complete | ~1h |
 | — | Single-agent validation test | ✅ Passed | Manual |
-| 3 | Phase 3: Test Gap Fixes | **Complete** | Feb 16 2026 |
-| 4 | **Phase 4: MCP Server** | **Next** | Est. 6-8h |
-| 5 | Phase 5: Agent Definitions | Pending Phase 4 | Est. 1-2 days/agent |
-| 6 | Phase 6: Pipeline Orchestration | Pending Phase 5 | Est. 2-3 days |
+| 3 | Phase 3: Test Gap Fixes | ✅ Complete | Feb 16 2026 |
+| 4 | Phase 4: MCP Server | ✅ Complete | ~3h |
+| 5 | Phase 5: Agent Definitions | ✅ Complete | Coder+Verifier validated |
+| 6 | **Phase 6: Pipeline Orchestration** | **Complete** | ~800 lines |
 | 7 | Phase 7: GUI | Deferred | TBD |
+| 8 | Phase 8: Neural Pathways | Future | TBD |
 
-**Critical path:** Gap fixes (`create-edge` + `read-content` are blockers) → MCP server → Coder+Verifier bounce loop (first real multi-agent test) → remaining agents → orchestration.
+**Current state:** Phase 6 orchestrator implemented. `mycelica-cli spore orchestrate "task"` automates the full Coder → Verifier bounce loop with run tracking, escalation, and failure handling. Testing in progress.
 
-**Recommended first multi-agent test:** Coder + Verifier only. Two MCP server instances, same database, small task. Does the bounce loop produce working code with a visible deliberation trail?
+**Next:** Validate orchestrator end-to-end → fix issues → remaining agents (Planner, Summarizer) → thin session experiments.
 
 ---
 
@@ -384,3 +477,4 @@ New `content_type = 'escalation'` for unresolved bounces. After 3 bounces on the
 7. Failed runs identifiable and rollback-able
 8. No duplicate nodes for the same concept
 9. Trust the top layer enough to make decisions from it
+10. (Phase 8) A third party can follow a graph pathway and reconstruct the complete reasoning chain without access to any agent's context window — the graph IS the thought, not a log of it

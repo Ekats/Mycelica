@@ -7659,7 +7659,7 @@ async fn handle_orchestrate(
 
         if !coder_result.success {
             eprintln!("[coder] FAILED (exit code {})", coder_result.exit_code);
-            if verbose && !coder_result.stderr_raw.is_empty() {
+            if !coder_result.stderr_raw.is_empty() {
                 eprintln!("[coder stderr] {}", &coder_result.stderr_raw[..2000.min(coder_result.stderr_raw.len())]);
             }
             // Record failure
@@ -7670,15 +7670,26 @@ async fn handle_orchestrate(
         if let Some(ref sid) = coder_result.session_id {
             println!("[coder] Session: {}", sid);
         }
+        if verbose {
+            if let Some(ref text) = coder_result.result_text {
+                eprintln!("[coder] Result: {}", text);
+            }
+            let truncated = &coder_result.stdout_raw[..2000.min(coder_result.stdout_raw.len())];
+            eprintln!("[coder] Raw output (truncated): {}", truncated);
+        }
 
         // Find coder's output node
         let coder_nodes = db.find_nodes_by_agent_and_time("spore:coder", coder_start)
             .map_err(|e| format!("Failed to query coder nodes: {}", e))?;
 
         if coder_nodes.is_empty() {
-            eprintln!("[coder] WARNING: No operational nodes created. Agent may have crashed before writing to graph.");
+            eprintln!("[coder] WARNING: Coder completed (exit 0) but created no operational nodes.");
+            if let Some(ref text) = coder_result.result_text {
+                eprintln!("[coder] Agent result: {}", text);
+            }
+            eprintln!("[coder] This may mean the feature already exists or the agent skipped graph recording.");
             record_run_status(db, &task_node_id, &coder_run_id, "spore:coder", "incomplete", 0)?;
-            return Err("Coder produced no operational nodes.".to_string());
+            return Err("Coder produced no operational nodes — see agent result above for details.".to_string());
         }
 
         let impl_node = &coder_nodes[0]; // Most recent
@@ -7702,10 +7713,20 @@ async fn handle_orchestrate(
 
         if !verifier_result.success {
             eprintln!("[verifier] FAILED (exit code {})", verifier_result.exit_code);
+            if !verifier_result.stderr_raw.is_empty() {
+                eprintln!("[verifier stderr] {}", &verifier_result.stderr_raw[..2000.min(verifier_result.stderr_raw.len())]);
+            }
             record_run_status(db, &task_node_id, &verifier_run_id, "spore:verifier", "failed", verifier_result.exit_code)?;
             return Err(format!("Verifier failed on bounce {} with exit code {}", bounce + 1, verifier_result.exit_code));
         }
         println!("[verifier] Completed successfully");
+        if verbose {
+            if let Some(ref text) = verifier_result.result_text {
+                eprintln!("[verifier] Result: {}", text);
+            }
+            let truncated = &verifier_result.stdout_raw[..2000.min(verifier_result.stdout_raw.len())];
+            eprintln!("[verifier] Raw output (truncated): {}", truncated);
+        }
         record_run_status(db, &task_node_id, &verifier_run_id, "spore:verifier", "completed", 0)?;
 
         // Check verdict

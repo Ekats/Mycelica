@@ -1,12 +1,12 @@
 # Spore — Architectural Concerns
 
-> Originally flagged during plan review, Feb 13 2026. Updated after Phase 4 (MCP server) shipped.
+> Originally flagged during plan review, Feb 13 2026. Updated after Phase 6 (orchestrator) shipped.
 
 ## Status
 
-Phases 1-4 complete and committed. The full infrastructure exists: typed edges with content/attribution/supersession, meta nodes with transactional creation, query/explain/path/rank commands, status dashboard, and an MCP server with 16 tools, role-based permissions, and recursion guards. Phase 5 (agent definitions) is next — Coder + Verifier pair only.
+Phases 1-6 complete and committed. The full infrastructure exists: typed edges with content/attribution/supersession, meta nodes with transactional creation, query/explain/path/rank commands, status dashboard, MCP server with 16 tools and role-based permissions, agent definitions (Coder + Verifier), and an automated orchestrator (`mycelica-cli spore orchestrate`) with run tracking, escalation, and failure handling. Phase 5 bounce loop validated manually. Phase 6 orchestrator testing in progress.
 
-**Next step: Coder + Verifier bounce loop validation.**
+**14 concerns tracked. 5 resolved, 9 active/future.**
 
 ## Concern 1: The Summarizer is editorial work, not engineering
 
@@ -139,3 +139,72 @@ Three tiers of garbage:
 **Prerequisite:** Indexes on `nodes.created_at` and `edges.created_at` if they don't already exist. Every GC query filters by age.
 
 **Status: Not needed yet. Design documented for when scale demands it.**
+
+## Concern 13: Bootstrap vs runtime agent context
+
+**Severity: Low now, Medium when agents run sustained sessions.**
+
+Agent instructions exist on two layers with a chicken-and-egg problem between them:
+
+**Bootstrap (`.md` files):** Identity, MCP tools, hard rules, workflow. Static, checked into repo. The agent reads this before it can connect to the graph. Must stay as files because the agent needs instructions to know how to use the graph — if those instructions were in the graph, it couldn't read them without already being connected.
+
+**Runtime context (graph nodes):** Current priorities, project conventions, learned patterns from past bounces, role-specific knowledge that evolves over time. The agent reads these via MCP after connecting. This layer doesn't exist yet.
+
+The runtime layer is where the system gets interesting. The Summarizer could write "lessons learned" nodes from bounce trails (e.g., "Verifier found that schema.rs lifetime errors always come from the conn.lock() pattern — Coder should use scoped blocks"). The Coder reads those next session and avoids repeating mistakes. The graph teaches agents over time — their effective instructions evolve without editing `.md` files.
+
+**What needs to happen:**
+1. Convention for runtime context nodes: `node_class = "operational"`, tagged with agent role, searchable by `mycelica_search("spore:coder context")`
+2. Agent prompts updated to query for their own runtime context after connecting
+3. A process (manual at first, Summarizer later) for distilling bounce patterns into reusable context nodes
+
+**Risk:** Runtime context nodes accumulate without curation, becoming noise. The Summarizer's editorial quality (Concern #1) directly determines whether runtime context helps or hurts.
+
+**Status: Concept documented. Build after bounce loop validates and agents actually need cross-session learning.**
+
+## Concern 14: Neural pathway architecture — thin sessions over fat sessions
+
+**Severity: Low now, High for scalability and reliability.**
+
+The current architecture uses **fat sessions**: one long Claude session carries the full prompt, all graph reads, code edits, build output, and graph writes. Context windows fill up. Instructions at the top (like "record your work in the graph") get lost to attention decay by session end. This is the root cause of agents skipping graph recording — it's not a prompt problem, it's a cognitive architecture problem.
+
+The alternative is **thin sessions**: each Claude session does one focused thing, writes a signal to the graph, and dies. The next session reads that signal and continues. The context window is temporary and local (like a neuron's membrane potential). The graph is persistent and structural (like the connectome). Intelligence emerges from the pathway, not from any single activation.
+
+**Fat session (current):**
+```
+[prompt + task + 15 graph reads + code edit + build + test + graph write]
+ ← instructions lost here                              still working here →
+```
+
+**Thin sessions (target):**
+```
+Session 1: read task node → plan approach → record plan node → exit
+Session 2: read plan node → edit files → record impl node → exit
+Session 3: read impl node → cargo check → record verdict → exit
+Session 4: read verdict → fix if needed → record fix node → exit
+```
+
+**The neural analogy is precise:**
+
+A neuron doesn't hold the whole thought. It fires, passes a signal along a synapse, goes quiet. The next neuron fires. The "thought" is the pathway — the sequence of activations, not the state of any single node.
+
+- **Context window** = membrane potential (temporary, local, gone after firing)
+- **Graph node** = neuron body (persistent, stores one unit of meaning)
+- **Graph edge** = synapse (carries type, confidence/weight, reasoning)
+- **`supports` edge (0.95 confidence)** = strong excitatory synapse
+- **`contradicts` edge** = inhibitory synapse
+- **Summarizer writing meta-nodes** = memory consolidation (converting short-term distributed activity into long-term structured memory)
+- **Thin session** = single neural firing
+- **Graph pathway** = the thought itself
+
+**What changes:**
+1. Orchestrator evolves from "launch agent, wait, check verdict" to a scheduler that fires micro-sessions along graph paths
+2. Agent prompts shrink from 130 lines to ~20 lines per micro-task
+3. Graph recording becomes the entire point of each session, not a forgotten cleanup step
+4. `max_turns` drops dramatically (5-10 instead of 50)
+5. More sessions, each cheap and focused. Latency tradeoff: more startup overhead, but each session is faster and never loses instructions
+
+**The Mycelica thesis comes full circle:** you've been building a brain and calling it a knowledge graph. The graph structure mirrors neural architecture. Nodes are neurons, edges are synapses with weights. What was missing was the activation pattern — thin sessions firing along graph paths IS the neural firing pattern. Spore becomes the action potential propagation mechanism.
+
+**Prerequisite:** Phase 6 orchestrator working and tested. The current fat-session model validates the graph-mediated communication pattern. Thin sessions optimize it.
+
+**Status: Architecture concept documented. The current fat-session model works for V1. Thin sessions are the evolution path once orchestration is stable and the startup-overhead tradeoff is measured.**
