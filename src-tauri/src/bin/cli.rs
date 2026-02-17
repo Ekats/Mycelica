@@ -10,6 +10,7 @@ use mycelica_lib::{db::{Database, Node, NodeType, Edge, EdgeType, Position}, set
 use serde_json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::collections::HashSet;
 use std::io::{BufRead, Read as _, Write};
 use chrono::{Timelike, Utc, Datelike, Local};
 use futures::{stream, StreamExt};
@@ -7507,11 +7508,12 @@ fn spawn_claude(
     max_turns: usize,
     verbose: bool,
     role: &str,
+    allowed_tools: Option<&str>,
 ) -> Result<ClaudeResult, String> {
     use std::process::{Command, Stdio};
 
-    let mut child = Command::new("claude")
-        .arg("-p")
+    let mut cmd = Command::new("claude");
+    cmd.arg("-p")
         .arg(prompt)
         .arg("--mcp-config")
         .arg(mcp_config)
@@ -7521,7 +7523,13 @@ fn spawn_claude(
         .arg("stream-json")
         .arg("--verbose")
         .arg("--max-turns")
-        .arg(max_turns.to_string())
+        .arg(max_turns.to_string());
+
+    if let Some(tools) = allowed_tools {
+        cmd.arg("--allowedTools").arg(tools);
+    }
+
+    let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -7732,6 +7740,150 @@ fn check_verdict(db: &Database, impl_node_id: &str) -> Verdict {
     Verdict::Unknown
 }
 
+/// Post-coder cleanup: re-index changed files, reinstall CLI if needed, create related edges.
+/// Failures warn but do NOT abort orchestration.
+fn post_coder_cleanup(
+    db: &Database,
+    impl_node_id: &str,
+    before_dirty: &HashSet<String>,
+    before_untracked: &HashSet<String>,
+    cli_binary: &Path,
+    verbose: bool,
+) {
+    // 1. Get files dirty/untracked NOW, subtract pre-existing ones
+    let after_dirty: HashSet<String> = std::process::Command::new("git")
+        .args(["diff", "--name-only"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.to_string())
+            .collect())
+        .unwrap_or_default();
+
+    let after_untracked: HashSet<String> = std::process::Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.to_string())
+            .collect())
+        .unwrap_or_default();
+
+    let changed_files: Vec<String> = after_dirty.difference(before_dirty)
+        .chain(after_untracked.difference(before_untracked))
+        .cloned()
+        .collect();
+
+    if changed_files.is_empty() {
+        if verbose {
+            eprintln!("[orchestrator] No files changed by coder");
+        }
+        return;
+    }
+
+    println!("[orchestrator] {} file(s) changed by coder", changed_files.len());
+
+    // 2. Re-index changed .rs files
+    let rs_files: Vec<&str> = changed_files.iter()
+        .filter(|f| f.ends_with(".rs"))
+        .map(|f| f.as_str())
+        .collect();
+
+    for file in &rs_files {
+        println!("[orchestrator] Indexing: {}", file);
+        let result = std::process::Command::new(cli_binary)
+            .args(["import", "code", file, "--update"])
+            .output();
+        match result {
+            Ok(o) if !o.status.success() => {
+                eprintln!("[orchestrator] WARNING: Failed to index {}", file);
+            }
+            Err(e) => {
+                eprintln!("[orchestrator] WARNING: Failed to run import for {}: {}", file, e);
+            }
+            _ => {}
+        }
+    }
+
+    // 3. Reinstall CLI if src-tauri/ files changed
+    let needs_reinstall = changed_files.iter().any(|f| f.starts_with("src-tauri/"));
+    if needs_reinstall {
+        println!("[orchestrator] Reinstalling CLI (source files changed)");
+        let install_result = std::process::Command::new("cargo")
+            .args(["+nightly", "install", "--path", "src-tauri", "--bin", "mycelica-cli", "--features", "mcp", "--force"])
+            .output();
+        match install_result {
+            Ok(o) if o.status.success() => {
+                // Copy sidecar
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ekats".to_string());
+                let src = PathBuf::from(&home).join(".cargo/bin/mycelica-cli");
+                let dst = PathBuf::from("binaries/mycelica-cli-x86_64-unknown-linux-gnu");
+                if let Err(e) = std::fs::copy(&src, &dst) {
+                    eprintln!("[orchestrator] WARNING: Failed to copy sidecar: {}", e);
+                } else {
+                    println!("[orchestrator] CLI reinstalled and sidecar updated");
+                }
+            }
+            Ok(o) => {
+                eprintln!("[orchestrator] WARNING: cargo install failed (exit {})", o.status.code().unwrap_or(-1));
+            }
+            Err(e) => {
+                eprintln!("[orchestrator] WARNING: Failed to run cargo install: {}", e);
+            }
+        }
+    }
+
+    // 4. Create related edges from impl node to code nodes matching changed files
+    let mut linked = 0usize;
+    for file in &changed_files {
+        // Find code nodes with this file_path in tags JSON
+        let node_ids: Vec<String> = (|| -> Option<Vec<String>> {
+            let conn = db.raw_conn().lock().ok()?;
+            let mut stmt = conn.prepare(
+                "SELECT id FROM nodes WHERE JSON_EXTRACT(tags, '$.file_path') = ?1 LIMIT 10"
+            ).ok()?;
+            let rows = stmt.query_map([file.as_str()], |row| row.get(0)).ok()?;
+            Some(rows.filter_map(|r| r.ok()).collect())
+        })().unwrap_or_default();
+
+        let now = chrono::Utc::now().timestamp_millis();
+        for node_id in &node_ids {
+            let edge = Edge {
+                id: uuid::Uuid::new_v4().to_string(),
+                source: impl_node_id.to_string(),
+                target: node_id.clone(),
+                edge_type: EdgeType::Related,
+                label: None,
+                weight: None,
+                edge_source: Some("orchestrator".to_string()),
+                evidence_id: None,
+                confidence: Some(0.85),
+                created_at: now,
+                updated_at: Some(now),
+                author: None,
+                reason: None,
+                content: Some("Implementation modifies this code".to_string()),
+                agent_id: Some("spore:orchestrator".to_string()),
+                superseded_by: None,
+                metadata: None,
+            };
+            if db.insert_edge(&edge).is_ok() {
+                linked += 1;
+            }
+        }
+    }
+
+    if linked > 0 {
+        println!("[orchestrator] Linked impl node to {} code node(s)", linked);
+    }
+}
+
 async fn handle_orchestrate(
     db: &Database,
     task: &str,
@@ -7822,6 +7974,32 @@ async fn handle_orchestrate(
 
         // === CODER PHASE ===
         let coder_run_id = uuid::Uuid::new_v4().to_string();
+
+        // Capture dirty + untracked files before coder runs (to diff against after)
+        let before_dirty: HashSet<String> = std::process::Command::new("git")
+            .args(["diff", "--name-only"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| l.to_string())
+                .collect())
+            .unwrap_or_default();
+
+        let before_untracked: HashSet<String> = std::process::Command::new("git")
+            .args(["ls-files", "--others", "--exclude-standard"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| l.to_string())
+                .collect())
+            .unwrap_or_default();
+
         let coder_start = chrono::Utc::now().timestamp_millis();
 
         let coder_mcp = write_temp_mcp_config(
@@ -7838,7 +8016,10 @@ async fn handle_orchestrate(
         };
 
         println!("[coder] Starting (run: {})", &coder_run_id[..8]);
-        let coder_result = spawn_claude(&coder_prompt, &coder_mcp, max_turns, verbose, "coder")?;
+        let coder_result = spawn_claude(
+            &coder_prompt, &coder_mcp, max_turns, verbose, "coder",
+            Some("Read,Write,Edit,Bash(*),mcp__mycelica__*"),
+        )?;
 
         if !coder_result.success {
             eprintln!("[coder] FAILED (exit code {})", coder_result.exit_code);
@@ -7876,6 +8057,9 @@ async fn handle_orchestrate(
         println!("[coder] Implementation node: {} ({})", &impl_node.id[..8], impl_node.title);
         record_run_status(db, &task_node_id, &coder_run_id, "spore:coder", "completed", 0)?;
 
+        // === POST-CODER CLEANUP ===
+        post_coder_cleanup(db, &impl_node.id, &before_dirty, &before_untracked, &cli_binary, verbose);
+
         // === VERIFIER PHASE ===
         let verifier_run_id = uuid::Uuid::new_v4().to_string();
 
@@ -7889,7 +8073,10 @@ async fn handle_orchestrate(
         );
 
         println!("[verifier] Starting (run: {})", &verifier_run_id[..8]);
-        let verifier_result = spawn_claude(&verifier_prompt, &verifier_mcp, max_turns, verbose, "verifier")?;
+        let verifier_result = spawn_claude(
+            &verifier_prompt, &verifier_mcp, max_turns, verbose, "verifier",
+            Some("Read,Grep,Glob,Bash(cargo:*),Bash(cd:*),Bash(mycelica-cli:*),mcp__mycelica__*"),
+        )?;
 
         if !verifier_result.success {
             eprintln!("[verifier] FAILED (exit code {})", verifier_result.exit_code);

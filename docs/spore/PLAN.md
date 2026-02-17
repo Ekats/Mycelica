@@ -376,6 +376,33 @@ New `content_type = 'escalation'` for unresolved bounces. After 3 bounces on the
 
 ---
 
+## Phase 6.5: Task File Generation (Future)
+
+**Goal:** Before spawning an agent, the orchestrator writes a task file to disk. The agent reads it at session start. The file stays as an audit trail.
+
+### What the orchestrator writes:
+
+`docs/spore/tasks/task-{run_id_prefix}.md` containing:
+- Task description (from the orchestrate command)
+- Agent role and expectations
+- Relevant context node IDs (from graph search)
+- Pre-gathered context summaries (from Dijkstra traversal, Phase 8)
+- Checklist of required outputs
+
+### Benefits:
+
+The task file solves three problems at once. First, it creates an audit trail — git history shows every task given to every agent, what context was provided, and what was expected. Second, the agent reads the file at session start so instructions are fresh in context, not buried 50 turns ago in a system prompt. Third, humans can review and edit the task file before the agent runs, adding constraints or removing scope.
+
+### Convergence with Phase 8:
+
+In the thin session model, the task file IS the session. The orchestrator writes it, the agent reads and executes it, writes one node, exits. The task file replaces the fat prompt. Each micro-session gets a micro-task-file with exactly the context it needs.
+
+### Implementation:
+
+Small change to `handle_orchestrate()`: before `spawn_claude()`, write the prompt string to `docs/spore/tasks/task-{run_id[..8]}.md`. Pass `--read docs/spore/tasks/task-{id}.md` or include the file path in the prompt. The task file is committed with the agent's code changes, creating a complete record: task → code → node → edges.
+
+---
+
 ## Phase 7: GUI Implications (Deferred)
 
 - Meta-nodes render at top hierarchy level with distinct visual per `meta_type` (summary=teal, contradiction=red, status=green/yellow, plan=purple)
@@ -524,6 +551,7 @@ Dijkstra context retrieval is the attention mechanism — selecting which neuron
 | 4 | Phase 4: MCP Server | ✅ Complete | ~3h |
 | 5 | Phase 5: Agent Definitions | ✅ Complete | Coder+Verifier validated |
 | 6 | **Phase 6: Pipeline Orchestration** | **Complete** | ~800 lines |
+| 6.5 | Phase 6.5: Task File Generation | Future | Small |
 | 7 | Phase 7: GUI | Deferred | TBD |
 | 8 | Phase 8: Neural Pathways | Future | TBD |
 
