@@ -5427,6 +5427,7 @@ impl Database {
         &self,
         edge_type: Option<&str>,
         agent_id: Option<&str>,
+        target_agent: Option<&str>,
         confidence_min: Option<f64>,
         since: Option<i64>,
         not_superseded: bool,
@@ -5446,6 +5447,11 @@ impl Database {
         if let Some(aid) = agent_id {
             conditions.push(format!("e.agent_id = ?{}", param_idx));
             param_values.push(Box::new(aid.to_string()));
+            param_idx += 1;
+        }
+        if let Some(ta) = target_agent {
+            conditions.push(format!("t.agent_id = ?{}", param_idx));
+            param_values.push(Box::new(ta.to_string()));
             param_idx += 1;
         }
         if let Some(cmin) = confidence_min {
@@ -5757,6 +5763,128 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    // ─── Run Tracking ─────────────────────────────────────────────────────────
+
+    /// List runs grouped by run_id in edge metadata.
+    pub fn list_runs(
+        &self,
+        agent_id: Option<&str>,
+        since: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<crate::db::models::RunSummary>> {
+        let conn = self.conn.lock().unwrap();
+        let mut sql = String::from(
+            "SELECT json_extract(metadata, '$.run_id') as run_id, \
+             MIN(created_at) as started_at, MAX(created_at) as ended_at, \
+             COUNT(*) as edge_count, \
+             GROUP_CONCAT(DISTINCT agent_id) as agents \
+             FROM edges \
+             WHERE metadata IS NOT NULL AND json_extract(metadata, '$.run_id') IS NOT NULL"
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut param_idx = 1;
+
+        if let Some(aid) = agent_id {
+            sql.push_str(&format!(" AND agent_id = ?{}", param_idx));
+            param_values.push(Box::new(aid.to_string()));
+            param_idx += 1;
+        }
+        if let Some(since_ms) = since {
+            sql.push_str(&format!(" AND created_at >= ?{}", param_idx));
+            param_values.push(Box::new(since_ms));
+            param_idx += 1;
+        }
+        let _ = param_idx;
+        sql.push_str(" GROUP BY run_id ORDER BY started_at DESC");
+        sql.push_str(&format!(" LIMIT {}", limit));
+
+        let mut stmt = conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(refs.as_slice(), |row| {
+            Ok(crate::db::models::RunSummary {
+                run_id: row.get(0)?,
+                started_at: row.get(1)?,
+                ended_at: row.get(2)?,
+                edge_count: row.get(3)?,
+                agents: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            })
+        })?;
+        let mut results = Vec::new();
+        for r in rows {
+            results.push(r?);
+        }
+        Ok(results)
+    }
+
+    /// Get all edges belonging to a specific run.
+    pub fn get_run_edges(&self, run_id: &str) -> Result<Vec<Edge>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM edges WHERE json_extract(metadata, '$.run_id') = ?1",
+            Self::EDGE_COLUMNS
+        ))?;
+        let rows = stmt.query_map(params![run_id], |row| Self::row_to_edge(row))?;
+        let mut results = Vec::new();
+        for r in rows {
+            results.push(r?);
+        }
+        Ok(results)
+    }
+
+    /// Rollback a run: delete edges (and optionally operational nodes) created during the run.
+    /// Returns (edges_deleted, nodes_deleted).
+    pub fn rollback_run(&self, run_id: &str, delete_nodes: bool) -> Result<(usize, usize)> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+
+        // Find time range and agents for this run
+        let (min_time, max_time, agents): (i64, i64, String) = tx.query_row(
+            "SELECT MIN(created_at), MAX(created_at), GROUP_CONCAT(DISTINCT agent_id) \
+             FROM edges WHERE json_extract(metadata, '$.run_id') = ?1",
+            params![run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, Option<String>>(2)?.unwrap_or_default())),
+        )?;
+
+        let edges_deleted = tx.execute(
+            "DELETE FROM edges WHERE json_extract(metadata, '$.run_id') = ?1",
+            params![run_id],
+        )?;
+
+        let mut nodes_deleted = 0;
+        if delete_nodes {
+            for agent in agents.split(',') {
+                let agent = agent.trim();
+                if agent.is_empty() { continue; }
+                nodes_deleted += tx.execute(
+                    "DELETE FROM nodes WHERE agent_id = ?1 AND created_at BETWEEN ?2 AND ?3 AND node_class = 'operational'",
+                    params![agent, min_time, max_time],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok((edges_deleted, nodes_deleted))
+    }
+
+    /// Find operational nodes created by a specific agent since a given timestamp.
+    pub fn find_nodes_by_agent_and_time(
+        &self,
+        agent_id: &str,
+        since_ms: i64,
+    ) -> Result<Vec<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM nodes WHERE agent_id = ?1 AND created_at >= ?2 AND node_class = 'operational' ORDER BY created_at DESC",
+            Self::NODE_COLUMNS
+        ))?;
+        let rows = stmt.query_map(params![agent_id, since_ms], |row| Self::row_to_node(row))?;
+        let mut results = Vec::new();
+        for r in rows {
+            results.push(r?);
+        }
+        Ok(results)
     }
 
     /// Mark an edge as superseded by another edge.

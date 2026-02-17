@@ -152,8 +152,10 @@ struct NavEdgesParams {
 struct QueryEdgesParams {
     /// Filter by edge type
     edge_type: Option<String>,
-    /// Filter by agent_id
+    /// Filter by agent_id (edge creator)
     agent: Option<String>,
+    /// Filter by target node's agent_id (whose work is being targeted)
+    target_agent: Option<String>,
     /// Minimum confidence threshold (0.0-1.0)
     confidence_min: Option<f64>,
     /// Only edges created after this ISO date (YYYY-MM-DD)
@@ -340,9 +342,29 @@ struct Tools {
     db: Arc<Database>,
     agent_id: String,
     role: AgentRole,
+    run_id: Option<String>,
 }
 
 impl Tools {
+    fn make_metadata(&self) -> Option<String> {
+        self.run_id.as_ref().map(|rid| serde_json::json!({"run_id": rid}).to_string())
+    }
+
+    fn merge_metadata(&self, existing: Option<&str>) -> Option<String> {
+        match (&self.run_id, existing) {
+            (Some(rid), Some(json_str)) => {
+                let mut obj: serde_json::Value = serde_json::from_str(json_str)
+                    .unwrap_or(serde_json::json!({}));
+                if let Some(map) = obj.as_object_mut() {
+                    map.insert("run_id".to_string(), serde_json::json!(rid));
+                }
+                Some(obj.to_string())
+            }
+            (Some(rid), None) => Some(serde_json::json!({"run_id": rid}).to_string()),
+            (None, existing) => existing.map(|s| s.to_string()),
+        }
+    }
+
     fn resolve(&self, reference: &str) -> Result<Node, String> {
         match team_resolve_node(&self.db, reference) {
             ResolveResult::Found(node) => Ok(node),
@@ -413,12 +435,13 @@ impl Tools {
 
 #[tool_router]
 impl Tools {
-    fn new(db: Arc<Database>, agent_id: String, role: AgentRole) -> Self {
+    fn new(db: Arc<Database>, agent_id: String, role: AgentRole, run_id: Option<String>) -> Self {
         Self {
             tool_router: Self::tool_router(),
             db,
             agent_id,
             role,
+            run_id,
         }
     }
 
@@ -555,6 +578,7 @@ impl Tools {
         let edges = match self.db.query_edges(
             p.edge_type.as_deref(),
             p.agent.as_deref(),
+            p.target_agent.as_deref(),
             p.confidence_min,
             since_ms,
             p.not_superseded.unwrap_or(false),
@@ -852,7 +876,7 @@ impl Tools {
             content: p.content,
             agent_id: Some(self.agent_id.clone()),
             superseded_by: None,
-            metadata: None,
+            metadata: self.make_metadata(),
         };
         if let Err(e) = self.db.insert_edge(&edge) {
             return Ok(Self::tool_error(format!("Failed to insert edge: {}", e)));
@@ -976,7 +1000,7 @@ impl Tools {
                 content: None,
                 agent_id: Some(self.agent_id.clone()),
                 superseded_by: None,
-                metadata: None,
+                metadata: self.make_metadata(),
             });
         }
 
@@ -1082,7 +1106,7 @@ impl Tools {
             content: None,
             agent_id: Some(self.agent_id.clone()),
             superseded_by: None,
-            metadata: None,
+            metadata: self.make_metadata(),
         });
 
         // 2. Copy old node's outgoing edges (3-part filter)
@@ -1121,7 +1145,7 @@ impl Tools {
                 content: old_edge.content.clone(),
                 agent_id: Some(self.agent_id.clone()),
                 superseded_by: None,
-                metadata: old_edge.metadata.clone(),
+                metadata: self.merge_metadata(old_edge.metadata.as_deref()),
             });
             copied_count += 1;
         }
@@ -1154,7 +1178,7 @@ impl Tools {
                     content: None,
                     agent_id: Some(self.agent_id.clone()),
                     superseded_by: None,
-                    metadata: None,
+                    metadata: self.make_metadata(),
                 });
                 new_edge_count += 1;
             }
@@ -1264,7 +1288,7 @@ impl Tools {
                     content: None,
                     agent_id: Some(self.agent_id.clone()),
                     superseded_by: None,
-                    metadata: None,
+                    metadata: self.make_metadata(),
                 });
             }
         }
@@ -1353,8 +1377,9 @@ pub async fn run_mcp_server(
     db: Arc<Database>,
     agent_id: String,
     role: AgentRole,
+    run_id: Option<String>,
 ) -> Result<(), String> {
-    let tools = Tools::new(db, agent_id, role.clone());
+    let tools = Tools::new(db, agent_id, role.clone(), run_id);
     let allowed: HashSet<String> = role
         .allowed_tools()
         .iter()

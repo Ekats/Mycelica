@@ -335,6 +335,20 @@ pub struct PathHop {
     pub node_title: String,
 }
 
+/// Summary of an orchestrator run (edges grouped by run_id)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunSummary {
+    #[serde(rename = "runId")]
+    pub run_id: String,
+    #[serde(rename = "startedAt")]
+    pub started_at: i64,
+    #[serde(rename = "endedAt")]
+    pub ended_at: i64,
+    #[serde(rename = "edgeCount")]
+    pub edge_count: i64,
+    pub agents: String,
+}
+
 /// Persistent tag for guiding clustering across rebuilds
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tag {

@@ -456,6 +456,9 @@ enum Commands {
         /// Use stdio transport (required)
         #[arg(long)]
         stdio: bool,
+        /// Run ID for tracking (UUID). All edges created in this session will include this in metadata.
+        #[arg(long)]
+        run_id: Option<String>,
     },
 }
 
@@ -470,9 +473,12 @@ enum SporeCommands {
         /// Filter by edge type
         #[arg(long = "type", short = 't')]
         edge_type: Option<String>,
-        /// Filter by agent_id
+        /// Filter by agent_id (edge creator)
         #[arg(long)]
         agent: Option<String>,
+        /// Filter by target node's agent_id (whose work is being targeted)
+        #[arg(long)]
+        target_agent: Option<String>,
         /// Minimum confidence threshold (0.0-1.0)
         #[arg(long)]
         confidence_min: Option<f64>,
@@ -615,6 +621,66 @@ enum SporeCommands {
     CheckFreshness {
         /// Node ID prefix or title substring
         id: String,
+    },
+    /// Run tracking: list, inspect, or rollback orchestrator runs
+    Runs {
+        #[command(subcommand)]
+        cmd: RunCommands,
+    },
+    /// Orchestrate a Coder → Verifier bounce loop for a task
+    Orchestrate {
+        /// Task description
+        task: String,
+        /// Maximum bounce iterations before escalation
+        #[arg(long, default_value = "3")]
+        max_bounces: usize,
+        /// Max turns per agent invocation
+        #[arg(long, default_value = "50")]
+        max_turns: usize,
+        /// Path to coder agent prompt
+        #[arg(long, default_value = "docs/spore/agents/coder.md")]
+        coder_prompt: std::path::PathBuf,
+        /// Path to verifier agent prompt
+        #[arg(long, default_value = "docs/spore/agents/verifier.md")]
+        verifier_prompt: std::path::PathBuf,
+        /// Show what would happen without running agents
+        #[arg(long)]
+        dry_run: bool,
+        /// Print agent stdout/stderr
+        #[arg(long, short)]
+        verbose: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RunCommands {
+    /// List recent runs
+    List {
+        /// Filter by agent ID
+        #[arg(long)]
+        agent: Option<String>,
+        /// Only runs since this date (YYYY-MM-DD)
+        #[arg(long)]
+        since: Option<String>,
+        /// Maximum results
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Show all edges in a run
+    Get {
+        /// Run ID (UUID)
+        run_id: String,
+    },
+    /// Delete all edges (and optionally nodes) from a run
+    Rollback {
+        /// Run ID (UUID)
+        run_id: String,
+        /// Also delete operational nodes created during the run
+        #[arg(long)]
+        delete_nodes: bool,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1400,13 +1466,13 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Migrate { cmd } => handle_migrate(cmd, &db, &db_path, cli.json),
         Commands::Spore { cmd } => handle_spore(cmd, &db, cli.json).await,
         #[cfg(feature = "mcp")]
-        Commands::McpServer { agent_role, agent_id, stdio } => {
+        Commands::McpServer { agent_role, agent_id, stdio, run_id } => {
             if !stdio {
                 return Err("Only --stdio transport is currently supported".to_string());
             }
             let role = mycelica_lib::mcp::AgentRole::from_str(&agent_role)
                 .ok_or_else(|| format!("Unknown role: '{}'. Valid: human, ingestor, coder, verifier, planner, synthesizer, summarizer, docwriter", agent_role))?;
-            mycelica_lib::mcp::run_mcp_server(db.clone(), agent_id, role).await
+            mycelica_lib::mcp::run_mcp_server(db.clone(), agent_id, role, run_id).await
         },
         Commands::Tui => run_tui(&db).await,
         Commands::Completions { .. } => unreachable!(),
@@ -6491,7 +6557,7 @@ fn handle_migrate(cmd: MigrateCommands, db: &Database, _db_path: &Path, json: bo
 
 async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(), String> {
     match cmd {
-        SporeCommands::QueryEdges { edge_type, agent, confidence_min, since, not_superseded, limit } => {
+        SporeCommands::QueryEdges { edge_type, agent, target_agent, confidence_min, since, not_superseded, limit } => {
             // Parse --since date string to epoch millis
             let since_millis = if let Some(ref date_str) = since {
                 let date = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
@@ -6505,6 +6571,7 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
             let results = db.query_edges(
                 edge_type.as_deref(),
                 agent.as_deref(),
+                target_agent.as_deref(),
                 confidence_min,
                 since_millis,
                 not_superseded,
@@ -7176,7 +7243,612 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
             }
             Ok(())
         }
+
+        SporeCommands::Runs { cmd } => {
+            handle_runs(cmd, db, json)
+        }
+
+        SporeCommands::Orchestrate { task, max_bounces, max_turns, coder_prompt, verifier_prompt, dry_run, verbose } => {
+            handle_orchestrate(db, &task, max_bounces, max_turns, &coder_prompt, &verifier_prompt, dry_run, verbose).await
+        }
     }
+}
+
+fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String> {
+    match cmd {
+        RunCommands::List { agent, since, limit } => {
+            let since_millis = if let Some(ref date_str) = since {
+                let date = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+                    .map_err(|e| format!("Invalid date '{}': {}. Use YYYY-MM-DD format.", date_str, e))?;
+                let dt = date.and_hms_opt(0, 0, 0).unwrap();
+                Some(dt.and_utc().timestamp_millis())
+            } else {
+                None
+            };
+            let runs = db.list_runs(agent.as_deref(), since_millis, limit)
+                .map_err(|e| format!("Failed to list runs: {}", e))?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&runs).unwrap_or_default());
+            } else if runs.is_empty() {
+                println!("No runs found.");
+            } else {
+                println!("{:<38} {:>5}  {:<20}  {}", "RUN ID", "EDGES", "STARTED", "AGENTS");
+                println!("{}", "-".repeat(90));
+                for r in &runs {
+                    let started = chrono::DateTime::from_timestamp_millis(r.started_at)
+                        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    println!("{:<38} {:>5}  {:<20}  {}", r.run_id, r.edge_count, started, r.agents);
+                }
+                println!("\n{} run(s)", runs.len());
+            }
+            Ok(())
+        }
+
+        RunCommands::Get { run_id } => {
+            let edges = db.get_run_edges(&run_id)
+                .map_err(|e| format!("Failed to get run edges: {}", e))?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&edges).unwrap_or_default());
+            } else if edges.is_empty() {
+                println!("No edges found for run: {}", run_id);
+            } else {
+                println!("Run: {}", run_id);
+                println!("{} edge(s):\n", edges.len());
+                for e in &edges {
+                    let created = chrono::DateTime::from_timestamp_millis(e.created_at)
+                        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    println!("  {} {:?} {} -> {} [{}]",
+                        &e.id[..8.min(e.id.len())],
+                        e.edge_type,
+                        &e.source[..8.min(e.source.len())],
+                        &e.target[..8.min(e.target.len())],
+                        created,
+                    );
+                    if let Some(ref reason) = e.reason {
+                        println!("    reason: {}", reason);
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        RunCommands::Rollback { run_id, delete_nodes, force } => {
+            // Show what will be deleted first
+            let edges = db.get_run_edges(&run_id)
+                .map_err(|e| format!("Failed to get run edges: {}", e))?;
+            if edges.is_empty() {
+                println!("No edges found for run: {}", run_id);
+                return Ok(());
+            }
+
+            if !force {
+                println!("Will delete {} edge(s) from run {}", edges.len(), run_id);
+                if delete_nodes {
+                    println!("Will also delete operational nodes created during this run.");
+                }
+                println!("Use --force to confirm.");
+                return Ok(());
+            }
+
+            let (edges_deleted, nodes_deleted) = db.rollback_run(&run_id, delete_nodes)
+                .map_err(|e| format!("Rollback failed: {}", e))?;
+
+            if json {
+                println!(r#"{{"runId":"{}","edgesDeleted":{},"nodesDeleted":{}}}"#,
+                    run_id, edges_deleted, nodes_deleted);
+            } else {
+                println!("Rolled back run {}: {} edge(s) deleted, {} node(s) deleted",
+                    run_id, edges_deleted, nodes_deleted);
+            }
+            Ok(())
+        }
+    }
+}
+
+// ============================================================================
+// Orchestrator
+// ============================================================================
+
+fn make_orchestrator_node(
+    id: String,
+    title: String,
+    content: String,
+    node_class: &str,
+    meta_type: Option<&str>,
+) -> Node {
+    let now = chrono::Utc::now().timestamp_millis();
+    Node {
+        id,
+        node_type: NodeType::Thought,
+        title,
+        url: None,
+        content: Some(content),
+        position: Position { x: 0.0, y: 0.0 },
+        created_at: now,
+        updated_at: now,
+        cluster_id: None,
+        cluster_label: None,
+        ai_title: None,
+        summary: None,
+        tags: None,
+        emoji: None,
+        is_processed: true,
+        depth: 0,
+        is_item: true,
+        is_universe: false,
+        parent_id: None,
+        child_count: 0,
+        conversation_id: None,
+        sequence_index: None,
+        is_pinned: false,
+        last_accessed_at: None,
+        latest_child_date: None,
+        is_private: None,
+        privacy_reason: None,
+        source: Some("orchestrator".to_string()),
+        pdf_available: None,
+        content_type: None,
+        associated_idea_id: None,
+        privacy: None,
+        human_edited: None,
+        human_created: false,
+        author: Some("orchestrator".to_string()),
+        agent_id: Some("spore:orchestrator".to_string()),
+        node_class: Some(node_class.to_string()),
+        meta_type: meta_type.map(|s| s.to_string()),
+    }
+}
+
+/// Resolve the full path to the mycelica-cli binary (for MCP configs).
+fn resolve_cli_binary() -> Result<PathBuf, String> {
+    // We ARE mycelica-cli, so current_exe gives the full path
+    std::env::current_exe()
+        .map_err(|e| format!("Failed to resolve CLI binary path: {}", e))
+}
+
+struct ClaudeResult {
+    success: bool,
+    exit_code: i32,
+    session_id: Option<String>,
+    result_text: Option<String>,
+    stdout_raw: String,
+    stderr_raw: String,
+}
+
+/// Spawn Claude Code as a subprocess with the given prompt and MCP config.
+fn spawn_claude(
+    prompt: &str,
+    mcp_config: &Path,
+    max_turns: usize,
+    verbose: bool,
+) -> Result<ClaudeResult, String> {
+    let output = std::process::Command::new("claude")
+        .arg("-p")
+        .arg(prompt)
+        .arg("--mcp-config")
+        .arg(mcp_config)
+        .arg("--strict-mcp-config")
+        .arg("--dangerously-skip-permissions")
+        .arg("--output-format")
+        .arg("json")
+        .arg("--max-turns")
+        .arg(max_turns.to_string())
+        .output()
+        .map_err(|e| format!("Failed to spawn claude: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if verbose {
+        if !stderr.is_empty() {
+            eprintln!("[claude stderr] {}", stderr);
+        }
+    }
+
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    // Try to parse JSON output
+    let (session_id, result_text) = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+        let sid = json.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let res = json.get("result").and_then(|v| v.as_str()).map(|s| s.to_string());
+        (sid, res)
+    } else {
+        (None, None)
+    };
+
+    Ok(ClaudeResult {
+        success: output.status.success(),
+        exit_code,
+        session_id,
+        result_text,
+        stdout_raw: stdout,
+        stderr_raw: stderr,
+    })
+}
+
+/// Write a temporary MCP config file for an agent run.
+fn write_temp_mcp_config(
+    cli_binary: &Path,
+    role: &str,
+    agent_id: &str,
+    run_id: &str,
+    db_path: &str,
+) -> Result<PathBuf, String> {
+    let dir = PathBuf::from("/tmp/mycelica-orchestrator");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create temp dir: {}", e))?;
+
+    let filename = format!("mcp-{}-{}.json", role, &run_id[..8.min(run_id.len())]);
+    let path = dir.join(filename);
+
+    let binary_str = cli_binary.to_string_lossy();
+    let args = vec![
+        "mcp-server".to_string(),
+        "--stdio".to_string(),
+        "--agent-role".to_string(),
+        role.to_string(),
+        "--agent-id".to_string(),
+        agent_id.to_string(),
+        "--run-id".to_string(),
+        run_id.to_string(),
+        "--db".to_string(),
+        db_path.to_string(),
+    ];
+
+    let config = serde_json::json!({
+        "mcpServers": {
+            "mycelica": {
+                "command": binary_str,
+                "args": args,
+            }
+        }
+    });
+
+    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap())
+        .map_err(|e| format!("Failed to write MCP config: {}", e))?;
+    Ok(path)
+}
+
+#[derive(Debug, PartialEq)]
+enum Verdict {
+    Supports,
+    Contradicts,
+    Unknown,
+}
+
+/// Check whether the verifier supports or contradicts the implementation node.
+fn check_verdict(db: &Database, impl_node_id: &str) -> Verdict {
+    let edges = match db.get_edges_for_node(impl_node_id) {
+        Ok(e) => e,
+        Err(_) => return Verdict::Unknown,
+    };
+
+    for edge in &edges {
+        // Only incoming edges targeting the impl node
+        if edge.target != impl_node_id {
+            continue;
+        }
+        // Only from verifier
+        if edge.agent_id.as_deref() != Some("spore:verifier") {
+            continue;
+        }
+        // Only non-superseded
+        if edge.superseded_by.is_some() {
+            continue;
+        }
+        match edge.edge_type {
+            EdgeType::Supports => return Verdict::Supports,
+            EdgeType::Contradicts => return Verdict::Contradicts,
+            _ => {}
+        }
+    }
+    Verdict::Unknown
+}
+
+async fn handle_orchestrate(
+    db: &Database,
+    task: &str,
+    max_bounces: usize,
+    max_turns: usize,
+    coder_prompt_path: &Path,
+    verifier_prompt_path: &Path,
+    dry_run: bool,
+    verbose: bool,
+) -> Result<(), String> {
+    // Resolve CLI binary path
+    let cli_binary = resolve_cli_binary()?;
+    if verbose {
+        eprintln!("[orchestrator] CLI binary: {}", cli_binary.display());
+    }
+
+    // Fail fast if claude is not available
+    let which_result = std::process::Command::new("which")
+        .arg("claude")
+        .output()
+        .map_err(|e| format!("Failed to check for claude: {}", e))?;
+    if !which_result.status.success() {
+        return Err("'claude' not found in PATH. Install Claude Code first.".to_string());
+    }
+
+    // Resolve DB path early — its parent is the repo root, used for prompt path fallback
+    let db_path_str = db.get_path();
+    let repo_root = Path::new(&db_path_str).parent();
+
+    // Resolve prompt paths: try CWD first, then relative to repo root (DB parent dir)
+    let resolve_prompt = |p: &Path| -> PathBuf {
+        if p.exists() {
+            return p.to_path_buf();
+        }
+        if let Some(root) = repo_root {
+            let resolved = root.join(p);
+            if resolved.exists() {
+                return resolved;
+            }
+        }
+        p.to_path_buf()
+    };
+    let coder_path = resolve_prompt(coder_prompt_path);
+    let verifier_path = resolve_prompt(verifier_prompt_path);
+
+    // Read agent prompts
+    let coder_prompt_template = std::fs::read_to_string(&coder_path)
+        .map_err(|e| format!("Failed to read coder prompt at {}: {}", coder_path.display(), e))?;
+    let verifier_prompt_template = std::fs::read_to_string(&verifier_path)
+        .map_err(|e| format!("Failed to read verifier prompt at {}: {}", verifier_path.display(), e))?;
+
+    // Clean up old temp MCP configs from previous runs
+    let _ = std::fs::remove_dir_all("/tmp/mycelica-orchestrator");
+    let db_path = std::fs::canonicalize(&db_path_str)
+        .map_err(|e| format!("Failed to resolve absolute DB path '{}': {}", db_path_str, e))?
+        .to_string_lossy()
+        .to_string();
+
+    if dry_run {
+        println!("=== DRY RUN ===");
+        println!("Task: {}", task);
+        println!("Max bounces: {}", max_bounces);
+        println!("Max turns per agent: {}", max_turns);
+        println!("CLI binary: {}", cli_binary.display());
+        println!("Coder prompt: {} ({} bytes)", coder_prompt_path.display(), coder_prompt_template.len());
+        println!("Verifier prompt: {} ({} bytes)", verifier_prompt_path.display(), verifier_prompt_template.len());
+        println!("DB path: {}", db_path);
+        println!("\nWould run {} bounce(s) of: Coder -> Verifier", max_bounces);
+        return Ok(());
+    }
+
+    // Create task node in graph
+    let task_node_id = uuid::Uuid::new_v4().to_string();
+    let task_node = make_orchestrator_node(
+        task_node_id.clone(),
+        format!("Orchestration: {}", if task.len() > 60 { &task[..60] } else { task }),
+        format!("## Task\n{}\n\n## Config\n- max_bounces: {}\n- max_turns: {}", task, max_bounces, max_turns),
+        "operational",
+        None,
+    );
+    db.insert_node(&task_node).map_err(|e| format!("Failed to create task node: {}", e))?;
+    println!("Created task node: {}", &task_node_id[..8]);
+
+    let mut last_impl_id: Option<String> = None;
+
+    for bounce in 0..max_bounces {
+        println!("\n--- Bounce {}/{} ---", bounce + 1, max_bounces);
+
+        // === CODER PHASE ===
+        let coder_run_id = uuid::Uuid::new_v4().to_string();
+        let coder_start = chrono::Utc::now().timestamp_millis();
+
+        let coder_mcp = write_temp_mcp_config(
+            &cli_binary, "coder", "spore:coder", &coder_run_id, &db_path,
+        )?;
+
+        let coder_prompt = if let Some(ref impl_id) = last_impl_id {
+            format!(
+                "{}\n\nThe Verifier found issues with node {}. Check its incoming contradicts edges and fix the code.\n\nYour task: {}",
+                coder_prompt_template, impl_id, task
+            )
+        } else {
+            format!("{}\n\nYour task: {}", coder_prompt_template, task)
+        };
+
+        println!("[coder] Starting (run: {})", &coder_run_id[..8]);
+        let coder_result = spawn_claude(&coder_prompt, &coder_mcp, max_turns, verbose)?;
+
+        if !coder_result.success {
+            eprintln!("[coder] FAILED (exit code {})", coder_result.exit_code);
+            if verbose && !coder_result.stderr_raw.is_empty() {
+                eprintln!("[coder stderr] {}", &coder_result.stderr_raw[..2000.min(coder_result.stderr_raw.len())]);
+            }
+            // Record failure
+            record_run_status(db, &task_node_id, &coder_run_id, "spore:coder", "failed", coder_result.exit_code)?;
+            return Err(format!("Coder failed on bounce {} with exit code {}", bounce + 1, coder_result.exit_code));
+        }
+        println!("[coder] Completed successfully");
+        if let Some(ref sid) = coder_result.session_id {
+            println!("[coder] Session: {}", sid);
+        }
+
+        // Find coder's output node
+        let coder_nodes = db.find_nodes_by_agent_and_time("spore:coder", coder_start)
+            .map_err(|e| format!("Failed to query coder nodes: {}", e))?;
+
+        if coder_nodes.is_empty() {
+            eprintln!("[coder] WARNING: No operational nodes created. Agent may have crashed before writing to graph.");
+            record_run_status(db, &task_node_id, &coder_run_id, "spore:coder", "incomplete", 0)?;
+            return Err("Coder produced no operational nodes.".to_string());
+        }
+
+        let impl_node = &coder_nodes[0]; // Most recent
+        println!("[coder] Implementation node: {} ({})", &impl_node.id[..8], impl_node.title);
+        record_run_status(db, &task_node_id, &coder_run_id, "spore:coder", "completed", 0)?;
+
+        // === VERIFIER PHASE ===
+        let verifier_run_id = uuid::Uuid::new_v4().to_string();
+
+        let verifier_mcp = write_temp_mcp_config(
+            &cli_binary, "verifier", "spore:verifier", &verifier_run_id, &db_path,
+        )?;
+
+        let verifier_prompt = format!(
+            "{}\n\nCheck implementation node {}",
+            verifier_prompt_template, impl_node.id
+        );
+
+        println!("[verifier] Starting (run: {})", &verifier_run_id[..8]);
+        let verifier_result = spawn_claude(&verifier_prompt, &verifier_mcp, max_turns, verbose)?;
+
+        if !verifier_result.success {
+            eprintln!("[verifier] FAILED (exit code {})", verifier_result.exit_code);
+            record_run_status(db, &task_node_id, &verifier_run_id, "spore:verifier", "failed", verifier_result.exit_code)?;
+            return Err(format!("Verifier failed on bounce {} with exit code {}", bounce + 1, verifier_result.exit_code));
+        }
+        println!("[verifier] Completed successfully");
+        record_run_status(db, &task_node_id, &verifier_run_id, "spore:verifier", "completed", 0)?;
+
+        // Check verdict
+        let verdict = check_verdict(db, &impl_node.id);
+        match verdict {
+            Verdict::Supports => {
+                println!("\n=== TASK COMPLETE ===");
+                println!("Verifier supports the implementation after {} bounce(s).", bounce + 1);
+                println!("Implementation: {} ({})", &impl_node.id[..8], impl_node.title);
+                println!("Task node: {}", &task_node_id[..8]);
+                return Ok(());
+            }
+            Verdict::Contradicts => {
+                println!("[verifier] Contradicts implementation — will bounce to coder");
+                last_impl_id = Some(impl_node.id.clone());
+            }
+            Verdict::Unknown => {
+                eprintln!("[verifier] WARNING: No supports/contradicts edge found. Verifier may not have recorded a verdict.");
+                last_impl_id = Some(impl_node.id.clone());
+            }
+        }
+    }
+
+    // Max bounces reached — escalate
+    println!("\n=== MAX BOUNCES REACHED ({}) ===", max_bounces);
+    if let Some(ref impl_id) = last_impl_id {
+        create_escalation(db, &task_node_id, impl_id, max_bounces, task)?;
+        println!("Escalation node created. Human review required.");
+    }
+    Err(format!("Task not resolved after {} bounce(s). Escalation created.", max_bounces))
+}
+
+/// Record a run status edge from task node to itself.
+fn record_run_status(
+    db: &Database,
+    task_node_id: &str,
+    run_id: &str,
+    agent: &str,
+    status: &str,
+    exit_code: i32,
+) -> Result<(), String> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let metadata = serde_json::json!({
+        "run_id": run_id,
+        "status": status,
+        "exit_code": exit_code,
+        "agent": agent,
+    });
+    let edge = Edge {
+        id: uuid::Uuid::new_v4().to_string(),
+        source: task_node_id.to_string(),
+        target: task_node_id.to_string(),
+        edge_type: EdgeType::Tracks,
+        label: None,
+        weight: None,
+        edge_source: Some("orchestrator".to_string()),
+        evidence_id: None,
+        confidence: Some(1.0),
+        created_at: now,
+        updated_at: Some(now),
+        author: Some("orchestrator".to_string()),
+        reason: Some(format!("{} run {}", agent, status)),
+        content: None,
+        agent_id: Some("spore:orchestrator".to_string()),
+        superseded_by: None,
+        metadata: Some(metadata.to_string()),
+    };
+    db.insert_edge(&edge).map_err(|e| format!("Failed to record run status: {}", e))?;
+    Ok(())
+}
+
+/// Create an escalation meta node after max bounces.
+fn create_escalation(
+    db: &Database,
+    task_node_id: &str,
+    last_impl_id: &str,
+    bounce_count: usize,
+    task: &str,
+) -> Result<(), String> {
+    let esc_id = uuid::Uuid::new_v4().to_string();
+    let esc_node = make_orchestrator_node(
+        esc_id.clone(),
+        format!("ESCALATION: {} (after {} bounces)", if task.len() > 40 { &task[..40] } else { task }, bounce_count),
+        format!(
+            "## Escalation\n\nTask did not converge after {} Coder-Verifier bounces.\n\n\
+             ### Task\n{}\n\n\
+             ### Last Implementation\nNode: {}\n\n\
+             ### Action Required\nHuman review needed. Check the contradicts edges on the last implementation node \
+             to understand what the Verifier flagged.",
+            bounce_count, task, last_impl_id
+        ),
+        "meta",
+        Some("escalation"),
+    );
+    db.insert_node(&esc_node).map_err(|e| format!("Failed to create escalation node: {}", e))?;
+    let now = esc_node.created_at;
+
+    // Edge: escalation flags last implementation
+    let flags_edge = Edge {
+        id: uuid::Uuid::new_v4().to_string(),
+        source: esc_id.clone(),
+        target: last_impl_id.to_string(),
+        edge_type: EdgeType::Flags,
+        label: None,
+        weight: None,
+        edge_source: Some("orchestrator".to_string()),
+        evidence_id: None,
+        confidence: Some(1.0),
+        created_at: now,
+        updated_at: Some(now),
+        author: Some("orchestrator".to_string()),
+        reason: Some(format!("Escalation after {} bounces", bounce_count)),
+        content: None,
+        agent_id: Some("spore:orchestrator".to_string()),
+        superseded_by: None,
+        metadata: None,
+    };
+    db.insert_edge(&flags_edge).map_err(|e| format!("Failed to create flags edge: {}", e))?;
+
+    // Edge: escalation tracks task
+    let tracks_edge = Edge {
+        id: uuid::Uuid::new_v4().to_string(),
+        source: esc_id,
+        target: task_node_id.to_string(),
+        edge_type: EdgeType::Tracks,
+        label: None,
+        weight: None,
+        edge_source: Some("orchestrator".to_string()),
+        evidence_id: None,
+        confidence: Some(1.0),
+        created_at: now,
+        updated_at: Some(now),
+        author: Some("orchestrator".to_string()),
+        reason: Some("Tracks orchestration task".to_string()),
+        content: None,
+        agent_id: Some("spore:orchestrator".to_string()),
+        superseded_by: None,
+        metadata: None,
+    };
+    db.insert_edge(&tracks_edge).map_err(|e| format!("Failed to create tracks edge: {}", e))?;
+
+    println!("Escalation: {} ({})", &esc_node.id[..8], esc_node.title);
+    Ok(())
 }
 
 async fn handle_link(
