@@ -7984,6 +7984,156 @@ fn post_coder_cleanup(
     }
 }
 
+/// Generate a task file with graph context for an agent before spawning.
+/// Searches the graph for nodes relevant to the task, runs Dijkstra from the
+/// top matches, and writes a markdown file as both bootstrap context and audit trail.
+fn generate_task_file(
+    db: &Database,
+    task: &str,
+    role: &str,
+    run_id: &str,
+    _task_node_id: &str,
+    bounce: usize,
+    max_bounces: usize,
+    last_impl_id: Option<&str>,
+) -> Result<PathBuf, String> {
+    use std::collections::HashMap;
+
+    // 1. Search for anchor nodes matching the task description.
+    //    FTS5 defaults to AND logic, so "optimize dendrogram clustering algorithm"
+    //    only matches nodes containing ALL four words. Use OR to broaden the search,
+    //    and filter stopwords to reduce noise.
+    let stopwords = ["the", "a", "an", "in", "on", "at", "to", "for", "of", "is", "it",
+                     "and", "or", "with", "from", "by", "this", "that", "as", "be"];
+    let fts_query: String = task.split_whitespace()
+        .filter(|w| w.len() > 2 && !stopwords.contains(&w.to_lowercase().as_str()))
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let anchors = if fts_query.is_empty() {
+        Vec::new()
+    } else {
+        db.search_nodes(&fts_query)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|n| n.id != _task_node_id)
+            .filter(|n| n.node_class.as_deref() != Some("operational"))
+            .take(3)
+            .collect()
+    };
+
+    // 2. Gather context via Dijkstra from each anchor
+    let mut seen: HashMap<String, (f64, String, String, String)> = HashMap::new(); // id -> (relevance, title, anchor_title, via)
+
+    for anchor in &anchors {
+        let anchor_title = anchor.ai_title.as_deref().unwrap_or(&anchor.title);
+        let context = db.context_for_task(
+            &anchor.id, 7, Some(4), Some(2.0), None, true, true,
+        ).unwrap_or_default();
+
+        for node in &context {
+            // Skip operational nodes (other orchestrator artifacts)
+            if node.node_class.as_deref() == Some("operational") {
+                continue;
+            }
+            let via = if node.path.is_empty() {
+                "direct".to_string()
+            } else {
+                node.path.iter()
+                    .map(|hop| hop.edge.edge_type.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+            };
+            let key = node.node_id.clone();
+            if !seen.contains_key(&key) || node.relevance > seen[&key].0 {
+                seen.insert(key, (
+                    node.relevance,
+                    node.node_title.clone(),
+                    anchor_title.to_string(),
+                    via,
+                ));
+            }
+        }
+
+        // Also include the anchor itself
+        if !seen.contains_key(&anchor.id) {
+            seen.insert(anchor.id.clone(), (
+                1.0,
+                anchor_title.to_string(),
+                "search".to_string(),
+                "FTS match".to_string(),
+            ));
+        }
+    }
+
+    // 3. Sort by relevance, filter out the task node itself
+    let mut context_rows: Vec<_> = seen.into_iter()
+        .filter(|(id, _)| id != _task_node_id)
+        .collect();
+    context_rows.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 4. Format markdown
+    let now = chrono::Utc::now();
+    let task_short = if task.len() > 60 { &task[..60] } else { task };
+
+    let mut md = String::new();
+    md.push_str(&format!("# Task: {}\n\n", task_short));
+    md.push_str(&format!("- **Run:** {}\n", &run_id[..8.min(run_id.len())]));
+    md.push_str(&format!("- **Agent:** {}\n", role));
+    md.push_str(&format!("- **Bounce:** {}/{}\n", bounce + 1, max_bounces));
+    md.push_str(&format!("- **Generated:** {}\n\n", now.format("%Y-%m-%d %H:%M:%S UTC")));
+
+    md.push_str("## Task\n\n");
+    md.push_str(task);
+    md.push_str("\n\n");
+
+    if let Some(impl_id) = last_impl_id {
+        md.push_str("## Previous Bounce\n\n");
+        md.push_str(&format!(
+            "Verifier found issues with node `{}`. Check its incoming `contradicts` edges and fix the code.\n\n",
+            impl_id
+        ));
+    }
+
+    md.push_str("## Graph Context\n\n");
+    md.push_str("Relevant nodes found by search + Dijkstra traversal from the task description.\n");
+    md.push_str("Use `mycelica_node_get` or `mycelica_read_content` to read full content of any node.\n\n");
+
+    if context_rows.is_empty() {
+        md.push_str("_No relevant nodes found in the graph._\n\n");
+    } else {
+        md.push_str("| # | Node | ID | Relevance | Via |\n");
+        md.push_str("|---|------|----|-----------|-----|\n");
+        for (i, (id, (rel, title, anchor, via))) in context_rows.iter().enumerate() {
+            let title_short = if title.len() > 50 { &title[..50] } else { title.as_str() };
+            let id_short = &id[..12.min(id.len())];
+            md.push_str(&format!(
+                "| {} | {} | `{}` | {:.0}% | {} → {} |\n",
+                i + 1, title_short, id_short, rel * 100.0, anchor, via
+            ));
+        }
+        md.push_str("\n");
+    }
+
+    md.push_str("## Checklist\n\n");
+    md.push_str("- [ ] Read relevant context nodes above before starting\n");
+    md.push_str("- [ ] Record implementation as operational node when done\n");
+    md.push_str("- [ ] Link implementation to modified code nodes with edges\n");
+
+    // 5. Write to disk
+    let tasks_dir = PathBuf::from("docs/spore/tasks");
+    std::fs::create_dir_all(&tasks_dir)
+        .map_err(|e| format!("Failed to create tasks dir: {}", e))?;
+
+    let filename = format!("task-{}.md", &run_id[..8.min(run_id.len())]);
+    let path = tasks_dir.join(&filename);
+    std::fs::write(&path, &md)
+        .map_err(|e| format!("Failed to write task file: {}", e))?;
+
+    Ok(path)
+}
+
 async fn handle_orchestrate(
     db: &Database,
     task: &str,
@@ -8051,6 +8201,7 @@ async fn handle_orchestrate(
         println!("Coder prompt: {} ({} bytes)", coder_prompt_path.display(), coder_prompt_template.len());
         println!("Verifier prompt: {} ({} bytes)", verifier_prompt_path.display(), verifier_prompt_template.len());
         println!("DB path: {}", db_path);
+        println!("Task files: docs/spore/tasks/task-{{run_id}}.md (generated per agent)");
         println!("\nWould run {} bounce(s) of: Coder -> Verifier", max_bounces);
         return Ok(());
     }
@@ -8106,13 +8257,23 @@ async fn handle_orchestrate(
             &cli_binary, "coder", "spore:coder", &coder_run_id, &db_path,
         )?;
 
+        // Generate task file with graph context
+        let task_file = generate_task_file(
+            db, task, "coder", &coder_run_id, &task_node_id,
+            bounce, max_bounces, last_impl_id.as_deref(),
+        )?;
+        println!("[coder] Task file: {}", task_file.display());
+
         let coder_prompt = if let Some(ref impl_id) = last_impl_id {
             format!(
-                "{}\n\nThe Verifier found issues with node {}. Check its incoming contradicts edges and fix the code.\n\nYour task: {}",
-                coder_prompt_template, impl_id, task
+                "{}\n\nRead the task file at {} for full context and graph-gathered information.\n\nThe Verifier found issues with node {}. Check its incoming contradicts edges and fix the code.\n\nYour task: {}",
+                coder_prompt_template, task_file.display(), impl_id, task
             )
         } else {
-            format!("{}\n\nYour task: {}", coder_prompt_template, task)
+            format!(
+                "{}\n\nRead the task file at {} for full context and graph-gathered information.\n\nYour task: {}",
+                coder_prompt_template, task_file.display(), task
+            )
         };
 
         println!("[coder] Starting (run: {})", &coder_run_id[..8]);
@@ -8168,9 +8329,16 @@ async fn handle_orchestrate(
             &cli_binary, "verifier", "spore:verifier", &verifier_run_id, &db_path,
         )?;
 
+        // Generate verifier task file with graph context
+        let verifier_task_file = generate_task_file(
+            db, task, "verifier", &verifier_run_id, &task_node_id,
+            bounce, max_bounces, Some(&impl_node.id),
+        )?;
+        println!("[verifier] Task file: {}", verifier_task_file.display());
+
         let verifier_prompt = format!(
-            "{}\n\nCheck implementation node {}",
-            verifier_prompt_template, impl_node.id
+            "{}\n\nRead the task file at {} for full context.\n\nCheck implementation node {}",
+            verifier_prompt_template, verifier_task_file.display(), impl_node.id
         );
 
         println!("[verifier] Starting (run: {})", &verifier_run_id[..8]);
