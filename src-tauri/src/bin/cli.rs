@@ -491,6 +491,9 @@ enum SporeCommands {
         /// Maximum results
         #[arg(long, default_value = "20")]
         limit: usize,
+        /// Compact one-line output: edge_id type source -> target [confidence]
+        #[arg(long)]
+        compact: bool,
     },
     /// Explain an edge with full context (nodes, adjacents, supersession chain)
     ExplainEdge {
@@ -6557,7 +6560,7 @@ fn handle_migrate(cmd: MigrateCommands, db: &Database, _db_path: &Path, json: bo
 
 async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(), String> {
     match cmd {
-        SporeCommands::QueryEdges { edge_type, agent, target_agent, confidence_min, since, not_superseded, limit } => {
+        SporeCommands::QueryEdges { edge_type, agent, target_agent, confidence_min, since, not_superseded, limit, compact } => {
             // Parse --since date string to epoch millis
             let since_millis = if let Some(ref date_str) = since {
                 let date = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
@@ -6580,6 +6583,17 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
 
             if json {
                 println!("{}", serde_json::to_string(&results).unwrap_or_default());
+            } else if compact {
+                for ewn in &results {
+                    let e = &ewn.edge;
+                    let src = ewn.source_title.as_deref().unwrap_or(&e.source[..8.min(e.source.len())]);
+                    let tgt = ewn.target_title.as_deref().unwrap_or(&e.target[..8.min(e.target.len())]);
+                    let conf = e.confidence.map(|c| format!("{:.2}", c)).unwrap_or_else(|| "?".to_string());
+                    println!("{} {} {} -> {} [{}]",
+                        &e.id[..8.min(e.id.len())],
+                        e.edge_type.as_str(),
+                        src, tgt, conf);
+                }
             } else {
                 if results.is_empty() {
                     println!("No matching edges found.");
