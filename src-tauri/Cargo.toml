@@ -69,7 +69,7 @@ candle-core = { git = "https://github.com/huggingface/candle" }
 candle-nn = { git = "https://github.com/huggingface/candle" }
 candle-transformers = { git = "https://github.com/huggingface/candle" }
 tokenizers = "0.20"
-hf-hub = "0.3"
+hf-hub = "0.4"
 
 # Code parsing
 syn = { version = "2.0", features = ["full", "parsing", "extra-traits"] }
