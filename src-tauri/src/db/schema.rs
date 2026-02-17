@@ -5795,7 +5795,14 @@ impl Database {
 
                 let confidence = edge.confidence.unwrap_or(0.5);
                 let type_priority = Self::edge_type_priority(&edge.edge_type);
-                let edge_cost = ((1.0 - confidence) * (1.0 - 0.5 * type_priority)).max(0.001);
+                let base_cost = ((1.0 - confidence) * (1.0 - 0.5 * type_priority)).max(0.001);
+                // Structural edges (defined_in, belongs_to, sibling) are high-confidence
+                // but low-information: "same file" != "semantically relevant". Apply a
+                // higher cost floor so they don't flood the budget before semantic edges.
+                let edge_cost = match edge.edge_type {
+                    EdgeType::DefinedIn | EdgeType::BelongsTo | EdgeType::Sibling => base_cost.max(0.4),
+                    _ => base_cost,
+                };
 
                 let new_dist = current_dist + edge_cost;
 
