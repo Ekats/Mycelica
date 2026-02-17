@@ -6,7 +6,7 @@
 
 Phases 1-6 complete and committed. The full infrastructure exists: typed edges with content/attribution/supersession, meta nodes with transactional creation, query/explain/path/rank commands, status dashboard, MCP server with 16 tools and role-based permissions, agent definitions (Coder + Verifier), and an automated orchestrator (`mycelica-cli spore orchestrate`) with run tracking, escalation, and failure handling. Phase 5 bounce loop validated manually. Phase 6 orchestrator testing in progress.
 
-**14 concerns tracked. 5 resolved, 9 active/future.**
+**14 concerns tracked → now 16. 5 resolved, 11 active/future.**
 
 ## Concern 1: The Summarizer is editorial work, not engineering
 
@@ -205,6 +205,78 @@ A neuron doesn't hold the whole thought. It fires, passes a signal along a synap
 
 **The Mycelica thesis comes full circle:** you've been building a brain and calling it a knowledge graph. The graph structure mirrors neural architecture. Nodes are neurons, edges are synapses with weights. What was missing was the activation pattern — thin sessions firing along graph paths IS the neural firing pattern. Spore becomes the action potential propagation mechanism.
 
-**Prerequisite:** Phase 6 orchestrator working and tested. The current fat-session model validates the graph-mediated communication pattern. Thin sessions optimize it.
+**Nested bounce loops emerge from this model.** Planning isn't a mode inside a fat session — it's a separate agent. The plan is a graph node, not a mental state. The orchestrator becomes:
+
+```
+Plan Loop:   Planner → Plan Reviewer → (bounce until approved)
+Build Loop:  Coder → Verifier → (bounce until verified)
+```
+
+The Plan Reviewer needs deep project context. It gets that from the graph via Dijkstra traversal (Concern #15), not from a 130-line prompt. The human can read and override any plan node before the Coder starts.
+
+**Prerequisite:** Phase 6 orchestrator working and tested. Summarizer agent for context quality (Concern #16). Dijkstra context retrieval (Concern #15).
 
 **Status: Architecture concept documented. The current fat-session model works for V1. Thin sessions are the evolution path once orchestration is stable and the startup-overhead tradeoff is measured.**
+
+## Concern 15: Dijkstra context retrieval — the graph as attention mechanism
+
+**Severity: Low now, Critical for Plan Reviewer and thin sessions.**
+
+Agents don't need the whole graph. They need the weighted shortest path from their task to relevant context. The graph has 1100+ nodes. A Plan Reviewer evaluating "Add WebSocket support to team server" needs maybe 20 of them. Which 20?
+
+Edge confidence IS the weight. A `derives_from` edge at 0.95 is a highway. A `related` edge at 0.3 is a dirt road. Dijkstra naturally follows strong connections and ignores noise.
+
+```
+Task node
+  ↓ dijkstra (maximize cumulative confidence)
+team_server.rs code node         (2 hops, confidence 0.95)  ← include
+"chose axum for HTTP" decision   (3 hops, confidence 0.85)  ← include
+"SQLite concurrent writes"       (4 hops, confidence 0.80)  ← include
+"painting exhibition at library" (8 hops, confidence 0.15)  ← skip
+```
+
+**Existing primitives:**
+- `spore path-between` — BFS with edge-type filtering (Phase 2)
+- `spore edges-for-context` — ranks by composite score: recency × confidence × type priority (Phase 2)
+
+**Missing:** `spore context-for-task <node-id> --budget <N>` — Dijkstra outward from a node, returns the N most relevant nodes by weighted proximity. The context window budget becomes a graph radius. This is the agent's "attention mechanism."
+
+**Implementation sketch:** Standard Dijkstra with edge weight = `1.0 - confidence` (so high confidence = low cost = preferred path). Start from task node, expand outward. Stop when N nodes collected or minimum path weight exceeds threshold. Return nodes sorted by proximity score. Reuse existing `get_edges_for_node` for neighbor discovery.
+
+**The neural analogy:** This is selective attention. The brain doesn't activate all neurons for every thought — it activates a pathway. Dijkstra selects which graph nodes to "activate" (load into context) based on connection strength. The graph prunes itself.
+
+**Status: Concept documented. Build when Plan Reviewer or thin sessions need focused context retrieval.**
+
+## Concern 16: Summarizer is the bottleneck for context quality
+
+**Severity: Medium now, High when Plan Reviewer and thin sessions exist.**
+
+Every agent that needs project context depends on the quality of summarized knowledge. The dependency chain:
+
+```
+Raw conversations       ← import pipeline (exists)
+       ↓
+Knowledge nodes (noisy) ← graph (exists)
+       ↓
+Decision/context nodes  ← Summarizer (doesn't exist yet)  ← BOTTLENECK
+       ↓
+Plan Reviewer           ← reads distilled context
+       ↓
+Coder                   ← reads approved plan + context
+```
+
+Raw conversation imports are noisy. A discussion about "should we use SQLite or Postgres" produces dozens of nodes. The Plan Reviewer needs the conclusion: "chose SQLite for V1, revisit for concurrent writes." That's the Summarizer's job — distill conversations into decision nodes with explicit reasoning edges.
+
+Without the Summarizer:
+- Plan Reviewer either flies blind (no context) or burns its entire context window on raw conversation nodes
+- Dijkstra traversal returns noisy conversation fragments instead of clean decision nodes
+- Runtime context (Concern #13) accumulates without curation
+- The top layer (what the human reads) doesn't exist
+
+The Summarizer is memory consolidation — converting short-term distributed activity into long-term structured knowledge. In the neural analogy, it's the hippocampus: it doesn't generate new thoughts, it organizes recent activity into durable memories that other brain regions can efficiently access.
+
+**Dependency:** The Summarizer is the most important agent after Coder+Verifier. It's the prerequisite for: Plan Reviewer (needs distilled context), thin sessions (need focused context), runtime context (Concern #13, needs curation), and human readability (Success Criterion #1 and #9).
+
+**Risk:** Summarizer editorial quality was partially validated in the single-agent test (Concern #1). Structural/temporal analysis works. Deliberation summarization (reading bounce trails, extracting lessons) is untested and harder.
+
+**Status: Concept documented. Build Summarizer agent definition + prompt after orchestrator is stable. Test on real bounce trail data from Phase 6 runs.**

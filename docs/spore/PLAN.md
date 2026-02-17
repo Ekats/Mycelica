@@ -434,15 +434,82 @@ A neuron doesn't hold the whole thought. It fires, passes a signal along a synap
 4. **Agent prompts shrink dramatically.** The graph carries the context. The prompt just says "read node X, do Y, write result."
 5. **More sessions, each cheap.** Tradeoff: more startup overhead, but each session never loses instructions to attention decay.
 
+### Nested bounce loops: Plan → Build
+
+Planning isn't a mode inside a fat session — it's a separate agent firing along the graph path. The plan is a graph node, not a mental state inside a context window. Everyone can read it, verify against it, revise it.
+
+```
+Plan Loop:
+  Planner:       read task → produce plan node → exit
+  Plan Reviewer: read plan node → approve or contradict → exit
+  (bounce until approved)
+
+Build Loop (only after plan approved):
+  Coder:    read approved plan node → implement → exit
+  Verifier: read impl node → check against plan + code → exit
+  (bounce until verified)
+```
+
+Two bounce loops nested. Both leave graph trails. The human can intervene at any point — read the plan node before the Coder starts, reject a plan the Reviewer approved, override a Verifier rejection.
+
+The Plan Reviewer needs deep project context to evaluate whether a plan makes sense. It needs to know the codebase, the architecture decisions, the constraints. This context comes from the graph, not from a prompt.
+
+### Dijkstra context retrieval: the graph prunes itself
+
+An agent doesn't need the whole graph. It needs the **weighted shortest path** from its task to relevant context. Edge confidence IS the weight.
+
+```
+Task: "Add WebSocket support to team server"
+         ↓ dijkstra (maximize cumulative confidence)
+Finds: team_server.rs code node         (2 hops, confidence 0.95)
+       → "chose axum for HTTP" decision (3 hops, confidence 0.85)
+       → "SQLite concurrent writes"     (4 hops, confidence 0.80)
+       → Phase 6 orchestration plan     (3 hops, confidence 0.90)
+Skips: 1100+ unrelated nodes
+```
+
+A `derives_from` edge at 0.95 is a highway. A `related` edge at 0.3 is a dirt road. Dijkstra naturally follows strong connections and ignores noise. The context window budget becomes a graph radius: start from the task node, expand outward by weighted proximity, stop when you've collected N nodes or path weight drops below threshold.
+
+Existing primitives that support this:
+- `spore path-between` — BFS with edge-type filtering (exists, Phase 2)
+- `spore edges-for-context` — ranks by composite score: recency × confidence × type priority (exists, Phase 2)
+- **Missing:** `spore context-for-task <node-id> --budget <N>` — Dijkstra outward from a node, returns the N most relevant nodes by weighted proximity. This is the agent's "attention mechanism."
+
+The Plan Reviewer gets the 20 most relevant nodes by graph proximity, not 20 random nodes or 20 most recent. **The graph does the pruning.** 90% of nodes are irrelevant to any given task. Dijkstra skips them structurally.
+
+### The Summarizer is the bottleneck
+
+Every agent that needs context depends on the quality of summarized knowledge. Raw conversation imports are noisy — a discussion about "should we use SQLite or Postgres" produces dozens of nodes. The Plan Reviewer needs the conclusion: "chose SQLite for V1, revisit for concurrent writes."
+
+The dependency chain:
+
+```
+Conversations (raw)          ← import pipeline (exists)
+       ↓
+Knowledge nodes (noisy)      ← graph (exists)
+       ↓
+Decision/context nodes       ← Summarizer (doesn't exist yet)
+       ↓
+Plan Reviewer reads these    ← uses distilled context
+       ↓
+Coder reads approved plan    ← uses plan + distilled context
+```
+
+Without the Summarizer, the Plan Reviewer either flies blind (no context) or burns its entire context window on raw conversation nodes (too much noise). The Summarizer is memory consolidation — it converts short-term distributed activity into long-term structured knowledge. It's the most important agent after Coder+Verifier because it's the bottleneck for every other agent that needs context.
+
 ### The Mycelica thesis completes
 
 The graph structure already mirrors neural architecture — nodes are neurons, edges are weighted synapses. What was missing was the activation pattern. Thin sessions firing along graph paths IS neural firing. The orchestrator becomes the action potential propagation mechanism. Spore becomes the brain's executive function, deciding which pathways to activate next.
 
+Dijkstra context retrieval is the attention mechanism — selecting which neurons to activate based on connection strength. The Summarizer is memory consolidation. The Plan Reviewer is prefrontal cortex — evaluating plans against accumulated experience before committing to action.
+
 ### Prerequisites
 
 - Phase 6 orchestrator stable and tested
+- Summarizer agent implemented (the bottleneck for context quality)
 - Measured startup-overhead per Claude Code invocation (if >10s, thin sessions have a latency cost)
-- Graph path query primitives (follow a chain of edges efficiently)
+- `spore context-for-task` — Dijkstra weighted traversal from a node, returns N most relevant nodes by proximity
+- Conversation import pipeline tested with Summarizer distillation
 
 ---
 
@@ -478,3 +545,5 @@ The graph structure already mirrors neural architecture — nodes are neurons, e
 8. No duplicate nodes for the same concept
 9. Trust the top layer enough to make decisions from it
 10. (Phase 8) A third party can follow a graph pathway and reconstruct the complete reasoning chain without access to any agent's context window — the graph IS the thought, not a log of it
+11. (Phase 8) `context-for-task` returns the 20 most relevant nodes for any task via Dijkstra — agents get focused context without manual curation
+12. (Phase 8) Summarizer distills raw conversation imports into decision nodes that Plan Reviewer can use — the dependency chain from conversations to actionable context works end-to-end

@@ -10,7 +10,7 @@ use mycelica_lib::{db::{Database, Node, NodeType, Edge, EdgeType, Position}, set
 use serde_json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::io::Write;
+use std::io::{BufRead, Read as _, Write};
 use chrono::{Timelike, Utc, Datelike, Local};
 use futures::{stream, StreamExt};
 
@@ -7429,18 +7429,25 @@ struct ClaudeResult {
     exit_code: i32,
     session_id: Option<String>,
     result_text: Option<String>,
+    total_cost_usd: Option<f64>,
+    num_turns: Option<u32>,
+    duration_ms: Option<u64>,
     stdout_raw: String,
     stderr_raw: String,
 }
 
-/// Spawn Claude Code as a subprocess with the given prompt and MCP config.
+/// Spawn Claude Code as a subprocess with streaming output.
+/// Reads stdout line-by-line (stream-json format) and prints real-time progress.
 fn spawn_claude(
     prompt: &str,
     mcp_config: &Path,
     max_turns: usize,
     verbose: bool,
+    role: &str,
 ) -> Result<ClaudeResult, String> {
-    let output = std::process::Command::new("claude")
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("claude")
         .arg("-p")
         .arg(prompt)
         .arg("--mcp-config")
@@ -7448,39 +7455,138 @@ fn spawn_claude(
         .arg("--strict-mcp-config")
         .arg("--dangerously-skip-permissions")
         .arg("--output-format")
-        .arg("json")
+        .arg("stream-json")
+        .arg("--verbose")
         .arg("--max-turns")
         .arg(max_turns.to_string())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("Failed to spawn claude: {}", e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = child.stdout.take()
+        .ok_or_else(|| "Failed to capture stdout".to_string())?;
+    let reader = std::io::BufReader::new(stdout);
 
-    if verbose {
-        if !stderr.is_empty() {
-            eprintln!("[claude stderr] {}", stderr);
+    let mut session_id: Option<String> = None;
+    let mut result_text: Option<String> = None;
+    let mut total_cost_usd: Option<f64> = None;
+    let mut num_turns: Option<u32> = None;
+    let mut duration_ms: Option<u64> = None;
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let json: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        match json.get("type").and_then(|t| t.as_str()) {
+            Some("system") => {
+                eprintln!("[{}] Connected", role);
+                // Check MCP server status
+                if let Some(servers) = json.get("mcp_servers").and_then(|s| s.as_array()) {
+                    for srv in servers {
+                        let name = srv.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                        let status = srv.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+                        eprintln!("[{}] MCP: {} ({})", role, name, status);
+                    }
+                }
+            }
+            Some("assistant") => {
+                if let Some(content) = json.pointer("/message/content").and_then(|c| c.as_array()) {
+                    for block in content {
+                        let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        match block_type {
+                            "text" => {
+                                if verbose {
+                                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                        let text = text.trim();
+                                        if !text.is_empty() {
+                                            let truncated = if text.len() > 120 {
+                                                format!("{}...", &text[..text.floor_char_boundary(120)])
+                                            } else {
+                                                text.to_string()
+                                            };
+                                            eprintln!("[{}] {}", role, truncated);
+                                        }
+                                    }
+                                }
+                            }
+                            "tool_use" => {
+                                let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                                let input = block.get("input");
+                                let summary = match name {
+                                    "Bash" => {
+                                        let cmd = input
+                                            .and_then(|i| i.get("command"))
+                                            .and_then(|c| c.as_str())
+                                            .unwrap_or("?");
+                                        let cmd = if cmd.len() > 120 {
+                                            format!("{}...", &cmd[..cmd.floor_char_boundary(120)])
+                                        } else {
+                                            cmd.to_string()
+                                        };
+                                        format!("$ {}", cmd)
+                                    }
+                                    n if n.starts_with("mcp__") => {
+                                        let tool_name = n.rsplit("__").next().unwrap_or(n);
+                                        format!("mcp: {}", tool_name)
+                                    }
+                                    "Read" | "Edit" | "Write" => {
+                                        let path = input
+                                            .and_then(|i| i.get("file_path"))
+                                            .and_then(|p| p.as_str())
+                                            .unwrap_or("?");
+                                        format!("{}: {}", name, path)
+                                    }
+                                    _ => format!("tool: {}", name),
+                                };
+                                eprintln!("[{}] {}", role, summary);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Some("result") => {
+                session_id = json.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+                result_text = json.get("result").and_then(|v| v.as_str()).map(|s| s.to_string());
+                total_cost_usd = json.get("total_cost_usd").and_then(|v| v.as_f64());
+                num_turns = json.get("num_turns").and_then(|v| v.as_u64()).map(|n| n as u32);
+                duration_ms = json.get("duration_ms").and_then(|v| v.as_u64());
+            }
+            _ => {}
         }
     }
 
-    let exit_code = output.status.code().unwrap_or(-1);
+    // Read stderr after stdout is drained
+    let mut stderr_buf = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_string(&mut stderr_buf);
+    }
 
-    // Try to parse JSON output
-    let (session_id, result_text) = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
-        let sid = json.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let res = json.get("result").and_then(|v| v.as_str()).map(|s| s.to_string());
-        (sid, res)
-    } else {
-        (None, None)
-    };
+    let status = child.wait()
+        .map_err(|e| format!("Failed to wait on claude: {}", e))?;
+    let exit_code = status.code().unwrap_or(-1);
 
     Ok(ClaudeResult {
-        success: output.status.success(),
+        success: status.success(),
         exit_code,
         session_id,
         result_text,
-        stdout_raw: stdout,
-        stderr_raw: stderr,
+        total_cost_usd,
+        num_turns,
+        duration_ms,
+        stdout_raw: String::new(),
+        stderr_raw: stderr_buf,
     })
 }
 
@@ -7669,7 +7775,7 @@ async fn handle_orchestrate(
         };
 
         println!("[coder] Starting (run: {})", &coder_run_id[..8]);
-        let coder_result = spawn_claude(&coder_prompt, &coder_mcp, max_turns, verbose)?;
+        let coder_result = spawn_claude(&coder_prompt, &coder_mcp, max_turns, verbose, "coder")?;
 
         if !coder_result.success {
             eprintln!("[coder] FAILED (exit code {})", coder_result.exit_code);
@@ -7680,16 +7786,13 @@ async fn handle_orchestrate(
             record_run_status(db, &task_node_id, &coder_run_id, "spore:coder", "failed", coder_result.exit_code)?;
             return Err(format!("Coder failed on bounce {} with exit code {}", bounce + 1, coder_result.exit_code));
         }
-        println!("[coder] Completed successfully");
+        println!("[coder] Done ({} turns, ${:.2}, {:.0}s)",
+            coder_result.num_turns.unwrap_or(0),
+            coder_result.total_cost_usd.unwrap_or(0.0),
+            coder_result.duration_ms.unwrap_or(0) as f64 / 1000.0,
+        );
         if let Some(ref sid) = coder_result.session_id {
             println!("[coder] Session: {}", sid);
-        }
-        if verbose {
-            if let Some(ref text) = coder_result.result_text {
-                eprintln!("[coder] Result: {}", text);
-            }
-            let truncated = &coder_result.stdout_raw[..2000.min(coder_result.stdout_raw.len())];
-            eprintln!("[coder] Raw output (truncated): {}", truncated);
         }
 
         // Find coder's output node
@@ -7723,7 +7826,7 @@ async fn handle_orchestrate(
         );
 
         println!("[verifier] Starting (run: {})", &verifier_run_id[..8]);
-        let verifier_result = spawn_claude(&verifier_prompt, &verifier_mcp, max_turns, verbose)?;
+        let verifier_result = spawn_claude(&verifier_prompt, &verifier_mcp, max_turns, verbose, "verifier")?;
 
         if !verifier_result.success {
             eprintln!("[verifier] FAILED (exit code {})", verifier_result.exit_code);
@@ -7733,14 +7836,11 @@ async fn handle_orchestrate(
             record_run_status(db, &task_node_id, &verifier_run_id, "spore:verifier", "failed", verifier_result.exit_code)?;
             return Err(format!("Verifier failed on bounce {} with exit code {}", bounce + 1, verifier_result.exit_code));
         }
-        println!("[verifier] Completed successfully");
-        if verbose {
-            if let Some(ref text) = verifier_result.result_text {
-                eprintln!("[verifier] Result: {}", text);
-            }
-            let truncated = &verifier_result.stdout_raw[..2000.min(verifier_result.stdout_raw.len())];
-            eprintln!("[verifier] Raw output (truncated): {}", truncated);
-        }
+        println!("[verifier] Done ({} turns, ${:.2}, {:.0}s)",
+            verifier_result.num_turns.unwrap_or(0),
+            verifier_result.total_cost_usd.unwrap_or(0.0),
+            verifier_result.duration_ms.unwrap_or(0) as f64 / 1000.0,
+        );
         record_run_status(db, &task_node_id, &verifier_run_id, "spore:verifier", "completed", 0)?;
 
         // Check verdict
