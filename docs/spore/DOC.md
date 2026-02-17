@@ -24,8 +24,9 @@ Mycelica is a knowledge graph that serves as the persistent memory layer for a m
                                     │ DocWriter│  ◄── reads graph + code, writes .md
                                     └──────────┘
 
-All agents communicate THROUGH the graph. No side channels.
+All agents communicate THROUGH the graph as primary coordination channel.
 Read graph → write nodes/edges → other agents read those → respond.
+(Coder writes files, Verifier runs bash — the graph records THAT it happened.)
 
          ┌──────────────────────────────────────────────────────┐
          │              mycelica-cli MCP Server(s)               │
@@ -199,15 +200,15 @@ DocWriter reads meta + graph → updates .md files
 
 ### Agent specifications
 
-| Agent | ID | Writes | Reads | Cannot |
-|-------|----|--------|-------|--------|
-| Ingestor | `spore:ingestor` | knowledge/operational nodes, edges | Full graph | Create meta, supersede edges |
-| Coder | `spore:coder` | code files, operational nodes, edges | Full graph + filesystem | Create meta, verify own work |
-| Verifier | `spore:verifier` | operational nodes, edges; bash | Full graph + filesystem | Fix code, create meta |
-| Planner | `spore:planner` | operational + plan meta nodes, edges | ALL agent output | Modify code, import |
-| Synthesizer | `spore:synthesizer` | Edges only (create + supersede) | Full graph (knowledge+operational) | Create or modify nodes |
-| Summarizer | `spore:summarizer` | Meta-nodes, summarizes/contradicts edges | Full graph EXCEPT meta | Create knowledge/operational nodes |
-| DocWriter | `spore:docwriter` | .md files, optionally documents edges | Full graph | Create nodes |
+| Agent | ID | Writes | Reads | Cannot | Tool Restrictions |
+|-------|----|--------|-------|--------|-------------------|
+| Ingestor | `spore:ingestor` | knowledge/operational nodes, edges | Full graph | Create meta, supersede edges | — |
+| Coder | `spore:coder` | code files, operational nodes, edges | Full graph + filesystem | Create meta, verify own work | No Grep/Glob (--allowedTools) |
+| Verifier | `spore:verifier` | operational nodes, edges; bash | Full graph + filesystem | Fix code, create meta | Bash restricted to cargo/cd/mycelica-cli |
+| Planner | `spore:planner` | operational + plan meta nodes, edges | ALL agent output | Modify code, import | — |
+| Synthesizer | `spore:synthesizer` | Edges only (create + supersede) | Full graph (knowledge+operational) | Create or modify nodes | — |
+| Summarizer | `spore:summarizer` | Meta-nodes, summarizes/contradicts edges | Full graph EXCEPT meta | Create knowledge/operational nodes | — |
+| DocWriter | `spore:docwriter` | .md files, optionally documents edges | Full graph | Create nodes | — |
 
 ### Recursion guards
 
@@ -267,6 +268,50 @@ When Coder and Verifier bounce:
 ```
 
 Summarizer compresses: "Edge signing: failed on lifetime error, fixed by restructuring MutexGuard scope, verified passing."
+
+---
+
+## Orchestrator
+
+### `spore orchestrate`
+
+```bash
+mycelica-cli spore orchestrate "task description" --max-bounces 3 --verbose
+```
+
+Automates the Coder → Verifier bounce loop. Creates a task node, spawns agents sequentially, reads verdicts, bounces or completes.
+
+### Pipeline flow
+
+```
+1. Create task node in graph
+2. Capture dirty + untracked files (git diff, git ls-files)
+3. Spawn Coder (Claude Code with MCP config, --allowedTools, streaming)
+4. Find Coder's operational node (by agent_id + timestamp)
+5. POST-CODER CLEANUP:
+   a. git diff to find files Coder changed
+   b. mycelica-cli import code <file> --update for each .rs file
+   c. cargo install + sidecar copy if src-tauri/ changed
+   d. Create related edges from impl node to code nodes
+6. Spawn Verifier (different MCP config, different --allowedTools)
+7. Read verdict: supports → complete, contradicts → bounce to step 3
+8. After max-bounces: exit for human review
+```
+
+### Streaming output
+
+Agents run with `--output-format stream-json`. The orchestrator parses events line-by-line and prints human-readable progress: tool calls (`[coder] $ cargo check`), MCP operations (`[coder] mcp: mycelica_search`), file operations (`[verifier] Read: schema.rs`). Completion includes turn count, cost, and duration.
+
+### Tool restrictions
+
+Enforced via `--allowedTools` flag on Claude Code:
+
+| Agent | Allowed Tools |
+|-------|---------------|
+| Coder | `Read,Write,Edit,Bash(*),mcp__mycelica__*` |
+| Verifier | `Read,Grep,Glob,Bash(cargo:*),Bash(cd:*),Bash(mycelica-cli:*),mcp__mycelica__*` |
+
+Coder cannot use Grep or Glob — forced to use `mycelica-cli search` (semantic, indexed) instead. This prevents thousands of wasted context tokens per session.
 
 ### Staleness detection
 
@@ -346,6 +391,16 @@ Returns all unique paths up to max-hops with full edge metadata per hop:
 ---
 
 ## Run Tracking
+
+### Commands
+
+```bash
+mycelica-cli spore runs list                       # recent runs with stats
+mycelica-cli spore runs get <run-id>               # nodes/edges created in this run
+mycelica-cli spore runs rollback <run-id>          # remove a run's output
+mycelica-cli spore runs rollback <run-id> --dry-run # preview what would be deleted
+mycelica-cli spore query-edges --compact           # one line per edge
+```
 
 ### Run metadata
 

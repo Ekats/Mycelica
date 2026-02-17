@@ -4,9 +4,9 @@
 
 ## Status
 
-Phases 1-6 complete and committed. The full infrastructure exists: typed edges with content/attribution/supersession, meta nodes with transactional creation, query/explain/path/rank commands, status dashboard, MCP server with 16 tools and role-based permissions, agent definitions (Coder + Verifier), and an automated orchestrator (`mycelica-cli spore orchestrate`) with run tracking, escalation, and failure handling. Phase 5 bounce loop validated manually. Phase 6 orchestrator testing in progress.
+Phases 1-6 complete and committed. The full infrastructure exists: typed edges with content/attribution/supersession, meta nodes with transactional creation, query/explain/path/rank commands, status dashboard, MCP server with 16 tools and role-based permissions, agent definitions (Coder + Verifier), and an automated orchestrator (`mycelica-cli spore orchestrate`) with run tracking, streaming output, post-coder cleanup (re-indexing, reinstall, code node edges), tool restrictions via `--allowedTools`, and escalation. 4 successful end-to-end orchestrator runs validated.
 
-**14 concerns tracked → now 16. 5 resolved, 11 active/future.**
+**16 concerns tracked. 6 resolved, 10 active/future.**
 
 ## Concern 1: The Summarizer is editorial work, not engineering
 
@@ -58,17 +58,17 @@ The original concern about linear pipeline feedback loops is moot. The bouncing 
 
 ## Concern 7: "No side channels" is an overpromise
 
-**Severity: Low — documentation wording.**
+**Severity: RESOLVED.**
 
-DOC.md should say "primary coordination channel" instead of "exclusive." Coder writes files, DocWriter writes markdown, Verifier runs bash — these are intentional side channels. The graph records THAT they happened, not the full content.
+DOC.md updated: says "primary coordination channel" instead of "no side channels." Coder writes files, DocWriter writes markdown, Verifier runs bash — these are intentional side channels. The graph records THAT they happened, not the full content.
 
-**Status: Still needs DOC.md wording fix.**
+**Status: Fixed in DOC.md.**
 
 ## Concern 8: Premature infrastructure risk
 
 **Severity: GATE PASSED.**
 
-Single-agent test proved the commands produce useful output. MCP server built and tested. Risk now shifts to Phase 5: can the bouncing model actually work?
+Single-agent test proved the commands produce useful output. MCP server built and tested. Phase 5 bounce loop validated. Phase 6 orchestrator complete with 4 successful end-to-end runs.
 
 ```
 Phase 1 ✅ (schema)
@@ -76,27 +76,28 @@ Phase 2 ✅ (edge CLI)
 Single-agent test ✅ (passed)
 Phase 3 ✅ (test gap fixes)
 Phase 4 ✅ (MCP server)
+Phase 5 ✅ (agent definitions, bounce loop validated)
+Phase 6 ✅ (orchestrator, streaming, post-run cleanup, --allowedTools)
     ↓
->>> PHASE 5: BOUNCE LOOP TEST <<<  ← you are here
-    ↓
-  ├─ Bounce works?    → add remaining agents
-  └─ Bounce fails?    → simplify or iterate prompts
+>>> NEXT: Summarizer agent, then Plan Reviewer <<<
 ```
 
 ## Concern 9: Bounce loop convergence
 
-**Severity: High — untested.**
+**Severity: RESOLVED for V1 — validated.**
 
-Context window exhaustion during bounces. Each bounce is: read graph (tool calls + responses) → do work → write graph. Three bounces between Coder and Verifier means 6 operational nodes, 6+ edges, and ~6 read-content calls per agent per bounce. At bounce 3, the agent's context window has 18 tool call/response pairs from graph reads alone, plus all the file editing. A 200k context window fills fast.
+4 end-to-end orchestrator runs, all converged in 1 bounce (Coder implements → Verifier approves). No multi-bounce scenarios tested yet — all tasks have been well-scoped single-feature additions. Real stress test: a task where the Verifier rejects and the Coder must fix.
 
-The 3-bounce escalation rule is a safeguard, not a solution. If agents can't converge in 3 bounces, the task decomposition is wrong or the feedback isn't specific enough.
+Context window usage per agent: 15-30 turns, $0.50-0.80 (Opus). Within budget for single-bounce. Multi-bounce would approach 50+ turns per agent — attention decay risk increases. The prompt slimming (375 → 155 lines) and --allowedTools (no Grep waste) mitigate this.
 
-**Mitigations:**
-- Verifier MUST be specific (exact error, file, line) — vague feedback forces extra bounces
-- SlimNode/SlimEdge reduces token usage per tool call
-- Human decides after 3 bounces — doesn't rely on agents to detect deadlock
+**Mitigations implemented:**
+- Verifier prompts require specific feedback (exact error, file, line)
+- `--allowedTools` prevents Grep/Glob waste for Coder (saves thousands of tokens)
+- Agent prompts slimmed from 375 to 155 lines total (less instruction competition)
+- `max-bounces` flag with human escalation after N bounces
+- Orchestrator post-run cleanup removes 3 steps from Coder's late-session work
 
-**Status: Untested. Phase 5 validation test will surface this.**
+**Status: V1 validated (1-bounce). Multi-bounce stress test pending.**
 
 ## Concern 10: Seven agents may be too many for V1
 
@@ -165,9 +166,17 @@ The runtime layer is where the system gets interesting. The Summarizer could wri
 
 **Severity: Low now, High for scalability and reliability.**
 
-The current architecture uses **fat sessions**: one long Claude session carries the full prompt, all graph reads, code edits, build output, and graph writes. Context windows fill up. Instructions at the top (like "record your work in the graph") get lost to attention decay by session end. This is the root cause of agents skipping graph recording — it's not a prompt problem, it's a cognitive architecture problem.
+The current architecture uses **fat sessions**: one long Claude session carries the full prompt, all graph reads, code edits, build output, and graph writes. Context windows fill up. Instructions at the top (like "record your work in the graph") get lost to attention decay by session end.
 
-The alternative is **thin sessions**: each Claude session does one focused thing, writes a signal to the graph, and dies. The next session reads that signal and continues. The context window is temporary and local (like a neuron's membrane potential). The graph is persistent and structural (like the connectome). Intelligence emerges from the pathway, not from any single activation.
+**Phase 6 partially addresses this through structural enforcement rather than thin sessions:**
+- Orchestrator post-run cleanup handles re-indexing, CLI reinstall, and code node edges — removing 3 steps from the agent's late-session work
+- `--allowedTools` prevents Grep/Glob for Coder — eliminates the biggest context waste
+- Agent prompts slimmed from 375 to 155 lines total (75 coder + 80 verifier) — less instruction competition
+- Agent's remaining post-coding job: build check, one node, one edge. Three checklist items instead of seven.
+
+These are "medium-thickness" sessions — still single Claude invocations, but with less for the agent to remember and more handled structurally by the orchestrator.
+
+The full **thin session** alternative remains the long-term path: each Claude session does one focused thing, writes a signal to the graph, and dies. The next session reads that signal and continues. The context window is temporary and local (like a neuron's membrane potential). The graph is persistent and structural (like the connectome). Intelligence emerges from the pathway, not from any single activation.
 
 **Fat session (current):**
 ```

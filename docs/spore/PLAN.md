@@ -320,59 +320,68 @@ Reads meta-nodes first (high-level state), drills into knowledge layer for detai
 ### Lessons from Phase 5 testing:
 
 1. **`--features mcp` must be in install command** — agent ran `cargo install` without it, overwrote MCP-enabled binary. Fixed in CLAUDE.md.
-2. **Graph recording is optional unless enforced** — agents skip "after coding" steps unless rules are emphatic. Fixed: moved graph recording to hard rules with "your work does not exist until recorded."
-3. **Agents default to CLI over MCP tools** — agents use `mycelica-cli` via bash instead of MCP tools unless explicitly told not to. Fixed: rule that MCP tools are mandatory for all graph operations.
+2. **Graph recording is optional unless enforced** — agents skip "after coding" steps due to attention decay. Phase 5 fix: emphatic rules. Phase 6 fix: orchestrator post-run cleanup handles re-indexing and code node edges structurally, reducing agent's post-coding job to one node + one edge.
+3. **Agents default to Grep over mycelica-cli search** — Grep burns thousands of tokens per call, accelerating attention decay. Phase 5 fix: prompt instructions. Phase 6 fix: `--allowedTools` blocks Grep for Coder entirely.
 4. **Full path required in MCP config** — Claude Code doesn't inherit shell PATH. Must use full absolute path (e.g. `~/.cargo/bin/mycelica-cli`) not bare `mycelica-cli`.
 
 ### Effort: 1-2 days for Coder + Verifier. Remaining agents after bounce loop validates.
 
 ---
 
-## Phase 6: Pipeline Orchestration
+## Phase 6: Pipeline Orchestration ✅ COMPLETE
 
-**Goal:** Run tracking, bounce protocol implementation, failure handling, escalation.
+Committed Feb 17, 2026. ~950 lines across cli.rs. 4 successful end-to-end runs validated.
 
-### 6a. Run tracking
+### What was built:
 
-Each agent stamps `metadata.run_id` (ISO timestamp) on every node/edge per run.
+**Orchestrate command:** `mycelica-cli spore orchestrate "task description" --max-bounces N --verbose`
 
-```bash
-mycelica-cli spore runs list                  # recent runs with stats
-mycelica-cli spore runs get <run-id>          # nodes/edges created in this run
-mycelica-cli spore runs rollback <run-id>     # remove incomplete run's output
-```
+Automates the full Coder → Verifier bounce loop:
+1. Creates task node in graph
+2. Generates Coder prompt with task + agent instructions
+3. Spawns Claude Code with MCP config, streams output in real-time
+4. Finds Coder's operational node, runs post-coder cleanup
+5. Swaps MCP config to verifier role, spawns Verifier
+6. Reads verdict (supports/contradicts edge), decides continue or bounce
+7. On contradiction: bounces back to Coder with feedback context
+8. On support or max-bounces: exits with summary
 
-### 6b. Bounce protocol queries
+**Streaming output:** `spawn_claude()` uses `--output-format stream-json` with line-by-line parsing. Prints real-time progress: `[coder] $ cargo check`, `[coder] mcp: mycelica_search`, `[verifier] tool: Read`. Replaces 2-4 minute black box with visible agent activity.
 
-Agents need to discover unresolved concerns targeting their work:
+**Post-coder cleanup (structural enforcement):** Between Coder exit and Verifier launch, the orchestrator:
+- Captures dirty + untracked files before/after via `git diff --name-only` and `git ls-files --others`
+- Re-indexes all changed .rs files: `mycelica-cli import code <file> --update`
+- Reinstalls CLI + sidecar if src-tauri/ files changed
+- Creates `related` edges from impl node to code nodes matching changed files
+- All failures warn but don't abort orchestration
 
-```bash
-# "What bounces are waiting for me?"
-mycelica-cli spore query-edges \
-  --type contradicts,questions \
-  --target-agent spore:coder \
-  --not-superseded \
-  --since <last_run>
-```
+This removes code index updates, CLI reinstall, and code node edge creation from the agent's responsibilities entirely. The agent's post-coding job is now: build check, create one node, create one edge.
 
-This requires extending `query-edges` with a `--target-agent` filter (find edges where the TARGET node was created by a specific agent). Different from `--agent` which filters by the edge's own creator.
+**Tool restrictions via --allowedTools:** Coder gets `Read,Write,Edit,Bash(*),mcp__mycelica__*` — no Grep or Glob. Verifier gets `Read,Grep,Glob,Bash(cargo:*),Bash(cd:*),Bash(mycelica-cli:*),mcp__mycelica__*`. Structural enforcement, zero prompt tokens, impossible to ignore.
 
-### 6c. Escalation
+**Run tracking:**
+- `spore runs list` — all runs with edge counts, timestamps, agents
+- `spore runs get <id>` — nodes/edges from a specific run
+- `spore runs rollback <id>` — remove a run's output
+- `spore runs rollback <id> --dry-run` — preview what would be deleted
+- `spore query-edges --compact` — one-line-per-edge output
 
-New `content_type = 'escalation'` for unresolved bounces. After 3 bounces on the same issue:
-1. Planner creates escalation node linking to the bounce chain
-2. Summarizer surfaces "UNRESOLVED" at top layer
-3. Human decides, creates decision node
-4. Relevant agent implements
+**Prompt slimming:** Agent prompts reduced from 375 to 155 lines total (59% reduction). MCP tool listings removed (agents discover via handshake). Steps handled by orchestrator removed from agent prompts. Verifier graph hygiene checks removed (orchestrator re-indexes before Verifier runs).
 
-### 6d. Failure handling
+**Escalation:** max-bounces flag (default 3). After N bounces without convergence, orchestrator exits with status for human review. Planner-driven escalation deferred to Phase 7.
 
-- Failed runs leave partial output marked with `run_id`
-- Summarizer creates status meta-node: "Coder run at 14:30 may be incomplete — 3/8 expected files modified"
-- Verifier explicitly skips verification of incomplete runs
-- `spore runs rollback` removes all nodes/edges from a failed run
+**Validated runs (all converged in 1 bounce):**
+1. `--json` flag for `db stats` ($0.67)
+2. `--compact` flag for `spore query-edges` ($0.96)
+3. `--dry-run` flag for `spore runs rollback` ($1.44)
+4. Post-run cleanup + --allowedTools (self-hosted)
 
-### Effort: 2-3 days
+### Lessons from Phase 6:
+
+1. **Agents forget late-session instructions** — the root cause of skipped graph recording is attention decay, not bad prompts. Solution: move post-coding work from agent to orchestrator (structural enforcement).
+2. **Grep wastes context** — a single Grep on cli.rs burns thousands of tokens, accelerating attention decay. Solution: --allowedTools blocks Grep for Coder, mycelica-cli search is the enforced alternative.
+3. **Streaming output is essential** — 2-4 minute black box sessions are unusable. Real-time progress makes the system trustworthy.
+4. **Cost baseline:** ~$0.50-0.80 per agent invocation (Opus, 15-30 turns). Full orchestration ~$1-1.50.
 
 ---
 
@@ -555,9 +564,9 @@ Dijkstra context retrieval is the attention mechanism — selecting which neuron
 | 7 | Phase 7: GUI | Deferred | TBD |
 | 8 | Phase 8: Neural Pathways | Future | TBD |
 
-**Current state:** Phase 6 orchestrator implemented. `mycelica-cli spore orchestrate "task"` automates the full Coder → Verifier bounce loop with run tracking, escalation, and failure handling. Testing in progress.
+**Current state:** Phase 6 complete and validated with 4 end-to-end runs. Orchestrator handles Coder → Verifier bounce loop with run tracking, streaming output, post-run cleanup, tool restrictions, and escalation. Agent prompts slimmed to ~75 lines each.
 
-**Next:** Validate orchestrator end-to-end → fix issues → remaining agents (Planner, Summarizer) → thin session experiments.
+**Next:** Validate --allowedTools in live orchestration → remaining agents (Planner, Summarizer) → thin session experiments.
 
 ---
 
