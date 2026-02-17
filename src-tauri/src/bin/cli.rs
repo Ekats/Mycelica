@@ -7629,6 +7629,10 @@ fn spawn_claude(
         cmd.arg("--disallowedTools").arg(tools);
     }
 
+    // Clear CLAUDECODE env var so the child process doesn't refuse to start
+    // when the orchestrator itself is running inside a Claude Code session.
+    cmd.env_remove("CLAUDECODE");
+
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -7985,8 +7989,39 @@ fn post_coder_cleanup(
 }
 
 /// Generate a task file with graph context for an agent before spawning.
-/// Searches the graph for nodes relevant to the task, runs Dijkstra from the
-/// top matches, and writes a markdown file as both bootstrap context and audit trail.
+///
+/// Produces a markdown file at `docs/spore/tasks/task-<run_id>.md` that serves as
+/// both bootstrap context for the spawned agent and an audit trail for the run.
+///
+/// # Generated Sections
+///
+/// - **Header** — Run metadata: truncated task title, run ID, agent role, bounce
+///   number (current/max), and UTC timestamp.
+/// - **Task** — The full, untruncated task description as provided by the caller.
+/// - **Previous Bounce** (conditional) — Present only when `last_impl_id` is set,
+///   meaning the verifier rejected a prior implementation. Points the agent at the
+///   failed node so it can read the incoming `contradicts` edges and fix the issues.
+/// - **Graph Context** — A relevance-ranked table of knowledge-graph nodes related
+///   to the task. Each row shows the node title, short ID, relevance score, the
+///   anchor it was reached from, and the edge-type path taken to reach it.
+/// - **Checklist** — Static reminders for the agent: read context first, create an
+///   operational node when done, and link it to modified code nodes.
+///
+/// # Context Gathering: FTS + Dijkstra
+///
+/// 1. **FTS5 anchor search** — The task description is tokenized, stopwords and
+///    short tokens (≤2 chars) are stripped, and the remaining terms are joined with
+///    `OR` to form a full-text query. This broadens recall vs. the default AND
+///    semantics. The top 3 non-operational matches become anchor nodes.
+/// 2. **Dijkstra expansion** — For each anchor, [`Database::context_for_task`] runs
+///    a weighted shortest-path traversal (max 4 hops, cost ceiling 2.0) that
+///    follows semantic edges (supports, contradicts, derives_from, etc.) while
+///    skipping structural edges (defined_in, belongs_to, sibling). Edge confidence
+///    and type priority determine traversal weights, so high-confidence semantic
+///    edges are explored first.
+/// 3. **Dedup and rank** — Nodes discovered from multiple anchors are deduplicated,
+///    keeping the highest relevance score. The final list is sorted by descending
+///    relevance and rendered into the Graph Context table.
 fn generate_task_file(
     db: &Database,
     task: &str,
