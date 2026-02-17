@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mycelica": {
+      "command": "mycelica-cli",
+      "args": ["mcp-server", "--stdio", "--agent-role", "coder", "--agent-id", "spore:coder"]
+    }
+  }
+}
