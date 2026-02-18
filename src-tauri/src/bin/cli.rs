@@ -713,6 +713,9 @@ enum RunCommands {
         /// Also show non-Orchestration operational nodes that have tracks edges
         #[arg(long)]
         all: bool,
+        /// Show total cost (USD) for each run from tracks edge metadata
+        #[arg(long)]
+        cost: bool,
     },
     /// Show all edges in a run
     Get {
@@ -7504,7 +7507,7 @@ fn parse_since_to_millis(s: &str) -> Result<i64, String> {
 
 fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String> {
     match cmd {
-        RunCommands::List { all } => {
+        RunCommands::List { all, cost: show_cost } => {
             // Query task nodes: Orchestration: prefixed, plus (with --all) any operational node with tracks edges
             let task_rows: Vec<(String, String, i64)> = (|| -> Result<Vec<_>, String> {
                 let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
@@ -7545,6 +7548,7 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                 created_at: i64,
                 status: String,
                 kind: &'static str,
+                total_cost: Option<f64>,
             }
 
             let mut runs = Vec::new();
@@ -7596,12 +7600,37 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                     "pending"
                 };
 
+                // Compute cost from tracks edges metadata if requested
+                let total_cost = if show_cost {
+                    (|| -> Result<Option<f64>, String> {
+                        let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+                        let mut stmt = conn.prepare(
+                            "SELECT metadata FROM edges \
+                             WHERE source_id = ?1 AND target_id = ?1 AND type = 'tracks'"
+                        ).map_err(|e| e.to_string())?;
+                        let costs: Vec<f64> = stmt.query_map(rusqlite::params![task_id], |row| {
+                            let meta: String = row.get(0)?;
+                            Ok(meta)
+                        }).map_err(|e| e.to_string())?
+                        .filter_map(|r| r.ok())
+                        .filter_map(|meta| {
+                            serde_json::from_str::<serde_json::Value>(&meta).ok()
+                                .and_then(|v| v["cost_usd"].as_f64())
+                        })
+                        .collect();
+                        if costs.is_empty() { Ok(None) } else { Ok(Some(costs.iter().sum())) }
+                    })().unwrap_or(None)
+                } else {
+                    None
+                };
+
                 runs.push(RunInfo {
                     id: task_id[..8.min(task_id.len())].to_string(),
                     description,
                     created_at: *created_at,
                     status: status.to_string(),
                     kind: if is_orchestration { "orchestration" } else { "tracked" },
+                    total_cost,
                 });
             }
 
@@ -7617,6 +7646,9 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                     });
                     if all {
                         obj["kind"] = serde_json::json!(r.kind);
+                    }
+                    if let Some(cost) = r.total_cost {
+                        obj["cost_usd"] = serde_json::json!(format!("{:.2}", cost));
                     }
                     obj
                 }).collect();
@@ -7636,6 +7668,25 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                     println!("{:<10} {:<14} {:<50} {:<20} {}", r.id, r.kind, desc, created, r.status);
                 }
                 println!("\n{} run(s)", runs.len());
+            } else if show_cost {
+                println!("{:<10} {:<52} {:<20} {:<10} {}", "RUN ID", "DESCRIPTION", "CREATED", "STATUS", "COST");
+                println!("{}", "-".repeat(106));
+                for r in &runs {
+                    let created = chrono::DateTime::from_timestamp_millis(r.created_at)
+                        .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    let desc = if r.description.chars().count() > 50 {
+                        format!("{}...", utils::safe_truncate(&r.description, 47))
+                    } else {
+                        r.description.clone()
+                    };
+                    let cost_str = r.total_cost
+                        .map(|c| format!("${:.2}", c))
+                        .unwrap_or_else(|| "-".to_string());
+                    println!("{:<10} {:<52} {:<20} {:<10} {}", r.id, desc, created, r.status, cost_str);
+                }
+                let total: f64 = runs.iter().filter_map(|r| r.total_cost).sum();
+                println!("\n{} run(s), total cost: ${:.2}", runs.len(), total);
             } else {
                 println!("{:<10} {:<62} {:<20} {}", "RUN ID", "DESCRIPTION", "CREATED", "STATUS");
                 println!("{}", "-".repeat(100));
@@ -9011,12 +9062,12 @@ async fn handle_orchestrate(
             println!("[coder] Fallback node: {} ({} file(s) changed)", &fallback_id[..8], changed.len());
             impl_node_holder = db.get_node(&fallback_id).map_err(|e| e.to_string())?
                 .ok_or("Failed to read back fallback node")?;
-            record_run_status(db, &task_node_id, &coder_run_id, "spore:coder", "completed-fallback", 0)?;
+            record_run_status_with_cost(db, &task_node_id, &coder_run_id, "spore:coder", "completed-fallback", 0, coder_result.total_cost_usd)?;
             &impl_node_holder
         } else {
             impl_node_holder = coder_nodes[0].clone();
             println!("[coder] Implementation node: {} ({})", &impl_node_holder.id[..8], impl_node_holder.title);
-            record_run_status(db, &task_node_id, &coder_run_id, "spore:coder", "completed", 0)?;
+            record_run_status_with_cost(db, &task_node_id, &coder_run_id, "spore:coder", "completed", 0, coder_result.total_cost_usd)?;
             &impl_node_holder
         };
 
@@ -9062,7 +9113,7 @@ async fn handle_orchestrate(
             verifier_result.total_cost_usd.unwrap_or(0.0),
             verifier_result.duration_ms.unwrap_or(0) as f64 / 1000.0,
         );
-        record_run_status(db, &task_node_id, &verifier_run_id, "spore:verifier", "completed", 0)?;
+        record_run_status_with_cost(db, &task_node_id, &verifier_run_id, "spore:verifier", "completed", 0, verifier_result.total_cost_usd)?;
 
         // Check verdict
         let verdict = check_verdict(db, &impl_node.id);
@@ -9106,7 +9157,7 @@ async fn handle_orchestrate(
                         summarizer_result.total_cost_usd.unwrap_or(0.0),
                         summarizer_result.duration_ms.unwrap_or(0) as f64 / 1000.0,
                     );
-                    record_run_status(db, &task_node_id, &summarizer_run_id, "spore:summarizer", "completed", 0)?;
+                    record_run_status_with_cost(db, &task_node_id, &summarizer_run_id, "spore:summarizer", "completed", 0, summarizer_result.total_cost_usd)?;
                 }
 
                 return Ok(());
@@ -9140,13 +9191,28 @@ fn record_run_status(
     status: &str,
     exit_code: i32,
 ) -> Result<(), String> {
+    record_run_status_with_cost(db, task_node_id, run_id, agent, status, exit_code, None)
+}
+
+fn record_run_status_with_cost(
+    db: &Database,
+    task_node_id: &str,
+    run_id: &str,
+    agent: &str,
+    status: &str,
+    exit_code: i32,
+    cost_usd: Option<f64>,
+) -> Result<(), String> {
     let now = chrono::Utc::now().timestamp_millis();
-    let metadata = serde_json::json!({
+    let mut metadata = serde_json::json!({
         "run_id": run_id,
         "status": status,
         "exit_code": exit_code,
         "agent": agent,
     });
+    if let Some(cost) = cost_usd {
+        metadata["cost_usd"] = serde_json::json!(cost);
+    }
     let edge = Edge {
         id: uuid::Uuid::new_v4().to_string(),
         source: task_node_id.to_string(),
