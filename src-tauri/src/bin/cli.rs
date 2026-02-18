@@ -656,6 +656,9 @@ enum SporeCommands {
         /// Run summarizer after verification completes
         #[arg(long)]
         summarize: bool,
+        /// Run a scout phase before coder (5-turn read-only exploration, writes a plan file)
+        #[arg(long)]
+        scout: bool,
         /// Show what would happen without running agents
         #[arg(long)]
         dry_run: bool,
@@ -7380,8 +7383,8 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
             handle_runs(cmd, db, json)
         }
 
-        SporeCommands::Orchestrate { task, max_bounces, max_turns, coder_prompt, verifier_prompt, summarizer_prompt, summarize, dry_run, verbose } => {
-            handle_orchestrate(db, &task, max_bounces, max_turns, &coder_prompt, &verifier_prompt, &summarizer_prompt, summarize, dry_run, verbose).await
+        SporeCommands::Orchestrate { task, max_bounces, max_turns, coder_prompt, verifier_prompt, summarizer_prompt, summarize, scout, dry_run, verbose } => {
+            handle_orchestrate(db, &task, max_bounces, max_turns, &coder_prompt, &verifier_prompt, &summarizer_prompt, summarize, scout, dry_run, verbose).await
         }
 
         SporeCommands::ContextForTask { id, budget, max_hops, max_cost, edge_types, not_superseded, items_only } => {
@@ -9071,6 +9074,7 @@ async fn handle_orchestrate(
     verifier_prompt_path: &Path,
     summarizer_prompt_path: &Path,
     summarize: bool,
+    scout: bool,
     dry_run: bool,
     verbose: bool,
 ) -> Result<(), String> {
@@ -9208,6 +9212,62 @@ async fn handle_orchestrate(
         )?;
         println!("[coder] Task file: {}", task_file.display());
 
+        // === OPTIONAL SCOUT PHASE ===
+        // Thin-session experiment: a 5-turn read-only scout explores code and writes a plan.
+        // The coder then starts with a focused plan instead of exploring blind.
+        let scout_plan_path: Option<PathBuf> = if scout && bounce == 0 && last_impl_id.is_none() {
+            let scout_run_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+            let plan_path = PathBuf::from(format!("docs/spore/tasks/plan-{}.md", &scout_run_id));
+            let scout_mcp = write_temp_mcp_config(
+                &cli_binary, "coder", "spore:scout", &scout_run_id, &db_path,
+            )?;
+            let scout_prompt = format!(
+                "You are a code scout. Your ONLY job is to explore and plan — do NOT edit any files.\n\n\
+                 Read the task file at {} for context.\n\n\
+                 Your task: {}\n\n\
+                 Steps:\n\
+                 1. Read the task file\n\
+                 2. Use mycelica_code_show and mycelica_search to find relevant code\n\
+                 3. Read the actual source files to understand the implementation\n\
+                 4. Write a plan file to {} with:\n\
+                    - Which file(s) to modify\n\
+                    - Which function(s) / struct(s) to change\n\
+                    - Line numbers for each change\n\
+                    - What each change should do (be specific)\n\
+                    - Any gotchas or edge cases\n\n\
+                 Keep the plan concise (under 40 lines). Be specific about line numbers and code locations.",
+                task_file.display(), task, plan_path.display()
+            );
+            println!("[scout] Starting (run: {})", &scout_run_id);
+            let scout_result = spawn_claude(
+                &scout_prompt, &scout_mcp, 5, verbose, "scout",
+                Some("Read,Write,mcp__mycelica__*"),
+                Some("Edit,Bash,Grep,Glob"),
+            )?;
+            println!("[scout] Done ({} turns, ${:.2}, {:.0}s)",
+                scout_result.num_turns.unwrap_or(0),
+                scout_result.total_cost_usd.unwrap_or(0.0),
+                scout_result.duration_ms.unwrap_or(0) as f64 / 1000.0,
+            );
+            record_run_status_with_cost(
+                db, &task_node_id, &scout_run_id, "spore:scout", "completed",
+                scout_result.exit_code, scout_result.total_cost_usd,
+            )?;
+            if plan_path.exists() {
+                println!("[scout] Plan written: {}", plan_path.display());
+                Some(plan_path)
+            } else {
+                println!("[scout] No plan file written — coder proceeds without plan");
+                None
+            }
+        } else {
+            None
+        };
+
+        let plan_context = scout_plan_path.as_ref()
+            .map(|p| format!("\n\nA scout has already explored the codebase and written a plan at {}. Read it first — it has specific file paths, line numbers, and change descriptions. Follow the plan unless you find it's wrong.", p.display()))
+            .unwrap_or_default();
+
         let coder_prompt = if let Some(ref impl_id) = last_impl_id {
             format!(
                 "{}\n\nRead the task file at {} for full context and graph-gathered information.\n\nThe Verifier found issues with node {}. Check its incoming contradicts edges and fix the code.\n\nYour task: {}",
@@ -9215,8 +9275,8 @@ async fn handle_orchestrate(
             )
         } else {
             format!(
-                "{}\n\nRead the task file at {} for full context and graph-gathered information.\n\nYour task: {}",
-                coder_prompt_template, task_file.display(), task
+                "{}\n\nRead the task file at {} for full context and graph-gathered information.{}\n\nYour task: {}",
+                coder_prompt_template, task_file.display(), plan_context, task
             )
         };
 
