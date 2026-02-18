@@ -8390,16 +8390,59 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                     }));
                 }
 
-                // Get all workflow edges from the run
+                // Get workflow edges by walking the task node's neighborhood
                 drop(conn);
-                let run_edges = db.get_run_edges(task_id)
-                    .map_err(|e| format!("Failed to get run edges: {}", e))?;
+                let run_edges: Vec<Edge> = {
+                    let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+                    let mut all_edges = Vec::new();
+                    let mut stmt = conn.prepare(
+                        "SELECT source_id, target_id, type, created_at, confidence, content, agent_id, superseded_by \
+                         FROM edges WHERE target_id = ?1 AND type = 'derives_from'"
+                    ).map_err(|e| e.to_string())?;
+                    let df_edges: Vec<(String, i64)> = stmt.query_map(rusqlite::params![task_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(3)?))
+                    }).map_err(|e| e.to_string())?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                    drop(stmt);
+                    let impl_ids: Vec<String> = df_edges.iter().map(|(id, _)| id.clone()).collect();
+                    for impl_id in &impl_ids {
+                        let mut stmt2 = conn.prepare(
+                            "SELECT source_id, target_id, type, created_at, confidence, content, agent_id, superseded_by \
+                             FROM edges WHERE (source_id = ?1 OR target_id = ?1) AND type IN ('supports', 'contradicts', 'supersedes', 'flags')"
+                        ).map_err(|e| e.to_string())?;
+                        let edges: Vec<Edge> = stmt2.query_map(rusqlite::params![impl_id], |row| {
+                            Ok(Edge {
+                                id: String::new(), source: row.get(0)?, target: row.get(1)?,
+                                edge_type: EdgeType::from_str(&row.get::<_, String>(2)?).unwrap_or(EdgeType::Related),
+                                label: None, weight: None, edge_source: None, evidence_id: None,
+                                confidence: row.get(4)?, created_at: row.get(3)?,
+                                updated_at: None, author: None, reason: None,
+                                content: row.get(5)?, agent_id: row.get(6)?,
+                                superseded_by: row.get(7)?, metadata: None,
+                            })
+                        }).map_err(|e| e.to_string())?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                        all_edges.extend(edges);
+                    }
+                    for (src, ts) in &df_edges {
+                        all_edges.push(Edge {
+                            id: String::new(), source: src.clone(), target: task_id.clone(),
+                            edge_type: EdgeType::DerivesFrom, label: None, weight: None,
+                            edge_source: None, evidence_id: None, confidence: Some(1.0),
+                            created_at: *ts, updated_at: None, author: None, reason: None,
+                            content: None, agent_id: Some("spore:orchestrator".to_string()),
+                            superseded_by: None, metadata: None,
+                        });
+                    }
+                    drop(conn);
+                    let mut seen = std::collections::HashSet::new();
+                    all_edges.retain(|e| seen.insert((e.source.clone(), e.target.clone(), e.edge_type.as_str().to_string())));
+                    all_edges
+                };
 
                 for e in &run_edges {
-                    // Skip the self-referencing tracks edges we already handled
-                    if e.edge_type == EdgeType::Tracks && e.source == *task_id && e.target == *task_id {
-                        continue;
-                    }
                     let time_str = chrono::DateTime::from_timestamp_millis(e.created_at)
                         .map(|d| d.format("%Y-%m-%d %H:%M:%S UTC").to_string())
                         .unwrap_or_else(|| "?".to_string());
@@ -8531,10 +8574,82 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                     events.push(TimelineEvent { timestamp: *ts, lines });
                 }
 
-                // Get all workflow edges from the run (derives_from, supports, contradicts, tracks, supersedes, etc.)
+                // Get workflow edges by walking the task node's neighborhood.
+                // get_run_edges() only finds edges with run_id in metadata,
+                // but derives_from/supports/contradicts don't have that.
                 drop(conn);
-                let run_edges = db.get_run_edges(task_id)
-                    .map_err(|e| format!("Failed to get run edges: {}", e))?;
+                let run_edges: Vec<Edge> = {
+                    let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+                    // Find impl nodes (derives_from → task), then verification edges on those
+                    let mut all_edges = Vec::new();
+                    // 1. derives_from edges pointing to task node
+                    let mut stmt = conn.prepare(&format!(
+                        "SELECT {} FROM edges WHERE target_id = ?1 AND type = 'derives_from'",
+                        "id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at, updated_at, author, reason, content, agent_id, superseded_by, metadata"
+                    )).map_err(|e| e.to_string())?;
+                    let df_edges: Vec<(String, i64)> = stmt.query_map(rusqlite::params![task_id], |row| {
+                        Ok((row.get::<_, String>(1)?, row.get::<_, i64>(9)?)) // source_id, created_at
+                    }).map_err(|e| e.to_string())?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                    drop(stmt);
+
+                    // Collect impl node IDs
+                    let impl_ids: Vec<String> = df_edges.iter().map(|(id, _)| id.clone()).collect();
+
+                    // 2. For each impl node, get supports/contradicts/supersedes edges
+                    for impl_id in &impl_ids {
+                        let mut stmt2 = conn.prepare(
+                            "SELECT source_id, target_id, type, created_at, confidence, content, agent_id, superseded_by \
+                             FROM edges WHERE (source_id = ?1 OR target_id = ?1) AND type IN ('supports', 'contradicts', 'supersedes', 'flags')"
+                        ).map_err(|e| e.to_string())?;
+                        let edges: Vec<Edge> = stmt2.query_map(rusqlite::params![impl_id], |row| {
+                            Ok(Edge {
+                                id: String::new(),
+                                source: row.get::<_, String>(0)?,
+                                target: row.get::<_, String>(1)?,
+                                edge_type: EdgeType::from_str(&row.get::<_, String>(2)?).unwrap_or(EdgeType::Related),
+                                label: None, weight: None,
+                                edge_source: None, evidence_id: None,
+                                confidence: row.get(4)?,
+                                created_at: row.get(3)?,
+                                updated_at: None, author: None, reason: None,
+                                content: row.get(5)?,
+                                agent_id: row.get(6)?,
+                                superseded_by: row.get(7)?,
+                                metadata: None,
+                            })
+                        }).map_err(|e| e.to_string())?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                        all_edges.extend(edges);
+                    }
+
+                    // Also add derives_from edges as Edge objects
+                    for (src, ts) in &df_edges {
+                        all_edges.push(Edge {
+                            id: String::new(),
+                            source: src.clone(),
+                            target: task_id.clone(),
+                            edge_type: EdgeType::DerivesFrom,
+                            label: None, weight: None,
+                            edge_source: None, evidence_id: None,
+                            confidence: Some(1.0),
+                            created_at: *ts,
+                            updated_at: None, author: None, reason: None,
+                            content: None,
+                            agent_id: Some("spore:orchestrator".to_string()),
+                            superseded_by: None,
+                            metadata: None,
+                        });
+                    }
+                    drop(conn);
+                    // Deduplicate edges by (source, target, type) — an edge between two impl nodes
+                    // gets picked up once for each impl, so we need to remove duplicates
+                    let mut seen = std::collections::HashSet::new();
+                    all_edges.retain(|e| seen.insert((e.source.clone(), e.target.clone(), e.edge_type.as_str().to_string())));
+                    all_edges
+                };
 
                 // Workflow edges: derives_from, supports, contradicts, supersedes
                 let workflow_types = [
@@ -8643,10 +8758,9 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                 let total_cost: f64 = agent_runs.iter()
                     .filter_map(|(m, _)| m["cost_usd"].as_f64())
                     .sum();
-                let total_duration_ms: u64 = agent_runs.iter()
-                    .filter_map(|(m, _)| m["duration_ms"].as_u64())
-                    .sum();
-                let total_secs = total_duration_ms / 1000;
+                // Duration = span from task creation to last tracks edge
+                let last_ts = agent_runs.iter().map(|(_, ts)| *ts).max().unwrap_or(task_node.created_at);
+                let total_secs = ((last_ts - task_node.created_at) / 1000) as u64;
 
                 println!("Outcome: {}", outcome);
                 println!("Agents: {} invocations | Edges: {} | Cost: ${:.2} | Duration: {}m {}s",
