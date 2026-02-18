@@ -8220,26 +8220,42 @@ fn post_coder_cleanup(
     let needs_reinstall = changed_files.iter().any(|f| f.starts_with("src-tauri/"));
     if needs_reinstall {
         println!("[orchestrator] Reinstalling CLI (source files changed)");
-        let install_result = std::process::Command::new("cargo")
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ekats".to_string());
+        let cargo_bin = PathBuf::from(&home).join(".cargo/bin/mycelica-cli");
+        let sidecar = PathBuf::from("binaries/mycelica-cli-x86_64-unknown-linux-gnu");
+
+        // Try cargo install first
+        let install_ok = std::process::Command::new("cargo")
             .args(["+nightly", "install", "--path", "src-tauri", "--bin", "mycelica-cli", "--features", "mcp", "--force"])
-            .output();
-        match install_result {
-            Ok(o) if o.status.success() => {
-                // Copy sidecar
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ekats".to_string());
-                let src = PathBuf::from(&home).join(".cargo/bin/mycelica-cli");
-                let dst = PathBuf::from("binaries/mycelica-cli-x86_64-unknown-linux-gnu");
-                if let Err(e) = std::fs::copy(&src, &dst) {
-                    eprintln!("[orchestrator] WARNING: Failed to copy sidecar: {}", e);
-                } else {
-                    println!("[orchestrator] CLI reinstalled and sidecar updated");
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if !install_ok {
+            // Fallback: cargo build --release + manual copy (works around nightly dep issues)
+            println!("[orchestrator] cargo install failed, trying cargo build --release");
+            let build_ok = std::process::Command::new("cargo")
+                .args(["+nightly", "build", "--release", "--bin", "mycelica-cli", "--features", "mcp"])
+                .current_dir("src-tauri")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+
+            if build_ok {
+                let built = PathBuf::from("src-tauri/target/release/mycelica-cli");
+                if let Err(e) = std::fs::copy(&built, &cargo_bin) {
+                    eprintln!("[orchestrator] WARNING: Failed to copy built binary: {}", e);
                 }
+            } else {
+                eprintln!("[orchestrator] WARNING: Both cargo install and cargo build failed");
             }
-            Ok(o) => {
-                eprintln!("[orchestrator] WARNING: cargo install failed (exit {})", o.status.code().unwrap_or(-1));
-            }
-            Err(e) => {
-                eprintln!("[orchestrator] WARNING: Failed to run cargo install: {}", e);
+        }
+
+        // Copy sidecar regardless of which method succeeded
+        if cargo_bin.exists() {
+            match std::fs::copy(&cargo_bin, &sidecar) {
+                Ok(_) => println!("[orchestrator] CLI reinstalled and sidecar updated"),
+                Err(e) => eprintln!("[orchestrator] WARNING: Failed to copy sidecar: {}", e),
             }
         }
     }
