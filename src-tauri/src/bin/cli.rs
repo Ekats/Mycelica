@@ -7989,27 +7989,39 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
 
                 // Look up escalation reason if --escalated flag is set
                 let escalation_reason = if escalated {
+                    // Get the last verifier contradicts edge content — that's the actual reason
                     (|| -> Result<Option<String>, String> {
                         let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+                        // Find the last contradicts edge targeting any impl node of this task
                         let mut stmt = conn.prepare(
-                            "SELECT esc.title FROM edges e \
+                            "SELECT e2.content FROM edges e1 \
+                             JOIN edges e2 ON e2.target_id = e1.source_id AND e2.type = 'contradicts' \
+                             WHERE e1.target_id = ?1 AND e1.type = 'derives_from' \
+                             ORDER BY e2.created_at DESC LIMIT 1"
+                        ).map_err(|e| e.to_string())?;
+                        let reason: Option<String> = stmt.query_row(rusqlite::params![task_id], |row| {
+                            row.get::<_, Option<String>>(0)
+                        }).ok().flatten();
+                        // Fall back to ESCALATION node content if no contradicts edge found
+                        if reason.is_some() {
+                            return Ok(reason);
+                        }
+                        let mut stmt2 = conn.prepare(
+                            "SELECT esc.content FROM edges e \
                              JOIN nodes esc ON esc.id = e.source_id \
                              WHERE e.target_id = ?1 AND e.type = 'tracks' \
                                AND esc.title LIKE 'ESCALATION:%' \
                              LIMIT 1"
                         ).map_err(|e| e.to_string())?;
-                        let title: Option<String> = stmt.query_row(rusqlite::params![task_id], |row| {
-                            row.get::<_, String>(0)
-                        }).ok();
-                        // Extract reason: strip "ESCALATION: " prefix and " (after N bounces)" suffix
-                        Ok(title.map(|t| {
-                            let reason = t.strip_prefix("ESCALATION:").unwrap_or(&t).trim();
-                            // Strip trailing " (after N bounces)" if present
-                            if let Some(pos) = reason.rfind(" (after ") {
-                                reason[..pos].trim().to_string()
-                            } else {
-                                reason.to_string()
-                            }
+                        let content: Option<String> = stmt2.query_row(rusqlite::params![task_id], |row| {
+                            row.get::<_, Option<String>>(0)
+                        }).ok().flatten();
+                        Ok(content.and_then(|c| {
+                            // Extract the first meaningful line after "## Escalation"
+                            c.lines()
+                                .skip_while(|l| l.starts_with('#') || l.trim().is_empty())
+                                .next()
+                                .map(|l| l.trim().to_string())
                         }))
                     })().unwrap_or(None)
                 } else {
