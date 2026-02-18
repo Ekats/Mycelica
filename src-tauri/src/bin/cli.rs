@@ -7513,12 +7513,15 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
             let cutoff_ms = chrono::Utc::now().timestamp_millis() - (days as i64) * 86_400_000;
             // By default, exclude Lesson: and Summary: nodes — they're valuable even without
             // incoming edges. --force includes them.
+            // Only GC nodes with NO edges at all (incoming or outgoing).
+            // Previous version only checked incoming edges, which incorrectly
+            // deleted verifier/summary nodes that had outgoing supports/summarizes edges.
             let query = if force {
                 "SELECT n.id, n.title, n.created_at FROM nodes n
                  WHERE n.node_class = 'operational'
                    AND n.created_at < ?1
                    AND NOT EXISTS (
-                     SELECT 1 FROM edges e WHERE e.target_id = n.id
+                     SELECT 1 FROM edges e WHERE e.target_id = n.id OR e.source_id = n.id
                    )".to_string()
             } else {
                 "SELECT n.id, n.title, n.created_at FROM nodes n
@@ -7527,7 +7530,7 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
                    AND n.title NOT LIKE 'Lesson:%'
                    AND n.title NOT LIKE 'Summary:%'
                    AND NOT EXISTS (
-                     SELECT 1 FROM edges e WHERE e.target_id = n.id
+                     SELECT 1 FROM edges e WHERE e.target_id = n.id OR e.source_id = n.id
                    )".to_string()
             };
             let candidates: Vec<(String, String, i64)> = (|| -> Result<Vec<_>, String> {
