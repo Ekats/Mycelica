@@ -9292,6 +9292,32 @@ fn generate_task_file(
             ));
         }
         md.push_str("\n");
+
+        // For code nodes, append file locations so agents can Read files directly
+        let code_locations: Vec<(String, String, usize, usize)> = context_rows.iter()
+            .filter(|(id, _)| id.starts_with("code-"))
+            .filter_map(|(id, (_, title, _, _))| {
+                db.get_node(id).ok().flatten().and_then(|n| {
+                    let tags: serde_json::Value = n.tags.as_deref()
+                        .and_then(|t| serde_json::from_str(t).ok())
+                        .unwrap_or(serde_json::Value::Null);
+                    let file = tags["file_path"].as_str()?;
+                    let start = tags["line_start"].as_u64().unwrap_or(1) as usize;
+                    let end = tags["line_end"].as_u64().unwrap_or(start as u64) as usize;
+                    Some((title.clone(), file.to_string(), start, end))
+                })
+            })
+            .collect();
+
+        if !code_locations.is_empty() {
+            md.push_str("### Code Locations\n\n");
+            md.push_str("Use `Read` tool with these paths for direct file access (faster than MCP):\n\n");
+            for (title, file, start, end) in &code_locations {
+                let title_short = if title.len() > 40 { &title[..40] } else { title.as_str() };
+                md.push_str(&format!("- `{}` L{}-{} — {}\n", file, start, end, title_short));
+            }
+            md.push_str("\n");
+        }
     }
 
     // 4b. Include lessons from past runs (runtime context — Concern 13)
