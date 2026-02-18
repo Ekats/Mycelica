@@ -709,7 +709,11 @@ enum SporeCommands {
 #[derive(Subcommand)]
 enum RunCommands {
     /// List all orchestrator runs with status
-    List,
+    List {
+        /// Also show non-Orchestration operational nodes that have tracks edges
+        #[arg(long)]
+        all: bool,
+    },
     /// Show all edges in a run
     Get {
         /// Run ID (UUID)
@@ -7500,15 +7504,23 @@ fn parse_since_to_millis(s: &str) -> Result<i64, String> {
 
 fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String> {
     match cmd {
-        RunCommands::List => {
-            // Query all Orchestration: task nodes
+        RunCommands::List { all } => {
+            // Query task nodes: Orchestration: prefixed, plus (with --all) any operational node with tracks edges
             let task_rows: Vec<(String, String, i64)> = (|| -> Result<Vec<_>, String> {
                 let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
-                let mut stmt = conn.prepare(
+                let query = if all {
+                    "SELECT DISTINCT n.id, n.title, n.created_at FROM nodes n \
+                     WHERE n.node_class = 'operational' AND ( \
+                       n.title LIKE 'Orchestration:%' \
+                       OR EXISTS (SELECT 1 FROM edges e WHERE e.source_id = n.id AND e.type = 'tracks') \
+                     ) \
+                     ORDER BY n.created_at DESC"
+                } else {
                     "SELECT id, title, created_at FROM nodes \
                      WHERE node_class = 'operational' AND title LIKE 'Orchestration:%' \
                      ORDER BY created_at DESC"
-                ).map_err(|e| e.to_string())?;
+                };
+                let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
                 let rows = stmt.query_map([], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
                 }).map_err(|e| e.to_string())?
@@ -7521,7 +7533,7 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                 if json {
                     println!("[]");
                 } else {
-                    println!("No orchestrator runs found.");
+                    println!("No {} found.", if all { "runs" } else { "orchestrator runs" });
                 }
                 return Ok(());
             }
@@ -7532,6 +7544,7 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                 description: String,
                 created_at: i64,
                 status: String,
+                kind: &'static str,
             }
 
             let mut runs = Vec::new();
@@ -7542,6 +7555,7 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                 } else {
                     description.to_string()
                 };
+                let is_orchestration = title.starts_with("Orchestration:");
 
                 // Check for derives_from edges where this task is the target
                 let impl_ids: Vec<String> = (|| -> Result<Vec<String>, String> {
@@ -7587,21 +7601,41 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                     description,
                     created_at: *created_at,
                     status: status.to_string(),
+                    kind: if is_orchestration { "orchestration" } else { "tracked" },
                 });
             }
 
             if json {
                 let items: Vec<serde_json::Value> = runs.iter().map(|r| {
-                    serde_json::json!({
+                    let mut obj = serde_json::json!({
                         "run_id": r.id,
                         "description": r.description,
                         "created_at": chrono::DateTime::from_timestamp_millis(r.created_at)
                             .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
                             .unwrap_or_else(|| "?".to_string()),
                         "status": r.status,
-                    })
+                    });
+                    if all {
+                        obj["kind"] = serde_json::json!(r.kind);
+                    }
+                    obj
                 }).collect();
                 println!("{}", serde_json::to_string_pretty(&items).unwrap_or_default());
+            } else if all {
+                println!("{:<10} {:<14} {:<50} {:<20} {}", "RUN ID", "KIND", "DESCRIPTION", "CREATED", "STATUS");
+                println!("{}", "-".repeat(104));
+                for r in &runs {
+                    let created = chrono::DateTime::from_timestamp_millis(r.created_at)
+                        .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    let desc = if r.description.chars().count() > 48 {
+                        format!("{}...", utils::safe_truncate(&r.description, 45))
+                    } else {
+                        r.description.clone()
+                    };
+                    println!("{:<10} {:<14} {:<50} {:<20} {}", r.id, r.kind, desc, created, r.status);
+                }
+                println!("\n{} run(s)", runs.len());
             } else {
                 println!("{:<10} {:<62} {:<20} {}", "RUN ID", "DESCRIPTION", "CREATED", "STATUS");
                 println!("{}", "-".repeat(100));
