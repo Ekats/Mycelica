@@ -790,6 +790,14 @@ enum RunCommands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Cancel a pending run (marks it as cancelled)
+    Cancel {
+        /// Run ID (prefix match)
+        run_id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -8068,7 +8076,21 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                     })().map_err(|e| format!("supports query failed: {}", e))?;
                     if has_verified { "verified" } else { "implemented" }
                 } else {
-                    "pending"
+                    // Check for cancellation tracks edge
+                    let is_cancelled = (|| -> Result<bool, String> {
+                        let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+                        let mut stmt = conn.prepare(
+                            "SELECT COUNT(*) FROM edges \
+                             WHERE source_id = ?1 AND target_id = ?1 AND type = 'tracks' \
+                             AND content = 'Cancelled by user'"
+                        ).map_err(|e| e.to_string())?;
+                        let count: i64 = stmt.query_row(
+                            rusqlite::params![task_id],
+                            |row| row.get(0),
+                        ).map_err(|e| e.to_string())?;
+                        Ok(count > 0)
+                    })().map_err(|e| format!("cancelled check failed: {}", e))?;
+                    if is_cancelled { "cancelled" } else { "pending" }
                 };
 
                 // Compute cost from tracks edges metadata if requested
@@ -9039,6 +9061,90 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
             } else {
                 println!("Rolled back run {}: {} edge(s) deleted, {} node(s) deleted",
                     run_id, edges_deleted, nodes_deleted);
+            }
+            Ok(())
+        }
+
+        RunCommands::Cancel { run_id, json: local_json } => {
+            let node = resolve_node(db, &run_id)?;
+
+            // Verify it's an operational/task node
+            if node.node_class.as_deref() != Some("operational") {
+                return Err(format!("Node {} is not an operational node", &node.id[..8.min(node.id.len())]));
+            }
+
+            // Check for derives_from edges (would mean it's already implemented)
+            let has_impl = (|| -> Result<bool, String> {
+                let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+                let mut stmt = conn.prepare(
+                    "SELECT COUNT(*) FROM edges \
+                     WHERE target_id = ?1 AND type = 'derives_from'"
+                ).map_err(|e| e.to_string())?;
+                let count: i64 = stmt.query_row(
+                    rusqlite::params![node.id],
+                    |row| row.get(0),
+                ).map_err(|e| e.to_string())?;
+                Ok(count > 0)
+            })().map_err(|e| format!("Failed to check status: {}", e))?;
+
+            if has_impl {
+                return Err(format!("Run {} is not pending (has derives_from edges — already implemented)", &node.id[..8.min(node.id.len())]));
+            }
+
+            // Check if already cancelled (has a tracks edge with content 'Cancelled by user')
+            let already_cancelled = (|| -> Result<bool, String> {
+                let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+                let mut stmt = conn.prepare(
+                    "SELECT COUNT(*) FROM edges \
+                     WHERE source_id = ?1 AND target_id = ?1 AND type = 'tracks' \
+                     AND content = 'Cancelled by user'"
+                ).map_err(|e| e.to_string())?;
+                let count: i64 = stmt.query_row(
+                    rusqlite::params![node.id],
+                    |row| row.get(0),
+                ).map_err(|e| e.to_string())?;
+                Ok(count > 0)
+            })().map_err(|e| format!("Failed to check cancellation: {}", e))?;
+
+            if already_cancelled {
+                return Err(format!("Run {} is already cancelled", &node.id[..8.min(node.id.len())]));
+            }
+
+            // Insert tracks edge with content 'Cancelled by user' and agent_id 'spore:user'
+            let now = chrono::Utc::now().timestamp_millis();
+            let edge = Edge {
+                id: uuid::Uuid::new_v4().to_string(),
+                source: node.id.clone(),
+                target: node.id.clone(),
+                edge_type: EdgeType::Tracks,
+                label: None,
+                weight: None,
+                edge_source: Some("user".to_string()),
+                evidence_id: None,
+                confidence: Some(1.0),
+                created_at: now,
+                updated_at: Some(now),
+                author: Some(settings::get_author_or_default()),
+                reason: Some("cancelled by user".to_string()),
+                content: Some("Cancelled by user".to_string()),
+                agent_id: Some("spore:user".to_string()),
+                superseded_by: None,
+                metadata: Some(serde_json::json!({
+                    "status": "cancelled",
+                }).to_string()),
+            };
+            db.insert_edge(&edge).map_err(|e| format!("Failed to insert cancellation edge: {}", e))?;
+
+            let short_id = &node.id[..8.min(node.id.len())];
+            if json || local_json {
+                println!("{}", serde_json::json!({
+                    "cancelled": true,
+                    "node_id": node.id,
+                    "title": node.title,
+                    "edge_id": edge.id,
+                }));
+            } else {
+                println!("Cancelled run {} ({})", short_id, node.title);
             }
             Ok(())
         }
