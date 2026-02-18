@@ -6,7 +6,7 @@
 
 use clap::{Parser, Subcommand, CommandFactory};
 use clap_complete::{generate, Shell};
-use mycelica_lib::{db::{Database, Node, NodeType, Edge, EdgeType, Position}, settings, import, hierarchy, similarity, openaire, ai_client, utils, classification};
+use mycelica_lib::{db::{Database, Node, NodeType, Edge, EdgeType, Position}, settings, import, hierarchy, similarity, openaire, ai_client, utils, classification, local_embeddings};
 use serde_json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -8074,12 +8074,14 @@ fn post_coder_cleanup(
 /// - **Checklist** — Static reminders for the agent: read context first, create an
 ///   operational node when done, and link it to modified code nodes.
 ///
-/// # Context Gathering: FTS + Dijkstra
+/// # Context Gathering: Semantic Search + Dijkstra
 ///
-/// 1. **FTS5 anchor search** — The task description is tokenized, stopwords and
-///    short tokens (≤2 chars) are stripped, and the remaining terms are joined with
-///    `OR` to form a full-text query. This broadens recall vs. the default AND
-///    semantics. The top 3 non-operational matches become anchor nodes.
+/// 1. **Semantic anchor search** — The task description is embedded using the local
+///    all-MiniLM-L6-v2 model and compared against all stored node embeddings via
+///    cosine similarity. This captures meaning ("format flag" ≈ SporeCommands) rather
+///    than requiring keyword overlap. Falls back to FTS5 with OR-joined tokens if
+///    embedding generation fails (model not downloaded, etc.).
+///    The top 3 non-operational matches become anchor nodes.
 /// 2. **Dijkstra expansion** — For each anchor, [`Database::context_for_task`] runs
 ///    a weighted shortest-path traversal (max 4 hops, cost ceiling 2.0) that
 ///    follows semantic edges (supports, contradicts, derives_from, etc.) while
@@ -8101,28 +8103,64 @@ fn generate_task_file(
 ) -> Result<PathBuf, String> {
     use std::collections::HashMap;
 
-    // 1. Search for anchor nodes matching the task description.
-    //    FTS5 defaults to AND logic, so "optimize dendrogram clustering algorithm"
-    //    only matches nodes containing ALL four words. Use OR to broaden the search,
-    //    and filter stopwords to reduce noise.
-    let stopwords = ["the", "a", "an", "in", "on", "at", "to", "for", "of", "is", "it",
-                     "and", "or", "with", "from", "by", "this", "that", "as", "be"];
-    let fts_query: String = task.split_whitespace()
-        .filter(|w| w.len() > 2 && !stopwords.contains(&w.to_lowercase().as_str()))
-        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
-        .filter(|w| !w.is_empty())
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    let anchors = if fts_query.is_empty() {
-        Vec::new()
-    } else {
-        db.search_nodes(&fts_query)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|n| n.id != _task_node_id)
-            .filter(|n| n.node_class.as_deref() != Some("operational"))
-            .take(3)
-            .collect()
+    // 1. Find anchor nodes via semantic search (embedding similarity).
+    //    Natural language task descriptions like "Add a format flag to spore status"
+    //    work poorly with FTS5 (common words match everything or nothing useful).
+    //    Embedding similarity captures meaning: "format flag" is semantically close
+    //    to the SporeCommands enum and handle_spore function even without keyword overlap.
+    //    Falls back to FTS5 if embedding generation fails (model not downloaded, etc.).
+    let anchors: Vec<Node> = {
+        let semantic_anchors = (|| -> Result<Vec<Node>, String> {
+            let query_embedding = local_embeddings::generate(task)?;
+            let all_embeddings = db.get_nodes_with_embeddings()
+                .map_err(|e| e.to_string())?;
+            let similar = similarity::find_similar(
+                &query_embedding, &all_embeddings, _task_node_id, 10, 0.3,
+            );
+            // Resolve node IDs to full nodes, filtering operational
+            let mut result = Vec::new();
+            for (node_id, _score) in similar {
+                if let Ok(Some(node)) = db.get_node(&node_id) {
+                    if node.node_class.as_deref() != Some("operational") {
+                        result.push(node);
+                        if result.len() >= 3 {
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(result)
+        })();
+
+        match semantic_anchors {
+            Ok(anchors) if !anchors.is_empty() => {
+                println!("[task-file] Semantic search found {} anchor(s)", anchors.len());
+                anchors
+            }
+            _ => {
+                // Fallback: FTS5 with OR logic
+                println!("[task-file] Falling back to FTS search");
+                let stopwords = ["the", "a", "an", "in", "on", "at", "to", "for", "of", "is", "it",
+                                 "and", "or", "with", "from", "by", "this", "that", "as", "be"];
+                let fts_query: String = task.split_whitespace()
+                    .filter(|w| w.len() > 2 && !stopwords.contains(&w.to_lowercase().as_str()))
+                    .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+                    .filter(|w| !w.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                if fts_query.is_empty() {
+                    Vec::new()
+                } else {
+                    db.search_nodes(&fts_query)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|n| n.id != _task_node_id)
+                        .filter(|n| n.node_class.as_deref() != Some("operational"))
+                        .take(3)
+                        .collect()
+                }
+            }
+        }
     };
 
     // 2. Gather context via Dijkstra from each anchor
@@ -8303,8 +8341,15 @@ async fn handle_orchestrate(
         println!("Coder prompt: {} ({} bytes)", coder_prompt_path.display(), coder_prompt_template.len());
         println!("Verifier prompt: {} ({} bytes)", verifier_prompt_path.display(), verifier_prompt_template.len());
         println!("DB path: {}", db_path);
-        println!("Task files: docs/spore/tasks/task-{{run_id}}.md (generated per agent)");
         println!("\nWould run {} bounce(s) of: Coder -> Verifier", max_bounces);
+
+        // Generate a preview task file to inspect context quality
+        let preview_run_id = "dry-run-preview-00000000";
+        let preview_task_id = "00000000-0000-0000-0000-000000000000";
+        match generate_task_file(db, task, "coder", preview_run_id, preview_task_id, 0, max_bounces, None) {
+            Ok(path) => println!("\nPreview task file: {}", path.display()),
+            Err(e) => println!("\nTask file preview failed: {}", e),
+        }
         return Ok(());
     }
 
