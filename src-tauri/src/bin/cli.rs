@@ -711,9 +711,12 @@ enum SporeCommands {
         /// Age threshold in days (default: 7)
         #[arg(long, default_value = "7")]
         days: u32,
-        /// Dry run — only print candidates without deleting (this is currently the default)
+        /// Dry run — only print candidates without deleting
         #[arg(long)]
         dry_run: bool,
+        /// Include Lesson: and Summary: nodes in GC candidates (normally excluded)
+        #[arg(long)]
+        force: bool,
     },
     /// List all Lesson: nodes from the graph
     Lessons,
@@ -7501,18 +7504,30 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
             Ok(())
         }
 
-        SporeCommands::Gc { days, dry_run: _ } => {
+        SporeCommands::Gc { days, dry_run, force } => {
             let cutoff_ms = chrono::Utc::now().timestamp_millis() - (days as i64) * 86_400_000;
+            // By default, exclude Lesson: and Summary: nodes — they're valuable even without
+            // incoming edges. --force includes them.
+            let query = if force {
+                "SELECT n.id, n.title, n.created_at FROM nodes n
+                 WHERE n.node_class = 'operational'
+                   AND n.created_at < ?1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM edges e WHERE e.target_id = n.id
+                   )".to_string()
+            } else {
+                "SELECT n.id, n.title, n.created_at FROM nodes n
+                 WHERE n.node_class = 'operational'
+                   AND n.created_at < ?1
+                   AND n.title NOT LIKE 'Lesson:%'
+                   AND n.title NOT LIKE 'Summary:%'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM edges e WHERE e.target_id = n.id
+                   )".to_string()
+            };
             let candidates: Vec<(String, String, i64)> = (|| -> Result<Vec<_>, String> {
                 let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
-                let mut stmt = conn.prepare(
-                    "SELECT n.id, n.title, n.created_at FROM nodes n
-                     WHERE n.node_class = 'operational'
-                       AND n.created_at < ?1
-                       AND NOT EXISTS (
-                         SELECT 1 FROM edges e WHERE e.target_id = n.id
-                       )"
-                ).map_err(|e| e.to_string())?;
+                let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
                 let rows = stmt.query_map(rusqlite::params![cutoff_ms], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
                 }).map_err(|e| e.to_string())?
@@ -7528,7 +7543,7 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
                 println!("{}", serde_json::to_string(&items).unwrap_or_default());
             } else if candidates.is_empty() {
                 println!("No GC candidates found (operational nodes older than {} days with no incoming edges).", days);
-            } else {
+            } else if dry_run {
                 println!("GC candidates: operational nodes older than {} days with no incoming edges\n", days);
                 for (id, title, created_at) in &candidates {
                     let date = chrono::DateTime::from_timestamp_millis(*created_at)
@@ -7536,7 +7551,25 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
                         .unwrap_or_else(|| "?".to_string());
                     println!("  {}  {}  created {}", &id[..8.min(id.len())], title, date);
                 }
-                println!("\n{} candidate(s). Dry-run is the default — no nodes were deleted.", candidates.len());
+                println!("\n{} candidate(s). --dry-run: no nodes were deleted.", candidates.len());
+            } else {
+                println!("Deleting {} GC candidate(s)...\n", candidates.len());
+                let mut deleted = 0;
+                for (id, title, created_at) in &candidates {
+                    let date = chrono::DateTime::from_timestamp_millis(*created_at)
+                        .map(|d| d.format("%Y-%m-%d").to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    match db.delete_node_tracked(id, "spore:gc") {
+                        Ok(()) => {
+                            println!("  deleted {}  {}  created {}", &id[..8.min(id.len())], title, date);
+                            deleted += 1;
+                        }
+                        Err(e) => {
+                            eprintln!("  FAILED  {}  {}: {}", &id[..8.min(id.len())], title, e);
+                        }
+                    }
+                }
+                println!("\nDeleted {} node(s).", deleted);
             }
             Ok(())
         }
