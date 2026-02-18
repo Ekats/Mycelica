@@ -680,6 +680,12 @@ enum SporeCommands {
         #[arg(long)]
         items_only: bool,
     },
+    /// Find stale operational nodes with no incoming edges (GC candidates)
+    Gc {
+        /// Age threshold in days (default: 7)
+        #[arg(long, default_value = "7")]
+        days: u32,
+    },
     /// Distill an orchestrator run into a summary node with lessons learned
     Distill {
         /// Run ID prefix (from task node ID) or "latest" for most recent run
@@ -7409,6 +7415,46 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
                     }
                     println!("\n{} node(s) within budget", results.len());
                 }
+            }
+            Ok(())
+        }
+
+        SporeCommands::Gc { days } => {
+            let cutoff_ms = chrono::Utc::now().timestamp_millis() - (days as i64) * 86_400_000;
+            let candidates: Vec<(String, String, i64)> = (|| -> Result<Vec<_>, String> {
+                let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+                let mut stmt = conn.prepare(
+                    "SELECT n.id, n.title, n.created_at FROM nodes n
+                     WHERE n.node_class = 'operational'
+                       AND n.created_at < ?1
+                       AND NOT EXISTS (
+                         SELECT 1 FROM edges e WHERE e.target_id = n.id
+                       )"
+                ).map_err(|e| e.to_string())?;
+                let rows = stmt.query_map(rusqlite::params![cutoff_ms], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+                }).map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+                Ok(rows)
+            })().unwrap_or_default();
+
+            if json {
+                let items: Vec<serde_json::Value> = candidates.iter().map(|(id, title, created_at)| {
+                    serde_json::json!({ "id": id, "title": title, "created_at": created_at })
+                }).collect();
+                println!("{}", serde_json::to_string(&items).unwrap_or_default());
+            } else if candidates.is_empty() {
+                println!("No GC candidates found (operational nodes older than {} days with no incoming edges).", days);
+            } else {
+                println!("GC candidates: operational nodes older than {} days with no incoming edges\n", days);
+                for (id, title, created_at) in &candidates {
+                    let date = chrono::DateTime::from_timestamp_millis(*created_at)
+                        .map(|d| d.format("%Y-%m-%d").to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    println!("  {}  {}  created {}", &id[..8.min(id.len())], title, date);
+                }
+                println!("\n{} candidate(s)", candidates.len());
             }
             Ok(())
         }
