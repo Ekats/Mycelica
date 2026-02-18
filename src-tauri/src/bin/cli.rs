@@ -734,6 +734,13 @@ enum RunCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Compare two runs side-by-side
+    Compare {
+        /// First run ID (prefix or UUID)
+        run_a: String,
+        /// Second run ID (prefix or UUID)
+        run_b: String,
+    },
     /// Delete all edges (and optionally nodes) from a run
     Rollback {
         /// Run ID (UUID)
@@ -7970,6 +7977,136 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                         println!("    reason: {}", reason);
                     }
                 }
+            }
+            Ok(())
+        }
+
+        RunCommands::Compare { run_a, run_b } => {
+            // Resolve both run task nodes
+            let node_a = resolve_node(db, &run_a)?;
+            let node_b = resolve_node(db, &run_b)?;
+
+            // Gather run info for each
+            struct RunDetail {
+                id: String,
+                description: String,
+                created: String,
+                agents: Vec<(String, String, Option<f64>)>, // (agent, status, cost)
+                status: String,
+                total_cost: f64,
+            }
+
+            let gather = |task_id: &str, title: &str| -> Result<RunDetail, String> {
+                let desc = title.strip_prefix("Orchestration:").unwrap_or(title).trim().to_string();
+                let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+
+                // Get tracks edges for agent info
+                let mut stmt = conn.prepare(
+                    "SELECT metadata FROM edges WHERE source_id = ?1 AND target_id = ?1 AND type = 'tracks'"
+                ).map_err(|e| e.to_string())?;
+                let agents: Vec<(String, String, Option<f64>)> = stmt.query_map(
+                    rusqlite::params![task_id], |row| row.get::<_, String>(0)
+                ).map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .filter_map(|meta| {
+                    let v: serde_json::Value = serde_json::from_str(&meta).ok()?;
+                    let agent = v["agent"].as_str()?.to_string();
+                    let status = v["status"].as_str().unwrap_or("?").to_string();
+                    let cost = v["cost_usd"].as_f64();
+                    Some((agent, status, cost))
+                })
+                .collect();
+                drop(stmt);
+
+                let total_cost: f64 = agents.iter().filter_map(|(_, _, c)| *c).sum();
+
+                // Check verification status
+                let has_verified: bool = conn.prepare(
+                    "SELECT COUNT(*) FROM edges e1 \
+                     JOIN edges e2 ON e2.target_id = e1.source_id \
+                     WHERE e1.target_id = ?1 AND e1.type = 'derives_from' AND e2.type = 'supports'"
+                ).and_then(|mut s| s.query_row(rusqlite::params![task_id], |r| r.get::<_, i64>(0)))
+                .unwrap_or(0) > 0;
+
+                let has_impl: bool = conn.prepare(
+                    "SELECT COUNT(*) FROM edges WHERE target_id = ?1 AND type = 'derives_from'"
+                ).and_then(|mut s| s.query_row(rusqlite::params![task_id], |r| r.get::<_, i64>(0)))
+                .unwrap_or(0) > 0;
+
+                let status = if has_verified { "verified" } else if has_impl { "implemented" } else { "pending" };
+
+                // Drop the lock before calling db.get_node (which also locks)
+                drop(conn);
+
+                let created = db.get_node(task_id).ok().flatten()
+                    .map(|n| chrono::DateTime::from_timestamp_millis(n.created_at)
+                        .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+                        .unwrap_or_else(|| "?".to_string()))
+                    .unwrap_or_else(|| "?".to_string());
+
+                Ok(RunDetail {
+                    id: task_id[..8.min(task_id.len())].to_string(),
+                    description: desc,
+                    created,
+                    agents,
+                    status: status.to_string(),
+                    total_cost,
+                })
+            };
+
+            let a = gather(&node_a.id, &node_a.title)?;
+            let b = gather(&node_b.id, &node_b.title)?;
+
+            if json {
+                let to_json = |r: &RunDetail| -> serde_json::Value {
+                    serde_json::json!({
+                        "run_id": r.id,
+                        "description": r.description,
+                        "created": r.created,
+                        "status": r.status,
+                        "agents": r.agents.iter().map(|(ag, st, c)| {
+                            let mut v = serde_json::json!({"agent": ag, "status": st});
+                            if let Some(cost) = c { v["cost_usd"] = serde_json::json!(cost); }
+                            v
+                        }).collect::<Vec<_>>(),
+                        "total_cost": r.total_cost,
+                    })
+                };
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "run_a": to_json(&a), "run_b": to_json(&b),
+                })).unwrap_or_default());
+            } else {
+                // Side-by-side comparison
+                let w = 42; // column width
+                println!("{:<w$} | {:<w$}", format!("Run A: {}", a.id), format!("Run B: {}", b.id), w = w);
+                println!("{}", "-".repeat(w * 2 + 3));
+
+                let desc_a = if a.description.chars().count() > w { format!("{}...", utils::safe_truncate(&a.description, w - 3)) } else { a.description.clone() };
+                let desc_b = if b.description.chars().count() > w { format!("{}...", utils::safe_truncate(&b.description, w - 3)) } else { b.description.clone() };
+                println!("{:<w$} | {:<w$}", desc_a, desc_b, w = w);
+                println!("{:<w$} | {:<w$}", a.created, b.created, w = w);
+                println!("{:<w$} | {:<w$}", format!("Status: {}", a.status), format!("Status: {}", b.status), w = w);
+                println!("{:<w$} | {:<w$}", format!("Agents: {}", a.agents.len()), format!("Agents: {}", b.agents.len()), w = w);
+
+                // Agent details
+                let max_agents = a.agents.len().max(b.agents.len());
+                for i in 0..max_agents {
+                    let left = a.agents.get(i).map(|(ag, st, c)| {
+                        let short_agent = ag.strip_prefix("spore:").unwrap_or(ag);
+                        let cost_str = c.map(|v| format!(" ${:.2}", v)).unwrap_or_default();
+                        format!("  {} ({}){}", short_agent, st, cost_str)
+                    }).unwrap_or_default();
+                    let right = b.agents.get(i).map(|(ag, st, c)| {
+                        let short_agent = ag.strip_prefix("spore:").unwrap_or(ag);
+                        let cost_str = c.map(|v| format!(" ${:.2}", v)).unwrap_or_default();
+                        format!("  {} ({}){}", short_agent, st, cost_str)
+                    }).unwrap_or_default();
+                    println!("{:<w$} | {:<w$}", left, right, w = w);
+                }
+
+                println!("{:<w$} | {:<w$}",
+                    format!("Total: ${:.2}", a.total_cost),
+                    format!("Total: ${:.2}", b.total_cost), w = w);
             }
             Ok(())
         }
