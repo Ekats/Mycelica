@@ -674,6 +674,9 @@ enum RunCommands {
     Get {
         /// Run ID (UUID)
         run_id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Delete all edges (and optionally nodes) from a run
     Rollback {
@@ -7324,11 +7327,11 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
             Ok(())
         }
 
-        RunCommands::Get { run_id } => {
+        RunCommands::Get { run_id, json: local_json } => {
             let edges = db.get_run_edges(&run_id)
                 .map_err(|e| format!("Failed to get run edges: {}", e))?;
 
-            if json {
+            if json || local_json {
                 println!("{}", serde_json::to_string_pretty(&edges).unwrap_or_default());
             } else if edges.is_empty() {
                 println!("No edges found for run: {}", run_id);

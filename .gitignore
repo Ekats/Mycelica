@@ -15,6 +15,7 @@ archive/
 binaries/
 docs/private/
 docs/implementation/
+docs/spore/
 *.db
 *-hnsw.bin
 mycelica-openAIRE-preview.db
