@@ -8071,9 +8071,11 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                                 if line.starts_with("## ") { break; }
                                 let trimmed = line.trim();
                                 if let Some(file) = trimmed.strip_prefix("- ") {
-                                    // Strip trailing description after ':'
+                                    // Strip trailing description after ':' then backticks
                                     let file = file.split(':').next().unwrap_or(file).trim();
-                                    if !file.is_empty() && !files.contains(&file.to_string()) {
+                                    let file = file.trim_matches('`');
+                                    // Only include if it looks like a file path
+                                    if !file.is_empty() && (file.contains('/') || file.contains('.')) && !files.contains(&file.to_string()) {
                                         files.push(file.to_string());
                                     }
                                 }
