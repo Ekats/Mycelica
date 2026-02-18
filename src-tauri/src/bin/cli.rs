@@ -685,6 +685,9 @@ enum SporeCommands {
         /// Age threshold in days (default: 7)
         #[arg(long, default_value = "7")]
         days: u32,
+        /// Dry run — only print candidates without deleting (this is currently the default)
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Distill an orchestrator run into a summary node with lessons learned
     Distill {
@@ -7419,7 +7422,7 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
             Ok(())
         }
 
-        SporeCommands::Gc { days } => {
+        SporeCommands::Gc { days, dry_run: _ } => {
             let cutoff_ms = chrono::Utc::now().timestamp_millis() - (days as i64) * 86_400_000;
             let candidates: Vec<(String, String, i64)> = (|| -> Result<Vec<_>, String> {
                 let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
@@ -7454,7 +7457,7 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
                         .unwrap_or_else(|| "?".to_string());
                     println!("  {}  {}  created {}", &id[..8.min(id.len())], title, date);
                 }
-                println!("\n{} candidate(s)", candidates.len());
+                println!("\n{} candidate(s). Dry-run is the default — no nodes were deleted.", candidates.len());
             }
             Ok(())
         }
@@ -8738,19 +8741,83 @@ async fn handle_orchestrate(
         let coder_nodes = db.find_nodes_by_agent_and_time("spore:coder", coder_start)
             .map_err(|e| format!("Failed to query coder nodes: {}", e))?;
 
-        if coder_nodes.is_empty() {
-            eprintln!("[coder] WARNING: Coder completed (exit 0) but created no operational nodes.");
-            if let Some(ref text) = coder_result.result_text {
-                eprintln!("[coder] Agent result: {}", text);
-            }
-            eprintln!("[coder] This may mean the feature already exists or the agent skipped graph recording.");
-            record_run_status(db, &task_node_id, &coder_run_id, "spore:coder", "incomplete", 0)?;
-            return Err("Coder produced no operational nodes — see agent result above for details.".to_string());
-        }
+        let impl_node_holder; // Owns the node if we create a fallback
+        let impl_node: &Node = if coder_nodes.is_empty() {
+            // Coder didn't create its operational node (common when it runs out of turns).
+            // The orchestrator creates a fallback from the git diff — observable facts,
+            // not guesses. The graph stays complete for the verifier and distill commands.
+            println!("[coder] No operational node created — building fallback from git diff");
 
-        let impl_node = &coder_nodes[0]; // Most recent
-        println!("[coder] Implementation node: {} ({})", &impl_node.id[..8], impl_node.title);
-        record_run_status(db, &task_node_id, &coder_run_id, "spore:coder", "completed", 0)?;
+            let after_dirty: HashSet<String> = std::process::Command::new("git")
+                .args(["diff", "--name-only"])
+                .output().ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).lines()
+                    .filter(|l| !l.trim().is_empty()).map(|l| l.to_string()).collect())
+                .unwrap_or_default();
+            let after_untracked: HashSet<String> = std::process::Command::new("git")
+                .args(["ls-files", "--others", "--exclude-standard"])
+                .output().ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).lines()
+                    .filter(|l| !l.trim().is_empty()).map(|l| l.to_string()).collect())
+                .unwrap_or_default();
+            let changed: Vec<String> = after_dirty.difference(&before_dirty)
+                .chain(after_untracked.difference(&before_untracked))
+                .cloned().collect();
+
+            let files_section = if changed.is_empty() {
+                "No files changed (code may already exist or agent explored only)".to_string()
+            } else {
+                changed.iter().map(|f| format!("- {}", f)).collect::<Vec<_>>().join("\n")
+            };
+
+            let task_short = if task.len() > 60 { &task[..60] } else { task };
+            let fallback_id = uuid::Uuid::new_v4().to_string();
+            let fallback = make_orchestrator_node(
+                fallback_id.clone(),
+                format!("Implemented (auto): {}", task_short),
+                format!("## What\nCoder completed but did not record work in graph. Fallback node created by orchestrator.\n\n## Task\n{}\n\n## Files Changed\n{}\n\n## Agent Stats\n- Turns: {}\n- Cost: ${:.2}\n- Duration: {:.0}s",
+                    task, files_section,
+                    coder_result.num_turns.unwrap_or(0),
+                    coder_result.total_cost_usd.unwrap_or(0.0),
+                    coder_result.duration_ms.unwrap_or(0) as f64 / 1000.0),
+                "operational",
+                None,
+            );
+            db.insert_node(&fallback).map_err(|e| format!("Failed to create fallback node: {}", e))?;
+
+            // derives_from edge to task node
+            let edge = Edge {
+                id: uuid::Uuid::new_v4().to_string(),
+                source: fallback_id.clone(),
+                target: task_node_id.clone(),
+                edge_type: EdgeType::DerivesFrom,
+                label: None, weight: None,
+                edge_source: Some("orchestrator".to_string()),
+                evidence_id: None,
+                confidence: Some(0.7),
+                created_at: chrono::Utc::now().timestamp_millis(),
+                updated_at: None,
+                author: None, reason: None,
+                content: Some("Fallback: coder did not create operational node".to_string()),
+                agent_id: Some("spore:orchestrator".to_string()),
+                superseded_by: None,
+                metadata: None,
+            };
+            let _ = db.insert_edge(&edge);
+
+            println!("[coder] Fallback node: {} ({} file(s) changed)", &fallback_id[..8], changed.len());
+            impl_node_holder = db.get_node(&fallback_id).map_err(|e| e.to_string())?
+                .ok_or("Failed to read back fallback node")?;
+            record_run_status(db, &task_node_id, &coder_run_id, "spore:coder", "completed-fallback", 0)?;
+            &impl_node_holder
+        } else {
+            impl_node_holder = coder_nodes[0].clone();
+            println!("[coder] Implementation node: {} ({})", &impl_node_holder.id[..8], impl_node_holder.title);
+            record_run_status(db, &task_node_id, &coder_run_id, "spore:coder", "completed", 0)?;
+            &impl_node_holder
+        };
 
         // === POST-CODER CLEANUP ===
         post_coder_cleanup(db, &impl_node.id, &before_dirty, &before_untracked, &cli_binary, verbose);
