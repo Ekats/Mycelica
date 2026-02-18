@@ -650,6 +650,12 @@ enum SporeCommands {
         /// Path to verifier agent prompt
         #[arg(long, default_value = "docs/spore/agents/verifier.md")]
         verifier_prompt: std::path::PathBuf,
+        /// Path to summarizer agent prompt
+        #[arg(long, default_value = "docs/spore/agents/summarizer.md")]
+        summarizer_prompt: std::path::PathBuf,
+        /// Run summarizer after verification completes
+        #[arg(long)]
+        summarize: bool,
         /// Show what would happen without running agents
         #[arg(long)]
         dry_run: bool,
@@ -694,6 +700,9 @@ enum SporeCommands {
         /// Run ID prefix (from task node ID) or "latest" for most recent run
         #[arg(default_value = "latest")]
         run: String,
+        /// Print only one-line summary (outcome, duration, bounces) without the full trail
+        #[arg(long)]
+        compact: bool,
     },
 }
 
@@ -7358,8 +7367,8 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
             handle_runs(cmd, db, json)
         }
 
-        SporeCommands::Orchestrate { task, max_bounces, max_turns, coder_prompt, verifier_prompt, dry_run, verbose } => {
-            handle_orchestrate(db, &task, max_bounces, max_turns, &coder_prompt, &verifier_prompt, dry_run, verbose).await
+        SporeCommands::Orchestrate { task, max_bounces, max_turns, coder_prompt, verifier_prompt, summarizer_prompt, summarize, dry_run, verbose } => {
+            handle_orchestrate(db, &task, max_bounces, max_turns, &coder_prompt, &verifier_prompt, &summarizer_prompt, summarize, dry_run, verbose).await
         }
 
         SporeCommands::ContextForTask { id, budget, max_hops, max_cost, edge_types, not_superseded, items_only } => {
@@ -7452,8 +7461,8 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
             Ok(())
         }
 
-        SporeCommands::Distill { run } => {
-            handle_distill(db, &run, json).await
+        SporeCommands::Distill { run, compact } => {
+            handle_distill(db, &run, json, compact).await
         }
     }
 }
@@ -7547,7 +7556,7 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                     .filter_map(|r| r.ok())
                     .collect();
                     Ok(ids)
-                })().unwrap_or_default();
+                })().map_err(|e| format!("derives_from query failed: {}", e))?;
 
                 let status = if !impl_ids.is_empty() {
                     // Check if any implementation has a supports edge from a verifier
@@ -7567,7 +7576,7 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                             |row| row.get(0),
                         ).map_err(|e| e.to_string())?;
                         Ok(count > 0)
-                    })().unwrap_or(false);
+                    })().map_err(|e| format!("supports query failed: {}", e))?;
                     if has_verified { "verified" } else { "implemented" }
                 } else {
                     "pending"
@@ -8200,7 +8209,7 @@ fn post_coder_cleanup(
 /// Finds the task node, follows edges to implementations, verifications, and
 /// escalations, then prints a structured timeline. If the trail is complete
 /// enough, creates a summary meta-node capturing lessons learned.
-async fn handle_distill(db: &Database, run_ref: &str, json: bool) -> Result<(), String> {
+async fn handle_distill(db: &Database, run_ref: &str, json: bool, compact: bool) -> Result<(), String> {
     use std::collections::{HashMap, VecDeque};
 
     // 1. Find the task node
@@ -8305,8 +8314,6 @@ async fn handle_distill(db: &Database, run_ref: &str, json: bool) -> Result<(), 
         return Ok(());
     }
 
-    println!("Trail: {} node(s)\n", trail.len());
-
     // Classify nodes
     let mut task_nodes = Vec::new();
     let mut impl_nodes = Vec::new();
@@ -8314,24 +8321,70 @@ async fn handle_distill(db: &Database, run_ref: &str, json: bool) -> Result<(), 
     let mut escalation_nodes = Vec::new();
 
     for n in &sorted {
+        if n.title.starts_with("Orchestration:") {
+            task_nodes.push(n);
+        } else if n.title.starts_with("Implemented:") || n.title.starts_with("Fixed:") {
+            impl_nodes.push(n);
+        } else if n.title.starts_with("Verified:") || n.title.starts_with("Verification failed:") {
+            verify_nodes.push(n);
+        } else if n.meta_type.as_deref() == Some("escalation") {
+            escalation_nodes.push(n);
+        }
+    }
+
+    // Compute outcome
+    let outcome = if !escalation_nodes.is_empty() {
+        "Escalated"
+    } else if !verify_nodes.is_empty() && verify_nodes.iter().any(|n| n.title.starts_with("Verified:")) {
+        "Verified"
+    } else if !impl_nodes.is_empty() {
+        "Implemented (unverified)"
+    } else {
+        "Incomplete"
+    };
+
+    // Compute duration string
+    let duration_str = if sorted.len() >= 2 {
+        let first = sorted.first().unwrap().created_at;
+        let last = sorted.last().unwrap().created_at;
+        let duration_s = (last - first) / 1000;
+        let mins = duration_s / 60;
+        let secs = duration_s % 60;
+        format!("{}m {}s", mins, secs)
+    } else {
+        "n/a".to_string()
+    };
+
+    // Bounce count: number of impl nodes (each represents a coder bounce)
+    let bounces = impl_nodes.len();
+
+    if compact {
+        // One-line summary: outcome | duration | bounces | task title
+        println!("{} | {} | {} bounce{} | {}",
+            outcome, duration_str,
+            bounces, if bounces == 1 { "" } else { "s" },
+            &task_title[..task_title.len().min(60)]);
+        return Ok(());
+    }
+
+    // --- Full output ---
+
+    println!("Trail: {} node(s)\n", trail.len());
+
+    for n in &sorted {
         let ts = chrono::DateTime::from_timestamp_millis(n.created_at)
             .map(|dt| dt.format("%H:%M:%S").to_string())
             .unwrap_or_else(|| "?".to_string());
-        let agent = n.agent.as_deref().unwrap_or("?");
         let id_short = &n.id[..8.min(n.id.len())];
 
         if n.title.starts_with("Orchestration:") {
             println!("[{}] {} TASK {} ({})", ts, "📋", &n.title[..n.title.len().min(60)], id_short);
-            task_nodes.push(n);
         } else if n.title.starts_with("Implemented:") || n.title.starts_with("Fixed:") {
             println!("[{}] {} IMPL {} ({})", ts, "🔨", &n.title[..n.title.len().min(60)], id_short);
-            impl_nodes.push(n);
         } else if n.title.starts_with("Verified:") || n.title.starts_with("Verification failed:") {
             println!("[{}] {} VERIFY {} ({})", ts, "✅", &n.title[..n.title.len().min(60)], id_short);
-            verify_nodes.push(n);
         } else if n.meta_type.as_deref() == Some("escalation") {
             println!("[{}] {} ESCALATION {} ({})", ts, "⚠️", &n.title[..n.title.len().min(60)], id_short);
-            escalation_nodes.push(n);
         } else {
             println!("[{}] {} {} {} ({})", ts, "  ", n.class, &n.title[..n.title.len().min(60)], id_short);
         }
@@ -8378,26 +8431,8 @@ async fn handle_distill(db: &Database, run_ref: &str, json: bool) -> Result<(), 
         .collect::<Vec<_>>()
         .join(", "));
 
-    let outcome = if !escalation_nodes.is_empty() {
-        "Escalated (did not converge)"
-    } else if !verify_nodes.is_empty() && verify_nodes.iter().any(|n| n.title.starts_with("Verified:")) {
-        "Verified (converged)"
-    } else if !impl_nodes.is_empty() {
-        "Implemented (not verified)"
-    } else {
-        "Incomplete"
-    };
     println!("Outcome: {}", outcome);
-
-    // Duration
-    if sorted.len() >= 2 {
-        let first = sorted.first().unwrap().created_at;
-        let last = sorted.last().unwrap().created_at;
-        let duration_s = (last - first) / 1000;
-        let mins = duration_s / 60;
-        let secs = duration_s % 60;
-        println!("Duration: {}m {}s", mins, secs);
-    }
+    println!("Duration: {}", duration_str);
 
     // Key content from impl nodes
     if !impl_nodes.is_empty() {
@@ -8651,6 +8686,8 @@ async fn handle_orchestrate(
     max_turns: usize,
     coder_prompt_path: &Path,
     verifier_prompt_path: &Path,
+    summarizer_prompt_path: &Path,
+    summarize: bool,
     dry_run: bool,
     verbose: bool,
 ) -> Result<(), String> {
@@ -8688,12 +8725,19 @@ async fn handle_orchestrate(
     };
     let coder_path = resolve_prompt(coder_prompt_path);
     let verifier_path = resolve_prompt(verifier_prompt_path);
+    let summarizer_path = resolve_prompt(summarizer_prompt_path);
 
     // Read agent prompts
     let coder_prompt_template = std::fs::read_to_string(&coder_path)
         .map_err(|e| format!("Failed to read coder prompt at {}: {}", coder_path.display(), e))?;
     let verifier_prompt_template = std::fs::read_to_string(&verifier_path)
         .map_err(|e| format!("Failed to read verifier prompt at {}: {}", verifier_path.display(), e))?;
+    let summarizer_prompt_template = if summarize {
+        Some(std::fs::read_to_string(&summarizer_path)
+            .map_err(|e| format!("Failed to read summarizer prompt at {}: {}", summarizer_path.display(), e))?)
+    } else {
+        None
+    };
 
     // Clean up old temp MCP configs from previous runs
     let _ = std::fs::remove_dir_all("/tmp/mycelica-orchestrator");
@@ -8952,6 +8996,43 @@ async fn handle_orchestrate(
                 println!("Verifier supports the implementation after {} bounce(s).", bounce + 1);
                 println!("Implementation: {} ({})", &impl_node.id[..8], impl_node.title);
                 println!("Task node: {}", &task_node_id[..8]);
+
+                // Run summarizer if requested
+                if let Some(ref summarizer_template) = summarizer_prompt_template {
+                    println!("\n--- Summarizer ---");
+                    let summarizer_run_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+
+                    let summarizer_task_file = generate_task_file(
+                        db, task, "summarizer", &summarizer_run_id, &task_node_id,
+                        bounce, max_bounces, Some(&impl_node.id),
+                    )?;
+                    println!("[summarizer] Task file: {}", summarizer_task_file.display());
+
+                    let summarizer_mcp = write_temp_mcp_config(&cli_binary, "summarizer", "spore:summarizer", &summarizer_run_id, &db_path)?;
+
+                    let summarizer_prompt = format!(
+                        "{}\n\nRead the task file at {} for context about the run.\n\nSummarize the orchestrator run for task node {}. The final implementation node is {}.\nThe run took {} bounce(s). Your job: read the trail, write one summary node with a summarizes edge to the task node.",
+                        summarizer_template, summarizer_task_file.display(), &task_node_id[..8], impl_node.id, bounce + 1
+                    );
+
+                    let summarizer_result = spawn_claude(
+                        &summarizer_prompt,
+                        &summarizer_mcp,
+                        15, // summarizer needs fewer turns
+                        verbose,
+                        "summarizer",
+                        None,
+                        Some("Bash,Edit,Write"),
+                    )?;
+
+                    println!("[summarizer] Done ({} turns, ${:.2}, {:.0}s)",
+                        summarizer_result.num_turns.unwrap_or(0),
+                        summarizer_result.total_cost_usd.unwrap_or(0.0),
+                        summarizer_result.duration_ms.unwrap_or(0) as f64 / 1000.0,
+                    );
+                    record_run_status(db, &task_node_id, &summarizer_run_id, "spore:summarizer", "completed", 0)?;
+                }
+
                 return Ok(());
             }
             Verdict::Contradicts => {

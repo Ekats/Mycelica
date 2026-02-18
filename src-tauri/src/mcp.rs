@@ -91,6 +91,7 @@ impl AgentRole {
             Self::Synthesizer => &["mycelica_create_edge"],
             Self::Summarizer => &[
                 "mycelica_create_edge",
+                "mycelica_create_node",
                 "mycelica_create_meta",
                 "mycelica_update_meta",
             ],
