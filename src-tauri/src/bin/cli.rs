@@ -574,6 +574,9 @@ enum SporeCommands {
         /// Show all details (meta nodes, edge breakdown, contradictions)
         #[arg(long)]
         all: bool,
+        /// Output format: compact (default) or full (adds top nodes, edge distribution, recent ops)
+        #[arg(long, default_value = "compact")]
+        format: String,
     },
     /// Create an edge between two existing nodes
     CreateEdge {
@@ -7018,7 +7021,8 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
             Ok(())
         }
 
-        SporeCommands::Status { all } => {
+        SporeCommands::Status { all, format } => {
+            let full_mode = format == "full";
             // Meta nodes by type
             let meta_nodes = db.get_meta_nodes(None).map_err(|e| e.to_string())?;
             let summaries = meta_nodes.iter().filter(|n| n.meta_type.as_deref() == Some("summary")).count();
@@ -7125,6 +7129,69 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
                             let agent_name = mn.agent_id.as_deref().unwrap_or("?");
                             println!("  [{}] {} (agent: {}, {})",
                                 mt, mn.title, agent_name, &mn.id[..8.min(mn.id.len())]);
+                        }
+                    }
+                }
+
+                if full_mode {
+                    // (1) Top 5 most-connected nodes by edge count
+                    println!("\n--- Full Mode ---");
+                    println!("\nTop 5 most-connected nodes:");
+                    // Collect IDs first, then drop the lock before calling get_node
+                    let top_nodes: Vec<(String, i64)> = (|| -> Result<Vec<_>, String> {
+                        let conn = db.raw_conn().lock().unwrap();
+                        let mut stmt = conn.prepare(
+                            "SELECT node_id, COUNT(*) as edge_count FROM (
+                                SELECT source_id as node_id FROM edges
+                                UNION ALL
+                                SELECT target_id as node_id FROM edges
+                            ) GROUP BY node_id ORDER BY edge_count DESC LIMIT 5"
+                        ).map_err(|e| e.to_string())?;
+                        let rows: Vec<_> = stmt.query_map([], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                        }).map_err(|e| e.to_string())?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                        Ok(rows)
+                    })().unwrap_or_default();
+                    for (node_id, count) in &top_nodes {
+                        let name = db.get_node(node_id).ok().flatten()
+                            .map(|n| n.ai_title.unwrap_or(n.title))
+                            .unwrap_or_else(|| node_id[..8.min(node_id.len())].to_string());
+                        println!("  {} edges  {}  ({})", count, name, &node_id[..8.min(node_id.len())]);
+                    }
+
+                    // (2) Edge type distribution
+                    println!("\nEdge type distribution:");
+                    {
+                        let mut type_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                        for e in &all_edges {
+                            *type_counts.entry(e.edge_type.as_str().to_string()).or_insert(0) += 1;
+                        }
+                        let mut sorted: Vec<_> = type_counts.into_iter().collect();
+                        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                        for (etype, count) in sorted {
+                            println!("  {:20} {}", etype, count);
+                        }
+                    }
+
+                    // (3) Recent operational nodes (last 24h)
+                    println!("\nRecent operational nodes (last 24h):");
+                    {
+                        let ops: Vec<_> = all_nodes.iter()
+                            .filter(|n| n.node_class.as_deref() == Some("operational") && n.created_at >= day_ago)
+                            .collect();
+                        if ops.is_empty() {
+                            println!("  (none)");
+                        } else {
+                            for n in &ops {
+                                let agent_name = n.agent_id.as_deref().unwrap_or("?");
+                                let ts = chrono::DateTime::from_timestamp_millis(n.created_at)
+                                    .map(|dt| dt.format("%H:%M:%S").to_string())
+                                    .unwrap_or_else(|| "?".to_string());
+                                println!("  [{}] {} (agent: {}, {})",
+                                    ts, n.title, agent_name, &n.id[..8.min(n.id.len())]);
+                            }
                         }
                     }
                 }
