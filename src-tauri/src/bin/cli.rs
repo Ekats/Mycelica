@@ -742,6 +742,9 @@ enum RunCommands {
         /// Show total cost (USD) for each run from tracks edge metadata
         #[arg(long)]
         cost: bool,
+        /// Show only runs that have an associated ESCALATION node
+        #[arg(long)]
+        escalated: bool,
     },
     /// Show all edges in a run
     Get {
@@ -7850,11 +7853,22 @@ fn handle_dashboard(db: &Database, json: bool, limit: usize) -> Result<(), Strin
 
 fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String> {
     match cmd {
-        RunCommands::List { all, cost: show_cost } => {
+        RunCommands::List { all, cost: show_cost, escalated } => {
             // Query task nodes: Orchestration: prefixed, plus (with --all) any operational node with tracks edges
             let task_rows: Vec<(String, String, i64)> = (|| -> Result<Vec<_>, String> {
                 let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
-                let query = if all {
+                let query = if escalated {
+                    // Only runs that have an ESCALATION node tracking them
+                    "SELECT DISTINCT n.id, n.title, n.created_at FROM nodes n \
+                     WHERE n.node_class = 'operational' AND n.title LIKE 'Orchestration:%' \
+                       AND EXISTS ( \
+                         SELECT 1 FROM edges e \
+                         JOIN nodes esc ON esc.id = e.source_id \
+                         WHERE e.target_id = n.id AND e.type = 'tracks' \
+                           AND esc.title LIKE 'ESCALATION:%' \
+                       ) \
+                     ORDER BY n.created_at DESC"
+                } else if all {
                     "SELECT DISTINCT n.id, n.title, n.created_at FROM nodes n \
                      WHERE n.node_class = 'operational' AND ( \
                        n.title LIKE 'Orchestration:%' \
@@ -7879,7 +7893,7 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                 if json {
                     println!("[]");
                 } else {
-                    println!("No {} found.", if all { "runs" } else { "orchestrator runs" });
+                    println!("No {} found.", if escalated { "escalated runs" } else if all { "runs" } else { "orchestrator runs" });
                 }
                 return Ok(());
             }
@@ -7892,6 +7906,7 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                 status: String,
                 kind: &'static str,
                 total_cost: Option<f64>,
+                escalation_reason: Option<String>,
             }
 
             let mut runs = Vec::new();
@@ -7967,6 +7982,35 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                     None
                 };
 
+                // Look up escalation reason if --escalated flag is set
+                let escalation_reason = if escalated {
+                    (|| -> Result<Option<String>, String> {
+                        let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+                        let mut stmt = conn.prepare(
+                            "SELECT esc.title FROM edges e \
+                             JOIN nodes esc ON esc.id = e.source_id \
+                             WHERE e.target_id = ?1 AND e.type = 'tracks' \
+                               AND esc.title LIKE 'ESCALATION:%' \
+                             LIMIT 1"
+                        ).map_err(|e| e.to_string())?;
+                        let title: Option<String> = stmt.query_row(rusqlite::params![task_id], |row| {
+                            row.get::<_, String>(0)
+                        }).ok();
+                        // Extract reason: strip "ESCALATION: " prefix and " (after N bounces)" suffix
+                        Ok(title.map(|t| {
+                            let reason = t.strip_prefix("ESCALATION:").unwrap_or(&t).trim();
+                            // Strip trailing " (after N bounces)" if present
+                            if let Some(pos) = reason.rfind(" (after ") {
+                                reason[..pos].trim().to_string()
+                            } else {
+                                reason.to_string()
+                            }
+                        }))
+                    })().unwrap_or(None)
+                } else {
+                    None
+                };
+
                 runs.push(RunInfo {
                     id: task_id[..8.min(task_id.len())].to_string(),
                     description,
@@ -7974,6 +8018,7 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                     status: status.to_string(),
                     kind: if is_orchestration { "orchestration" } else { "tracked" },
                     total_cost,
+                    escalation_reason,
                 });
             }
 
@@ -7993,9 +8038,33 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                     if let Some(cost) = r.total_cost {
                         obj["cost_usd"] = serde_json::json!(format!("{:.2}", cost));
                     }
+                    if let Some(ref reason) = r.escalation_reason {
+                        obj["escalation_reason"] = serde_json::json!(reason);
+                    }
                     obj
                 }).collect();
                 println!("{}", serde_json::to_string_pretty(&items).unwrap_or_default());
+            } else if escalated {
+                println!("{:<10} {:<42} {:<20} {:<10} {}", "RUN ID", "DESCRIPTION", "CREATED", "STATUS", "ESCALATION REASON");
+                println!("{}", "-".repeat(120));
+                for r in &runs {
+                    let created = chrono::DateTime::from_timestamp_millis(r.created_at)
+                        .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    let desc = if r.description.chars().count() > 40 {
+                        format!("{}...", utils::safe_truncate(&r.description, 37))
+                    } else {
+                        r.description.clone()
+                    };
+                    let reason = r.escalation_reason.as_deref().unwrap_or("-");
+                    let reason = if reason.chars().count() > 40 {
+                        format!("{}...", utils::safe_truncate(reason, 37))
+                    } else {
+                        reason.to_string()
+                    };
+                    println!("{:<10} {:<42} {:<20} {:<10} {}", r.id, desc, created, r.status, reason);
+                }
+                println!("\n{} escalated run(s)", runs.len());
             } else if all {
                 println!("{:<10} {:<14} {:<50} {:<20} {}", "RUN ID", "KIND", "DESCRIPTION", "CREATED", "STATUS");
                 println!("{}", "-".repeat(104));
