@@ -8695,6 +8695,48 @@ fn generate_task_file(
         md.push_str("\n");
     }
 
+    // 4b. Include lessons from past runs (runtime context — Concern 13)
+    let lessons: Vec<(String, String)> = (|| -> Result<Vec<(String, String)>, String> {
+        let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(
+            "SELECT id, title, content FROM nodes \
+             WHERE node_class = 'operational' AND title LIKE 'Lesson:%' \
+             ORDER BY created_at DESC LIMIT 5"
+        ).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([], |row| {
+            let title: String = row.get(1)?;
+            let content: String = row.get::<_, String>(2).unwrap_or_default();
+            // Extract just the Pattern section for brevity
+            let pattern = content.lines()
+                .skip_while(|l| !l.starts_with("## Pattern"))
+                .skip(1)
+                .take_while(|l| !l.starts_with("## "))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim()
+                .to_string();
+            let summary = if pattern.is_empty() {
+                title.strip_prefix("Lesson: ").unwrap_or(&title).to_string()
+            } else {
+                pattern
+            };
+            Ok((title, summary))
+        }).map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+        Ok(rows)
+    })().unwrap_or_default();
+
+    if !lessons.is_empty() {
+        md.push_str("## Lessons from Past Runs\n\n");
+        md.push_str("These were extracted from previous orchestrator runs. Keep them in mind.\n\n");
+        for (title, summary) in &lessons {
+            let lesson_name = title.strip_prefix("Lesson: ").unwrap_or(title);
+            md.push_str(&format!("- **{}**: {}\n", lesson_name, summary));
+        }
+        md.push_str("\n");
+    }
+
     md.push_str("## Checklist\n\n");
     md.push_str("- [ ] Read relevant context nodes above before starting\n");
     md.push_str("- [ ] Record implementation as operational node when done\n");
