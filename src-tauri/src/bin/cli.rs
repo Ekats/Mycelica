@@ -7620,7 +7620,32 @@ fn handle_dashboard(db: &Database, json: bool, limit: usize) -> Result<(), Strin
         Ok((nodes, edges, recent, contras))
     })().unwrap_or((0, 0, 0, 0));
 
-    // 4. Total cost across all tracked runs
+    // 4. Unresolved contradiction details (if any)
+    let contradiction_details: Vec<(String, String, String, String)> = if unresolved_contradictions > 0 {
+        (|| -> Result<Vec<_>, String> {
+            let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+            let mut stmt = conn.prepare(
+                "SELECT e.source_id, e.target_id, \
+                 COALESCE(s.title, e.source_id), COALESCE(t.title, e.target_id) \
+                 FROM edges e \
+                 LEFT JOIN nodes s ON s.id = e.source_id \
+                 LEFT JOIN nodes t ON t.id = e.target_id \
+                 WHERE e.type = 'contradicts' AND e.superseded_by IS NULL \
+                 LIMIT 5"
+            ).map_err(|e| e.to_string())?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+            }).map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+            Ok(rows)
+        })().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // 5. Total cost across all tracked runs
     let all_time_spend: f64 = (|| -> Result<f64, String> {
         let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
         let mut stmt = conn.prepare(
@@ -7701,8 +7726,17 @@ fn handle_dashboard(db: &Database, json: bool, limit: usize) -> Result<(), Strin
 
         // Graph health
         println!("Graph: {} nodes, {} edges ({} this week)", node_count, edge_count, edge_7d);
-        if unresolved_contradictions > 0 {
-            println!("  {} unresolved contradiction(s)", unresolved_contradictions);
+        if !contradiction_details.is_empty() {
+            println!("  {} unresolved contradiction(s):", unresolved_contradictions);
+            for (_src_id, _tgt_id, src_title, tgt_title) in &contradiction_details {
+                let src_short = if src_title.chars().count() > 40 {
+                    format!("{}...", utils::safe_truncate(src_title, 37))
+                } else { src_title.clone() };
+                let tgt_short = if tgt_title.chars().count() > 40 {
+                    format!("{}...", utils::safe_truncate(tgt_title, 37))
+                } else { tgt_title.clone() };
+                println!("    {} -> {}", src_short, tgt_short);
+            }
         }
         if all_time_spend > 0.0 {
             println!("Total spend: ${:.2}", all_time_spend);
