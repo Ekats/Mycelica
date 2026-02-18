@@ -761,6 +761,11 @@ enum RunCommands {
         /// Second run ID (prefix or UUID)
         run_b: String,
     },
+    /// Show complete timeline of a run: agents, edges, outcomes
+    History {
+        /// Run ID (prefix match)
+        run_id: String,
+    },
     /// Delete all edges (and optionally nodes) from a run
     Rollback {
         /// Run ID (UUID)
@@ -8328,6 +8333,324 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                     }).unwrap_or_default();
                     println!("{:<w$} | {:<w$}", left, right, w = w);
                 }
+            }
+            Ok(())
+        }
+
+        RunCommands::History { run_id } => {
+            let task_node = resolve_node(db, &run_id)?;
+            let task_id = &task_node.id;
+            let task_desc = task_node.title.strip_prefix("Orchestration:").unwrap_or(&task_node.title).trim();
+            let task_created = chrono::DateTime::from_timestamp_millis(task_node.created_at)
+                .map(|d| d.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| "?".to_string());
+
+            if json {
+                // Collect all timeline events as JSON
+                let mut events: Vec<serde_json::Value> = Vec::new();
+
+                // Task creation event
+                events.push(serde_json::json!({
+                    "timestamp": task_node.created_at,
+                    "time": &task_created,
+                    "type": "task_created",
+                    "description": task_desc,
+                    "node_id": &task_id[..8.min(task_id.len())],
+                }));
+
+                // Get tracks edges (self-referencing: source=target=task_id for agent metadata)
+                let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+                let mut stmt = conn.prepare(
+                    "SELECT metadata, created_at FROM edges WHERE source_id = ?1 AND target_id = ?1 AND type = 'tracks' ORDER BY created_at"
+                ).map_err(|e| e.to_string())?;
+                let agent_runs: Vec<(serde_json::Value, i64)> = stmt.query_map(rusqlite::params![task_id], |row| {
+                    let meta: String = row.get(0)?;
+                    let ts: i64 = row.get(1)?;
+                    Ok((meta, ts))
+                }).map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .filter_map(|(meta, ts)| serde_json::from_str::<serde_json::Value>(&meta).ok().map(|v| (v, ts)))
+                .collect();
+                drop(stmt);
+
+                for (meta, ts) in &agent_runs {
+                    let time_str = chrono::DateTime::from_timestamp_millis(*ts)
+                        .map(|d| d.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    events.push(serde_json::json!({
+                        "timestamp": ts,
+                        "time": time_str,
+                        "type": "agent_run",
+                        "agent": meta["agent"],
+                        "status": meta["status"],
+                        "cost_usd": meta["cost_usd"],
+                        "turns": meta["turns"],
+                        "duration_ms": meta["duration_ms"],
+                        "bounce": meta["bounce"],
+                    }));
+                }
+
+                // Get all workflow edges from the run
+                drop(conn);
+                let run_edges = db.get_run_edges(task_id)
+                    .map_err(|e| format!("Failed to get run edges: {}", e))?;
+
+                for e in &run_edges {
+                    // Skip the self-referencing tracks edges we already handled
+                    if e.edge_type == EdgeType::Tracks && e.source == *task_id && e.target == *task_id {
+                        continue;
+                    }
+                    let time_str = chrono::DateTime::from_timestamp_millis(e.created_at)
+                        .map(|d| d.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    let source_title = db.get_node(&e.source).ok().flatten()
+                        .map(|n| n.title.clone()).unwrap_or_else(|| e.source[..8.min(e.source.len())].to_string());
+                    let target_title = db.get_node(&e.target).ok().flatten()
+                        .map(|n| n.title.clone()).unwrap_or_else(|| e.target[..8.min(e.target.len())].to_string());
+                    events.push(serde_json::json!({
+                        "timestamp": e.created_at,
+                        "time": time_str,
+                        "type": "edge",
+                        "edge_type": e.edge_type.as_str(),
+                        "edge_id": &e.id[..8.min(e.id.len())],
+                        "source": &e.source[..8.min(e.source.len())],
+                        "source_title": source_title,
+                        "target": &e.target[..8.min(e.target.len())],
+                        "target_title": target_title,
+                        "confidence": e.confidence,
+                        "content": e.content,
+                        "agent_id": e.agent_id,
+                    }));
+                }
+
+                // Sort by timestamp
+                events.sort_by_key(|e| e["timestamp"].as_i64().unwrap_or(0));
+
+                // Determine outcome for JSON
+                let has_supports = run_edges.iter().any(|e| e.edge_type == EdgeType::Supports);
+                let has_contradicts = run_edges.iter().any(|e| e.edge_type == EdgeType::Contradicts && e.superseded_by.is_none());
+                let has_escalation = (|| -> Result<bool, String> {
+                    let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+                    let mut stmt = conn.prepare(
+                        "SELECT 1 FROM edges e \
+                         JOIN nodes esc ON esc.id = e.source_id \
+                         WHERE e.target_id = ?1 AND e.type = 'tracks' \
+                           AND esc.title LIKE 'ESCALATION:%' \
+                         LIMIT 1"
+                    ).map_err(|e| e.to_string())?;
+                    Ok(stmt.query_row(rusqlite::params![task_id], |_| Ok(())).is_ok())
+                })().unwrap_or(false);
+                let outcome = if has_escalation {
+                    "ESCALATED"
+                } else if has_supports && !has_contradicts {
+                    "VERIFIED"
+                } else if has_contradicts {
+                    "UNRESOLVED"
+                } else if run_edges.iter().any(|e| e.edge_type == EdgeType::DerivesFrom) {
+                    "IMPLEMENTED"
+                } else {
+                    "PENDING"
+                };
+
+                let output = serde_json::json!({
+                    "run_id": &task_id[..8.min(task_id.len())],
+                    "description": task_desc,
+                    "created": task_created,
+                    "outcome": outcome,
+                    "events": events,
+                });
+                println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
+            } else {
+                // Human-readable chronological timeline
+                println!("Run: {} ({})", &task_id[..8.min(task_id.len())], task_desc);
+                println!("{}", "=".repeat(80));
+                println!();
+
+                // Collect all timeline events: (timestamp, indent_level, lines)
+                struct TimelineEvent {
+                    timestamp: i64,
+                    lines: Vec<(usize, String)>, // (indent_level, text)
+                }
+                let mut events: Vec<TimelineEvent> = Vec::new();
+
+                // Task creation
+                events.push(TimelineEvent {
+                    timestamp: task_node.created_at,
+                    lines: vec![
+                        (0, format!("[{}] Task created", task_created)),
+                        (1, format!("\"{}\"", task_desc)),
+                    ],
+                });
+
+                // Get tracks edges for agent run metadata
+                let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+                let mut stmt = conn.prepare(
+                    "SELECT metadata, created_at FROM edges WHERE source_id = ?1 AND target_id = ?1 AND type = 'tracks' ORDER BY created_at"
+                ).map_err(|e| e.to_string())?;
+                let agent_runs: Vec<(serde_json::Value, i64)> = stmt.query_map(rusqlite::params![task_id], |row| {
+                    let meta: String = row.get(0)?;
+                    let ts: i64 = row.get(1)?;
+                    Ok((meta, ts))
+                }).map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .filter_map(|(meta, ts)| serde_json::from_str::<serde_json::Value>(&meta).ok().map(|v| (v, ts)))
+                .collect();
+                drop(stmt);
+
+                for (meta, ts) in &agent_runs {
+                    let time_str = chrono::DateTime::from_timestamp_millis(*ts)
+                        .map(|d| d.format("%H:%M:%S").to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    let agent = meta["agent"].as_str().unwrap_or("?");
+                    let short_agent = agent.strip_prefix("spore:").unwrap_or(agent);
+                    let status = meta["status"].as_str().unwrap_or("?");
+                    let bounce = meta["bounce"].as_u64();
+                    let turns = meta["turns"].as_u64();
+                    let duration_ms = meta["duration_ms"].as_u64();
+                    let cost = meta["cost_usd"].as_f64();
+
+                    let mut lines = Vec::new();
+                    let bounce_str = bounce.map(|b| format!(" (bounce {})", b)).unwrap_or_default();
+                    lines.push((0, format!("[{}] {} {}{}", time_str, short_agent, status, bounce_str)));
+
+                    let mut details = Vec::new();
+                    if let Some(t) = turns { details.push(format!("{} turns", t)); }
+                    if let Some(d) = duration_ms {
+                        let secs = d / 1000;
+                        if secs >= 60 {
+                            details.push(format!("{}m {}s", secs / 60, secs % 60));
+                        } else {
+                            details.push(format!("{}s", secs));
+                        }
+                    }
+                    if let Some(c) = cost { details.push(format!("${:.2}", c)); }
+                    if !details.is_empty() {
+                        lines.push((1, details.join(" | ")));
+                    }
+
+                    events.push(TimelineEvent { timestamp: *ts, lines });
+                }
+
+                // Get all workflow edges from the run (derives_from, supports, contradicts, tracks, supersedes, etc.)
+                drop(conn);
+                let run_edges = db.get_run_edges(task_id)
+                    .map_err(|e| format!("Failed to get run edges: {}", e))?;
+
+                // Workflow edges: derives_from, supports, contradicts, supersedes
+                let workflow_types = [
+                    EdgeType::DerivesFrom, EdgeType::Supports, EdgeType::Contradicts,
+                    EdgeType::Supersedes, EdgeType::Flags, EdgeType::Resolves, EdgeType::Questions,
+                ];
+                for e in &run_edges {
+                    // Skip self-referencing tracks edges (already shown as agent runs)
+                    if e.edge_type == EdgeType::Tracks && e.source == *task_id && e.target == *task_id {
+                        continue;
+                    }
+                    if !workflow_types.contains(&e.edge_type) && e.edge_type != EdgeType::Tracks {
+                        continue;
+                    }
+                    let time_str = chrono::DateTime::from_timestamp_millis(e.created_at)
+                        .map(|d| d.format("%H:%M:%S").to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    let source_title = db.get_node(&e.source).ok().flatten()
+                        .map(|n| {
+                            let t = n.title.clone();
+                            if t.chars().count() > 50 { format!("{}...", utils::safe_truncate(&t, 47)) } else { t }
+                        })
+                        .unwrap_or_else(|| e.source[..8.min(e.source.len())].to_string());
+                    let target_title = db.get_node(&e.target).ok().flatten()
+                        .map(|n| {
+                            let t = n.title.clone();
+                            if t.chars().count() > 50 { format!("{}...", utils::safe_truncate(&t, 47)) } else { t }
+                        })
+                        .unwrap_or_else(|| e.target[..8.min(e.target.len())].to_string());
+
+                    let edge_label = match e.edge_type {
+                        EdgeType::DerivesFrom => "derives_from",
+                        EdgeType::Supports => "SUPPORTS",
+                        EdgeType::Contradicts => "CONTRADICTS",
+                        EdgeType::Supersedes => "supersedes",
+                        EdgeType::Flags => "flags",
+                        EdgeType::Resolves => "resolves",
+                        EdgeType::Questions => "questions",
+                        EdgeType::Tracks => "tracks",
+                        _ => e.edge_type.as_str(),
+                    };
+
+                    let agent_str = e.agent_id.as_deref()
+                        .map(|a| a.strip_prefix("spore:").unwrap_or(a))
+                        .unwrap_or("?");
+                    let conf_str = e.confidence
+                        .map(|c| format!(" [{:.0}%]", c * 100.0))
+                        .unwrap_or_default();
+
+                    let mut lines = Vec::new();
+                    lines.push((0, format!("[{}] {} {} -> {}{}", time_str, edge_label, source_title, target_title, conf_str)));
+                    lines.push((1, format!("by {} ({})", agent_str, &e.id[..8.min(e.id.len())])));
+                    if let Some(ref content) = e.content {
+                        let short = if content.chars().count() > 70 {
+                            format!("{}...", utils::safe_truncate(content, 67))
+                        } else {
+                            content.clone()
+                        };
+                        lines.push((1, format!("\"{}\"", short)));
+                    }
+
+                    events.push(TimelineEvent { timestamp: e.created_at, lines });
+                }
+
+                // Sort all events by timestamp
+                events.sort_by_key(|e| e.timestamp);
+
+                // Render
+                for event in &events {
+                    for (indent, line) in &event.lines {
+                        let prefix = "  ".repeat(*indent);
+                        println!("{}{}", prefix, line);
+                    }
+                    println!();
+                }
+
+                // Final outcome summary
+                let has_supports = run_edges.iter().any(|e| e.edge_type == EdgeType::Supports);
+                let has_contradicts = run_edges.iter().any(|e| e.edge_type == EdgeType::Contradicts && e.superseded_by.is_none());
+                let has_escalation = (|| -> Result<bool, String> {
+                    let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+                    let mut stmt = conn.prepare(
+                        "SELECT 1 FROM edges e \
+                         JOIN nodes esc ON esc.id = e.source_id \
+                         WHERE e.target_id = ?1 AND e.type = 'tracks' \
+                           AND esc.title LIKE 'ESCALATION:%' \
+                         LIMIT 1"
+                    ).map_err(|e| e.to_string())?;
+                    Ok(stmt.query_row(rusqlite::params![task_id], |_| Ok(())).is_ok())
+                })().unwrap_or(false);
+
+                println!("{}", "-".repeat(80));
+                let outcome = if has_escalation {
+                    "ESCALATED"
+                } else if has_supports && !has_contradicts {
+                    "VERIFIED"
+                } else if has_contradicts {
+                    "UNRESOLVED (open contradictions)"
+                } else if run_edges.iter().any(|e| e.edge_type == EdgeType::DerivesFrom) {
+                    "IMPLEMENTED (not yet verified)"
+                } else {
+                    "PENDING"
+                };
+
+                let total_edges = run_edges.len();
+                let total_cost: f64 = agent_runs.iter()
+                    .filter_map(|(m, _)| m["cost_usd"].as_f64())
+                    .sum();
+                let total_duration_ms: u64 = agent_runs.iter()
+                    .filter_map(|(m, _)| m["duration_ms"].as_u64())
+                    .sum();
+                let total_secs = total_duration_ms / 1000;
+
+                println!("Outcome: {}", outcome);
+                println!("Agents: {} invocations | Edges: {} | Cost: ${:.2} | Duration: {}m {}s",
+                    agent_runs.len(), total_edges, total_cost, total_secs / 60, total_secs % 60);
             }
             Ok(())
         }
