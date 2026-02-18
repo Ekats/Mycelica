@@ -771,6 +771,11 @@ enum RunCommands {
         /// Run ID (prefix match)
         run_id: String,
     },
+    /// Show source code files changed by a run
+    Diff {
+        /// Run ID (prefix match)
+        run_id: String,
+    },
     /// Delete all edges (and optionally nodes) from a run
     Rollback {
         /// Run ID (UUID)
@@ -8881,6 +8886,69 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
             Ok(())
         }
 
+        RunCommands::Diff { run_id } => {
+            let task_node = resolve_node(db, &run_id)?;
+            let task_id = &task_node.id;
+
+            // Walk derives_from edges to find implementation nodes
+            let files_changed: Vec<String> = {
+                let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+                let mut stmt = conn.prepare(
+                    "SELECT n.content FROM edges e \
+                     JOIN nodes n ON n.id = e.source_id \
+                     WHERE e.target_id = ?1 AND e.type = 'derives_from' AND n.content IS NOT NULL"
+                ).map_err(|e| e.to_string())?;
+                let contents: Vec<String> = stmt.query_map(
+                    rusqlite::params![task_id], |row| row.get::<_, String>(0)
+                ).map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+                drop(stmt);
+                drop(conn);
+
+                let mut files = Vec::new();
+                for content in &contents {
+                    // Parse "## Files Changed" section from markdown content
+                    if let Some(start) = content.find("## Files Changed") {
+                        let section = &content[start..];
+                        for line in section.lines().skip(1) {
+                            if line.starts_with("## ") { break; }
+                            let trimmed = line.trim();
+                            if let Some(file) = trimmed.strip_prefix("- ") {
+                                let file = file.split(':').next().unwrap_or(file).trim();
+                                let file = file.trim_matches('`');
+                                if !file.is_empty() && (file.contains('/') || file.contains('.')) && !files.contains(&file.to_string()) {
+                                    files.push(file.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                files
+            };
+
+            if files_changed.is_empty() {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                        "run_id": &task_id[..8.min(task_id.len())],
+                        "files_changed": serde_json::Value::Array(vec![]),
+                    })).unwrap_or_default());
+                } else {
+                    println!("No file changes recorded.");
+                }
+            } else if json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "run_id": &task_id[..8.min(task_id.len())],
+                    "files_changed": files_changed,
+                })).unwrap_or_default());
+            } else {
+                for f in &files_changed {
+                    println!("{}", f);
+                }
+            }
+            Ok(())
+        }
+
         RunCommands::Rollback { run_id, delete_nodes, force, dry_run } => {
             if dry_run {
                 let (edges, nodes) = db.preview_rollback_run(&run_id, delete_nodes)
@@ -9982,7 +10050,10 @@ fn generate_task_file(
 
     md.push_str("## Checklist\n\n");
     md.push_str("- [ ] Read relevant context nodes above before starting\n");
-    md.push_str("- [ ] Record implementation as operational node when done\n");
+    md.push_str(&format!(
+        "- [ ] Record implementation as operational node when done, with a `derives_from` edge targeting **this task node `{}`**\n",
+        _task_node_id
+    ));
     md.push_str("- [ ] Link implementation to modified code nodes with edges\n");
 
     // 5. Write to disk
