@@ -7844,7 +7844,7 @@ fn handle_dashboard(db: &Database, json: bool, limit: usize) -> Result<(), Strin
     })().unwrap_or(0.0);
 
     // 6. Success rate across ALL runs (not just recent)
-    let (total_runs, verified_runs, implemented_runs, escalated_runs): (i64, i64, i64, i64) = (|| -> Result<_, String> {
+    let (total_runs, verified_runs, implemented_runs, escalated_runs, cancelled_runs): (i64, i64, i64, i64, i64) = (|| -> Result<_, String> {
         let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
         let total: i64 = conn.prepare(
             "SELECT COUNT(*) FROM nodes WHERE node_class = 'operational' AND title LIKE 'Orchestration:%'"
@@ -7873,8 +7873,15 @@ fn handle_dashboard(db: &Database, json: bool, limit: usize) -> Result<(), Strin
             "SELECT COUNT(*) FROM nodes WHERE title LIKE 'ESCALATION:%'"
         ).and_then(|mut s| s.query_row([], |r| r.get(0))).unwrap_or(0);
 
-        Ok((total, verified, implemented, escalated))
-    })().unwrap_or((0, 0, 0, 0));
+        let cancelled: i64 = conn.prepare(
+            "SELECT COUNT(DISTINCT n.id) FROM nodes n \
+             JOIN edges e ON e.source_id = n.id AND e.target_id = n.id AND e.type = 'tracks' \
+             AND e.content = 'Cancelled by user' \
+             WHERE n.node_class = 'operational' AND n.title LIKE 'Orchestration:%'"
+        ).and_then(|mut s| s.query_row([], |r| r.get(0))).unwrap_or(0);
+
+        Ok((total, verified, implemented, escalated, cancelled))
+    })().unwrap_or((0, 0, 0, 0, 0));
 
     if json {
         let runs_json: Vec<serde_json::Value> = recent_runs.iter().map(|(id, desc, ts, status, cost)| {
@@ -7961,9 +7968,9 @@ fn handle_dashboard(db: &Database, json: bool, limit: usize) -> Result<(), Strin
         // Success rate
         if total_runs > 0 {
             let rate = if total_runs > 0 { verified_runs as f64 / total_runs as f64 * 100.0 } else { 0.0 };
-            let pending = total_runs - verified_runs - implemented_runs;
-            println!("Runs: {} total, {} verified ({:.0}%), {} implemented, {} escalated, {} pending",
-                total_runs, verified_runs, rate, implemented_runs, escalated_runs, pending);
+            let pending = total_runs - verified_runs - implemented_runs - cancelled_runs;
+            println!("Runs: {} total, {} verified ({:.0}%), {} implemented, {} escalated, {} cancelled, {} pending",
+                total_runs, verified_runs, rate, implemented_runs, escalated_runs, cancelled_runs, pending);
         }
         if all_time_spend > 0.0 {
             println!("Total spend: ${:.2}", all_time_spend);
