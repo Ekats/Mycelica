@@ -9222,27 +9222,27 @@ async fn handle_orchestrate(
                 &cli_binary, "coder", "spore:scout", &scout_run_id, &db_path,
             )?;
             let scout_prompt = format!(
-                "You are a code scout. Your ONLY job is to explore and plan — do NOT edit any files.\n\n\
-                 Read the task file at {} for context.\n\n\
+                "You are a code scout. Your ONLY job is to explore and write a plan — do NOT edit source files.\n\n\
+                 IMPORTANT: Use the Read tool to read files directly. Do NOT use mycelica_code_show — it truncates. \
+                 Use mycelica_search only to find which files/functions are relevant, then Read the actual files.\n\n\
+                 Read the task file at {} first.\n\n\
                  Your task: {}\n\n\
                  Steps:\n\
-                 1. Read the task file\n\
-                 2. Use mycelica_code_show and mycelica_search to find relevant code\n\
-                 3. Read the actual source files to understand the implementation\n\
-                 4. Write a plan file to {} with:\n\
-                    - Which file(s) to modify\n\
-                    - Which function(s) / struct(s) to change\n\
-                    - Line numbers for each change\n\
-                    - What each change should do (be specific)\n\
-                    - Any gotchas or edge cases\n\n\
-                 Keep the plan concise (under 40 lines). Be specific about line numbers and code locations.",
+                 1. Read the task file (has graph context with relevant code node IDs)\n\
+                 2. Use mycelica_search to find relevant code, then Read the source files directly with line ranges\n\
+                 3. Write a plan file to {} containing ONLY:\n\
+                    - File path(s) to modify\n\
+                    - Function/struct names and line numbers for each change\n\
+                    - What to add/change at each location (be specific about the code)\n\
+                    - Data model notes (what SQL queries, what structs to use)\n\n\
+                 The plan must be under 40 lines and specific enough that a coder can implement without exploring.",
                 task_file.display(), task, plan_path.display()
             );
             println!("[scout] Starting (run: {})", &scout_run_id);
             let scout_result = spawn_claude(
-                &scout_prompt, &scout_mcp, 5, verbose, "scout",
-                Some("Read,Write,mcp__mycelica__*"),
-                Some("Edit,Bash,Grep,Glob"),
+                &scout_prompt, &scout_mcp, 8, verbose, "scout",
+                Some("Read,Write,Grep,mcp__mycelica__*"),
+                Some("Edit,Bash,Glob"),
             )?;
             println!("[scout] Done ({} turns, ${:.2}, {:.0}s)",
                 scout_result.num_turns.unwrap_or(0),
