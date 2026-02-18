@@ -696,7 +696,11 @@ enum SporeCommands {
         dry_run: bool,
     },
     /// Show a combined dashboard: recent runs, lessons, costs, and graph health
-    Dashboard,
+    Dashboard {
+        /// Number of recent runs to show
+        #[arg(long, default_value = "5")]
+        limit: usize,
+    },
     /// Distill an orchestrator run into a summary node with lessons learned
     Distill {
         /// Run ID prefix (from task node ID) or "latest" for most recent run
@@ -7470,8 +7474,8 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
             Ok(())
         }
 
-        SporeCommands::Dashboard => {
-            handle_dashboard(db, json)
+        SporeCommands::Dashboard { limit } => {
+            handle_dashboard(db, json, limit)
         }
 
         SporeCommands::Distill { run, compact } => {
@@ -7511,7 +7515,7 @@ fn parse_since_to_millis(s: &str) -> Result<i64, String> {
     Ok(dt.and_utc().timestamp_millis())
 }
 
-fn handle_dashboard(db: &Database, json: bool) -> Result<(), String> {
+fn handle_dashboard(db: &Database, json: bool, limit: usize) -> Result<(), String> {
     let now = chrono::Utc::now().timestamp_millis();
     let week_ago = now - 7 * 86_400_000;
 
@@ -7521,9 +7525,9 @@ fn handle_dashboard(db: &Database, json: bool) -> Result<(), String> {
         let mut stmt = conn.prepare(
             "SELECT id, title, created_at FROM nodes \
              WHERE node_class = 'operational' AND title LIKE 'Orchestration:%' \
-             ORDER BY created_at DESC LIMIT 5"
+             ORDER BY created_at DESC LIMIT ?1"
         ).map_err(|e| e.to_string())?;
-        let rows: Vec<(String, String, i64)> = stmt.query_map([], |row| {
+        let rows: Vec<(String, String, i64)> = stmt.query_map(rusqlite::params![limit as i64], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
         }).map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
@@ -7616,8 +7620,7 @@ fn handle_dashboard(db: &Database, json: bool) -> Result<(), String> {
         Ok((nodes, edges, recent, contras))
     })().unwrap_or((0, 0, 0, 0));
 
-    // 4. Total cost across all runs
-    let total_spend: f64 = recent_runs.iter().filter_map(|(_, _, _, _, c)| *c).sum();
+    // 4. Total cost across all tracked runs
     let all_time_spend: f64 = (|| -> Result<f64, String> {
         let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
         let mut stmt = conn.prepare(
