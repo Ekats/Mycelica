@@ -695,6 +695,8 @@ enum SporeCommands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Show a combined dashboard: recent runs, lessons, costs, and graph health
+    Dashboard,
     /// Distill an orchestrator run into a summary node with lessons learned
     Distill {
         /// Run ID prefix (from task node ID) or "latest" for most recent run
@@ -7468,6 +7470,10 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
             Ok(())
         }
 
+        SporeCommands::Dashboard => {
+            handle_dashboard(db, json)
+        }
+
         SporeCommands::Distill { run, compact } => {
             handle_distill(db, &run, json, compact).await
         }
@@ -7503,6 +7509,203 @@ fn parse_since_to_millis(s: &str) -> Result<i64, String> {
         .map_err(|e| format!("Invalid --since '{}': {}. Use YYYY-MM-DD or relative (1h, 2d, 1w).", s, e))?;
     let dt = date.and_hms_opt(0, 0, 0).unwrap();
     Ok(dt.and_utc().timestamp_millis())
+}
+
+fn handle_dashboard(db: &Database, json: bool) -> Result<(), String> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let week_ago = now - 7 * 86_400_000;
+
+    // 1. Recent runs (last 5 orchestrator runs with cost + status)
+    let recent_runs: Vec<(String, String, i64, String, Option<f64>)> = (|| -> Result<Vec<_>, String> {
+        let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(
+            "SELECT id, title, created_at FROM nodes \
+             WHERE node_class = 'operational' AND title LIKE 'Orchestration:%' \
+             ORDER BY created_at DESC LIMIT 5"
+        ).map_err(|e| e.to_string())?;
+        let rows: Vec<(String, String, i64)> = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        }).map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+        drop(stmt);
+
+        let mut result = Vec::new();
+        for (task_id, title, created_at) in rows {
+            // Status from edges
+            let has_impl = conn.prepare(
+                "SELECT COUNT(*) FROM edges WHERE target_id = ?1 AND type = 'derives_from'"
+            ).and_then(|mut s| s.query_row(rusqlite::params![&task_id], |r| r.get::<_, i64>(0)))
+            .unwrap_or(0) > 0;
+            let has_verified = if has_impl {
+                conn.prepare(
+                    "SELECT COUNT(*) FROM edges e1 \
+                     JOIN edges e2 ON e2.target_id = e1.source_id \
+                     WHERE e1.target_id = ?1 AND e1.type = 'derives_from' AND e2.type = 'supports'"
+                ).and_then(|mut s| s.query_row(rusqlite::params![&task_id], |r| r.get::<_, i64>(0)))
+                .unwrap_or(0) > 0
+            } else { false };
+            let status = if has_verified { "verified" } else if has_impl { "implemented" } else { "pending" };
+
+            // Cost from tracks edges
+            let mut cost_stmt = conn.prepare(
+                "SELECT metadata FROM edges WHERE source_id = ?1 AND target_id = ?1 AND type = 'tracks'"
+            ).map_err(|e| e.to_string())?;
+            let costs: Vec<f64> = cost_stmt.query_map(rusqlite::params![&task_id], |row| {
+                row.get::<_, String>(0)
+            }).map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .filter_map(|meta| {
+                serde_json::from_str::<serde_json::Value>(&meta).ok()
+                    .and_then(|v| v["cost_usd"].as_f64())
+            })
+            .collect();
+            let total_cost = if costs.is_empty() { None } else { Some(costs.iter().sum()) };
+
+            let desc = title.strip_prefix("Orchestration:").unwrap_or(&title).trim().to_string();
+            result.push((task_id, desc, created_at, status.to_string(), total_cost));
+        }
+        Ok(result)
+    })().unwrap_or_default();
+
+    // 2. Lessons
+    let lessons: Vec<(String, String)> = (|| -> Result<Vec<_>, String> {
+        let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(
+            "SELECT title, content FROM nodes \
+             WHERE node_class = 'operational' AND title LIKE 'Lesson:%' \
+             ORDER BY created_at DESC LIMIT 5"
+        ).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([], |row| {
+            let title: String = row.get(0)?;
+            let content: String = row.get::<_, String>(1).unwrap_or_default();
+            let pattern = content.lines()
+                .skip_while(|l| !l.starts_with("## Pattern"))
+                .skip(1)
+                .take_while(|l| !l.starts_with("## "))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim()
+                .to_string();
+            let summary = if pattern.is_empty() {
+                title.strip_prefix("Lesson: ").unwrap_or(&title).to_string()
+            } else { pattern };
+            Ok((title.strip_prefix("Lesson: ").unwrap_or(&title).to_string(), summary))
+        }).map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+        Ok(rows)
+    })().unwrap_or_default();
+
+    // 3. Graph health stats (lightweight — just counts)
+    let (node_count, edge_count, edge_7d, unresolved_contradictions): (i64, i64, i64, i64) = (|| -> Result<_, String> {
+        let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+        let nodes: i64 = conn.prepare("SELECT COUNT(*) FROM nodes")
+            .and_then(|mut s| s.query_row([], |r| r.get(0)))
+            .unwrap_or(0);
+        let edges: i64 = conn.prepare("SELECT COUNT(*) FROM edges")
+            .and_then(|mut s| s.query_row([], |r| r.get(0)))
+            .unwrap_or(0);
+        let recent: i64 = conn.prepare("SELECT COUNT(*) FROM edges WHERE created_at >= ?1")
+            .and_then(|mut s| s.query_row(rusqlite::params![week_ago], |r| r.get(0)))
+            .unwrap_or(0);
+        let contras: i64 = conn.prepare(
+            "SELECT COUNT(*) FROM edges WHERE type = 'contradicts' AND superseded_by IS NULL"
+        ).and_then(|mut s| s.query_row([], |r| r.get(0)))
+        .unwrap_or(0);
+        Ok((nodes, edges, recent, contras))
+    })().unwrap_or((0, 0, 0, 0));
+
+    // 4. Total cost across all runs
+    let total_spend: f64 = recent_runs.iter().filter_map(|(_, _, _, _, c)| *c).sum();
+    let all_time_spend: f64 = (|| -> Result<f64, String> {
+        let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(
+            "SELECT metadata FROM edges WHERE type = 'tracks' AND metadata IS NOT NULL"
+        ).map_err(|e| e.to_string())?;
+        let total: f64 = stmt.query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .filter_map(|meta| {
+                serde_json::from_str::<serde_json::Value>(&meta).ok()
+                    .and_then(|v| v["cost_usd"].as_f64())
+            })
+            .sum();
+        Ok(total)
+    })().unwrap_or(0.0);
+
+    if json {
+        let runs_json: Vec<serde_json::Value> = recent_runs.iter().map(|(id, desc, ts, status, cost)| {
+            let mut v = serde_json::json!({
+                "run_id": &id[..8.min(id.len())],
+                "description": desc,
+                "created_at": chrono::DateTime::from_timestamp_millis(*ts)
+                    .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+                    .unwrap_or_default(),
+                "status": status,
+            });
+            if let Some(c) = cost { v["cost_usd"] = serde_json::json!(c); }
+            v
+        }).collect();
+        let output = serde_json::json!({
+            "recent_runs": runs_json,
+            "lessons": lessons.iter().map(|(t, s)| serde_json::json!({"title": t, "summary": s})).collect::<Vec<_>>(),
+            "graph": { "nodes": node_count, "edges": edge_count, "edges_7d": edge_7d, "unresolved_contradictions": unresolved_contradictions },
+            "total_spend_usd": all_time_spend,
+        });
+        println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
+    } else {
+        println!("=== Spore Dashboard ===\n");
+
+        // Recent runs
+        if recent_runs.is_empty() {
+            println!("No orchestrator runs yet.\n");
+        } else {
+            println!("Recent runs:");
+            for (id, desc, ts, status, cost) in &recent_runs {
+                let date = chrono::DateTime::from_timestamp_millis(*ts)
+                    .map(|d| d.format("%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let cost_str = cost.map(|c| format!(" ${:.2}", c)).unwrap_or_default();
+                let desc_short = if desc.chars().count() > 45 {
+                    format!("{}...", utils::safe_truncate(desc, 42))
+                } else {
+                    desc.clone()
+                };
+                let status_marker = match status.as_str() {
+                    "verified" => "+",
+                    "implemented" => "~",
+                    _ => " ",
+                };
+                println!("  {} {} {:<47} {} {}{}", &id[..8.min(id.len())], status_marker, desc_short, date, status, cost_str);
+            }
+            println!();
+        }
+
+        // Lessons
+        if !lessons.is_empty() {
+            println!("Lessons learned:");
+            for (title, summary) in &lessons {
+                let summary_short = if summary.chars().count() > 80 {
+                    format!("{}...", utils::safe_truncate(summary, 77))
+                } else {
+                    summary.clone()
+                };
+                println!("  * {}: {}", title, summary_short);
+            }
+            println!();
+        }
+
+        // Graph health
+        println!("Graph: {} nodes, {} edges ({} this week)", node_count, edge_count, edge_7d);
+        if unresolved_contradictions > 0 {
+            println!("  {} unresolved contradiction(s)", unresolved_contradictions);
+        }
+        if all_time_spend > 0.0 {
+            println!("Total spend: ${:.2}", all_time_spend);
+        }
+    }
+    Ok(())
 }
 
 fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String> {
