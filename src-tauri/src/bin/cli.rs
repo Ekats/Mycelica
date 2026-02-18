@@ -7994,6 +7994,7 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                 agents: Vec<(String, String, Option<f64>)>, // (agent, status, cost)
                 status: String,
                 total_cost: f64,
+                files_changed: Vec<String>,
             }
 
             let gather = |task_id: &str, title: &str| -> Result<RunDetail, String> {
@@ -8044,6 +8045,44 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                         .unwrap_or_else(|| "?".to_string()))
                     .unwrap_or_else(|| "?".to_string());
 
+                // Extract files changed from implementation nodes' content
+                let files_changed: Vec<String> = {
+                    let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+                    let mut stmt = conn.prepare(
+                        "SELECT n.content FROM edges e \
+                         JOIN nodes n ON n.id = e.source_id \
+                         WHERE e.target_id = ?1 AND e.type = 'derives_from' AND n.content IS NOT NULL"
+                    ).map_err(|e| e.to_string())?;
+                    let contents: Vec<String> = stmt.query_map(
+                        rusqlite::params![task_id], |row| row.get::<_, String>(0)
+                    ).map_err(|e| e.to_string())?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                    drop(stmt);
+                    drop(conn);
+
+                    let mut files = Vec::new();
+                    for content in &contents {
+                        // Parse "## Files Changed" section from markdown content
+                        if let Some(start) = content.find("## Files Changed") {
+                            let section = &content[start..];
+                            // Take lines until next heading or end
+                            for line in section.lines().skip(1) {
+                                if line.starts_with("## ") { break; }
+                                let trimmed = line.trim();
+                                if let Some(file) = trimmed.strip_prefix("- ") {
+                                    // Strip trailing description after ':'
+                                    let file = file.split(':').next().unwrap_or(file).trim();
+                                    if !file.is_empty() && !files.contains(&file.to_string()) {
+                                        files.push(file.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    files
+                };
+
                 Ok(RunDetail {
                     id: task_id[..8.min(task_id.len())].to_string(),
                     description: desc,
@@ -8051,6 +8090,7 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                     agents,
                     status: status.to_string(),
                     total_cost,
+                    files_changed,
                 })
             };
 
@@ -8070,6 +8110,7 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                             v
                         }).collect::<Vec<_>>(),
                         "total_cost": r.total_cost,
+                        "files_changed": r.files_changed,
                     })
                 };
                 println!("{}", serde_json::to_string_pretty(&serde_json::json!({
@@ -8107,6 +8148,22 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                 println!("{:<w$} | {:<w$}",
                     format!("Total: ${:.2}", a.total_cost),
                     format!("Total: ${:.2}", b.total_cost), w = w);
+
+                // Files changed
+                println!("{}", "-".repeat(w * 2 + 3));
+                println!("{:<w$} | {:<w$}",
+                    format!("Files ({})", a.files_changed.len()),
+                    format!("Files ({})", b.files_changed.len()), w = w);
+                let max_files = a.files_changed.len().max(b.files_changed.len());
+                for i in 0..max_files {
+                    let left = a.files_changed.get(i).map(|f| {
+                        if f.len() > w - 2 { format!("  ...{}", &f[f.len() - (w - 5)..]) } else { format!("  {}", f) }
+                    }).unwrap_or_default();
+                    let right = b.files_changed.get(i).map(|f| {
+                        if f.len() > w - 2 { format!("  ...{}", &f[f.len() - (w - 5)..]) } else { format!("  {}", f) }
+                    }).unwrap_or_default();
+                    println!("{:<w$} | {:<w$}", left, right, w = w);
+                }
             }
             Ok(())
         }
