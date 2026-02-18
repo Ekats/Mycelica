@@ -715,6 +715,8 @@ enum SporeCommands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// List all Lesson: nodes from the graph
+    Lessons,
     /// Show a combined dashboard: recent runs, lessons, costs, and graph health
     Dashboard {
         /// Number of recent runs to show
@@ -7539,6 +7541,10 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
             Ok(())
         }
 
+        SporeCommands::Lessons => {
+            handle_spore_lessons(db, json)
+        }
+
         SporeCommands::Dashboard { limit } => {
             handle_dashboard(db, json, limit)
         }
@@ -7578,6 +7584,67 @@ fn parse_since_to_millis(s: &str) -> Result<i64, String> {
         .map_err(|e| format!("Invalid --since '{}': {}. Use YYYY-MM-DD or relative (1h, 2d, 1w).", s, e))?;
     let dt = date.and_hms_opt(0, 0, 0).unwrap();
     Ok(dt.and_utc().timestamp_millis())
+}
+
+fn handle_spore_lessons(db: &Database, json: bool) -> Result<(), String> {
+    let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare(
+        "SELECT title, content, created_at FROM nodes \
+         WHERE node_class = 'operational' AND title LIKE 'Lesson:%' \
+         ORDER BY created_at DESC"
+    ).map_err(|e| e.to_string())?;
+    let lessons: Vec<(String, String, i64)> = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1).unwrap_or_default(),
+            row.get::<_, i64>(2)?,
+        ))
+    }).map_err(|e| e.to_string())?
+    .filter_map(|r| r.ok())
+    .collect();
+    drop(stmt);
+    drop(conn);
+
+    if json {
+        let items: Vec<serde_json::Value> = lessons.iter().map(|(title, content, created_at)| {
+            let name = title.strip_prefix("Lesson: ").unwrap_or(title);
+            let preview = if content.chars().count() > 100 {
+                utils::safe_truncate(content, 100).to_string()
+            } else {
+                content.clone()
+            };
+            let date = chrono::DateTime::from_timestamp_millis(*created_at)
+                .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_default();
+            serde_json::json!({
+                "title": name,
+                "created_at": date,
+                "content_preview": preview,
+            })
+        }).collect();
+        println!("{}", serde_json::to_string_pretty(&items).unwrap_or_default());
+    } else if lessons.is_empty() {
+        println!("No lessons found.");
+    } else {
+        for (title, content, created_at) in &lessons {
+            let name = title.strip_prefix("Lesson: ").unwrap_or(title);
+            let date = chrono::DateTime::from_timestamp_millis(*created_at)
+                .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let preview = if content.chars().count() > 100 {
+                format!("{}...", utils::safe_truncate(content, 97))
+            } else {
+                content.clone()
+            };
+            println!("  {}  {}", date, name);
+            if !preview.is_empty() {
+                println!("    {}", preview);
+            }
+            println!();
+        }
+        println!("{} lesson(s)", lessons.len());
+    }
+    Ok(())
 }
 
 fn handle_dashboard(db: &Database, json: bool, limit: usize) -> Result<(), String> {
