@@ -680,6 +680,12 @@ enum SporeCommands {
         #[arg(long)]
         items_only: bool,
     },
+    /// Distill an orchestrator run into a summary node with lessons learned
+    Distill {
+        /// Run ID prefix (from task node ID) or "latest" for most recent run
+        #[arg(default_value = "latest")]
+        run: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -7406,6 +7412,10 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
             }
             Ok(())
         }
+
+        SporeCommands::Distill { run } => {
+            handle_distill(db, &run, json).await
+        }
     }
 }
 
@@ -8053,6 +8063,236 @@ fn post_coder_cleanup(
     if linked > 0 {
         println!("[orchestrator] Linked impl node to {} code node(s)", linked);
     }
+}
+
+/// Distill an orchestrator run into a summary, walking the graph trail.
+///
+/// Finds the task node, follows edges to implementations, verifications, and
+/// escalations, then prints a structured timeline. If the trail is complete
+/// enough, creates a summary meta-node capturing lessons learned.
+async fn handle_distill(db: &Database, run_ref: &str, json: bool) -> Result<(), String> {
+    use std::collections::{HashMap, VecDeque};
+
+    // 1. Find the task node
+    let task_node = if run_ref == "latest" {
+        // Find most recent orchestration node
+        let conn = db.raw_conn().lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM nodes WHERE node_class = 'operational' AND title LIKE 'Orchestration:%' ORDER BY created_at DESC LIMIT 1"
+        ).map_err(|e| e.to_string())?;
+        let id: Option<String> = stmt.query_row([], |row| row.get(0)).ok();
+        drop(stmt);
+        drop(conn);
+        match id {
+            Some(id) => db.get_node(&id).map_err(|e| e.to_string())?.ok_or("No orchestration runs found")?,
+            None => return Err("No orchestration runs found".to_string()),
+        }
+    } else {
+        resolve_node(db, run_ref)?
+    };
+
+    let task_title = task_node.ai_title.as_deref().unwrap_or(&task_node.title);
+    println!("=== Distill: {} ===\n", &task_title[..task_title.len().min(60)]);
+
+    // 2. BFS through connected operational/meta nodes to build the trail
+    struct TrailNode {
+        id: String,
+        title: String,
+        content: String,
+        class: String,
+        meta_type: Option<String>,
+        agent: Option<String>,
+        created_at: i64,
+        edges_out: Vec<(String, String)>,  // (edge_type, target_id)
+        edges_in: Vec<(String, String)>,   // (edge_type, source_id)
+    }
+
+    let mut trail: HashMap<String, TrailNode> = HashMap::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    queue.push_back(task_node.id.clone());
+
+    while let Some(nid) = queue.pop_front() {
+        if trail.contains_key(&nid) {
+            continue;
+        }
+
+        let node = match db.get_node(&nid).map_err(|e| e.to_string())? {
+            Some(n) => n,
+            None => continue,
+        };
+
+        // Only follow operational and meta nodes
+        match node.node_class.as_deref() {
+            Some("operational") | Some("meta") => {},
+            _ => continue,
+        }
+
+        let edges = db.get_edges_for_node(&nid).map_err(|e| e.to_string())?;
+        let mut edges_out = Vec::new();
+        let mut edges_in = Vec::new();
+
+        for edge in &edges {
+            if edge.source == nid {
+                edges_out.push((edge.edge_type.as_str().to_string(), edge.target.clone()));
+                queue.push_back(edge.target.clone());
+            } else {
+                edges_in.push((edge.edge_type.as_str().to_string(), edge.source.clone()));
+                queue.push_back(edge.source.clone());
+            }
+        }
+
+        trail.insert(nid, TrailNode {
+            id: node.id,
+            title: node.ai_title.unwrap_or(node.title),
+            content: node.content.unwrap_or_default(),
+            class: node.node_class.unwrap_or_default(),
+            meta_type: node.meta_type,
+            agent: node.agent_id,
+            created_at: node.created_at,
+            edges_out,
+            edges_in,
+        });
+    }
+
+    // 3. Sort by timestamp and print timeline
+    let mut sorted: Vec<&TrailNode> = trail.values().collect();
+    sorted.sort_by_key(|n| n.created_at);
+
+    if json {
+        let timeline: Vec<_> = sorted.iter().map(|n| {
+            serde_json::json!({
+                "id": &n.id[..8.min(n.id.len())],
+                "title": n.title,
+                "class": n.class,
+                "meta_type": n.meta_type,
+                "agent": n.agent,
+                "created_at": n.created_at,
+                "edges_out": n.edges_out.iter().map(|(t, id)| format!("{} → {}", t, &id[..8.min(id.len())])).collect::<Vec<_>>(),
+                "edges_in": n.edges_in.iter().map(|(t, id)| format!("{} ← {}", t, &id[..8.min(id.len())])).collect::<Vec<_>>(),
+            })
+        }).collect();
+        println!("{}", serde_json::to_string_pretty(&timeline).unwrap_or_default());
+        return Ok(());
+    }
+
+    println!("Trail: {} node(s)\n", trail.len());
+
+    // Classify nodes
+    let mut task_nodes = Vec::new();
+    let mut impl_nodes = Vec::new();
+    let mut verify_nodes = Vec::new();
+    let mut escalation_nodes = Vec::new();
+
+    for n in &sorted {
+        let ts = chrono::DateTime::from_timestamp_millis(n.created_at)
+            .map(|dt| dt.format("%H:%M:%S").to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let agent = n.agent.as_deref().unwrap_or("?");
+        let id_short = &n.id[..8.min(n.id.len())];
+
+        if n.title.starts_with("Orchestration:") {
+            println!("[{}] {} TASK {} ({})", ts, "📋", &n.title[..n.title.len().min(60)], id_short);
+            task_nodes.push(n);
+        } else if n.title.starts_with("Implemented:") || n.title.starts_with("Fixed:") {
+            println!("[{}] {} IMPL {} ({})", ts, "🔨", &n.title[..n.title.len().min(60)], id_short);
+            impl_nodes.push(n);
+        } else if n.title.starts_with("Verified:") || n.title.starts_with("Verification failed:") {
+            println!("[{}] {} VERIFY {} ({})", ts, "✅", &n.title[..n.title.len().min(60)], id_short);
+            verify_nodes.push(n);
+        } else if n.meta_type.as_deref() == Some("escalation") {
+            println!("[{}] {} ESCALATION {} ({})", ts, "⚠️", &n.title[..n.title.len().min(60)], id_short);
+            escalation_nodes.push(n);
+        } else {
+            println!("[{}] {} {} {} ({})", ts, "  ", n.class, &n.title[..n.title.len().min(60)], id_short);
+        }
+
+        // Show edges
+        for (etype, tid) in &n.edges_out {
+            if trail.contains_key(tid) {
+                let target_title = &trail[tid].title;
+                println!("         → {} → {}",
+                    etype, &target_title[..target_title.len().min(40)]);
+            }
+        }
+        for (etype, sid) in &n.edges_in {
+            if trail.contains_key(sid) {
+                let source_title = &trail[sid].title;
+                println!("         ← {} ← {}",
+                    etype, &source_title[..source_title.len().min(40)]);
+            }
+        }
+        println!();
+    }
+
+    // 4. Generate summary
+    println!("--- Summary ---\n");
+
+    let task_desc = if let Some(tn) = task_nodes.first() {
+        // Extract task from content (after "## Task\n")
+        if let Some(idx) = tn.content.find("## Task\n") {
+            let rest = &tn.content[idx + 8..];
+            let end = rest.find("\n\n## ").unwrap_or(rest.len());
+            rest[..end].trim().to_string()
+        } else {
+            tn.title.replace("Orchestration: ", "")
+        }
+    } else {
+        "Unknown".to_string()
+    };
+
+    println!("Task: {}", &task_desc[..task_desc.len().min(80)]);
+    println!("Agents: {}", sorted.iter()
+        .filter_map(|n| n.agent.as_deref())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", "));
+
+    let outcome = if !escalation_nodes.is_empty() {
+        "Escalated (did not converge)"
+    } else if !verify_nodes.is_empty() && verify_nodes.iter().any(|n| n.title.starts_with("Verified:")) {
+        "Verified (converged)"
+    } else if !impl_nodes.is_empty() {
+        "Implemented (not verified)"
+    } else {
+        "Incomplete"
+    };
+    println!("Outcome: {}", outcome);
+
+    // Duration
+    if sorted.len() >= 2 {
+        let first = sorted.first().unwrap().created_at;
+        let last = sorted.last().unwrap().created_at;
+        let duration_s = (last - first) / 1000;
+        let mins = duration_s / 60;
+        let secs = duration_s % 60;
+        println!("Duration: {}m {}s", mins, secs);
+    }
+
+    // Key content from impl nodes
+    if !impl_nodes.is_empty() {
+        println!("\nImplementation highlights:");
+        for imp in &impl_nodes {
+            // Extract "## What" section
+            if let Some(idx) = imp.content.find("## What\n") {
+                let rest = &imp.content[idx + 8..];
+                let end = rest.find("\n\n## ").unwrap_or(rest.len());
+                let what = rest[..end].trim();
+                for line in what.lines().take(3) {
+                    println!("  {}", line);
+                }
+            }
+        }
+    }
+
+    if !escalation_nodes.is_empty() {
+        println!("\nEscalation reason: max bounces reached without verifier verdict");
+    }
+
+    println!("\nNodes in trail: {} task, {} impl, {} verify, {} escalation",
+        task_nodes.len(), impl_nodes.len(), verify_nodes.len(), escalation_nodes.len());
+
+    Ok(())
 }
 
 /// Generate a task file with graph context for an agent before spawning.
