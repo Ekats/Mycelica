@@ -699,18 +699,8 @@ enum SporeCommands {
 
 #[derive(Subcommand)]
 enum RunCommands {
-    /// List recent runs
-    List {
-        /// Filter by agent ID
-        #[arg(long)]
-        agent: Option<String>,
-        /// Only runs since this date (YYYY-MM-DD or relative: 1h, 2d, 1w)
-        #[arg(long)]
-        since: Option<String>,
-        /// Maximum results
-        #[arg(long, default_value = "20")]
-        limit: usize,
-    },
+    /// List all orchestrator runs with status
+    List,
     /// Show all edges in a run
     Get {
         /// Run ID (UUID)
@@ -7501,25 +7491,116 @@ fn parse_since_to_millis(s: &str) -> Result<i64, String> {
 
 fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String> {
     match cmd {
-        RunCommands::List { agent, since, limit } => {
-            let since_millis = since.as_deref()
-                .map(parse_since_to_millis)
-                .transpose()?;
-            let runs = db.list_runs(agent.as_deref(), since_millis, limit)
-                .map_err(|e| format!("Failed to list runs: {}", e))?;
+        RunCommands::List => {
+            // Query all Orchestration: task nodes
+            let task_rows: Vec<(String, String, i64)> = (|| -> Result<Vec<_>, String> {
+                let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+                let mut stmt = conn.prepare(
+                    "SELECT id, title, created_at FROM nodes \
+                     WHERE node_class = 'operational' AND title LIKE 'Orchestration:%' \
+                     ORDER BY created_at DESC"
+                ).map_err(|e| e.to_string())?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+                }).map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+                Ok(rows)
+            })().map_err(|e| e.to_string())?;
+
+            if task_rows.is_empty() {
+                if json {
+                    println!("[]");
+                } else {
+                    println!("No orchestrator runs found.");
+                }
+                return Ok(());
+            }
+
+            // For each task node, determine status from edges
+            struct RunInfo {
+                id: String,
+                description: String,
+                created_at: i64,
+                status: String,
+            }
+
+            let mut runs = Vec::new();
+            for (task_id, title, created_at) in &task_rows {
+                let description = title.strip_prefix("Orchestration:").unwrap_or(title).trim();
+                let description = if description.chars().count() > 60 {
+                    format!("{}...", utils::safe_truncate(description, 57))
+                } else {
+                    description.to_string()
+                };
+
+                // Check for derives_from edges where this task is the target
+                let impl_ids: Vec<String> = (|| -> Result<Vec<String>, String> {
+                    let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+                    let mut stmt = conn.prepare(
+                        "SELECT source_id FROM edges \
+                         WHERE target_id = ?1 AND type = 'derives_from'"
+                    ).map_err(|e| e.to_string())?;
+                    let ids = stmt.query_map(rusqlite::params![task_id], |row| {
+                        row.get::<_, String>(0)
+                    }).map_err(|e| e.to_string())?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                    Ok(ids)
+                })().unwrap_or_default();
+
+                let status = if !impl_ids.is_empty() {
+                    // Check if any implementation has a supports edge from a verifier
+                    let has_verified = (|| -> Result<bool, String> {
+                        let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+                        let placeholders: Vec<String> = impl_ids.iter().enumerate()
+                            .map(|(i, _)| format!("?{}", i + 1))
+                            .collect();
+                        let query = format!(
+                            "SELECT COUNT(*) FROM edges \
+                             WHERE target_id IN ({}) AND type = 'supports'",
+                            placeholders.join(",")
+                        );
+                        let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
+                        let count: i64 = stmt.query_row(
+                            rusqlite::params_from_iter(&impl_ids),
+                            |row| row.get(0),
+                        ).map_err(|e| e.to_string())?;
+                        Ok(count > 0)
+                    })().unwrap_or(false);
+                    if has_verified { "verified" } else { "implemented" }
+                } else {
+                    "pending"
+                };
+
+                runs.push(RunInfo {
+                    id: task_id[..8.min(task_id.len())].to_string(),
+                    description,
+                    created_at: *created_at,
+                    status: status.to_string(),
+                });
+            }
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&runs).unwrap_or_default());
-            } else if runs.is_empty() {
-                println!("No runs found.");
+                let items: Vec<serde_json::Value> = runs.iter().map(|r| {
+                    serde_json::json!({
+                        "run_id": r.id,
+                        "description": r.description,
+                        "created_at": chrono::DateTime::from_timestamp_millis(r.created_at)
+                            .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+                            .unwrap_or_else(|| "?".to_string()),
+                        "status": r.status,
+                    })
+                }).collect();
+                println!("{}", serde_json::to_string_pretty(&items).unwrap_or_default());
             } else {
-                println!("{:<38} {:>5}  {:<20}  {}", "RUN ID", "EDGES", "STARTED", "AGENTS");
-                println!("{}", "-".repeat(90));
+                println!("{:<10} {:<62} {:<20} {}", "RUN ID", "DESCRIPTION", "CREATED", "STATUS");
+                println!("{}", "-".repeat(100));
                 for r in &runs {
-                    let started = chrono::DateTime::from_timestamp_millis(r.started_at)
-                        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+                    let created = chrono::DateTime::from_timestamp_millis(r.created_at)
+                        .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
                         .unwrap_or_else(|| "?".to_string());
-                    println!("{:<38} {:>5}  {:<20}  {}", r.run_id, r.edge_count, started, r.agents);
+                    println!("{:<10} {:<62} {:<20} {}", r.id, r.description, created, r.status);
                 }
                 println!("\n{} run(s)", runs.len());
             }
