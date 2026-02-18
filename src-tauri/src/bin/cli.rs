@@ -666,6 +666,23 @@ enum SporeCommands {
         #[arg(long, short)]
         verbose: bool,
     },
+    /// Re-run an escalated or failed task with optional higher turn/bounce budget
+    Retry {
+        /// Run ID (prefix match) of a previous orchestrator run to retry
+        run_id: String,
+        /// Maximum bounce iterations (default: 3)
+        #[arg(long, default_value = "3")]
+        max_bounces: usize,
+        /// Max turns per agent invocation (default: 50)
+        #[arg(long, default_value = "50")]
+        max_turns: usize,
+        /// Run summarizer after verification
+        #[arg(long)]
+        summarize: bool,
+        /// Print agent stdout/stderr
+        #[arg(long, short)]
+        verbose: bool,
+    },
     /// Dijkstra context retrieval: find the N most relevant nodes by weighted graph proximity
     ContextForTask {
         /// Starting node (ID prefix, UUID, or title substring)
@@ -7392,6 +7409,36 @@ async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(
 
         SporeCommands::Orchestrate { task, max_bounces, max_turns, coder_prompt, verifier_prompt, summarizer_prompt, summarize, scout, dry_run, verbose } => {
             handle_orchestrate(db, &task, max_bounces, max_turns, &coder_prompt, &verifier_prompt, &summarizer_prompt, summarize, scout, dry_run, verbose).await
+        }
+
+        SporeCommands::Retry { run_id, max_bounces, max_turns, summarize, verbose } => {
+            // Find the original task node and extract its description
+            let node = resolve_node(db, &run_id)?;
+            // Extract full task from content (## Task section), fall back to title
+            let task_desc = node.content.as_deref()
+                .and_then(|c| {
+                    c.find("## Task\n").map(|start| {
+                        let after = &c[start + 8..];
+                        after.lines()
+                            .take_while(|l| !l.starts_with("## "))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                            .trim()
+                            .to_string()
+                    })
+                })
+                .unwrap_or_else(|| node.title.strip_prefix("Orchestration:").unwrap_or(&node.title).trim().to_string());
+            if task_desc.is_empty() {
+                return Err(format!("Node {} doesn't look like an orchestration task (title: {})", &run_id, node.title));
+            }
+            println!("[retry] Original run: {} ({})", &node.id[..8.min(node.id.len())], node.title);
+            println!("[retry] Task: {}", task_desc);
+            println!("[retry] Retrying with max_bounces={}, max_turns={}", max_bounces, max_turns);
+
+            let coder_prompt = std::path::PathBuf::from("docs/spore/agents/coder.md");
+            let verifier_prompt = std::path::PathBuf::from("docs/spore/agents/verifier.md");
+            let summarizer_prompt = std::path::PathBuf::from("docs/spore/agents/summarizer.md");
+            handle_orchestrate(db, &task_desc, max_bounces, max_turns, &coder_prompt, &verifier_prompt, &summarizer_prompt, summarize, false, false, verbose).await
         }
 
         SporeCommands::ContextForTask { id, budget, max_hops, max_cost, edge_types, not_superseded, items_only } => {
