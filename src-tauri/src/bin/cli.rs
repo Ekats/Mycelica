@@ -7672,6 +7672,39 @@ fn handle_dashboard(db: &Database, json: bool, limit: usize) -> Result<(), Strin
         Ok(total)
     })().unwrap_or(0.0);
 
+    // 6. Success rate across ALL runs (not just recent)
+    let (total_runs, verified_runs, implemented_runs, escalated_runs): (i64, i64, i64, i64) = (|| -> Result<_, String> {
+        let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+        let total: i64 = conn.prepare(
+            "SELECT COUNT(*) FROM nodes WHERE node_class = 'operational' AND title LIKE 'Orchestration:%'"
+        ).and_then(|mut s| s.query_row([], |r| r.get(0))).unwrap_or(0);
+
+        let verified: i64 = conn.prepare(
+            "SELECT COUNT(DISTINCT n.id) FROM nodes n \
+             JOIN edges e1 ON e1.target_id = n.id AND e1.type = 'derives_from' \
+             JOIN edges e2 ON e2.target_id = e1.source_id AND e2.type = 'supports' \
+             WHERE n.node_class = 'operational' AND n.title LIKE 'Orchestration:%'"
+        ).and_then(|mut s| s.query_row([], |r| r.get(0))).unwrap_or(0);
+
+        let implemented: i64 = conn.prepare(
+            "SELECT COUNT(DISTINCT n.id) FROM nodes n \
+             JOIN edges e1 ON e1.target_id = n.id AND e1.type = 'derives_from' \
+             WHERE n.node_class = 'operational' AND n.title LIKE 'Orchestration:%' \
+             AND n.id NOT IN ( \
+               SELECT n2.id FROM nodes n2 \
+               JOIN edges e3 ON e3.target_id = n2.id AND e3.type = 'derives_from' \
+               JOIN edges e4 ON e4.target_id = e3.source_id AND e4.type = 'supports' \
+               WHERE n2.node_class = 'operational' AND n2.title LIKE 'Orchestration:%' \
+             )"
+        ).and_then(|mut s| s.query_row([], |r| r.get(0))).unwrap_or(0);
+
+        let escalated: i64 = conn.prepare(
+            "SELECT COUNT(*) FROM nodes WHERE title LIKE 'ESCALATION:%'"
+        ).and_then(|mut s| s.query_row([], |r| r.get(0))).unwrap_or(0);
+
+        Ok((total, verified, implemented, escalated))
+    })().unwrap_or((0, 0, 0, 0));
+
     if json {
         let runs_json: Vec<serde_json::Value> = recent_runs.iter().map(|(id, desc, ts, status, cost)| {
             let mut v = serde_json::json!({
@@ -7690,6 +7723,12 @@ fn handle_dashboard(db: &Database, json: bool, limit: usize) -> Result<(), Strin
             "lessons": lessons.iter().map(|(t, s)| serde_json::json!({"title": t, "summary": s})).collect::<Vec<_>>(),
             "graph": { "nodes": node_count, "edges": edge_count, "edges_7d": edge_7d, "unresolved_contradictions": unresolved_contradictions },
             "total_spend_usd": all_time_spend,
+            "success_rate": {
+                "total": total_runs,
+                "verified": verified_runs,
+                "implemented": implemented_runs,
+                "escalated": escalated_runs,
+            },
         });
         println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
     } else {
@@ -7747,6 +7786,13 @@ fn handle_dashboard(db: &Database, json: bool, limit: usize) -> Result<(), Strin
                 } else { tgt_title.clone() };
                 println!("    {} -> {}", src_short, tgt_short);
             }
+        }
+        // Success rate
+        if total_runs > 0 {
+            let rate = if total_runs > 0 { verified_runs as f64 / total_runs as f64 * 100.0 } else { 0.0 };
+            let pending = total_runs - verified_runs - implemented_runs;
+            println!("Runs: {} total, {} verified ({:.0}%), {} implemented, {} escalated, {} pending",
+                total_runs, verified_runs, rate, implemented_runs, escalated_runs, pending);
         }
         if all_time_spend > 0.0 {
             println!("Total spend: ${:.2}", all_time_spend);
@@ -8148,8 +8194,8 @@ fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String
                 }
 
                 println!("{:<w$} | {:<w$}",
-                    format!("Total: ${:.2}", a.total_cost),
-                    format!("Total: ${:.2}", b.total_cost), w = w);
+                    format!("Total: ${:.2}", a.total_cost.abs()),
+                    format!("Total: ${:.2}", b.total_cost.abs()), w = w);
 
                 // Files changed
                 println!("{}", "-".repeat(w * 2 + 3));
@@ -9579,6 +9625,39 @@ async fn handle_orchestrate(
         } else {
             impl_node_holder = coder_nodes[0].clone();
             println!("[coder] Implementation node: {} ({})", &impl_node_holder.id[..8], impl_node_holder.title);
+
+            // Ensure derives_from edge exists to THIS task node.
+            // Coders may self-record but link to a stale task node from a previous run.
+            let has_correct_link = {
+                let conn = db.raw_conn().lock().map_err(|e| e.to_string())?;
+                conn.prepare(
+                    "SELECT COUNT(*) FROM edges WHERE source_id = ?1 AND target_id = ?2 AND type = 'derives_from'"
+                ).and_then(|mut s| s.query_row(
+                    rusqlite::params![&impl_node_holder.id, &task_node_id], |r| r.get::<_, i64>(0)
+                )).unwrap_or(0) > 0
+            };
+            if !has_correct_link {
+                let edge = Edge {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    source: impl_node_holder.id.clone(),
+                    target: task_node_id.clone(),
+                    edge_type: EdgeType::DerivesFrom,
+                    label: None, weight: None,
+                    edge_source: Some("orchestrator".to_string()),
+                    evidence_id: None,
+                    confidence: Some(0.9),
+                    created_at: chrono::Utc::now().timestamp_millis(),
+                    updated_at: None,
+                    author: None, reason: None,
+                    content: Some("Orchestrator: ensured derives_from links to correct task node".to_string()),
+                    agent_id: Some("spore:orchestrator".to_string()),
+                    superseded_by: None,
+                    metadata: None,
+                };
+                let _ = db.insert_edge(&edge);
+                println!("[orchestrator] Added derives_from edge to task node (coder linked elsewhere)");
+            }
+
             record_run_status_with_cost(db, &task_node_id, &coder_run_id, "spore:coder", "completed", 0, coder_result.total_cost_usd)?;
             &impl_node_holder
         };
