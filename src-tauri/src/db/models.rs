@@ -335,6 +335,28 @@ pub struct PathHop {
     pub node_title: String,
 }
 
+/// A node reached by Dijkstra traversal from a source, with distance metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextNode {
+    pub rank: usize,
+    #[serde(rename = "nodeId")]
+    pub node_id: String,
+    #[serde(rename = "nodeTitle")]
+    pub node_title: String,
+    /// Weighted distance from source (lower = more relevant)
+    pub distance: f64,
+    /// Relevance score: 1.0 / (1.0 + distance), normalized to 0.0-1.0
+    pub relevance: f64,
+    /// Number of hops from source
+    pub hops: usize,
+    /// The path from source to this node
+    pub path: Vec<PathHop>,
+    #[serde(rename = "nodeClass")]
+    pub node_class: Option<String>,
+    #[serde(rename = "isItem")]
+    pub is_item: bool,
+}
+
 /// Summary of an orchestrator run (edges grouped by run_id)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunSummary {

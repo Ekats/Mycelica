@@ -6,7 +6,7 @@
 
 use clap::{Parser, Subcommand, CommandFactory};
 use clap_complete::{generate, Shell};
-use mycelica_lib::{db::{Database, Node, NodeType, Edge, EdgeType, Position}, settings, import, hierarchy, similarity, openaire, ai_client, utils, classification};
+use mycelica_lib::{db::{Database, Node, NodeType, Edge, EdgeType, Position}, settings, import, hierarchy, similarity, openaire, ai_client, utils, classification, local_embeddings};
 use serde_json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use futures::{stream, StreamExt};
 use std::sync::Mutex;
 use std::fs::{self, File, OpenOptions};
 
-static LOG_FILE: Mutex<Option<File>> = Mutex::new(None);
+pub(crate) static LOG_FILE: Mutex<Option<File>> = Mutex::new(None);
 
 /// Initialize logging - creates log file and cleans old logs
 fn init_logging() -> Option<PathBuf> {
@@ -69,7 +69,7 @@ fn init_logging() -> Option<PathBuf> {
 
 /// Log to both terminal and file
 #[allow(unused)]
-fn log_both(msg: &str) {
+pub(crate) fn log_both(msg: &str) {
     let now = Local::now();
     let timestamp = format!("[{:02}:{:02}:{:02}]", now.hour(), now.minute(), now.second());
 
@@ -86,7 +86,7 @@ fn log_both(msg: &str) {
 
 /// Log error to both terminal and file
 #[allow(unused)]
-fn elog_both(msg: &str) {
+pub(crate) fn elog_both(msg: &str) {
     let now = Local::now();
     let timestamp = format!("[{:02}:{:02}:{:02}]", now.hour(), now.minute(), now.second());
 
@@ -104,7 +104,7 @@ fn elog_both(msg: &str) {
 /// Check if text is predominantly English using ASCII ratio heuristic.
 /// Returns true if >90% of characters are ASCII (letters, numbers, punctuation).
 /// Used to detect non-English text that local LLMs may hallucinate on.
-fn is_predominantly_english(texts: &[String]) -> bool {
+pub(crate) fn is_predominantly_english(texts: &[String]) -> bool {
     if texts.is_empty() {
         return true;
     }
@@ -135,20 +135,17 @@ macro_rules! elog {
     };
 }
 
-// TUI imports
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
-    Frame, Terminal,
-};
+#[path = "cli/spore.rs"]
+mod spore;
+
+#[path = "cli/spore_runs.rs"]
+mod spore_runs;
+
+#[path = "cli/tui.rs"]
+mod tui;
+
+#[path = "cli/spore_analyzer.rs"]
+mod spore_analyzer;
 
 // Privacy scoring imports
 use serde::{Deserialize, Serialize};
@@ -448,7 +445,7 @@ enum Commands {
     #[cfg(feature = "mcp")]
     /// Start MCP server for agent coordination
     McpServer {
-        /// Agent role: human, ingestor, coder, verifier, planner, synthesizer, summarizer, docwriter
+        /// Agent role: human, ingestor, coder, verifier, planner, architect, synthesizer, summarizer, docwriter, researcher
         #[arg(long)]
         agent_role: String,
         /// Agent ID for attribution (e.g. spore:coder-1)
@@ -468,7 +465,7 @@ enum Commands {
 // ============================================================================
 
 #[derive(Subcommand)]
-enum SporeCommands {
+pub(crate) enum SporeCommands {
     /// Query edges with multi-filter (type, agent, confidence, recency)
     QueryEdges {
         /// Filter by edge type
@@ -574,6 +571,9 @@ enum SporeCommands {
         /// Show all details (meta nodes, edge breakdown, contradictions)
         #[arg(long)]
         all: bool,
+        /// Output format: compact (default) or full (adds top nodes, edge distribution, recent ops)
+        #[arg(long, default_value = "compact")]
+        format: String,
     },
     /// Create an edge between two existing nodes
     CreateEdge {
@@ -647,28 +647,263 @@ enum SporeCommands {
         /// Path to verifier agent prompt
         #[arg(long, default_value = "docs/spore/agents/verifier.md")]
         verifier_prompt: std::path::PathBuf,
+        /// Path to summarizer agent prompt
+        #[arg(long, default_value = "docs/spore/agents/summarizer.md")]
+        summarizer_prompt: std::path::PathBuf,
+        /// Skip summarizer after verification
+        #[arg(long)]
+        no_summarize: bool,
         /// Show what would happen without running agents
         #[arg(long)]
         dry_run: bool,
         /// Print agent stdout/stderr
         #[arg(long, short)]
         verbose: bool,
+        /// Suppress per-agent detail output; only show phase headers and final status
+        #[arg(long, short = 'q')]
+        quiet: bool,
+        /// Custom process timeout in seconds (overrides default: max(turns*120, 600))
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Run as a single named agent role (skips coder/verifier pipeline)
+        #[arg(long)]
+        agent: Option<String>,
+        /// Path to the agent prompt file (used with --agent)
+        #[arg(long)]
+        agent_prompt: Option<std::path::PathBuf>,
+        // Deprecated: native agent mode is now auto-detected via resolve_agent_name() in spore.rs
+        /// Use native Claude Code agent file for coder (--agent coder) [DEPRECATED: auto-detected]
+        #[arg(long)]
+        native_agent: bool,
+        /// Tag this run with an experiment label for A/B comparisons
+        #[arg(long)]
+        experiment: Option<String>,
+        /// Override model for the coder role (e.g., "opus", "sonnet", "haiku")
+        #[arg(long)]
+        coder_model: Option<String>,
+    },
+    /// Re-run an escalated or failed task with optional higher turn/bounce budget
+    Retry {
+        /// Run ID (prefix match) of a previous orchestrator run to retry
+        run_id: String,
+        /// Maximum bounce iterations (default: 3)
+        #[arg(long, default_value = "3")]
+        max_bounces: usize,
+        /// Max turns per agent invocation (default: 50)
+        #[arg(long, default_value = "50")]
+        max_turns: usize,
+        /// Skip summarizer after verification
+        #[arg(long)]
+        no_summarize: bool,
+        /// Print agent stdout/stderr
+        #[arg(long, short)]
+        verbose: bool,
+    },
+    /// Run multiple orchestrator tasks from a file (one task per line)
+    Batch {
+        /// Path to task file (one task description per line, # comments ignored)
+        file: std::path::PathBuf,
+        /// Maximum bounce iterations per task (default: 3)
+        #[arg(long, default_value = "3")]
+        max_bounces: usize,
+        /// Max turns per agent invocation (default: 50)
+        #[arg(long, default_value = "50")]
+        max_turns: usize,
+        /// Custom process timeout in seconds
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Print agent stdout/stderr
+        #[arg(long, short)]
+        verbose: bool,
+        /// Stop on first failure (default: continue all tasks)
+        #[arg(long)]
+        stop_on_failure: bool,
+        /// Show what would happen without running agents
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Continuous orchestration loop: read tasks from file, dispatch sequentially, evaluate mechanically
+    Loop {
+        /// Task source: path to task file (one task per line, # comments ignored)
+        #[arg(long)]
+        source: String,
+        /// Total cost budget in USD (default: $20.00)
+        #[arg(long, default_value = "20.0")]
+        budget: f64,
+        /// Maximum tasks to dispatch (default: 10)
+        #[arg(long, default_value = "10")]
+        max_runs: usize,
+        /// Per-task bounce limit (default: 3)
+        #[arg(long, default_value = "3")]
+        max_bounces: usize,
+        /// Max turns per agent invocation (default: 50)
+        #[arg(long, default_value = "50")]
+        max_turns: usize,
+        /// Custom process timeout in seconds per task
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Show what would be dispatched without running
+        #[arg(long)]
+        dry_run: bool,
+        /// Stop the loop when a task escalates (default: continue)
+        #[arg(long)]
+        pause_on_escalation: bool,
+        /// Run summarizer after verified tasks
+        #[arg(long)]
+        summarize: bool,
+        /// Print agent stdout/stderr
+        #[arg(long, short)]
+        verbose: bool,
+        /// Delete loop state before starting (clears all verified task history)
+        #[arg(long)]
+        reset: bool,
+        /// Tag this run with an experiment label for A/B comparisons
+        #[arg(long)]
+        experiment: Option<String>,
+        /// Override model for the coder role (e.g., "opus", "sonnet", "haiku")
+        #[arg(long)]
+        coder_model: Option<String>,
+    },
+    /// Resume an interrupted orchestrator run from its last checkpoint
+    Resume {
+        /// Task node ID or 'last' for most recent checkpoint
+        #[arg(default_value = "last")]
+        id: String,
+        /// Print agent stdout/stderr
+        #[arg(long, short)]
+        verbose: bool,
+    },
+    /// Dijkstra context retrieval: find the N most relevant nodes by weighted graph proximity
+    ContextForTask {
+        /// Starting node (ID prefix, UUID, or title substring)
+        id: String,
+        /// Maximum number of context nodes to return
+        #[arg(long, default_value = "20")]
+        budget: usize,
+        /// Maximum number of hops from source
+        #[arg(long, default_value = "6")]
+        max_hops: usize,
+        /// Maximum cumulative path cost (lower = stricter)
+        #[arg(long, default_value = "3.0")]
+        max_cost: f64,
+        /// Comma-separated edge types to follow (e.g. "supports,derives_from,calls")
+        #[arg(long = "edge-types")]
+        edge_types: Option<String>,
+        /// Exclude superseded edges
+        #[arg(long)]
+        not_superseded: bool,
+        /// Only include item nodes in results (categories still traversed)
+        #[arg(long)]
+        items_only: bool,
+    },
+    /// Find stale operational nodes with no incoming edges (GC candidates)
+    Gc {
+        /// Age threshold in days (default: 7)
+        #[arg(long, default_value = "7")]
+        days: u32,
+        /// Dry run — only print candidates without deleting
+        #[arg(long)]
+        dry_run: bool,
+        /// Include Lesson: and Summary: nodes in GC candidates (normally excluded)
+        #[arg(long)]
+        force: bool,
+    },
+    /// List all Lesson: nodes from the graph
+    Lessons {
+        /// Show one lesson per line (title only, no content preview)
+        #[arg(long)]
+        compact: bool,
+    },
+    /// Show a combined dashboard: recent runs, lessons, costs, and graph health
+    Dashboard {
+        /// Number of recent runs to show
+        #[arg(long, default_value = "5")]
+        limit: usize,
+        /// Output format: text (default), json, or csv
+        #[arg(long, default_value = "text", value_enum)]
+        format: DashboardFormat,
+        /// Show only summary counts (runs, verified, cost) without recent runs table or lessons
+        #[arg(long)]
+        count: bool,
+        /// Show today's cost (runs created today UTC)
+        #[arg(long)]
+        cost: bool,
+        /// Show count of stale code nodes (files no longer on disk)
+        #[arg(long)]
+        stale: bool,
+    },
+    /// Distill an orchestrator run into a summary node with lessons learned
+    Distill {
+        /// Run ID prefix (from task node ID) or "latest" for most recent run
+        #[arg(default_value = "latest")]
+        run: String,
+        /// Print only one-line summary (outcome, duration, bounces) without the full trail
+        #[arg(long)]
+        compact: bool,
+    },
+    /// Check system health: database, CLI binary, agent prompts, MCP sidecar
+    Health,
+    /// Show line counts for all agent prompt files
+    PromptStats,
+    /// Analyze graph structure: topology, staleness, bridges, health score
+    Analyze {
+        /// Scope analysis to descendants of this node ID
+        #[arg(long)]
+        region: Option<String>,
+        /// Number of top items to show per section
+        #[arg(long, default_value = "10")]
+        top_n: usize,
+        /// Days since update to consider a node stale
+        #[arg(long, default_value = "60")]
+        stale_days: i64,
+        /// Minimum degree to consider a node a hub
+        #[arg(long, default_value = "15")]
+        hub_threshold: usize,
     },
 }
 
+#[derive(Clone, clap::ValueEnum)]
+pub(crate) enum DashboardFormat {
+    Text,
+    Json,
+    Csv,
+    Compact,
+}
+
 #[derive(Subcommand)]
-enum RunCommands {
-    /// List recent runs
+pub(crate) enum RunCommands {
+    /// List all orchestrator runs with status
     List {
-        /// Filter by agent ID
+        /// Also show non-Orchestration operational nodes that have tracks edges
         #[arg(long)]
-        agent: Option<String>,
-        /// Only runs since this date (YYYY-MM-DD or relative: 1h, 2d, 1w)
+        all: bool,
+        /// Sort by cost (most expensive first) and show total cost for each run
+        #[arg(long)]
+        cost: bool,
+        /// Show only runs that have an associated ESCALATION node
+        #[arg(long)]
+        escalated: bool,
+        /// Filter by run status (comma-separated: verified,implemented,escalated,cancelled,pending)
+        #[arg(long)]
+        status: Option<String>,
+        /// Only show runs created after this date (YYYY-MM-DD or relative: 1h, 2d, 1w)
         #[arg(long)]
         since: Option<String>,
-        /// Maximum results
-        #[arg(long, default_value = "20")]
+        /// Maximum number of runs to show (0 = no limit)
+        #[arg(long, default_value = "0")]
         limit: usize,
+        /// Show full task text instead of truncating
+        #[arg(long, short)]
+        verbose: bool,
+        /// Output format: text (default), compact, json, or csv
+        #[arg(long, default_value = "text", value_enum)]
+        format: DashboardFormat,
+        /// Only show runs with total duration >= this many seconds
+        #[arg(long)]
+        duration: Option<u64>,
+        /// Filter by agent name (e.g. "researcher", "coder", or "spore:coder")
+        #[arg(long)]
+        agent: Option<String>,
     },
     /// Show all edges in a run
     Get {
@@ -677,6 +912,34 @@ enum RunCommands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Compare two runs side-by-side
+    Compare {
+        /// First run ID (prefix or UUID)
+        run_a: String,
+        /// Second run ID (prefix or UUID)
+        run_b: String,
+    },
+    /// Compare two experiment batches side-by-side
+    CompareExperiments {
+        /// Experiment labels to compare (exactly 2)
+        #[arg(long, required = true, num_args = 2)]
+        experiment: Vec<String>,
+    },
+    /// Show complete timeline of a run: agents, edges, outcomes
+    History {
+        /// Run ID (prefix match)
+        run_id: String,
+    },
+    /// Alias for 'history'
+    Show {
+        /// Run ID (prefix match)
+        run_id: String,
+    },
+    /// Show source code files changed by a run
+    Diff {
+        /// Run ID (prefix match)
+        run_id: String,
     },
     /// Delete all edges (and optionally nodes) from a run
     Rollback {
@@ -691,6 +954,42 @@ enum RunCommands {
         /// Show what would be deleted without deleting
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Cancel a pending run (marks it as cancelled)
+    Cancel {
+        /// Run ID (prefix match)
+        run_id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show cost breakdown: total, average, by status, and today's cost
+    Cost {
+        /// Only include runs created after this date (YYYY-MM-DD or relative: 1h, 2d, 1w)
+        #[arg(long)]
+        since: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the top N most expensive runs by total cost (default: 5)
+    Top {
+        /// Number of top results to show
+        #[arg(long, default_value = "5")]
+        limit: usize,
+    },
+    /// Show aggregate statistics across all runs
+    Stats {
+        /// Filter stats to only runs tagged with this experiment label
+        #[arg(long)]
+        experiment: Option<String>,
+    },
+    /// One-paragraph natural language summary of recent orchestrator activity
+    Summary,
+    /// Show a vertical timeline of agent phases for a run
+    Timeline {
+        /// Run ID (prefix match)
+        run_id: String,
     },
 }
 
@@ -1388,6 +1687,15 @@ enum CodeCommands {
         /// Node ID (e.g., code-abc123...)
         id: String,
     },
+    /// Detect stale code nodes whose source files no longer exist on disk
+    Stale {
+        /// Delete stale nodes and their edges (default: dry-run report only)
+        #[arg(long)]
+        fix: bool,
+        /// Only check nodes matching this path prefix
+        #[arg(long)]
+        path: Option<String>,
+    },
 }
 
 // ============================================================================
@@ -1396,6 +1704,24 @@ enum CodeCommands {
 
 #[tokio::main]
 async fn main() {
+    // Ignore SIGPIPE so piping through head/tail doesn't kill the process.
+    // Without this, `mycelica-cli spore orchestrate ... | head -30` sends SIGPIPE
+    // when head closes its stdin, terminating the entire orchestrator.
+    #[cfg(unix)]
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN); }
+
+    // Exit cleanly on broken pipe instead of panicking.
+    // println! internally unwraps write results, so even with SIGPIPE ignored,
+    // it panics when the pipe is closed. This hook catches that and exits quietly.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info.to_string();
+        if msg.contains("Broken pipe") {
+            std::process::exit(0);
+        }
+        default_hook(info);
+    }));
+
     // Initialize logging
     if let Some(log_path) = init_logging() {
         eprintln!("Logging to: {}", log_path.display());
@@ -1471,20 +1797,20 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Ask { question, connects_to } => handle_ask(&question, connects_to, &db, cli.json).await,
         Commands::Concept { title, note, connects_to } => handle_concept(&title, note, connects_to, &db, cli.json).await,
         Commands::Decide { title, reason, connects_to } => handle_decide(&title, reason, connects_to, &db, cli.json).await,
-        Commands::Link { source, target, edge_type, reason, content, agent, confidence, supersedes } => handle_link(&source, &target, &edge_type, reason, content, &agent, confidence, supersedes, "user", &db, cli.json).await,
+        Commands::Link { source, target, edge_type, reason, content, agent, confidence, supersedes } => spore::handle_link(&source, &target, &edge_type, reason, content, &agent, confidence, supersedes, "user", &db, cli.json).await,
         Commands::Orphans { limit } => handle_orphans(limit, &db, cli.json).await,
         Commands::Migrate { cmd } => handle_migrate(cmd, &db, &db_path, cli.json),
-        Commands::Spore { cmd } => handle_spore(cmd, &db, cli.json).await,
+        Commands::Spore { cmd } => spore::handle_spore(cmd, &db, cli.json).await,
         #[cfg(feature = "mcp")]
         Commands::McpServer { agent_role, agent_id, stdio, run_id } => {
             if !stdio {
                 return Err("Only --stdio transport is currently supported".to_string());
             }
             let role = mycelica_lib::mcp::AgentRole::from_str(&agent_role)
-                .ok_or_else(|| format!("Unknown role: '{}'. Valid: human, ingestor, coder, verifier, planner, synthesizer, summarizer, docwriter", agent_role))?;
+                .ok_or_else(|| format!("Unknown role: '{}'. Valid: human, ingestor, coder, tester, verifier, planner, architect, synthesizer, summarizer, docwriter, researcher, operator", agent_role))?;
             mycelica_lib::mcp::run_mcp_server(db.clone(), agent_id, role, run_id).await
         },
-        Commands::Tui => run_tui(&db).await,
+        Commands::Tui => tui::run_tui(&db).await,
         Commands::Completions { .. } => unreachable!(),
     }
 }
@@ -1891,6 +2217,222 @@ async fn handle_db(cmd: DbCommands, db: &Database, json: bool) -> Result<(), Str
 }
 
 // ============================================================================
+// Code Update (reusable for import --update and watch)
+// ============================================================================
+
+/// Summary of a code update operation (delete + reimport + embeddings + call edges).
+pub(crate) struct CodeUpdateSummary {
+    pub deleted: usize,
+    pub imported: usize,
+    pub embeddings: usize,
+    pub calls_edges: usize,
+    pub node_ids: Vec<String>,
+    /// Stale nodes cleaned (from files that no longer exist on disk)
+    pub stale_cleaned: usize,
+    /// The raw import result (for detailed per-type counts in output)
+    pub import_result: mycelica_lib::code::CodeImportResult,
+}
+
+/// Run a full code update: delete existing nodes for the given path, reimport,
+/// generate embeddings, and refresh Calls edges. This is the core logic extracted
+/// from `ImportCommands::Code` with `--update`.
+pub(crate) async fn run_code_update(
+    db: &Database,
+    path: &str,
+    language: Option<&str>,
+    quiet: bool,
+    _json: bool,
+) -> Result<CodeUpdateSummary, String> {
+    use mycelica_lib::code;
+    use mycelica_lib::ai_client;
+
+    // Collect files and delete existing nodes
+    let file_path = std::path::Path::new(path);
+    let is_directory = file_path.is_dir();
+    let files_to_process: Vec<String> = if file_path.is_file() {
+        vec![path.to_string()]
+    } else {
+        code::collect_code_files(file_path, language)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect()
+    };
+
+    // When updating a directory, detect and clean stale nodes from deleted/moved files.
+    // Compare DB file paths against files found on disk — any DB path under this directory
+    // that no longer exists on disk is stale.
+    let mut stale_cleaned = 0;
+    if is_directory {
+        let disk_files: std::collections::HashSet<String> = files_to_process.iter().cloned().collect();
+        if let Ok(db_paths) = db.get_all_code_file_paths() {
+            for (db_file, _count) in &db_paths {
+                // Only check paths that would be under the update directory
+                if db_file.contains(path) && !disk_files.contains(db_file) {
+                    // Verify the file truly doesn't exist (resolve relative paths)
+                    let resolved = if std::path::Path::new(db_file).is_relative() {
+                        std::path::Path::new(".").join(db_file)
+                    } else {
+                        std::path::PathBuf::from(db_file)
+                    };
+                    if !resolved.exists() {
+                        match db.delete_nodes_by_file_path(db_file) {
+                            Ok(deleted) if deleted > 0 => {
+                                if !quiet {
+                                    log!("  Cleaned {} stale nodes: {} (file no longer exists)", deleted, db_file);
+                                }
+                                stale_cleaned += deleted;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            if stale_cleaned > 0 {
+                // Prune dangling edges from deleted stale nodes
+                let _ = db.prune_dead_edges();
+                if !quiet {
+                    log!("[Code] Cleaned {} stale nodes from deleted/moved files", stale_cleaned);
+                }
+            }
+        }
+    }
+
+    let mut total_deleted = 0;
+    for file in &files_to_process {
+        match db.delete_nodes_by_file_path(file) {
+            Ok(deleted) if deleted > 0 => {
+                if !quiet {
+                    log!("  Deleted {} nodes from {}", deleted, file);
+                }
+                total_deleted += deleted;
+            }
+            _ => {}
+        }
+    }
+    if !quiet && total_deleted > 0 {
+        log!("[Code] Deleted {} existing nodes", total_deleted);
+    }
+
+    // Reimport
+    let result = code::import_code(db, path, language)?;
+
+    // Generate embeddings and refresh edges
+    let mut embeddings_generated = 0;
+    let mut calls_edges_created = 0;
+    let mut new_node_ids: Vec<String> = Vec::new();
+
+    if result.total_items() > 0 {
+        // Collect newly imported node IDs
+        for file in &files_to_process {
+            if let Ok(ids) = db.get_node_ids_by_file_path(file) {
+                new_node_ids.extend(ids);
+            }
+        }
+
+        // Generate embeddings for nodes without them
+        if !new_node_ids.is_empty() {
+            if !quiet {
+                log!("[Code] Generating embeddings for {} nodes...", new_node_ids.len());
+            }
+            for node_id in &new_node_ids {
+                if db.get_node_embedding(node_id).ok().flatten().is_none() {
+                    if let Ok(Some(node)) = db.get_node(node_id) {
+                        let file_path = node.tags.as_ref()
+                            .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+                            .and_then(|v| v.get("file_path").and_then(|s| s.as_str()).map(|s| s.to_string()));
+                        let text = if let Some(fp) = file_path {
+                            format!("[{}] {}\n{}", fp, node.title, node.content.as_deref().unwrap_or(""))
+                        } else {
+                            format!("{}\n{}", node.title, node.content.as_deref().unwrap_or(""))
+                        };
+                        let embed_text = utils::safe_truncate(&text, 1000);
+                        if let Ok(embedding) = ai_client::generate_embedding(embed_text).await {
+                            db.update_node_embedding(node_id, &embedding).ok();
+                            embeddings_generated += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Refresh Calls edges for functions
+        let functions: Vec<_> = new_node_ids.iter()
+            .filter_map(|id| db.get_node(id).ok().flatten())
+            .filter(|n| n.content_type.as_deref() == Some("code_function"))
+            .collect();
+
+        if !functions.is_empty() {
+            if !quiet {
+                log!("[Code] Refreshing Calls edges for {} functions...", functions.len());
+            }
+
+            let all_functions: Vec<_> = db.get_items()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|n| n.content_type.as_deref() == Some("code_function"))
+                .collect();
+
+            let fn_name_to_id: std::collections::HashMap<String, String> = all_functions.iter()
+                .filter_map(|f| {
+                    let title = &f.title;
+                    let name = title.split('(').next()
+                        .and_then(|s| s.split_whitespace().last())
+                        .map(|s| s.to_string());
+                    name.map(|n| (n, f.id.clone()))
+                })
+                .collect();
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+
+            for func in &functions {
+                if let Some(content) = &func.content {
+                    for (fn_name, target_id) in &fn_name_to_id {
+                        if target_id != &func.id && content.contains(&format!("{}(", fn_name)) {
+                            let edge = mycelica_lib::db::Edge {
+                                id: format!("calls-{}-{}", func.id, target_id),
+                                source: func.id.clone(),
+                                target: target_id.clone(),
+                                edge_type: mycelica_lib::db::EdgeType::Calls,
+                                label: None,
+                                weight: Some(1.0),
+                                edge_source: Some("code-analysis".to_string()),
+                                evidence_id: None,
+                                confidence: None,
+                                created_at: now,
+                                updated_at: Some(now),
+                                author: None,
+                                reason: None,
+                                content: None,
+                                agent_id: None,
+                                superseded_by: None,
+                                metadata: None,
+                            };
+                            if db.insert_edge(&edge).is_ok() {
+                                calls_edges_created += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(CodeUpdateSummary {
+        deleted: total_deleted,
+        imported: result.total_items(),
+        embeddings: embeddings_generated,
+        calls_edges: calls_edges_created,
+        node_ids: new_node_ids,
+        stale_cleaned,
+        import_result: result,
+    })
+}
+
+// ============================================================================
 // Import Commands
 // ============================================================================
 
@@ -2026,7 +2568,6 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
         }
         ImportCommands::Code { path, language, update } => {
             use mycelica_lib::code;
-            use mycelica_lib::ai_client;
 
             if !quiet {
                 if update {
@@ -2039,188 +2580,82 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
                 }
             }
 
-            // In update mode, collect files first and delete existing nodes
-            let mut total_deleted = 0;
             if update {
-                let file_path = std::path::Path::new(&path);
-                let files_to_delete: Vec<String> = if file_path.is_file() {
-                    vec![path.clone()]
+                // Delegate to reusable run_code_update()
+                let summary = run_code_update(db, &path, language.as_deref(), quiet, json).await?;
+                let result = &summary.import_result;
+
+                if json {
+                    println!("{}", serde_json::to_string(result).map_err(|e| e.to_string())?);
                 } else {
-                    // Get list of files we'll be importing (respects .gitignore)
-                    code::collect_code_files(file_path, language.as_deref())
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .collect()
-                };
-
-                for file in &files_to_delete {
-                    match db.delete_nodes_by_file_path(file) {
-                        Ok(deleted) if deleted > 0 => {
-                            if !quiet {
-                                log!("  Deleted {} nodes from {}", deleted, file);
-                            }
-                            total_deleted += deleted;
+                    if summary.deleted > 0 {
+                        log!("Updated {} files (replaced {} existing nodes):", result.files_processed, summary.deleted);
+                    } else {
+                        log!("Imported {} items from {} files:", result.total_items(), result.files_processed);
+                    }
+                    if result.functions > 0 { log!("  Functions: {}", result.functions); }
+                    if result.structs > 0 { log!("  Structs: {}", result.structs); }
+                    if result.enums > 0 { log!("  Enums: {}", result.enums); }
+                    if result.traits > 0 { log!("  Traits: {}", result.traits); }
+                    if result.impls > 0 { log!("  Impl blocks: {}", result.impls); }
+                    if result.modules > 0 { log!("  Modules: {}", result.modules); }
+                    if result.macros > 0 { log!("  Macros: {}", result.macros); }
+                    if result.docs > 0 { log!("  Docs: {}", result.docs); }
+                    if result.classes > 0 { log!("  Classes: {}", result.classes); }
+                    if result.interfaces > 0 { log!("  Interfaces: {}", result.interfaces); }
+                    if result.types > 0 { log!("  Types: {}", result.types); }
+                    if result.consts > 0 { log!("  Consts: {}", result.consts); }
+                    log!("  Edges created: {}", result.edges_created);
+                    if result.doc_edges > 0 { log!("  Doc→code edges: {}", result.doc_edges); }
+                    if summary.embeddings > 0 { log!("  Embeddings generated: {}", summary.embeddings); }
+                    if summary.calls_edges > 0 { log!("  Calls edges refreshed: {}", summary.calls_edges); }
+                    if summary.stale_cleaned > 0 { log!("  Stale nodes cleaned: {}", summary.stale_cleaned); }
+                    if result.files_skipped > 0 {
+                        log!("  Files skipped: {}", result.files_skipped);
+                    }
+                    if !result.errors.is_empty() {
+                        elog!("\nErrors ({}):", result.errors.len());
+                        for err in &result.errors[..result.errors.len().min(5)] {
+                            elog!("  {}", err);
                         }
-                        _ => {}
-                    }
-                }
-                if !quiet && total_deleted > 0 {
-                    log!("[Code] Deleted {} existing nodes", total_deleted);
-                }
-            }
-
-            let result = code::import_code(db, &path, language.as_deref())?;
-
-            // In update mode, generate embeddings for new nodes and refresh Calls edges
-            let mut embeddings_generated = 0;
-            let mut calls_edges_created = 0;
-            if update && result.total_items() > 0 {
-                // Get the newly imported node IDs
-                let file_path = std::path::Path::new(&path);
-                let imported_files: Vec<String> = if file_path.is_file() {
-                    vec![path.clone()]
-                } else {
-                    code::collect_code_files(file_path, language.as_deref())
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .collect()
-                };
-
-                // Collect all newly imported node IDs
-                let mut new_node_ids: Vec<String> = Vec::new();
-                for file in &imported_files {
-                    if let Ok(ids) = db.get_node_ids_by_file_path(file) {
-                        new_node_ids.extend(ids);
-                    }
-                }
-
-                // Generate embeddings for nodes without them
-                if !new_node_ids.is_empty() {
-                    if !quiet {
-                        log!("[Code] Generating embeddings for {} nodes...", new_node_ids.len());
-                    }
-                    for node_id in &new_node_ids {
-                        if db.get_node_embedding(node_id).ok().flatten().is_none() {
-                            if let Ok(Some(node)) = db.get_node(node_id) {
-                                let text = format!("{}\n{}", node.title, node.content.as_deref().unwrap_or(""));
-                                let embed_text = utils::safe_truncate(&text, 1000);
-                                if let Ok(embedding) = ai_client::generate_embedding(embed_text).await {
-                                    db.update_node_embedding(node_id, &embedding).ok();
-                                    embeddings_generated += 1;
-                                }
-                            }
+                        if result.errors.len() > 5 {
+                            elog!("  ... and {} more", result.errors.len() - 5);
                         }
                     }
                 }
-
-                // Refresh Calls edges for functions
-                let functions: Vec<_> = new_node_ids.iter()
-                    .filter_map(|id| db.get_node(id).ok().flatten())
-                    .filter(|n| n.content_type.as_deref() == Some("code_function"))
-                    .collect();
-
-                if !functions.is_empty() {
-                    if !quiet {
-                        log!("[Code] Refreshing Calls edges for {} functions...", functions.len());
-                    }
-
-                    // Build function name index
-                    let all_functions: Vec<_> = db.get_items()
-                        .map_err(|e| e.to_string())?
-                        .into_iter()
-                        .filter(|n| n.content_type.as_deref() == Some("code_function"))
-                        .collect();
-
-                    let fn_name_to_id: std::collections::HashMap<String, String> = all_functions.iter()
-                        .filter_map(|f| {
-                            // Extract function name from title (e.g., "pub fn foo(...)" -> "foo")
-                            let title = &f.title;
-                            let name = title.split('(').next()
-                                .and_then(|s| s.split_whitespace().last())
-                                .map(|s| s.to_string());
-                            name.map(|n| (n, f.id.clone()))
-                        })
-                        .collect();
-
-                    // For each function, find calls in its body
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as i64;
-
-                    for func in &functions {
-                        if let Some(content) = &func.content {
-                            for (fn_name, target_id) in &fn_name_to_id {
-                                if target_id != &func.id && content.contains(&format!("{}(", fn_name)) {
-                                    // Create Calls edge
-                                    let edge = mycelica_lib::db::Edge {
-                                        id: format!("calls-{}-{}", func.id, target_id),
-                                        source: func.id.clone(),
-                                        target: target_id.clone(),
-                                        edge_type: mycelica_lib::db::EdgeType::Calls,
-                                        label: None,
-                                        weight: Some(1.0),
-                                        edge_source: Some("code-analysis".to_string()),
-                                        evidence_id: None,
-                                        confidence: None,
-                                        created_at: now,
-                                        updated_at: Some(now),
-                                        author: None,
-                                        reason: None,
-                                        content: None,
-                                        agent_id: None,
-                                        superseded_by: None,
-                                        metadata: None,
-                                    };
-                                    if db.insert_edge(&edge).is_ok() {
-                                        calls_edges_created += 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if json {
-                println!("{}", serde_json::to_string(&result).map_err(|e| e.to_string())?);
             } else {
-                if update && total_deleted > 0 {
-                    log!("Updated {} files (replaced {} existing nodes):", result.files_processed, total_deleted);
+                // Non-update: plain import (no delete, no embeddings, no edge refresh)
+                let result = code::import_code(db, &path, language.as_deref())?;
+
+                if json {
+                    println!("{}", serde_json::to_string(&result).map_err(|e| e.to_string())?);
                 } else {
                     log!("Imported {} items from {} files:", result.total_items(), result.files_processed);
-                }
-                if result.functions > 0 { log!("  Functions: {}", result.functions); }
-                if result.structs > 0 { log!("  Structs: {}", result.structs); }
-                if result.enums > 0 { log!("  Enums: {}", result.enums); }
-                if result.traits > 0 { log!("  Traits: {}", result.traits); }
-                if result.impls > 0 { log!("  Impl blocks: {}", result.impls); }
-                if result.modules > 0 { log!("  Modules: {}", result.modules); }
-                if result.macros > 0 { log!("  Macros: {}", result.macros); }
-                if result.docs > 0 { log!("  Docs: {}", result.docs); }
-                // TypeScript/JavaScript
-                if result.classes > 0 { log!("  Classes: {}", result.classes); }
-                if result.interfaces > 0 { log!("  Interfaces: {}", result.interfaces); }
-                if result.types > 0 { log!("  Types: {}", result.types); }
-                if result.consts > 0 { log!("  Consts: {}", result.consts); }
-                log!("  Edges created: {}", result.edges_created);
-                if result.doc_edges > 0 { log!("  Doc→code edges: {}", result.doc_edges); }
-                if update {
-                    if embeddings_generated > 0 { log!("  Embeddings generated: {}", embeddings_generated); }
-                    if calls_edges_created > 0 { log!("  Calls edges refreshed: {}", calls_edges_created); }
-                }
-                if result.files_skipped > 0 {
-                    log!("  Files skipped: {}", result.files_skipped);
-                }
-                if !result.errors.is_empty() {
-                    elog!("\nErrors ({}):", result.errors.len());
-                    for err in &result.errors[..result.errors.len().min(5)] {
-                        elog!("  {}", err);
+                    if result.functions > 0 { log!("  Functions: {}", result.functions); }
+                    if result.structs > 0 { log!("  Structs: {}", result.structs); }
+                    if result.enums > 0 { log!("  Enums: {}", result.enums); }
+                    if result.traits > 0 { log!("  Traits: {}", result.traits); }
+                    if result.impls > 0 { log!("  Impl blocks: {}", result.impls); }
+                    if result.modules > 0 { log!("  Modules: {}", result.modules); }
+                    if result.macros > 0 { log!("  Macros: {}", result.macros); }
+                    if result.docs > 0 { log!("  Docs: {}", result.docs); }
+                    if result.classes > 0 { log!("  Classes: {}", result.classes); }
+                    if result.interfaces > 0 { log!("  Interfaces: {}", result.interfaces); }
+                    if result.types > 0 { log!("  Types: {}", result.types); }
+                    if result.consts > 0 { log!("  Consts: {}", result.consts); }
+                    log!("  Edges created: {}", result.edges_created);
+                    if result.doc_edges > 0 { log!("  Doc→code edges: {}", result.doc_edges); }
+                    if result.files_skipped > 0 {
+                        log!("  Files skipped: {}", result.files_skipped);
                     }
-                    if result.errors.len() > 5 {
-                        elog!("  ... and {} more", result.errors.len() - 5);
+                    if !result.errors.is_empty() {
+                        elog!("\nErrors ({}):", result.errors.len());
+                        for err in &result.errors[..result.errors.len().min(5)] {
+                            elog!("  {}", err);
+                        }
+                        if result.errors.len() > 5 {
+                            elog!("  ... and {} more", result.errors.len() - 5);
+                        }
                     }
                 }
             }
@@ -4698,7 +5133,14 @@ async fn handle_embeddings(cmd: EmbeddingsCommands, db: &Database, json: bool) -
                     std::io::stderr().flush().ok();
                 }
 
-                let text = format!("{}\n{}", node.title, node.content.as_deref().unwrap_or(""));
+                let file_path = node.tags.as_ref()
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+                    .and_then(|v| v.get("file_path").and_then(|s| s.as_str()).map(|s| s.to_string()));
+                let text = if let Some(fp) = file_path {
+                    format!("[{}] {}\n{}", fp, node.title, node.content.as_deref().unwrap_or(""))
+                } else {
+                    format!("{}\n{}", node.title, node.content.as_deref().unwrap_or(""))
+                };
                 match mycelica_lib::ai_client::generate_embedding(&text).await {
                     Ok(emb) => {
                         db.update_node_embedding(&node.id, &emb).map_err(|e| e.to_string())?;
@@ -5573,11 +6015,16 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, include_code: bool, al
                     node.title.chars().take(50).collect::<String>());
             }
 
-            // Embed signature + content for semantic search
-            let text = format!("{}\n{}",
-                node.title,
-                node.content.as_deref().unwrap_or("")
-            );
+            // Embed file path + signature + content for semantic search
+            let file_path = node.tags.as_ref()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+                .and_then(|v| v.get("file_path").and_then(|s| s.as_str()).map(|s| s.to_string()))
+                .unwrap_or_default();
+            let text = if file_path.is_empty() {
+                format!("{}\n{}", node.title, node.content.as_deref().unwrap_or(""))
+            } else {
+                format!("[{}] {}\n{}", file_path, node.title, node.content.as_deref().unwrap_or(""))
+            };
             let embed_text = utils::safe_truncate(&text, 1000);
 
             if let Ok(embedding) = ai_client::generate_embedding(embed_text).await {
@@ -6336,7 +6783,7 @@ async fn handle_search(query: &str, type_filter: &str, author_filter: Option<Str
 
 /// Create a node with proper sovereignty fields set. Returns the new node ID.
 /// Delegates to team::create_human_node with CLI-specific defaults.
-fn create_human_node(
+pub(crate) fn create_human_node(
     db: &Database,
     title: &str,
     content: Option<&str>,
@@ -6350,7 +6797,7 @@ fn create_human_node(
 
 /// Resolve a node reference (UUID, ID prefix, or title text).
 /// Wraps team::resolve_node with CLI-friendly error formatting.
-fn resolve_node(db: &Database, reference: &str) -> Result<Node, String> {
+pub(crate) fn resolve_node(db: &Database, reference: &str) -> Result<Node, String> {
     use mycelica_lib::team::ResolveResult;
     match mycelica_lib::team::resolve_node(db, reference) {
         ResolveResult::Found(node) => Ok(node),
@@ -6366,7 +6813,7 @@ fn resolve_node(db: &Database, reference: &str) -> Result<Node, String> {
 
 /// Process --connects-to terms: search for each, create Related edges.
 /// Wraps team::create_connects_to_edges with CLI output formatting.
-fn handle_connects_to(
+pub(crate) fn handle_connects_to(
     db: &Database,
     source_node_id: &str,
     terms: &[String],
@@ -6559,1786 +7006,6 @@ fn handle_migrate(cmd: MigrateCommands, db: &Database, _db_path: &Path, json: bo
             Ok(())
         }
     }
-}
-
-// ============================================================================
-// Spore Commands
-// ============================================================================
-
-async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) -> Result<(), String> {
-    match cmd {
-        SporeCommands::QueryEdges { edge_type, agent, target_agent, confidence_min, since, not_superseded, limit, compact } => {
-            let since_millis = since.as_deref()
-                .map(parse_since_to_millis)
-                .transpose()?;
-
-            let results = db.query_edges(
-                edge_type.as_deref(),
-                agent.as_deref(),
-                target_agent.as_deref(),
-                confidence_min,
-                since_millis,
-                not_superseded,
-                limit,
-            ).map_err(|e| e.to_string())?;
-
-            if json {
-                println!("{}", serde_json::to_string(&results).unwrap_or_default());
-            } else if compact {
-                for ewn in &results {
-                    let e = &ewn.edge;
-                    let src = ewn.source_title.as_deref().unwrap_or(&e.source[..8.min(e.source.len())]);
-                    let tgt = ewn.target_title.as_deref().unwrap_or(&e.target[..8.min(e.target.len())]);
-                    let conf = e.confidence.map(|c| format!("{:.2}", c)).unwrap_or_else(|| "?".to_string());
-                    println!("{} {} {} -> {} [{}]",
-                        &e.id[..8.min(e.id.len())],
-                        e.edge_type.as_str(),
-                        src, tgt, conf);
-                }
-            } else {
-                if results.is_empty() {
-                    println!("No matching edges found.");
-                } else {
-                    for ewn in &results {
-                        let e = &ewn.edge;
-                        let src = ewn.source_title.as_deref().unwrap_or(&e.source[..8.min(e.source.len())]);
-                        let tgt = ewn.target_title.as_deref().unwrap_or(&e.target[..8.min(e.target.len())]);
-                        let conf = e.confidence.map(|c| format!("{:.0}%", c * 100.0)).unwrap_or_else(|| "?".to_string());
-                        let agent_str = e.agent_id.as_deref().unwrap_or("?");
-                        let date = chrono::DateTime::from_timestamp_millis(e.created_at)
-                            .map(|d| d.format("%Y-%m-%d").to_string())
-                            .unwrap_or_else(|| "?".to_string());
-                        println!("{} {} {} → {} [{}] agent:{} {}",
-                            &e.id[..8.min(e.id.len())],
-                            e.edge_type.as_str(),
-                            src, tgt, conf, agent_str, date);
-                    }
-                    println!("\n{} edge(s)", results.len());
-                }
-            }
-            Ok(())
-        }
-
-        SporeCommands::ExplainEdge { id, depth } => {
-            let explanation = db.explain_edge(&id, depth).map_err(|e| e.to_string())?;
-            match explanation {
-                None => {
-                    if json {
-                        println!("null");
-                    } else {
-                        println!("Edge not found: {}", id);
-                    }
-                }
-                Some(exp) => {
-                    if json {
-                        println!("{}", serde_json::to_string(&exp).unwrap_or_default());
-                    } else {
-                        let e = &exp.edge;
-                        println!("Edge: {} [{}]", e.id, e.edge_type.as_str());
-                        println!("  Confidence: {}", e.confidence.map(|c| format!("{:.0}%", c * 100.0)).unwrap_or_else(|| "?".to_string()));
-                        println!("  Agent: {}", e.agent_id.as_deref().unwrap_or("?"));
-                        if let Some(ref reason) = e.reason {
-                            println!("  Reason: {}", reason);
-                        }
-                        if let Some(ref content) = e.content {
-                            println!("  Content: {}", &content[..200.min(content.len())]);
-                        }
-                        if e.superseded_by.is_some() {
-                            println!("  [SUPERSEDED by {}]", e.superseded_by.as_deref().unwrap_or("?"));
-                        }
-                        println!("\nSource: {} ({})", exp.source_node.ai_title.as_ref().unwrap_or(&exp.source_node.title), &exp.source_node.id[..8.min(exp.source_node.id.len())]);
-                        if let Some(ref summary) = exp.source_node.summary {
-                            println!("  {}", &summary[..200.min(summary.len())]);
-                        }
-                        println!("\nTarget: {} ({})", exp.target_node.ai_title.as_ref().unwrap_or(&exp.target_node.title), &exp.target_node.id[..8.min(exp.target_node.id.len())]);
-                        if let Some(ref summary) = exp.target_node.summary {
-                            println!("  {}", &summary[..200.min(summary.len())]);
-                        }
-
-                        if !exp.adjacent_edges.is_empty() {
-                            println!("\nAdjacent edges ({}):", exp.adjacent_edges.len());
-                            for ae in &exp.adjacent_edges {
-                                println!("  {} {} {} → {}",
-                                    &ae.id[..8.min(ae.id.len())],
-                                    ae.edge_type.as_str(),
-                                    &ae.source[..8.min(ae.source.len())],
-                                    &ae.target[..8.min(ae.target.len())]);
-                            }
-                        }
-
-                        if !exp.supersession_chain.is_empty() {
-                            println!("\nSupersession chain ({}):", exp.supersession_chain.len());
-                            for se in &exp.supersession_chain {
-                                let status = if se.superseded_by.is_some() { "superseded" } else { "current" };
-                                println!("  {} [{}] {}", &se.id[..8.min(se.id.len())], se.edge_type.as_str(), status);
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(())
-        }
-
-        SporeCommands::PathBetween { from, to, max_hops, edge_types } => {
-            let source = resolve_node(db, &from)?;
-            let target = resolve_node(db, &to)?;
-
-            let type_list: Option<Vec<String>> = edge_types.map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
-            let type_refs: Option<Vec<&str>> = type_list.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
-
-            let paths = db.path_between(&source.id, &target.id, max_hops, type_refs.as_deref())
-                .map_err(|e| e.to_string())?;
-
-            if json {
-                println!("{}", serde_json::to_string(&paths).unwrap_or_default());
-            } else {
-                if paths.is_empty() {
-                    println!("No paths found between {} and {} (max {} hops)",
-                        source.ai_title.as_ref().unwrap_or(&source.title),
-                        target.ai_title.as_ref().unwrap_or(&target.title),
-                        max_hops);
-                } else {
-                    let src_name = source.ai_title.as_ref().unwrap_or(&source.title);
-                    for (i, path) in paths.iter().enumerate() {
-                        let mut display = format!("{}", src_name);
-                        for hop in path {
-                            display.push_str(&format!(" →[{}]→ {}", hop.edge.edge_type.as_str(), hop.node_title));
-                        }
-                        println!("Path {}: {}", i + 1, display);
-                    }
-                    println!("\n{} path(s) found", paths.len());
-                }
-            }
-            Ok(())
-        }
-
-        SporeCommands::EdgesForContext { id, top, not_superseded } => {
-            let node = resolve_node(db, &id)?;
-
-            let edges = db.edges_for_context(&node.id, top, not_superseded)
-                .map_err(|e| e.to_string())?;
-
-            if json {
-                println!("{}", serde_json::to_string(&edges).unwrap_or_default());
-            } else {
-                if edges.is_empty() {
-                    println!("No edges found for {}", node.ai_title.as_ref().unwrap_or(&node.title));
-                } else {
-                    println!("Top {} edges for: {}", edges.len(), node.ai_title.as_ref().unwrap_or(&node.title));
-                    for (i, e) in edges.iter().enumerate() {
-                        let other_id = if e.source == node.id { &e.target } else { &e.source };
-                        let other_name = db.get_node(other_id).ok().flatten()
-                            .map(|n| n.ai_title.unwrap_or(n.title))
-                            .unwrap_or_else(|| other_id[..8.min(other_id.len())].to_string());
-                        let conf = e.confidence.map(|c| format!(" {:.0}%", c * 100.0)).unwrap_or_default();
-                        let dir = if e.source == node.id { "→" } else { "←" };
-                        println!("  {}. {} {} {} [{}]{}",
-                            i + 1, dir, e.edge_type.as_str(), other_name, &e.id[..8.min(e.id.len())], conf);
-                    }
-                }
-            }
-            Ok(())
-        }
-
-        SporeCommands::CreateMeta { meta_type, title, content, agent, connects_to, edge_type } => {
-            // Validate meta_type
-            let valid_types = ["summary", "contradiction", "status"];
-            if !valid_types.contains(&meta_type.as_str()) {
-                return Err(format!("Invalid meta type: '{}'. Must be one of: summary, contradiction, status", meta_type));
-            }
-
-            // Validate edge_type
-            let et = EdgeType::from_str(&edge_type.to_lowercase())
-                .ok_or_else(|| format!("Unknown edge type: '{}'", edge_type))?;
-
-            // Find universe node for parent_id
-            let universe_id = {
-                let all_nodes = db.get_all_nodes(true).map_err(|e| e.to_string())?;
-                all_nodes.iter().find(|n| n.is_universe).map(|n| n.id.clone())
-                    .ok_or_else(|| "No universe node found. Run 'mycelica-cli hierarchy build' first.".to_string())?
-            };
-
-            let author = settings::get_author_or_default();
-            let now = Utc::now().timestamp_millis();
-            let node_id = uuid::Uuid::new_v4().to_string();
-
-            let node = Node {
-                id: node_id.clone(),
-                node_type: NodeType::Thought,
-                title: title.clone(),
-                url: None,
-                content,
-                position: Position { x: 0.0, y: 0.0 },
-                created_at: now,
-                updated_at: now,
-                cluster_id: None,
-                cluster_label: None,
-                depth: 1,
-                is_item: false,
-                is_universe: false,
-                parent_id: Some(universe_id),
-                child_count: 0,
-                ai_title: None,
-                summary: None,
-                tags: None,
-                emoji: None,
-                is_processed: false,
-                conversation_id: None,
-                sequence_index: None,
-                is_pinned: false,
-                last_accessed_at: None,
-                latest_child_date: None,
-                is_private: None,
-                privacy_reason: None,
-                source: Some("spore".to_string()),
-                pdf_available: None,
-                content_type: None,
-                associated_idea_id: None,
-                privacy: None,
-                human_edited: None,
-                human_created: true,
-                author: Some(author.clone()),
-                agent_id: Some(agent.clone()),
-                node_class: Some("meta".to_string()),
-                meta_type: Some(meta_type.clone()),
-            };
-
-            let mut edges = Vec::new();
-            for target_id in &connects_to {
-                edges.push(Edge {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    source: node_id.clone(),
-                    target: target_id.clone(),
-                    edge_type: et.clone(),
-                    label: None,
-                    weight: Some(1.0),
-                    edge_source: Some("user".to_string()),
-                    evidence_id: None,
-                    confidence: Some(1.0),
-                    created_at: now,
-                    updated_at: Some(now),
-                    author: Some(author.clone()),
-                    reason: None,
-                    content: None,
-                    agent_id: Some(agent.clone()),
-                    superseded_by: None,
-                    metadata: None,
-                });
-            }
-
-            db.create_meta_node_with_edges(&node, &edges).map_err(|e| e.to_string())?;
-
-            if json {
-                println!(r#"{{"id":"{}","type":"{}","title":"{}","edges":{}}}"#,
-                    node_id, meta_type, escape_json(&title), edges.len());
-            } else {
-                println!("Created meta node: {} [{}] \"{}\"", &node_id[..8], meta_type, title);
-                if !connects_to.is_empty() {
-                    println!("  {} {} edge(s) created", connects_to.len(), edge_type);
-                }
-            }
-            Ok(())
-        }
-
-        SporeCommands::UpdateMeta { id, content, title, agent, add_connects, edge_type } => {
-            let old_node = resolve_node(db, &id)?;
-
-            // Verify it's a meta node
-            if old_node.node_class.as_deref() != Some("meta") {
-                return Err(format!("Node {} is not a meta node (class: {:?})", id, old_node.node_class));
-            }
-
-            let author = settings::get_author_or_default();
-            let now = Utc::now().timestamp_millis();
-            let new_id = uuid::Uuid::new_v4().to_string();
-
-            // Create NEW meta node inheriting fields from old
-            let new_node = Node {
-                id: new_id.clone(),
-                node_type: old_node.node_type.clone(),
-                title: title.unwrap_or_else(|| old_node.title.clone()),
-                url: old_node.url.clone(),
-                content: content.or_else(|| old_node.content.clone()),
-                position: Position { x: 0.0, y: 0.0 },
-                created_at: now,
-                updated_at: now,
-                cluster_id: None,
-                cluster_label: None,
-                depth: old_node.depth,
-                is_item: old_node.is_item,
-                is_universe: false,
-                parent_id: old_node.parent_id.clone(),
-                child_count: 0,
-                ai_title: old_node.ai_title.clone(),
-                summary: old_node.summary.clone(),
-                tags: old_node.tags.clone(),
-                emoji: old_node.emoji.clone(),
-                is_processed: old_node.is_processed,
-                conversation_id: None,
-                sequence_index: None,
-                is_pinned: false,
-                last_accessed_at: None,
-                latest_child_date: None,
-                is_private: old_node.is_private,
-                privacy_reason: old_node.privacy_reason.clone(),
-                source: Some("spore".to_string()),
-                pdf_available: None,
-                content_type: old_node.content_type.clone(),
-                associated_idea_id: None,
-                privacy: old_node.privacy,
-                human_edited: None,
-                human_created: true,
-                author: Some(author.clone()),
-                agent_id: Some(agent.clone()),
-                node_class: old_node.node_class.clone(),
-                meta_type: old_node.meta_type.clone(),
-            };
-
-            // Build edges for new node
-            let mut edges = Vec::new();
-
-            // 1. Supersedes edge: new -> old
-            edges.push(Edge {
-                id: uuid::Uuid::new_v4().to_string(),
-                source: new_id.clone(),
-                target: old_node.id.clone(),
-                edge_type: EdgeType::Supersedes,
-                label: None,
-                weight: Some(1.0),
-                edge_source: Some("spore".to_string()),
-                evidence_id: None,
-                confidence: Some(1.0),
-                created_at: now,
-                updated_at: Some(now),
-                author: Some(author.clone()),
-                reason: Some(format!("Supersedes {}", &old_node.id[..8.min(old_node.id.len())])),
-                content: None,
-                agent_id: Some(agent.clone()),
-                superseded_by: None,
-                metadata: None,
-            });
-
-            // 2. Copy old node's outgoing edges (excluding superseded and Supersedes-typed)
-            let old_edges = db.get_edges_for_node(&old_node.id).map_err(|e| e.to_string())?;
-            for old_edge in &old_edges {
-                // Only copy outgoing edges from old node
-                if old_edge.source != old_node.id {
-                    continue;
-                }
-                // Skip edges that have been superseded
-                if old_edge.superseded_by.is_some() {
-                    continue;
-                }
-                // Skip Supersedes-typed edges (avoid false chains)
-                if old_edge.edge_type == EdgeType::Supersedes {
-                    continue;
-                }
-                edges.push(Edge {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    source: new_id.clone(),
-                    target: old_edge.target.clone(),
-                    edge_type: old_edge.edge_type.clone(),
-                    label: old_edge.label.clone(),
-                    weight: old_edge.weight,
-                    edge_source: Some("spore".to_string()),
-                    evidence_id: old_edge.evidence_id.clone(),
-                    confidence: old_edge.confidence,
-                    created_at: now,
-                    updated_at: Some(now),
-                    author: Some(author.clone()),
-                    reason: old_edge.reason.clone(),
-                    content: old_edge.content.clone(),
-                    agent_id: Some(agent.clone()),
-                    superseded_by: None,
-                    metadata: old_edge.metadata.clone(),
-                });
-            }
-
-            // 3. New --add-connects edges
-            if !add_connects.is_empty() {
-                let et = EdgeType::from_str(&edge_type.to_lowercase())
-                    .ok_or_else(|| format!("Unknown edge type: '{}'", edge_type))?;
-                for target_id in &add_connects {
-                    edges.push(Edge {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        source: new_id.clone(),
-                        target: target_id.clone(),
-                        edge_type: et.clone(),
-                        label: None,
-                        weight: Some(1.0),
-                        edge_source: Some("spore".to_string()),
-                        evidence_id: None,
-                        confidence: Some(1.0),
-                        created_at: now,
-                        updated_at: Some(now),
-                        author: Some(author.clone()),
-                        reason: None,
-                        content: None,
-                        agent_id: Some(agent.clone()),
-                        superseded_by: None,
-                        metadata: None,
-                    });
-                }
-            }
-
-            let copied_count = edges.len() - 1 - add_connects.len(); // total - supersedes - new
-            db.create_meta_node_with_edges(&new_node, &edges).map_err(|e| e.to_string())?;
-
-            if json {
-                println!(r#"{{"newId":"{}","oldId":"{}","copiedEdges":{},"newEdges":{}}}"#,
-                    new_id, old_node.id, copied_count, add_connects.len());
-            } else {
-                println!("Created superseding meta node: {} -> {}",
-                    &new_id[..8.min(new_id.len())], &old_node.id[..8.min(old_node.id.len())]);
-                println!("  Copied {} edge(s), added {} new edge(s)", copied_count, add_connects.len());
-            }
-            Ok(())
-        }
-
-        SporeCommands::Status { all } => {
-            // Meta nodes by type
-            let meta_nodes = db.get_meta_nodes(None).map_err(|e| e.to_string())?;
-            let summaries = meta_nodes.iter().filter(|n| n.meta_type.as_deref() == Some("summary")).count();
-            let contradictions_meta = meta_nodes.iter().filter(|n| n.meta_type.as_deref() == Some("contradiction")).count();
-            let statuses = meta_nodes.iter().filter(|n| n.meta_type.as_deref() == Some("status")).count();
-
-            // Edge stats
-            let all_edges = db.get_all_edges().map_err(|e| e.to_string())?;
-            let now = Utc::now().timestamp_millis();
-            let day_ago = now - 86_400_000;
-            let week_ago = now - 7 * 86_400_000;
-
-            let edges_24h = all_edges.iter().filter(|e| e.created_at >= day_ago).count();
-            let edges_7d = all_edges.iter().filter(|e| e.created_at >= week_ago).count();
-
-            // Unresolved contradictions (contradiction edges not superseded)
-            let unresolved = all_edges.iter()
-                .filter(|e| e.edge_type == EdgeType::Contradicts && e.superseded_by.is_none())
-                .count();
-
-            // Coverage: knowledge nodes referenced by summarizes edges
-            let all_nodes = db.get_all_nodes(true).map_err(|e| e.to_string())?;
-            let knowledge_nodes = all_nodes.iter().filter(|n| n.node_class.as_deref() != Some("meta") && n.is_item).count();
-            let summarized_targets: std::collections::HashSet<&str> = all_edges.iter()
-                .filter(|e| e.edge_type == EdgeType::Summarizes && e.superseded_by.is_none())
-                .map(|e| e.target.as_str())
-                .collect();
-            let coverage = if knowledge_nodes > 0 {
-                summarized_targets.len() as f64 / knowledge_nodes as f64
-            } else {
-                0.0
-            };
-
-            // Coherence
-            let active_edges = all_edges.iter().filter(|e| e.superseded_by.is_none()).count();
-            let coherence = if active_edges > 0 {
-                1.0 - (unresolved as f64 / active_edges as f64)
-            } else {
-                1.0
-            };
-
-            if json {
-                println!(r#"{{"metaNodes":{{"summary":{},"contradiction":{},"status":{}}},"edges":{{"last24h":{},"last7d":{},"total":{}}},"unresolvedContradictions":{},"coverage":{:.4},"coherence":{:.6}}}"#,
-                    summaries, contradictions_meta, statuses,
-                    edges_24h, edges_7d, all_edges.len(),
-                    unresolved, coverage, coherence);
-            } else {
-                println!("=== Spore Status ===\n");
-                println!("Meta nodes: {} total", meta_nodes.len());
-                println!("  Summaries:      {}", summaries);
-                println!("  Contradictions: {}", contradictions_meta);
-                println!("  Status nodes:   {}", statuses);
-
-                println!("\nEdge activity:");
-                println!("  Last 24h: {}", edges_24h);
-                println!("  Last 7d:  {}", edges_7d);
-                println!("  Total:    {}", all_edges.len());
-
-                println!("\nUnresolved contradictions: {}", unresolved);
-                println!("Coverage: {:.1}% ({} / {} knowledge nodes summarized)", coverage * 100.0, summarized_targets.len(), knowledge_nodes);
-                println!("Coherence: {:.4}", coherence);
-
-                if all {
-                    // Agent breakdown
-                    let mut agent_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-                    for e in all_edges.iter().filter(|e| e.created_at >= week_ago) {
-                        let agent_key = e.agent_id.as_deref().unwrap_or("unknown").to_string();
-                        *agent_counts.entry(agent_key).or_insert(0) += 1;
-                    }
-                    if !agent_counts.is_empty() {
-                        println!("\nEdges by agent (last 7d):");
-                        let mut sorted: Vec<_> = agent_counts.into_iter().collect();
-                        sorted.sort_by(|a, b| b.1.cmp(&a.1));
-                        for (agent_name, count) in sorted {
-                            println!("  {}: {}", agent_name, count);
-                        }
-                    }
-
-                    // List unresolved contradictions
-                    if unresolved > 0 {
-                        println!("\nUnresolved contradiction edges:");
-                        for e in all_edges.iter()
-                            .filter(|e| e.edge_type == EdgeType::Contradicts && e.superseded_by.is_none())
-                            .take(10)
-                        {
-                            let src_name = db.get_node(&e.source).ok().flatten()
-                                .map(|n| n.ai_title.unwrap_or(n.title))
-                                .unwrap_or_else(|| e.source[..8.min(e.source.len())].to_string());
-                            let tgt_name = db.get_node(&e.target).ok().flatten()
-                                .map(|n| n.ai_title.unwrap_or(n.title))
-                                .unwrap_or_else(|| e.target[..8.min(e.target.len())].to_string());
-                            println!("  {} contradicts {}", src_name, tgt_name);
-                        }
-                        if unresolved > 10 {
-                            println!("  ... and {} more", unresolved - 10);
-                        }
-                    }
-
-                    // List meta nodes
-                    if !meta_nodes.is_empty() {
-                        println!("\nMeta nodes:");
-                        for mn in &meta_nodes {
-                            let mt = mn.meta_type.as_deref().unwrap_or("?");
-                            let agent_name = mn.agent_id.as_deref().unwrap_or("?");
-                            println!("  [{}] {} (agent: {}, {})",
-                                mt, mn.title, agent_name, &mn.id[..8.min(mn.id.len())]);
-                        }
-                    }
-                }
-            }
-            Ok(())
-        }
-
-        // Gap 3a: Create edge between existing nodes (delegates to handle_link)
-        SporeCommands::CreateEdge { from, to, edge_type, content, reason, agent, confidence, supersedes } => {
-            handle_link(&from, &to, &edge_type, reason, content, &agent, confidence, supersedes, "spore", db, json).await
-        }
-
-        // Gap 3b: Read full content of a node (no metadata noise)
-        SporeCommands::ReadContent { id } => {
-            let node = resolve_node(db, &id)?;
-            if json {
-                println!(r#"{{"id":"{}","title":"{}","content":{},"tags":{},"content_type":{},"node_class":{},"meta_type":{}}}"#,
-                    node.id,
-                    escape_json(&node.title),
-                    node.content.as_ref().map(|c| format!("\"{}\"", escape_json(c))).unwrap_or("null".to_string()),
-                    node.tags.as_ref().map(|t| format!("\"{}\"", escape_json(t))).unwrap_or("null".to_string()),
-                    node.content_type.as_ref().map(|c| format!("\"{}\"", c)).unwrap_or("null".to_string()),
-                    node.node_class.as_ref().map(|c| format!("\"{}\"", c)).unwrap_or("null".to_string()),
-                    node.meta_type.as_ref().map(|m| format!("\"{}\"", m)).unwrap_or("null".to_string()),
-                );
-            } else {
-                if let Some(ref content) = node.content {
-                    println!("{}", content);
-                } else {
-                    println!("(no content)");
-                }
-            }
-            Ok(())
-        }
-
-        // Gap 3c: List descendants of a category
-        SporeCommands::ListRegion { id, class, items_only, limit } => {
-            let parent = resolve_node(db, &id)?;
-            let descendants = db.get_descendants(&parent.id, class.as_deref(), items_only, limit)
-                .map_err(|e| e.to_string())?;
-
-            if json {
-                let items: Vec<String> = descendants.iter().map(|n| {
-                    format!(r#"{{"id":"{}","title":"{}","depth":{},"is_item":{},"node_class":{},"content_type":{}}}"#,
-                        n.id,
-                        escape_json(&n.title),
-                        n.depth,
-                        n.is_item,
-                        n.node_class.as_ref().map(|c| format!("\"{}\"", c)).unwrap_or("null".to_string()),
-                        n.content_type.as_ref().map(|c| format!("\"{}\"", c)).unwrap_or("null".to_string()),
-                    )
-                }).collect();
-                println!("[{}]", items.join(","));
-            } else {
-                if descendants.is_empty() {
-                    println!("No descendants found for: {} ({})", parent.title, &parent.id[..8.min(parent.id.len())]);
-                } else {
-                    let parent_depth = parent.depth;
-                    for n in &descendants {
-                        let indent = "  ".repeat((n.depth - parent_depth).max(0) as usize);
-                        let marker = if n.is_item { "[I]" } else { "[C]" };
-                        let class_label = n.node_class.as_deref().unwrap_or("");
-                        let ct_label = n.content_type.as_deref().map(|c| format!(" ({})", c)).unwrap_or_default();
-                        println!("{}{} {} {}{}", indent, marker, &n.id[..8.min(n.id.len())], n.title, if class_label.is_empty() { ct_label } else { format!(" [{}]{}", class_label, ct_label) });
-                    }
-                    println!("\n{} descendant(s)", descendants.len());
-                }
-            }
-            Ok(())
-        }
-
-        // Gap 3f: Check freshness of summary meta-nodes
-        SporeCommands::CheckFreshness { id } => {
-            let node = resolve_node(db, &id)?;
-
-            // Find all summarizes edges where this node is the TARGET
-            let edges = db.get_edges_for_node(&node.id).map_err(|e| e.to_string())?;
-            let summary_edges: Vec<&Edge> = edges.iter()
-                .filter(|e| e.edge_type == EdgeType::Summarizes && e.target == node.id && e.superseded_by.is_none())
-                .collect();
-
-            if summary_edges.is_empty() {
-                // Check if this node is itself a summary — look at outgoing summarizes edges
-                let outgoing: Vec<&Edge> = edges.iter()
-                    .filter(|e| e.edge_type == EdgeType::Summarizes && e.source == node.id && e.superseded_by.is_none())
-                    .collect();
-
-                if outgoing.is_empty() {
-                    if json {
-                        println!(r#"{{"id":"{}","summaries":[],"message":"No summarizes edges found"}}"#, node.id);
-                    } else {
-                        println!("No summarizes edges found for: {}", node.title);
-                    }
-                } else {
-                    // This node IS a summary — check if its targets have been updated since
-                    let summary_updated = node.updated_at;
-                    if json {
-                        let items: Vec<String> = outgoing.iter().map(|e| {
-                            let target_node = db.get_node(&e.target).ok().flatten();
-                            let target_updated = target_node.as_ref().map(|n| n.updated_at).unwrap_or(0);
-                            let stale = target_updated > summary_updated;
-                            let target_title = target_node.map(|n| n.title).unwrap_or_else(|| e.target.clone());
-                            format!(r#"{{"targetId":"{}","targetTitle":"{}","stale":{},"targetUpdated":{},"summaryUpdated":{}}}"#,
-                                e.target, escape_json(&target_title), stale, target_updated, summary_updated)
-                        }).collect();
-                        println!(r#"{{"id":"{}","title":"{}","targets":[{}]}}"#, node.id, escape_json(&node.title), items.join(","));
-                    } else {
-                        println!("Summary: {} (updated {})", node.title,
-                            chrono::DateTime::from_timestamp_millis(summary_updated)
-                                .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
-                                .unwrap_or_else(|| "?".to_string()));
-                        for e in &outgoing {
-                            let target_node = db.get_node(&e.target).ok().flatten();
-                            let target_updated = target_node.as_ref().map(|n| n.updated_at).unwrap_or(0);
-                            let stale = target_updated > summary_updated;
-                            let target_title = target_node.map(|n| n.title).unwrap_or_else(|| e.target.clone());
-                            let status = if stale { "STALE" } else { "fresh" };
-                            println!("  {} {} (updated {})", status, target_title,
-                                chrono::DateTime::from_timestamp_millis(target_updated)
-                                    .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
-                                    .unwrap_or_else(|| "?".to_string()));
-                        }
-                    }
-                }
-            } else {
-                // Node is summarized BY other nodes — show their freshness
-                if json {
-                    let items: Vec<String> = summary_edges.iter().map(|e| {
-                        let summary_node = db.get_node(&e.source).ok().flatten();
-                        let summary_updated = summary_node.as_ref().map(|n| n.updated_at).unwrap_or(0);
-                        let stale = node.updated_at > summary_updated;
-                        let summary_title = summary_node.map(|n| n.title).unwrap_or_else(|| e.source.clone());
-                        format!(r#"{{"summaryId":"{}","summaryTitle":"{}","stale":{},"summaryUpdated":{},"nodeUpdated":{}}}"#,
-                            e.source, escape_json(&summary_title), stale, summary_updated, node.updated_at)
-                    }).collect();
-                    println!(r#"{{"id":"{}","title":"{}","summaries":[{}]}}"#, node.id, escape_json(&node.title), items.join(","));
-                } else {
-                    println!("Node: {} (updated {})", node.title,
-                        chrono::DateTime::from_timestamp_millis(node.updated_at)
-                            .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
-                            .unwrap_or_else(|| "?".to_string()));
-                    for e in &summary_edges {
-                        let summary_node = db.get_node(&e.source).ok().flatten();
-                        let summary_updated = summary_node.as_ref().map(|n| n.updated_at).unwrap_or(0);
-                        let stale = node.updated_at > summary_updated;
-                        let summary_title = summary_node.map(|n| n.title).unwrap_or_else(|| e.source.clone());
-                        let status = if stale { "STALE" } else { "fresh" };
-                        println!("  {} {} (updated {})", status, summary_title,
-                            chrono::DateTime::from_timestamp_millis(summary_updated)
-                                .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
-                                .unwrap_or_else(|| "?".to_string()));
-                    }
-                }
-            }
-            Ok(())
-        }
-
-        SporeCommands::Runs { cmd } => {
-            handle_runs(cmd, db, json)
-        }
-
-        SporeCommands::Orchestrate { task, max_bounces, max_turns, coder_prompt, verifier_prompt, dry_run, verbose } => {
-            handle_orchestrate(db, &task, max_bounces, max_turns, &coder_prompt, &verifier_prompt, dry_run, verbose).await
-        }
-    }
-}
-
-/// Parse a --since value as either an ISO date (YYYY-MM-DD) or a relative duration (e.g. 30m, 1h, 2d, 1w).
-/// Returns epoch milliseconds.
-fn parse_since_to_millis(s: &str) -> Result<i64, String> {
-    // Try relative duration first: number + unit suffix
-    let s_trimmed = s.trim();
-    if let Some((num_str, unit)) = s_trimmed
-        .strip_suffix('m')
-        .map(|n| (n, 'm'))
-        .or_else(|| s_trimmed.strip_suffix('h').map(|n| (n, 'h')))
-        .or_else(|| s_trimmed.strip_suffix('d').map(|n| (n, 'd')))
-        .or_else(|| s_trimmed.strip_suffix('w').map(|n| (n, 'w')))
-    {
-        if let Ok(num) = num_str.parse::<u64>() {
-            let seconds = match unit {
-                'm' => num * 60,
-                'h' => num * 3600,
-                'd' => num * 86400,
-                'w' => num * 604800,
-                _ => unreachable!(),
-            };
-            let now = chrono::Utc::now().timestamp_millis();
-            return Ok(now - (seconds as i64 * 1000));
-        }
-    }
-    // Fall back to ISO date
-    let date = chrono::NaiveDate::parse_from_str(s_trimmed, "%Y-%m-%d")
-        .map_err(|e| format!("Invalid --since '{}': {}. Use YYYY-MM-DD or relative (1h, 2d, 1w).", s, e))?;
-    let dt = date.and_hms_opt(0, 0, 0).unwrap();
-    Ok(dt.and_utc().timestamp_millis())
-}
-
-fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result<(), String> {
-    match cmd {
-        RunCommands::List { agent, since, limit } => {
-            let since_millis = since.as_deref()
-                .map(parse_since_to_millis)
-                .transpose()?;
-            let runs = db.list_runs(agent.as_deref(), since_millis, limit)
-                .map_err(|e| format!("Failed to list runs: {}", e))?;
-
-            if json {
-                println!("{}", serde_json::to_string_pretty(&runs).unwrap_or_default());
-            } else if runs.is_empty() {
-                println!("No runs found.");
-            } else {
-                println!("{:<38} {:>5}  {:<20}  {}", "RUN ID", "EDGES", "STARTED", "AGENTS");
-                println!("{}", "-".repeat(90));
-                for r in &runs {
-                    let started = chrono::DateTime::from_timestamp_millis(r.started_at)
-                        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
-                        .unwrap_or_else(|| "?".to_string());
-                    println!("{:<38} {:>5}  {:<20}  {}", r.run_id, r.edge_count, started, r.agents);
-                }
-                println!("\n{} run(s)", runs.len());
-            }
-            Ok(())
-        }
-
-        RunCommands::Get { run_id, json: local_json } => {
-            let edges = db.get_run_edges(&run_id)
-                .map_err(|e| format!("Failed to get run edges: {}", e))?;
-
-            if json || local_json {
-                println!("{}", serde_json::to_string_pretty(&edges).unwrap_or_default());
-            } else if edges.is_empty() {
-                println!("No edges found for run: {}", run_id);
-            } else {
-                println!("Run: {}", run_id);
-                println!("{} edge(s):\n", edges.len());
-                for e in &edges {
-                    let created = chrono::DateTime::from_timestamp_millis(e.created_at)
-                        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
-                        .unwrap_or_else(|| "?".to_string());
-                    println!("  {} {:?} {} -> {} [{}]",
-                        &e.id[..8.min(e.id.len())],
-                        e.edge_type,
-                        &e.source[..8.min(e.source.len())],
-                        &e.target[..8.min(e.target.len())],
-                        created,
-                    );
-                    if let Some(ref reason) = e.reason {
-                        println!("    reason: {}", reason);
-                    }
-                }
-            }
-            Ok(())
-        }
-
-        RunCommands::Rollback { run_id, delete_nodes, force, dry_run } => {
-            if dry_run {
-                let (edges, nodes) = db.preview_rollback_run(&run_id, delete_nodes)
-                    .map_err(|e| format!("Failed to preview rollback: {}", e))?;
-
-                if json {
-                    let obj = serde_json::json!({
-                        "runId": run_id,
-                        "dryRun": true,
-                        "edgesCount": edges.len(),
-                        "nodesCount": nodes.len(),
-                        "edges": edges,
-                        "nodes": nodes.iter().map(|n| serde_json::json!({
-                            "id": n.id,
-                            "title": n.title,
-                            "nodeClass": n.node_class,
-                            "agentId": n.agent_id,
-                        })).collect::<Vec<_>>(),
-                    });
-                    println!("{}", serde_json::to_string_pretty(&obj).unwrap_or_default());
-                } else if edges.is_empty() {
-                    println!("No edges found for run: {}", run_id);
-                } else {
-                    println!("[dry-run] Run: {}", run_id);
-                    println!("\nEdges that would be deleted ({}):", edges.len());
-                    for e in &edges {
-                        let created = chrono::DateTime::from_timestamp_millis(e.created_at)
-                            .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
-                            .unwrap_or_else(|| "?".to_string());
-                        println!("  {} {:?} {} -> {} [{}]",
-                            &e.id[..8.min(e.id.len())],
-                            e.edge_type,
-                            &e.source[..8.min(e.source.len())],
-                            &e.target[..8.min(e.target.len())],
-                            created,
-                        );
-                        if let Some(ref reason) = e.reason {
-                            println!("    reason: {}", reason);
-                        }
-                    }
-                    if delete_nodes {
-                        if nodes.is_empty() {
-                            println!("\nNo operational nodes would be deleted.");
-                        } else {
-                            println!("\nNodes that would be deleted ({}):", nodes.len());
-                            for n in &nodes {
-                                println!("  {} {}",
-                                    &n.id[..8.min(n.id.len())],
-                                    n.title,
-                                );
-                                if let Some(ref agent) = n.agent_id {
-                                    println!("    agent: {}", agent);
-                                }
-                            }
-                        }
-                    }
-                    println!("\nNo changes made. Remove --dry-run and use --force to execute.");
-                }
-                return Ok(());
-            }
-
-            // Show what will be deleted first
-            let edges = db.get_run_edges(&run_id)
-                .map_err(|e| format!("Failed to get run edges: {}", e))?;
-            if edges.is_empty() {
-                println!("No edges found for run: {}", run_id);
-                return Ok(());
-            }
-
-            if !force {
-                println!("Will delete {} edge(s) from run {}", edges.len(), run_id);
-                if delete_nodes {
-                    println!("Will also delete operational nodes created during this run.");
-                }
-                println!("Use --force to confirm, or --dry-run to preview details.");
-                return Ok(());
-            }
-
-            let (edges_deleted, nodes_deleted) = db.rollback_run(&run_id, delete_nodes)
-                .map_err(|e| format!("Rollback failed: {}", e))?;
-
-            if json {
-                println!(r#"{{"runId":"{}","edgesDeleted":{},"nodesDeleted":{}}}"#,
-                    run_id, edges_deleted, nodes_deleted);
-            } else {
-                println!("Rolled back run {}: {} edge(s) deleted, {} node(s) deleted",
-                    run_id, edges_deleted, nodes_deleted);
-            }
-            Ok(())
-        }
-    }
-}
-
-// ============================================================================
-// Orchestrator
-// ============================================================================
-
-fn make_orchestrator_node(
-    id: String,
-    title: String,
-    content: String,
-    node_class: &str,
-    meta_type: Option<&str>,
-) -> Node {
-    let now = chrono::Utc::now().timestamp_millis();
-    Node {
-        id,
-        node_type: NodeType::Thought,
-        title,
-        url: None,
-        content: Some(content),
-        position: Position { x: 0.0, y: 0.0 },
-        created_at: now,
-        updated_at: now,
-        cluster_id: None,
-        cluster_label: None,
-        ai_title: None,
-        summary: None,
-        tags: None,
-        emoji: None,
-        is_processed: true,
-        depth: 0,
-        is_item: true,
-        is_universe: false,
-        parent_id: None,
-        child_count: 0,
-        conversation_id: None,
-        sequence_index: None,
-        is_pinned: false,
-        last_accessed_at: None,
-        latest_child_date: None,
-        is_private: None,
-        privacy_reason: None,
-        source: Some("orchestrator".to_string()),
-        pdf_available: None,
-        content_type: None,
-        associated_idea_id: None,
-        privacy: None,
-        human_edited: None,
-        human_created: false,
-        author: Some("orchestrator".to_string()),
-        agent_id: Some("spore:orchestrator".to_string()),
-        node_class: Some(node_class.to_string()),
-        meta_type: meta_type.map(|s| s.to_string()),
-    }
-}
-
-/// Resolve the full path to the mycelica-cli binary (for MCP configs).
-fn resolve_cli_binary() -> Result<PathBuf, String> {
-    // We ARE mycelica-cli, so current_exe gives the full path
-    std::env::current_exe()
-        .map_err(|e| format!("Failed to resolve CLI binary path: {}", e))
-}
-
-struct ClaudeResult {
-    success: bool,
-    exit_code: i32,
-    session_id: Option<String>,
-    result_text: Option<String>,
-    total_cost_usd: Option<f64>,
-    num_turns: Option<u32>,
-    duration_ms: Option<u64>,
-    stdout_raw: String,
-    stderr_raw: String,
-}
-
-/// Spawn Claude Code as a subprocess with streaming output.
-/// Reads stdout line-by-line (stream-json format) and prints real-time progress.
-fn spawn_claude(
-    prompt: &str,
-    mcp_config: &Path,
-    max_turns: usize,
-    verbose: bool,
-    role: &str,
-    allowed_tools: Option<&str>,
-    disallowed_tools: Option<&str>,
-) -> Result<ClaudeResult, String> {
-    use std::process::{Command, Stdio};
-
-    let mut cmd = Command::new("claude");
-    cmd.arg("-p")
-        .arg(prompt)
-        .arg("--mcp-config")
-        .arg(mcp_config)
-        .arg("--strict-mcp-config")
-        .arg("--dangerously-skip-permissions")
-        .arg("--output-format")
-        .arg("stream-json")
-        .arg("--verbose")
-        .arg("--max-turns")
-        .arg(max_turns.to_string());
-
-    if let Some(tools) = allowed_tools {
-        cmd.arg("--allowedTools").arg(tools);
-    }
-    if let Some(tools) = disallowed_tools {
-        cmd.arg("--disallowedTools").arg(tools);
-    }
-
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to spawn claude: {}", e))?;
-
-    let stdout = child.stdout.take()
-        .ok_or_else(|| "Failed to capture stdout".to_string())?;
-    let reader = std::io::BufReader::new(stdout);
-
-    let mut session_id: Option<String> = None;
-    let mut result_text: Option<String> = None;
-    let mut total_cost_usd: Option<f64> = None;
-    let mut num_turns: Option<u32> = None;
-    let mut duration_ms: Option<u64> = None;
-
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let json: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        match json.get("type").and_then(|t| t.as_str()) {
-            Some("system") => {
-                eprintln!("[{}] Connected", role);
-                // Check MCP server status
-                if let Some(servers) = json.get("mcp_servers").and_then(|s| s.as_array()) {
-                    for srv in servers {
-                        let name = srv.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-                        let status = srv.get("status").and_then(|s| s.as_str()).unwrap_or("?");
-                        eprintln!("[{}] MCP: {} ({})", role, name, status);
-                    }
-                }
-            }
-            Some("assistant") => {
-                if let Some(content) = json.pointer("/message/content").and_then(|c| c.as_array()) {
-                    for block in content {
-                        let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        match block_type {
-                            "text" => {
-                                if verbose {
-                                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                        let text = text.trim();
-                                        if !text.is_empty() {
-                                            let truncated = if text.len() > 120 {
-                                                format!("{}...", &text[..text.floor_char_boundary(120)])
-                                            } else {
-                                                text.to_string()
-                                            };
-                                            eprintln!("[{}] {}", role, truncated);
-                                        }
-                                    }
-                                }
-                            }
-                            "tool_use" => {
-                                let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-                                let input = block.get("input");
-                                let summary = match name {
-                                    "Bash" => {
-                                        let cmd = input
-                                            .and_then(|i| i.get("command"))
-                                            .and_then(|c| c.as_str())
-                                            .unwrap_or("?");
-                                        let cmd = if cmd.len() > 120 {
-                                            format!("{}...", &cmd[..cmd.floor_char_boundary(120)])
-                                        } else {
-                                            cmd.to_string()
-                                        };
-                                        format!("$ {}", cmd)
-                                    }
-                                    n if n.starts_with("mcp__") => {
-                                        let tool_name = n.rsplit("__").next().unwrap_or(n);
-                                        format!("mcp: {}", tool_name)
-                                    }
-                                    "Read" | "Edit" | "Write" => {
-                                        let path = input
-                                            .and_then(|i| i.get("file_path"))
-                                            .and_then(|p| p.as_str())
-                                            .unwrap_or("?");
-                                        format!("{}: {}", name, path)
-                                    }
-                                    _ => format!("tool: {}", name),
-                                };
-                                eprintln!("[{}] {}", role, summary);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            Some("result") => {
-                session_id = json.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string());
-                result_text = json.get("result").and_then(|v| v.as_str()).map(|s| s.to_string());
-                total_cost_usd = json.get("total_cost_usd").and_then(|v| v.as_f64());
-                num_turns = json.get("num_turns").and_then(|v| v.as_u64()).map(|n| n as u32);
-                duration_ms = json.get("duration_ms").and_then(|v| v.as_u64());
-            }
-            _ => {}
-        }
-    }
-
-    // Read stderr after stdout is drained
-    let mut stderr_buf = String::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        let _ = stderr.read_to_string(&mut stderr_buf);
-    }
-
-    let status = child.wait()
-        .map_err(|e| format!("Failed to wait on claude: {}", e))?;
-    let exit_code = status.code().unwrap_or(-1);
-
-    Ok(ClaudeResult {
-        success: status.success(),
-        exit_code,
-        session_id,
-        result_text,
-        total_cost_usd,
-        num_turns,
-        duration_ms,
-        stdout_raw: String::new(),
-        stderr_raw: stderr_buf,
-    })
-}
-
-/// Write a temporary MCP config file for an agent run.
-fn write_temp_mcp_config(
-    cli_binary: &Path,
-    role: &str,
-    agent_id: &str,
-    run_id: &str,
-    db_path: &str,
-) -> Result<PathBuf, String> {
-    let dir = PathBuf::from("/tmp/mycelica-orchestrator");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("Failed to create temp dir: {}", e))?;
-
-    let filename = format!("mcp-{}-{}.json", role, &run_id[..8.min(run_id.len())]);
-    let path = dir.join(filename);
-
-    let binary_str = cli_binary.to_string_lossy();
-    let args = vec![
-        "mcp-server".to_string(),
-        "--stdio".to_string(),
-        "--agent-role".to_string(),
-        role.to_string(),
-        "--agent-id".to_string(),
-        agent_id.to_string(),
-        "--run-id".to_string(),
-        run_id.to_string(),
-        "--db".to_string(),
-        db_path.to_string(),
-    ];
-
-    let config = serde_json::json!({
-        "mcpServers": {
-            "mycelica": {
-                "command": binary_str,
-                "args": args,
-            }
-        }
-    });
-
-    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap())
-        .map_err(|e| format!("Failed to write MCP config: {}", e))?;
-    Ok(path)
-}
-
-#[derive(Debug, PartialEq)]
-enum Verdict {
-    Supports,
-    Contradicts,
-    Unknown,
-}
-
-/// Check whether the verifier supports or contradicts the implementation node.
-fn check_verdict(db: &Database, impl_node_id: &str) -> Verdict {
-    let edges = match db.get_edges_for_node(impl_node_id) {
-        Ok(e) => e,
-        Err(_) => return Verdict::Unknown,
-    };
-
-    for edge in &edges {
-        // Only incoming edges targeting the impl node
-        if edge.target != impl_node_id {
-            continue;
-        }
-        // Only from verifier
-        if edge.agent_id.as_deref() != Some("spore:verifier") {
-            continue;
-        }
-        // Only non-superseded
-        if edge.superseded_by.is_some() {
-            continue;
-        }
-        match edge.edge_type {
-            EdgeType::Supports => return Verdict::Supports,
-            EdgeType::Contradicts => return Verdict::Contradicts,
-            _ => {}
-        }
-    }
-    Verdict::Unknown
-}
-
-/// Post-coder cleanup: re-index changed files, reinstall CLI if needed, create related edges.
-/// Failures warn but do NOT abort orchestration.
-fn post_coder_cleanup(
-    db: &Database,
-    impl_node_id: &str,
-    before_dirty: &HashSet<String>,
-    before_untracked: &HashSet<String>,
-    cli_binary: &Path,
-    verbose: bool,
-) {
-    // 1. Get files dirty/untracked NOW, subtract pre-existing ones
-    let after_dirty: HashSet<String> = std::process::Command::new("git")
-        .args(["diff", "--name-only"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| l.to_string())
-            .collect())
-        .unwrap_or_default();
-
-    let after_untracked: HashSet<String> = std::process::Command::new("git")
-        .args(["ls-files", "--others", "--exclude-standard"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| l.to_string())
-            .collect())
-        .unwrap_or_default();
-
-    let changed_files: Vec<String> = after_dirty.difference(before_dirty)
-        .chain(after_untracked.difference(before_untracked))
-        .cloned()
-        .collect();
-
-    if changed_files.is_empty() {
-        if verbose {
-            eprintln!("[orchestrator] No files changed by coder");
-        }
-        return;
-    }
-
-    println!("[orchestrator] {} file(s) changed by coder", changed_files.len());
-
-    // 2. Re-index changed .rs files
-    let rs_files: Vec<&str> = changed_files.iter()
-        .filter(|f| f.ends_with(".rs"))
-        .map(|f| f.as_str())
-        .collect();
-
-    for file in &rs_files {
-        println!("[orchestrator] Indexing: {}", file);
-        let result = std::process::Command::new(cli_binary)
-            .args(["import", "code", file, "--update"])
-            .output();
-        match result {
-            Ok(o) if !o.status.success() => {
-                eprintln!("[orchestrator] WARNING: Failed to index {}", file);
-            }
-            Err(e) => {
-                eprintln!("[orchestrator] WARNING: Failed to run import for {}: {}", file, e);
-            }
-            _ => {}
-        }
-    }
-
-    // 3. Reinstall CLI if src-tauri/ files changed
-    let needs_reinstall = changed_files.iter().any(|f| f.starts_with("src-tauri/"));
-    if needs_reinstall {
-        println!("[orchestrator] Reinstalling CLI (source files changed)");
-        let install_result = std::process::Command::new("cargo")
-            .args(["+nightly", "install", "--path", "src-tauri", "--bin", "mycelica-cli", "--features", "mcp", "--force"])
-            .output();
-        match install_result {
-            Ok(o) if o.status.success() => {
-                // Copy sidecar
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ekats".to_string());
-                let src = PathBuf::from(&home).join(".cargo/bin/mycelica-cli");
-                let dst = PathBuf::from("binaries/mycelica-cli-x86_64-unknown-linux-gnu");
-                if let Err(e) = std::fs::copy(&src, &dst) {
-                    eprintln!("[orchestrator] WARNING: Failed to copy sidecar: {}", e);
-                } else {
-                    println!("[orchestrator] CLI reinstalled and sidecar updated");
-                }
-            }
-            Ok(o) => {
-                eprintln!("[orchestrator] WARNING: cargo install failed (exit {})", o.status.code().unwrap_or(-1));
-            }
-            Err(e) => {
-                eprintln!("[orchestrator] WARNING: Failed to run cargo install: {}", e);
-            }
-        }
-    }
-
-    // 4. Create related edges from impl node to code nodes matching changed files
-    let mut linked = 0usize;
-    for file in &changed_files {
-        // Find code nodes with this file_path in tags JSON
-        let node_ids: Vec<String> = (|| -> Option<Vec<String>> {
-            let conn = db.raw_conn().lock().ok()?;
-            let mut stmt = conn.prepare(
-                "SELECT id FROM nodes WHERE JSON_EXTRACT(tags, '$.file_path') = ?1 LIMIT 10"
-            ).ok()?;
-            let rows = stmt.query_map([file.as_str()], |row| row.get(0)).ok()?;
-            Some(rows.filter_map(|r| r.ok()).collect())
-        })().unwrap_or_default();
-
-        let now = chrono::Utc::now().timestamp_millis();
-        for node_id in &node_ids {
-            let edge = Edge {
-                id: uuid::Uuid::new_v4().to_string(),
-                source: impl_node_id.to_string(),
-                target: node_id.clone(),
-                edge_type: EdgeType::Related,
-                label: None,
-                weight: None,
-                edge_source: Some("orchestrator".to_string()),
-                evidence_id: None,
-                confidence: Some(0.85),
-                created_at: now,
-                updated_at: Some(now),
-                author: None,
-                reason: None,
-                content: Some("Implementation modifies this code".to_string()),
-                agent_id: Some("spore:orchestrator".to_string()),
-                superseded_by: None,
-                metadata: None,
-            };
-            if db.insert_edge(&edge).is_ok() {
-                linked += 1;
-            }
-        }
-    }
-
-    if linked > 0 {
-        println!("[orchestrator] Linked impl node to {} code node(s)", linked);
-    }
-}
-
-async fn handle_orchestrate(
-    db: &Database,
-    task: &str,
-    max_bounces: usize,
-    max_turns: usize,
-    coder_prompt_path: &Path,
-    verifier_prompt_path: &Path,
-    dry_run: bool,
-    verbose: bool,
-) -> Result<(), String> {
-    // Resolve CLI binary path
-    let cli_binary = resolve_cli_binary()?;
-    if verbose {
-        eprintln!("[orchestrator] CLI binary: {}", cli_binary.display());
-    }
-
-    // Fail fast if claude is not available
-    let which_result = std::process::Command::new("which")
-        .arg("claude")
-        .output()
-        .map_err(|e| format!("Failed to check for claude: {}", e))?;
-    if !which_result.status.success() {
-        return Err("'claude' not found in PATH. Install Claude Code first.".to_string());
-    }
-
-    // Resolve DB path early — its parent is the repo root, used for prompt path fallback
-    let db_path_str = db.get_path();
-    let repo_root = Path::new(&db_path_str).parent();
-
-    // Resolve prompt paths: try CWD first, then relative to repo root (DB parent dir)
-    let resolve_prompt = |p: &Path| -> PathBuf {
-        if p.exists() {
-            return p.to_path_buf();
-        }
-        if let Some(root) = repo_root {
-            let resolved = root.join(p);
-            if resolved.exists() {
-                return resolved;
-            }
-        }
-        p.to_path_buf()
-    };
-    let coder_path = resolve_prompt(coder_prompt_path);
-    let verifier_path = resolve_prompt(verifier_prompt_path);
-
-    // Read agent prompts
-    let coder_prompt_template = std::fs::read_to_string(&coder_path)
-        .map_err(|e| format!("Failed to read coder prompt at {}: {}", coder_path.display(), e))?;
-    let verifier_prompt_template = std::fs::read_to_string(&verifier_path)
-        .map_err(|e| format!("Failed to read verifier prompt at {}: {}", verifier_path.display(), e))?;
-
-    // Clean up old temp MCP configs from previous runs
-    let _ = std::fs::remove_dir_all("/tmp/mycelica-orchestrator");
-    let db_path = std::fs::canonicalize(&db_path_str)
-        .map_err(|e| format!("Failed to resolve absolute DB path '{}': {}", db_path_str, e))?
-        .to_string_lossy()
-        .to_string();
-
-    if dry_run {
-        println!("=== DRY RUN ===");
-        println!("Task: {}", task);
-        println!("Max bounces: {}", max_bounces);
-        println!("Max turns per agent: {}", max_turns);
-        println!("CLI binary: {}", cli_binary.display());
-        println!("Coder prompt: {} ({} bytes)", coder_prompt_path.display(), coder_prompt_template.len());
-        println!("Verifier prompt: {} ({} bytes)", verifier_prompt_path.display(), verifier_prompt_template.len());
-        println!("DB path: {}", db_path);
-        println!("\nWould run {} bounce(s) of: Coder -> Verifier", max_bounces);
-        return Ok(());
-    }
-
-    // Create task node in graph
-    let task_node_id = uuid::Uuid::new_v4().to_string();
-    let task_node = make_orchestrator_node(
-        task_node_id.clone(),
-        format!("Orchestration: {}", if task.len() > 60 { &task[..60] } else { task }),
-        format!("## Task\n{}\n\n## Config\n- max_bounces: {}\n- max_turns: {}", task, max_bounces, max_turns),
-        "operational",
-        None,
-    );
-    db.insert_node(&task_node).map_err(|e| format!("Failed to create task node: {}", e))?;
-    println!("Created task node: {}", &task_node_id[..8]);
-
-    let mut last_impl_id: Option<String> = None;
-
-    for bounce in 0..max_bounces {
-        println!("\n--- Bounce {}/{} ---", bounce + 1, max_bounces);
-
-        // === CODER PHASE ===
-        let coder_run_id = uuid::Uuid::new_v4().to_string();
-
-        // Capture dirty + untracked files before coder runs (to diff against after)
-        let before_dirty: HashSet<String> = std::process::Command::new("git")
-            .args(["diff", "--name-only"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| l.to_string())
-                .collect())
-            .unwrap_or_default();
-
-        let before_untracked: HashSet<String> = std::process::Command::new("git")
-            .args(["ls-files", "--others", "--exclude-standard"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| l.to_string())
-                .collect())
-            .unwrap_or_default();
-
-        let coder_start = chrono::Utc::now().timestamp_millis();
-
-        let coder_mcp = write_temp_mcp_config(
-            &cli_binary, "coder", "spore:coder", &coder_run_id, &db_path,
-        )?;
-
-        let coder_prompt = if let Some(ref impl_id) = last_impl_id {
-            format!(
-                "{}\n\nThe Verifier found issues with node {}. Check its incoming contradicts edges and fix the code.\n\nYour task: {}",
-                coder_prompt_template, impl_id, task
-            )
-        } else {
-            format!("{}\n\nYour task: {}", coder_prompt_template, task)
-        };
-
-        println!("[coder] Starting (run: {})", &coder_run_id[..8]);
-        let coder_result = spawn_claude(
-            &coder_prompt, &coder_mcp, max_turns, verbose, "coder",
-            Some("Read,Write,Edit,Bash(*),mcp__mycelica__*"),
-            Some("Grep,Glob"),
-        )?;
-
-        if !coder_result.success {
-            eprintln!("[coder] FAILED (exit code {})", coder_result.exit_code);
-            if !coder_result.stderr_raw.is_empty() {
-                eprintln!("[coder stderr] {}", &coder_result.stderr_raw[..2000.min(coder_result.stderr_raw.len())]);
-            }
-            // Record failure
-            record_run_status(db, &task_node_id, &coder_run_id, "spore:coder", "failed", coder_result.exit_code)?;
-            return Err(format!("Coder failed on bounce {} with exit code {}", bounce + 1, coder_result.exit_code));
-        }
-        println!("[coder] Done ({} turns, ${:.2}, {:.0}s)",
-            coder_result.num_turns.unwrap_or(0),
-            coder_result.total_cost_usd.unwrap_or(0.0),
-            coder_result.duration_ms.unwrap_or(0) as f64 / 1000.0,
-        );
-        if let Some(ref sid) = coder_result.session_id {
-            println!("[coder] Session: {}", sid);
-        }
-
-        // Find coder's output node
-        let coder_nodes = db.find_nodes_by_agent_and_time("spore:coder", coder_start)
-            .map_err(|e| format!("Failed to query coder nodes: {}", e))?;
-
-        if coder_nodes.is_empty() {
-            eprintln!("[coder] WARNING: Coder completed (exit 0) but created no operational nodes.");
-            if let Some(ref text) = coder_result.result_text {
-                eprintln!("[coder] Agent result: {}", text);
-            }
-            eprintln!("[coder] This may mean the feature already exists or the agent skipped graph recording.");
-            record_run_status(db, &task_node_id, &coder_run_id, "spore:coder", "incomplete", 0)?;
-            return Err("Coder produced no operational nodes — see agent result above for details.".to_string());
-        }
-
-        let impl_node = &coder_nodes[0]; // Most recent
-        println!("[coder] Implementation node: {} ({})", &impl_node.id[..8], impl_node.title);
-        record_run_status(db, &task_node_id, &coder_run_id, "spore:coder", "completed", 0)?;
-
-        // === POST-CODER CLEANUP ===
-        post_coder_cleanup(db, &impl_node.id, &before_dirty, &before_untracked, &cli_binary, verbose);
-
-        // === VERIFIER PHASE ===
-        let verifier_run_id = uuid::Uuid::new_v4().to_string();
-
-        let verifier_mcp = write_temp_mcp_config(
-            &cli_binary, "verifier", "spore:verifier", &verifier_run_id, &db_path,
-        )?;
-
-        let verifier_prompt = format!(
-            "{}\n\nCheck implementation node {}",
-            verifier_prompt_template, impl_node.id
-        );
-
-        println!("[verifier] Starting (run: {})", &verifier_run_id[..8]);
-        let verifier_result = spawn_claude(
-            &verifier_prompt, &verifier_mcp, max_turns, verbose, "verifier",
-            Some("Read,Grep,Glob,Bash(cargo:*),Bash(cd:*),Bash(mycelica-cli:*),mcp__mycelica__*"),
-            None,
-        )?;
-
-        if !verifier_result.success {
-            eprintln!("[verifier] FAILED (exit code {})", verifier_result.exit_code);
-            if !verifier_result.stderr_raw.is_empty() {
-                eprintln!("[verifier stderr] {}", &verifier_result.stderr_raw[..2000.min(verifier_result.stderr_raw.len())]);
-            }
-            record_run_status(db, &task_node_id, &verifier_run_id, "spore:verifier", "failed", verifier_result.exit_code)?;
-            return Err(format!("Verifier failed on bounce {} with exit code {}", bounce + 1, verifier_result.exit_code));
-        }
-        println!("[verifier] Done ({} turns, ${:.2}, {:.0}s)",
-            verifier_result.num_turns.unwrap_or(0),
-            verifier_result.total_cost_usd.unwrap_or(0.0),
-            verifier_result.duration_ms.unwrap_or(0) as f64 / 1000.0,
-        );
-        record_run_status(db, &task_node_id, &verifier_run_id, "spore:verifier", "completed", 0)?;
-
-        // Check verdict
-        let verdict = check_verdict(db, &impl_node.id);
-        match verdict {
-            Verdict::Supports => {
-                println!("\n=== TASK COMPLETE ===");
-                println!("Verifier supports the implementation after {} bounce(s).", bounce + 1);
-                println!("Implementation: {} ({})", &impl_node.id[..8], impl_node.title);
-                println!("Task node: {}", &task_node_id[..8]);
-                return Ok(());
-            }
-            Verdict::Contradicts => {
-                println!("[verifier] Contradicts implementation — will bounce to coder");
-                last_impl_id = Some(impl_node.id.clone());
-            }
-            Verdict::Unknown => {
-                eprintln!("[verifier] WARNING: No supports/contradicts edge found. Verifier may not have recorded a verdict.");
-                last_impl_id = Some(impl_node.id.clone());
-            }
-        }
-    }
-
-    // Max bounces reached — escalate
-    println!("\n=== MAX BOUNCES REACHED ({}) ===", max_bounces);
-    if let Some(ref impl_id) = last_impl_id {
-        create_escalation(db, &task_node_id, impl_id, max_bounces, task)?;
-        println!("Escalation node created. Human review required.");
-    }
-    Err(format!("Task not resolved after {} bounce(s). Escalation created.", max_bounces))
-}
-
-/// Record a run status edge from task node to itself.
-fn record_run_status(
-    db: &Database,
-    task_node_id: &str,
-    run_id: &str,
-    agent: &str,
-    status: &str,
-    exit_code: i32,
-) -> Result<(), String> {
-    let now = chrono::Utc::now().timestamp_millis();
-    let metadata = serde_json::json!({
-        "run_id": run_id,
-        "status": status,
-        "exit_code": exit_code,
-        "agent": agent,
-    });
-    let edge = Edge {
-        id: uuid::Uuid::new_v4().to_string(),
-        source: task_node_id.to_string(),
-        target: task_node_id.to_string(),
-        edge_type: EdgeType::Tracks,
-        label: None,
-        weight: None,
-        edge_source: Some("orchestrator".to_string()),
-        evidence_id: None,
-        confidence: Some(1.0),
-        created_at: now,
-        updated_at: Some(now),
-        author: Some("orchestrator".to_string()),
-        reason: Some(format!("{} run {}", agent, status)),
-        content: None,
-        agent_id: Some("spore:orchestrator".to_string()),
-        superseded_by: None,
-        metadata: Some(metadata.to_string()),
-    };
-    db.insert_edge(&edge).map_err(|e| format!("Failed to record run status: {}", e))?;
-    Ok(())
-}
-
-/// Create an escalation meta node after max bounces.
-fn create_escalation(
-    db: &Database,
-    task_node_id: &str,
-    last_impl_id: &str,
-    bounce_count: usize,
-    task: &str,
-) -> Result<(), String> {
-    let esc_id = uuid::Uuid::new_v4().to_string();
-    let esc_node = make_orchestrator_node(
-        esc_id.clone(),
-        format!("ESCALATION: {} (after {} bounces)", if task.len() > 40 { &task[..40] } else { task }, bounce_count),
-        format!(
-            "## Escalation\n\nTask did not converge after {} Coder-Verifier bounces.\n\n\
-             ### Task\n{}\n\n\
-             ### Last Implementation\nNode: {}\n\n\
-             ### Action Required\nHuman review needed. Check the contradicts edges on the last implementation node \
-             to understand what the Verifier flagged.",
-            bounce_count, task, last_impl_id
-        ),
-        "meta",
-        Some("escalation"),
-    );
-    db.insert_node(&esc_node).map_err(|e| format!("Failed to create escalation node: {}", e))?;
-    let now = esc_node.created_at;
-
-    // Edge: escalation flags last implementation
-    let flags_edge = Edge {
-        id: uuid::Uuid::new_v4().to_string(),
-        source: esc_id.clone(),
-        target: last_impl_id.to_string(),
-        edge_type: EdgeType::Flags,
-        label: None,
-        weight: None,
-        edge_source: Some("orchestrator".to_string()),
-        evidence_id: None,
-        confidence: Some(1.0),
-        created_at: now,
-        updated_at: Some(now),
-        author: Some("orchestrator".to_string()),
-        reason: Some(format!("Escalation after {} bounces", bounce_count)),
-        content: None,
-        agent_id: Some("spore:orchestrator".to_string()),
-        superseded_by: None,
-        metadata: None,
-    };
-    db.insert_edge(&flags_edge).map_err(|e| format!("Failed to create flags edge: {}", e))?;
-
-    // Edge: escalation tracks task
-    let tracks_edge = Edge {
-        id: uuid::Uuid::new_v4().to_string(),
-        source: esc_id,
-        target: task_node_id.to_string(),
-        edge_type: EdgeType::Tracks,
-        label: None,
-        weight: None,
-        edge_source: Some("orchestrator".to_string()),
-        evidence_id: None,
-        confidence: Some(1.0),
-        created_at: now,
-        updated_at: Some(now),
-        author: Some("orchestrator".to_string()),
-        reason: Some("Tracks orchestration task".to_string()),
-        content: None,
-        agent_id: Some("spore:orchestrator".to_string()),
-        superseded_by: None,
-        metadata: None,
-    };
-    db.insert_edge(&tracks_edge).map_err(|e| format!("Failed to create tracks edge: {}", e))?;
-
-    println!("Escalation: {} ({})", &esc_node.id[..8], esc_node.title);
-    Ok(())
-}
-
-async fn handle_link(
-    source_ref: &str,
-    target_ref: &str,
-    edge_type_str: &str,
-    reason: Option<String>,
-    content: Option<String>,
-    agent: &str,
-    confidence: Option<f64>,
-    supersedes: Option<String>,
-    edge_source: &str,
-    db: &Database,
-    json: bool,
-) -> Result<(), String> {
-    // Parse edge type (case-insensitive)
-    let edge_type = EdgeType::from_str(&edge_type_str.to_lowercase())
-        .ok_or_else(|| format!(
-            "Unknown edge type: '{}'. Valid types include: related, reference, because, contains, \
-             belongs_to, calls, uses_type, implements, defined_in, imports, tests, documents, \
-             prerequisite, contradicts, supports, evolved_from, questions, \
-             summarizes, tracks, flags, resolves, derives_from, supersedes",
-            edge_type_str
-        ))?;
-
-    let source = resolve_node(db, source_ref)?;
-    let target = resolve_node(db, target_ref)?;
-
-    let author = settings::get_author_or_default();
-    let now = Utc::now().timestamp_millis();
-    let edge_id = uuid::Uuid::new_v4().to_string();
-
-    let edge = Edge {
-        id: edge_id.clone(),
-        source: source.id.clone(),
-        target: target.id.clone(),
-        edge_type,
-        label: None,
-        weight: Some(1.0),
-        edge_source: Some(edge_source.to_string()),
-        evidence_id: None,
-        confidence: Some(confidence.unwrap_or(1.0)),
-        created_at: now,
-        updated_at: Some(now),
-        author: Some(author),
-        reason,
-        content,
-        agent_id: Some(agent.to_string()),
-        superseded_by: None,
-        metadata: None,
-    };
-
-    db.insert_edge(&edge).map_err(|e| e.to_string())?;
-
-    // If superseding another edge, mark the old one
-    if let Some(ref old_edge_id) = supersedes {
-        db.supersede_edge(old_edge_id, &edge_id).map_err(|e| e.to_string())?;
-    }
-
-    if json {
-        println!(r#"{{"id":"{}","source":"{}","target":"{}","type":"{}","agent":"{}","confidence":{}}}"#,
-            edge_id, source.id, target.id, edge_type_str.to_lowercase(), agent, confidence.unwrap_or(1.0));
-    } else {
-        let conf_str = confidence.map(|c| format!(" ({:.0}%)", c * 100.0)).unwrap_or_default();
-        println!("Linked: {} -> {} [{}]{} (agent: {})",
-            source.ai_title.as_ref().unwrap_or(&source.title),
-            target.ai_title.as_ref().unwrap_or(&target.title),
-            edge_type_str.to_lowercase(),
-            conf_str,
-            agent);
-        if let Some(ref old_id) = supersedes {
-            println!("  Superseded edge: {}", &old_id[..8.min(old_id.len())]);
-        }
-    }
-
-    Ok(())
 }
 
 async fn handle_orphans(limit: u32, db: &Database, json: bool) -> Result<(), String> {
@@ -8913,7 +7580,7 @@ fn parse_privacy_scoring_response(text: &str) -> Result<Vec<PrivacyScoreResult>,
         .map_err(|e| format!("JSON parse error: {}", e))
 }
 
-fn confirm_action(action: &str) -> Result<bool, String> {
+pub(crate) fn confirm_action(action: &str) -> Result<bool, String> {
     println!("\n⚠️  Are you sure you want to {}?", action);
     print!("Type 'yes' to confirm: ");
     std::io::stdout().flush().ok();
@@ -9813,6 +8480,76 @@ async fn handle_code(cmd: CodeCommands, db: &Database, db_path: &PathBuf) -> Res
                 println!("{:4} | {}", line_num, line);
             }
         }
+        CodeCommands::Stale { fix, path } => {
+            let db_dir = db_path.parent().unwrap_or(Path::new("."));
+
+            // Get all file paths from code nodes
+            let all_paths = db.get_all_code_file_paths().map_err(|e| e.to_string())?;
+
+            let mut stale_files: Vec<(String, usize)> = Vec::new();
+            let mut ok_files = 0usize;
+
+            for (file_path, node_count) in &all_paths {
+                // Apply path filter if provided
+                if let Some(ref prefix) = path {
+                    if !file_path.contains(prefix.as_str()) {
+                        continue;
+                    }
+                }
+
+                // Resolve relative paths from the DB directory
+                let resolved = if PathBuf::from(file_path).is_relative() {
+                    db_dir.join(file_path)
+                } else {
+                    PathBuf::from(file_path)
+                };
+
+                if resolved.exists() {
+                    ok_files += 1;
+                } else {
+                    stale_files.push((file_path.clone(), *node_count));
+                }
+            }
+
+            if stale_files.is_empty() {
+                println!("No stale code nodes found ({} files checked, all exist on disk).", ok_files);
+                return Ok(());
+            }
+
+            let total_stale_nodes: usize = stale_files.iter().map(|(_, c)| c).sum();
+
+            if fix {
+                println!("Cleaning {} stale file(s) ({} nodes)...", stale_files.len(), total_stale_nodes);
+                let mut total_deleted = 0;
+                for (file_path, _) in &stale_files {
+                    match db.delete_nodes_by_file_path(file_path) {
+                        Ok(deleted) => {
+                            println!("  Deleted {} nodes: {}", deleted, file_path);
+                            total_deleted += deleted;
+                        }
+                        Err(e) => {
+                            eprintln!("  Error deleting nodes for {}: {}", file_path, e);
+                        }
+                    }
+                }
+                // Prune any dangling edges left behind
+                if let Ok(pruned) = db.prune_dead_edges() {
+                    if pruned > 0 {
+                        println!("  Pruned {} dangling edges", pruned);
+                    }
+                }
+                println!("Done: deleted {} stale nodes from {} missing files ({} files OK).",
+                    total_deleted, stale_files.len(), ok_files);
+            } else {
+                println!("Found {} stale file(s) ({} nodes) — files no longer exist on disk:\n",
+                    stale_files.len(), total_stale_nodes);
+                for (file_path, node_count) in &stale_files {
+                    println!("  {:>4} nodes  {}", node_count, file_path);
+                }
+                println!("\n{} files OK.", ok_files);
+                println!("\nRun with --fix to delete these stale nodes and their edges.");
+            }
+        }
     }
     Ok(())
 }
@@ -9936,2109 +8673,12 @@ fn export_graphml(nodes: &[Node], db: &Database, include_edges: bool) -> Result<
 }
 
 // ============================================================================
-// TUI Mode
-// ============================================================================
-
-/// TUI operating mode
-#[derive(Clone, Copy, PartialEq)]
-enum TuiMode {
-    Navigation,  // Browsing hierarchy (tree view)
-    LeafView,    // Viewing item content (full screen)
-    Edit,        // Editing content
-    Search,      // Search mode
-    Maintenance, // Maintenance menu
-    Settings,    // Settings screen
-    Jobs,        // Job status popup
-}
-
-/// Focus state for Navigation mode (3-column layout)
-#[derive(Clone, Copy, PartialEq)]
-enum NavFocus {
-    Tree,
-    Pins,
-    Recents,
-}
-
-/// Focus state for Leaf View mode
-#[derive(Clone, Copy, PartialEq)]
-enum LeafFocus {
-    Content,
-    Similar,
-    Calls,  // Only shown for code nodes
-}
-
-/// Tree node for TUI display
-#[derive(Clone)]
-struct TreeNode {
-    id: String,
-    parent_id: Option<String>,
-    title: String,
-    emoji: Option<String>,
-    depth: i32,
-    child_count: i32,
-    is_item: bool,
-    is_expanded: bool,
-    is_universe: bool,
-    children_loaded: bool,
-    created_at: i64,
-    latest_child_date: Option<i64>,
-}
-
-/// Similar node for leaf view sidebar
-#[derive(Clone)]
-struct SimilarNodeInfo {
-    id: String,
-    title: String,
-    emoji: Option<String>,
-    similarity: f32,
-    parent_title: Option<String>,
-}
-
-/// TUI Application state
-struct TuiApp {
-    // Mode
-    mode: TuiMode,
-
-    // Tree data
-    nodes: Vec<TreeNode>,
-    visible_nodes: Vec<usize>,  // Indices into nodes that are currently visible
-    list_state: ListState,
-
-    // CD-style navigation
-    current_root_id: String,        // Current "directory" being viewed
-    breadcrumb_path: Vec<(String, String)>,  // (id, title) pairs from Universe to current
-
-    // Navigation mode focus (which pane is active)
-    nav_focus: NavFocus,
-    pins_selected: usize,
-    recents_selected: usize,
-
-    // Selected node in navigation
-    selected_node: Option<Node>,
-
-    // Leaf view state
-    leaf_node_id: Option<String>,
-    leaf_content: Option<String>,
-    leaf_scroll_offset: u16,
-    leaf_focus: LeafFocus,  // Which section is focused: Content, Similar, or Edges
-
-    // Similar nodes (loaded on leaf view entry)
-    similar_nodes: Vec<SimilarNodeInfo>,
-    similar_selected: usize,
-
-    // Calls for current leaf (only for code nodes)
-    calls_for_node: Vec<(String, String, bool)>,  // (target_id, title, is_outgoing)
-    calls_selected: usize,
-    is_code_node: bool,  // Whether current leaf is a code node
-
-    // Pins and recents
-    pinned_nodes: Vec<Node>,
-    recent_nodes: Vec<Node>,
-
-    // Search
-    search_mode: bool,
-    search_query: String,
-    search_results: Vec<Node>,
-
-    // Edit mode
-    edit_buffer: String,
-    edit_cursor_line: usize,
-    edit_cursor_col: usize,
-    edit_scroll_offset: usize,
-    edit_dirty: bool,  // Track if content has been modified
-
-    // Status
-    status_message: String,
-
-    // Date range for color gradient
-    date_min: i64,
-    date_max: i64,
-}
-
-impl TuiApp {
-    fn new() -> Self {
-        let mut list_state = ListState::default();
-        list_state.select(Some(0));
-        Self {
-            mode: TuiMode::Navigation,
-            nodes: Vec::new(),
-            visible_nodes: Vec::new(),
-            list_state,
-            current_root_id: String::new(),
-            breadcrumb_path: Vec::new(),
-            nav_focus: NavFocus::Tree,
-            pins_selected: 0,
-            recents_selected: 0,
-            selected_node: None,
-            leaf_node_id: None,
-            leaf_content: None,
-            leaf_scroll_offset: 0,
-            leaf_focus: LeafFocus::Content,
-            similar_nodes: Vec::new(),
-            similar_selected: 0,
-            calls_for_node: Vec::new(),
-            calls_selected: 0,
-            is_code_node: false,
-            pinned_nodes: Vec::new(),
-            recent_nodes: Vec::new(),
-            search_mode: false,
-            search_query: String::new(),
-            search_results: Vec::new(),
-            edit_buffer: String::new(),
-            edit_cursor_line: 0,
-            edit_cursor_col: 0,
-            edit_scroll_offset: 0,
-            edit_dirty: false,
-            status_message: String::new(),
-            date_min: 0,
-            date_max: i64::MAX,
-        }
-    }
-
-    fn load_tree(&mut self, db: &Database) -> Result<(), String> {
-        self.nodes.clear();
-        self.visible_nodes.clear();
-
-        // Get universe as root
-        if let Some(universe) = db.get_universe().map_err(|e| e.to_string())? {
-            // If no current root, start at Universe
-            if self.current_root_id.is_empty() {
-                self.current_root_id = universe.id.clone();
-                self.breadcrumb_path = vec![(universe.id.clone(), "Universe".to_string())];
-            }
-
-            // Load children of current root directly (flat list, not tree)
-            let children = db.get_children(&self.current_root_id).map_err(|e| e.to_string())?;
-
-            // Calculate date range for color gradient (use effective dates)
-            // Exclude Recent Notes from date range calculation (it skews the gradient)
-            let recent_notes_id = settings::RECENT_NOTES_CONTAINER_ID;
-            if !children.is_empty() {
-                self.date_min = children.iter()
-                    .filter(|n| n.id != recent_notes_id)
-                    .map(|n| n.latest_child_date.unwrap_or(n.created_at))
-                    .min()
-                    .unwrap_or(0);
-                self.date_max = children.iter()
-                    .filter(|n| n.id != recent_notes_id)
-                    .map(|n| n.latest_child_date.unwrap_or(n.created_at))
-                    .max()
-                    .unwrap_or(i64::MAX);
-            }
-
-            for child in children {
-                self.nodes.push(TreeNode {
-                    id: child.id.clone(),
-                    parent_id: Some(self.current_root_id.clone()),
-                    title: child.ai_title.clone().unwrap_or(child.title.clone()),
-                    emoji: child.emoji.clone(),
-                    depth: 0,  // Relative depth from current root
-                    child_count: child.child_count,
-                    is_item: child.is_item,
-                    is_expanded: false,
-                    is_universe: false,
-                    children_loaded: false,
-                    created_at: child.created_at,
-                    latest_child_date: child.latest_child_date,
-                });
-            }
-        }
-
-        self.update_visible_nodes();
-
-        // Load pins and recents
-        self.pinned_nodes = db.get_pinned_nodes().unwrap_or_default();
-        self.recent_nodes = db.get_recent_nodes(10).unwrap_or_default();
-
-        Ok(())
-    }
-
-    /// CD into a cluster (make it the new root)
-    fn cd_into(&mut self, db: &Database, node_id: &str) -> Result<(), String> {
-        let node = db.get_node(node_id)
-            .map_err(|e| e.to_string())?
-            .ok_or("Node not found")?;
-
-        // Add to breadcrumb
-        let title = node.ai_title.clone().unwrap_or(node.title.clone());
-        self.breadcrumb_path.push((node_id.to_string(), title));
-
-        // Set as new root
-        self.current_root_id = node_id.to_string();
-
-        // Reload tree from new root
-        self.nodes.clear();
-        self.list_state.select(Some(0));
-
-        let children = db.get_children(node_id).map_err(|e| e.to_string())?;
-
-        // Update date range (use effective dates)
-        // Exclude Recent Notes from date range calculation (it skews the gradient)
-        let recent_notes_id = settings::RECENT_NOTES_CONTAINER_ID;
-        if !children.is_empty() {
-            self.date_min = children.iter()
-                .filter(|n| n.id != recent_notes_id)
-                .map(|n| n.latest_child_date.unwrap_or(n.created_at))
-                .min()
-                .unwrap_or(0);
-            self.date_max = children.iter()
-                .filter(|n| n.id != recent_notes_id)
-                .map(|n| n.latest_child_date.unwrap_or(n.created_at))
-                .max()
-                .unwrap_or(i64::MAX);
-        }
-
-        for child in children {
-            self.nodes.push(TreeNode {
-                id: child.id.clone(),
-                parent_id: Some(node_id.to_string()),
-                title: child.ai_title.clone().unwrap_or(child.title.clone()),
-                emoji: child.emoji.clone(),
-                depth: 0,
-                child_count: child.child_count,
-                is_item: child.is_item,
-                is_expanded: false,
-                is_universe: false,
-                children_loaded: false,
-                created_at: child.created_at,
-                latest_child_date: child.latest_child_date,
-            });
-        }
-
-        self.update_visible_nodes();
-        self.status_message = format!("Entered {} ({} items)",
-            self.breadcrumb_path.last().map(|(_, t)| t.as_str()).unwrap_or("?"),
-            self.nodes.len()
-        );
-        Ok(())
-    }
-
-    /// Go up one level (cd ..)
-    fn cd_up(&mut self, db: &Database) -> Result<(), String> {
-        if self.breadcrumb_path.len() <= 1 {
-            self.status_message = "Already at root".to_string();
-            return Ok(());
-        }
-
-        // Remove current from breadcrumb
-        self.breadcrumb_path.pop();
-
-        // Get parent ID
-        let parent_id = self.breadcrumb_path.last()
-            .map(|(id, _)| id.clone())
-            .unwrap_or_default();
-
-        self.current_root_id = parent_id.clone();
-
-        // Reload tree from parent
-        self.nodes.clear();
-        self.list_state.select(Some(0));
-
-        let children = db.get_children(&parent_id).map_err(|e| e.to_string())?;
-
-        for child in children {
-            self.nodes.push(TreeNode {
-                id: child.id.clone(),
-                parent_id: Some(parent_id.clone()),
-                title: child.ai_title.clone().unwrap_or(child.title.clone()),
-                emoji: child.emoji.clone(),
-                depth: 0,
-                child_count: child.child_count,
-                is_item: child.is_item,
-                is_expanded: false,
-                is_universe: false,
-                children_loaded: false,
-                created_at: child.created_at,
-                latest_child_date: child.latest_child_date,
-            });
-        }
-
-        self.update_visible_nodes();
-        self.status_message = format!("Back to {} ({} items)",
-            self.breadcrumb_path.last().map(|(_, t)| t.as_str()).unwrap_or("Universe"),
-            self.nodes.len()
-        );
-        Ok(())
-    }
-
-    /// Enter leaf view mode for an item
-    fn enter_leaf_view(&mut self, db: &Database, node_id: &str) -> Result<(), String> {
-        let node = db.get_node(node_id)
-            .map_err(|e| e.to_string())?
-            .ok_or("Node not found")?;
-
-        self.mode = TuiMode::LeafView;
-        self.leaf_node_id = Some(node_id.to_string());
-        self.leaf_content = node.content.clone();
-        self.leaf_scroll_offset = 0;
-        self.leaf_focus = LeafFocus::Content;
-        self.calls_selected = 0;
-        self.similar_nodes.clear();
-        self.similar_selected = 0;
-
-        // Check if this is a code node
-        self.is_code_node = node.content_type.as_ref().map(|ct| ct.starts_with("code_")).unwrap_or(false);
-
-        // Store selected node for header display
-        self.selected_node = Some(node.clone());
-
-        // Load similar nodes using embeddings
-        if let Some(target_emb) = db.get_node_embedding(node_id).ok().flatten() {
-            if let Ok(all_embeddings) = db.get_nodes_with_embeddings() {
-                let similar = similarity::find_similar(&target_emb, &all_embeddings, node_id, 15, 0.5);
-
-                for (sim_id, score) in similar {
-                    if let Ok(Some(sim_node)) = db.get_node(&sim_id) {
-                        // Get parent title for grouping display
-                        let parent_title = if let Some(ref pid) = sim_node.parent_id {
-                            db.get_node(pid).ok().flatten().map(|p| p.ai_title.unwrap_or(p.title))
-                        } else {
-                            None
-                        };
-
-                        self.similar_nodes.push(SimilarNodeInfo {
-                            id: sim_id,
-                            title: sim_node.ai_title.unwrap_or(sim_node.title),
-                            emoji: sim_node.emoji,
-                            similarity: score,
-                            parent_title,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Load Calls edges for code nodes only
-        self.calls_for_node.clear();
-        if self.is_code_node {
-            if let Ok(edges) = db.get_edges_for_node(node_id) {
-                for edge in edges {
-                    // Only process Calls edges
-                    if edge.edge_type != EdgeType::Calls {
-                        continue;
-                    }
-                    // Determine direction: outgoing if this node is source
-                    let is_outgoing = edge.source == node_id;
-                    let other_id = if is_outgoing { &edge.target } else { &edge.source };
-                    if let Ok(Some(other_node)) = db.get_node(other_id) {
-                        let title = other_node.ai_title.unwrap_or(other_node.title);
-                        self.calls_for_node.push((other_id.to_string(), title, is_outgoing));
-                    }
-                }
-            }
-        }
-
-        // Touch node to update recent
-        let _ = db.touch_node(node_id);
-
-        // Reload recents
-        self.recent_nodes = db.get_recent_nodes(10).unwrap_or_default();
-
-        self.status_message = format!("Viewing: {} ({} similar) [q/Esc to go back]",
-            node.ai_title.unwrap_or(node.title),
-            self.similar_nodes.len());
-        Ok(())
-    }
-
-    /// Exit leaf view, return to navigation
-    fn exit_leaf_view(&mut self) {
-        self.mode = TuiMode::Navigation;
-        self.leaf_node_id = None;
-        self.leaf_content = None;
-        self.similar_nodes.clear();
-        self.calls_for_node.clear();
-        self.is_code_node = false;
-        self.status_message = "Back to navigation".to_string();
-    }
-
-    /// Enter edit mode from leaf view
-    fn enter_edit_mode(&mut self) {
-        if let Some(ref content) = self.leaf_content {
-            self.edit_buffer = content.clone();
-        } else {
-            self.edit_buffer = String::new();
-        }
-        self.edit_cursor_line = 0;
-        self.edit_cursor_col = 0;
-        self.edit_scroll_offset = 0;
-        self.edit_dirty = false;
-        self.mode = TuiMode::Edit;
-        self.status_message = "Edit mode: Ctrl+S save, Esc cancel".to_string();
-    }
-
-    /// Save edited content and return to leaf view
-    fn save_edit(&mut self, db: &Database) -> Result<(), String> {
-        if let Some(ref node_id) = self.leaf_node_id {
-            db.update_node_content(node_id, &self.edit_buffer)
-                .map_err(|e| e.to_string())?;
-
-            // Update the leaf content with saved buffer
-            self.leaf_content = Some(self.edit_buffer.clone());
-            self.leaf_scroll_offset = 0;
-            self.mode = TuiMode::LeafView;
-            self.edit_dirty = false;
-            self.status_message = "Content saved".to_string();
-            Ok(())
-        } else {
-            Err("No node to save".to_string())
-        }
-    }
-
-    /// Cancel edit and return to leaf view
-    fn cancel_edit(&mut self) {
-        let was_dirty = self.edit_dirty;
-        self.mode = TuiMode::LeafView;
-        self.edit_buffer.clear();
-        self.edit_dirty = false;
-        self.status_message = if was_dirty {
-            "Edit cancelled (changes discarded)".to_string()
-        } else {
-            "Edit cancelled".to_string()
-        };
-    }
-
-    /// Get the lines of the edit buffer
-    fn edit_lines(&self) -> Vec<&str> {
-        self.edit_buffer.lines().collect()
-    }
-
-    /// Get total line count in edit buffer
-    fn edit_line_count(&self) -> usize {
-        self.edit_buffer.lines().count().max(1)
-    }
-
-    /// Get the current line content
-    fn current_edit_line(&self) -> &str {
-        self.edit_buffer.lines().nth(self.edit_cursor_line).unwrap_or("")
-    }
-
-    /// Insert a character at cursor position
-    fn edit_insert_char(&mut self, c: char) {
-        let byte_pos = self.cursor_byte_position();
-        self.edit_buffer.insert(byte_pos, c);
-        if c == '\n' {
-            self.edit_cursor_line += 1;
-            self.edit_cursor_col = 0;
-        } else {
-            self.edit_cursor_col += 1;
-        }
-        self.edit_dirty = true;
-    }
-
-    /// Delete character before cursor (backspace)
-    fn edit_backspace(&mut self) {
-        if self.edit_cursor_col > 0 {
-            // Delete character before cursor on current line
-            let byte_pos = self.cursor_byte_position();
-            if byte_pos > 0 {
-                // Find the byte position of the previous character
-                let prev_char_start = self.edit_buffer[..byte_pos]
-                    .char_indices()
-                    .last()
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                self.edit_buffer.remove(prev_char_start);
-                self.edit_cursor_col = self.edit_cursor_col.saturating_sub(1);
-                self.edit_dirty = true;
-            }
-        } else if self.edit_cursor_line > 0 {
-            // At start of line, merge with previous line
-            let byte_pos = self.cursor_byte_position();
-            if byte_pos > 0 {
-                // Remove the newline before current position
-                self.edit_buffer.remove(byte_pos - 1);
-                self.edit_cursor_line -= 1;
-                // Set cursor to end of the now-merged line
-                self.edit_cursor_col = self.edit_buffer
-                    .lines()
-                    .nth(self.edit_cursor_line)
-                    .map(|l| l.chars().count())
-                    .unwrap_or(0);
-                self.edit_dirty = true;
-            }
-        }
-    }
-
-    /// Delete character at cursor (delete key)
-    fn edit_delete(&mut self) {
-        let byte_pos = self.cursor_byte_position();
-        if byte_pos < self.edit_buffer.len() {
-            self.edit_buffer.remove(byte_pos);
-            self.edit_dirty = true;
-        }
-    }
-
-    /// Move cursor left
-    fn edit_cursor_left(&mut self) {
-        if self.edit_cursor_col > 0 {
-            self.edit_cursor_col -= 1;
-        } else if self.edit_cursor_line > 0 {
-            self.edit_cursor_line -= 1;
-            self.edit_cursor_col = self.current_edit_line().chars().count();
-        }
-    }
-
-    /// Move cursor right
-    fn edit_cursor_right(&mut self) {
-        let line_len = self.current_edit_line().chars().count();
-        if self.edit_cursor_col < line_len {
-            self.edit_cursor_col += 1;
-        } else if self.edit_cursor_line < self.edit_line_count().saturating_sub(1) {
-            self.edit_cursor_line += 1;
-            self.edit_cursor_col = 0;
-        }
-    }
-
-    /// Move cursor up
-    fn edit_cursor_up(&mut self) {
-        if self.edit_cursor_line > 0 {
-            self.edit_cursor_line -= 1;
-            // Clamp column to line length
-            let line_len = self.current_edit_line().chars().count();
-            self.edit_cursor_col = self.edit_cursor_col.min(line_len);
-        }
-    }
-
-    /// Move cursor down
-    fn edit_cursor_down(&mut self) {
-        let line_count = self.edit_line_count();
-        if self.edit_cursor_line < line_count.saturating_sub(1) {
-            self.edit_cursor_line += 1;
-            // Clamp column to line length
-            let line_len = self.current_edit_line().chars().count();
-            self.edit_cursor_col = self.edit_cursor_col.min(line_len);
-        }
-    }
-
-    /// Move cursor to start of line
-    fn edit_cursor_home(&mut self) {
-        self.edit_cursor_col = 0;
-    }
-
-    /// Move cursor to end of line
-    fn edit_cursor_end(&mut self) {
-        self.edit_cursor_col = self.current_edit_line().chars().count();
-    }
-
-    /// Calculate byte position from line/col
-    fn cursor_byte_position(&self) -> usize {
-        let mut byte_pos = 0;
-        for (line_idx, line) in self.edit_buffer.lines().enumerate() {
-            if line_idx == self.edit_cursor_line {
-                // Add bytes up to cursor column
-                for (col, c) in line.chars().enumerate() {
-                    if col >= self.edit_cursor_col {
-                        break;
-                    }
-                    byte_pos += c.len_utf8();
-                }
-                return byte_pos;
-            }
-            byte_pos += line.len() + 1; // +1 for newline
-        }
-        self.edit_buffer.len()
-    }
-
-    /// Update scroll offset to keep cursor visible
-    fn edit_ensure_cursor_visible(&mut self, visible_lines: usize) {
-        if self.edit_cursor_line < self.edit_scroll_offset {
-            self.edit_scroll_offset = self.edit_cursor_line;
-        } else if self.edit_cursor_line >= self.edit_scroll_offset + visible_lines {
-            self.edit_scroll_offset = self.edit_cursor_line.saturating_sub(visible_lines) + 1;
-        }
-    }
-
-    fn load_children_for_node(&mut self, db: &Database, node_idx: usize) -> Result<(), String> {
-        if self.nodes[node_idx].children_loaded {
-            return Ok(());
-        }
-
-        let parent_id = self.nodes[node_idx].id.clone();
-        let children = db.get_children(&parent_id).map_err(|e| e.to_string())?;
-
-        // Insert children right after the parent node
-        let insert_pos = node_idx + 1;
-
-        for (i, child) in children.into_iter().enumerate() {
-            self.nodes.insert(insert_pos + i, TreeNode {
-                id: child.id.clone(),
-                parent_id: Some(parent_id.clone()),
-                title: child.ai_title.clone().unwrap_or(child.title.clone()),
-                emoji: child.emoji.clone(),
-                depth: child.depth,
-                child_count: child.child_count,
-                is_item: child.is_item,
-                is_expanded: false,
-                is_universe: false,
-                children_loaded: false,
-                created_at: child.created_at,
-                latest_child_date: child.latest_child_date,
-            });
-        }
-
-        self.nodes[node_idx].children_loaded = true;
-        Ok(())
-    }
-
-    fn update_visible_nodes(&mut self) {
-        self.visible_nodes.clear();
-
-        // With CD-style navigation, all direct children of current_root are at depth 0
-        // They are always visible. Only their expanded children need ancestor checking.
-
-        // Build set of expanded node IDs for quick lookup
-        let expanded_ids: std::collections::HashSet<String> = self.nodes.iter()
-            .filter(|n| n.is_expanded)
-            .map(|n| n.id.clone())
-            .collect();
-
-        for (idx, node) in self.nodes.iter().enumerate() {
-            // Depth 0 nodes are direct children of current root - always visible
-            if node.depth == 0 {
-                self.visible_nodes.push(idx);
-                continue;
-            }
-
-            // For deeper nodes, check if all ancestors are expanded
-            if self.is_ancestor_chain_expanded(idx, &expanded_ids) {
-                self.visible_nodes.push(idx);
-            }
-        }
-    }
-
-    fn is_ancestor_chain_expanded(&self, idx: usize, expanded_ids: &std::collections::HashSet<String>) -> bool {
-        let node = &self.nodes[idx];
-
-        // Check if parent is expanded
-        if let Some(ref parent_id) = node.parent_id {
-            // If parent is the current root, it's implicitly expanded
-            if *parent_id == self.current_root_id {
-                return true;
-            }
-
-            if !expanded_ids.contains(parent_id) {
-                return false;
-            }
-            // Recursively check parent's ancestors
-            for (i, n) in self.nodes.iter().enumerate() {
-                if n.id == *parent_id {
-                    return self.is_ancestor_chain_expanded(i, expanded_ids);
-                }
-            }
-        }
-        true
-    }
-
-    fn toggle_expand(&mut self, db: &Database) {
-        if let Some(selected) = self.list_state.selected() {
-            if selected < self.visible_nodes.len() {
-                let node_idx = self.visible_nodes[selected];
-                let node = &self.nodes[node_idx];
-
-                if !node.is_item && node.child_count > 0 {
-                    // Toggle expansion
-                    let was_expanded = self.nodes[node_idx].is_expanded;
-                    self.nodes[node_idx].is_expanded = !was_expanded;
-
-                    if !was_expanded {
-                        // Load children if not already loaded
-                        let _ = self.load_children_for_node(db, node_idx);
-                    }
-
-                    self.update_visible_nodes();
-
-                    // Adjust selection if needed (visible_nodes may have changed)
-                    if selected >= self.visible_nodes.len() {
-                        self.list_state.select(Some(self.visible_nodes.len().saturating_sub(1)));
-                    }
-                }
-            }
-        }
-    }
-
-    fn select_next(&mut self) {
-        if let Some(selected) = self.list_state.selected() {
-            if selected < self.visible_nodes.len().saturating_sub(1) {
-                self.list_state.select(Some(selected + 1));
-            }
-        }
-    }
-
-    fn select_prev(&mut self) {
-        if let Some(selected) = self.list_state.selected() {
-            if selected > 0 {
-                self.list_state.select(Some(selected - 1));
-            }
-        }
-    }
-
-    fn get_selected_node(&self, db: &Database) -> Option<Node> {
-        if let Some(selected) = self.list_state.selected() {
-            if selected < self.visible_nodes.len() {
-                let node_idx = self.visible_nodes[selected];
-                let tree_node = &self.nodes[node_idx];
-                return db.get_node(&tree_node.id).ok().flatten();
-            }
-        }
-        None
-    }
-}
-
-async fn run_tui(db: &Database) -> Result<(), String> {
-    // Setup terminal
-    enable_raw_mode().map_err(|e| e.to_string())?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).map_err(|e| e.to_string())?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
-
-    // Create app and load data
-    let mut app = TuiApp::new();
-    app.load_tree(db)?;
-    app.status_message = format!("Loaded {} nodes. Press ? for help, q to quit.", app.nodes.len());
-
-    // Main loop
-    let result = run_tui_loop(&mut terminal, &mut app, db);
-
-    // Restore terminal
-    disable_raw_mode().map_err(|e| e.to_string())?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    ).map_err(|e| e.to_string())?;
-    terminal.show_cursor().map_err(|e| e.to_string())?;
-
-    result
-}
-
-fn run_tui_loop(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    app: &mut TuiApp,
-    db: &Database,
-) -> Result<(), String> {
-    loop {
-        // Update selected node details (only in Navigation mode)
-        if app.mode == TuiMode::Navigation && !app.search_mode {
-            app.selected_node = app.get_selected_node(db);
-        }
-
-        // Draw UI
-        terminal.draw(|f| draw_ui(f, app)).map_err(|e| e.to_string())?;
-
-        // Handle input
-        if event::poll(std::time::Duration::from_millis(100)).map_err(|e| e.to_string())? {
-            if let Event::Key(key) = event::read().map_err(|e| e.to_string())? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-
-                // Handle search mode (overlay on Navigation)
-                if app.search_mode {
-                    match key.code {
-                        KeyCode::Esc => {
-                            app.search_mode = false;
-                            app.search_query.clear();
-                            app.status_message = "Search cancelled".to_string();
-                        }
-                        KeyCode::Enter => {
-                            app.search_mode = false;
-                            // Perform search
-                            if !app.search_query.is_empty() {
-                                if let Ok(results) = db.search_nodes(&app.search_query) {
-                                    app.status_message = format!("Found {} results for '{}'", results.len(), app.search_query);
-                                    app.search_results = results.clone();
-                                    // Jump to first result if found in current view
-                                    if let Some(first) = results.first() {
-                                        for (i, &idx) in app.visible_nodes.iter().enumerate() {
-                                            if app.nodes[idx].id == first.id {
-                                                app.list_state.select(Some(i));
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            app.search_query.clear();
-                        }
-                        KeyCode::Backspace => {
-                            app.search_query.pop();
-                        }
-                        KeyCode::Char(c) => {
-                            app.search_query.push(c);
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-
-                // Handle input based on current mode
-                match app.mode {
-                    TuiMode::Navigation => {
-                        match key.code {
-                            KeyCode::Char('q') => return Ok(()),
-
-                            // Tab: Cycle focus between Tree → Pins → Recents
-                            KeyCode::Tab => {
-                                app.nav_focus = match app.nav_focus {
-                                    NavFocus::Tree => NavFocus::Pins,
-                                    NavFocus::Pins => NavFocus::Recents,
-                                    NavFocus::Recents => NavFocus::Tree,
-                                };
-                                app.status_message = match app.nav_focus {
-                                    NavFocus::Tree => "Focus: Tree".to_string(),
-                                    NavFocus::Pins => "Focus: Pins".to_string(),
-                                    NavFocus::Recents => "Focus: Recents".to_string(),
-                                };
-                            }
-                            // Shift+Tab: Cycle focus in reverse
-                            KeyCode::BackTab => {
-                                app.nav_focus = match app.nav_focus {
-                                    NavFocus::Tree => NavFocus::Recents,
-                                    NavFocus::Pins => NavFocus::Tree,
-                                    NavFocus::Recents => NavFocus::Pins,
-                                };
-                                app.status_message = match app.nav_focus {
-                                    NavFocus::Tree => "Focus: Tree".to_string(),
-                                    NavFocus::Pins => "Focus: Pins".to_string(),
-                                    NavFocus::Recents => "Focus: Recents".to_string(),
-                                };
-                            }
-
-                            // j/k: Navigate in focused pane
-                            KeyCode::Char('j') | KeyCode::Down => {
-                                match app.nav_focus {
-                                    NavFocus::Tree => app.select_next(),
-                                    NavFocus::Pins => {
-                                        if !app.pinned_nodes.is_empty() {
-                                            app.pins_selected = (app.pins_selected + 1).min(app.pinned_nodes.len() - 1);
-                                        }
-                                    }
-                                    NavFocus::Recents => {
-                                        if !app.recent_nodes.is_empty() {
-                                            app.recents_selected = (app.recents_selected + 1).min(app.recent_nodes.len() - 1);
-                                        }
-                                    }
-                                }
-                            }
-                            KeyCode::Char('k') | KeyCode::Up => {
-                                match app.nav_focus {
-                                    NavFocus::Tree => app.select_prev(),
-                                    NavFocus::Pins => {
-                                        app.pins_selected = app.pins_selected.saturating_sub(1);
-                                    }
-                                    NavFocus::Recents => {
-                                        app.recents_selected = app.recents_selected.saturating_sub(1);
-                                    }
-                                }
-                            }
-
-                            // Enter: Action depends on focused pane
-                            KeyCode::Enter => {
-                                match app.nav_focus {
-                                    NavFocus::Tree => {
-                                        if let Some(selected) = app.list_state.selected() {
-                                            if selected < app.visible_nodes.len() {
-                                                let node_idx = app.visible_nodes[selected];
-                                                let node = &app.nodes[node_idx];
-
-                                                if node.is_item {
-                                                    let node_id = node.id.clone();
-                                                    if let Err(e) = app.enter_leaf_view(db, &node_id) {
-                                                        app.status_message = format!("Error: {}", e);
-                                                    }
-                                                } else if node.child_count > 0 {
-                                                    let node_id = node.id.clone();
-                                                    if let Err(e) = app.cd_into(db, &node_id) {
-                                                        app.status_message = format!("Error: {}", e);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    NavFocus::Pins => {
-                                        if app.pins_selected < app.pinned_nodes.len() {
-                                            let node = &app.pinned_nodes[app.pins_selected];
-                                            let node_id = node.id.clone();
-                                            let is_item = node.is_item;
-                                            if is_item {
-                                                if let Err(e) = app.enter_leaf_view(db, &node_id) {
-                                                    app.status_message = format!("Error: {}", e);
-                                                }
-                                            } else {
-                                                if let Err(e) = app.cd_into(db, &node_id) {
-                                                    app.status_message = format!("Error: {}", e);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    NavFocus::Recents => {
-                                        if app.recents_selected < app.recent_nodes.len() {
-                                            let node = &app.recent_nodes[app.recents_selected];
-                                            let node_id = node.id.clone();
-                                            let is_item = node.is_item;
-                                            if is_item {
-                                                if let Err(e) = app.enter_leaf_view(db, &node_id) {
-                                                    app.status_message = format!("Error: {}", e);
-                                                }
-                                            } else {
-                                                if let Err(e) = app.cd_into(db, &node_id) {
-                                                    app.status_message = format!("Error: {}", e);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // l/Right: Expand children inline (toggle) - only in Tree focus
-                            KeyCode::Char('l') | KeyCode::Right => {
-                                if app.nav_focus == NavFocus::Tree {
-                                    app.toggle_expand(db);
-                                }
-                            }
-
-                            // h/Left: Collapse children - only in Tree focus
-                            KeyCode::Char('h') | KeyCode::Left => {
-                                if app.nav_focus == NavFocus::Tree {
-                                    if let Some(selected) = app.list_state.selected() {
-                                        if selected < app.visible_nodes.len() {
-                                            let node_idx = app.visible_nodes[selected];
-                                            if app.nodes[node_idx].is_expanded {
-                                                app.nodes[node_idx].is_expanded = false;
-                                                app.update_visible_nodes();
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Backspace/-/Esc: Go up one level (cd ..)
-                            KeyCode::Backspace | KeyCode::Char('-') | KeyCode::Esc => {
-                                if let Err(e) = app.cd_up(db) {
-                                    app.status_message = format!("Error: {}", e);
-                                }
-                            }
-
-                            KeyCode::Char('/') => {
-                                app.search_mode = true;
-                                app.search_query.clear();
-                                app.status_message = "Search: ".to_string();
-                            }
-                            KeyCode::Char('?') => {
-                                app.status_message = "Tab:focus  Enter:cd/view  l:expand  h:collapse  -:up  /:search  q:quit".to_string();
-                            }
-                            KeyCode::Char('g') => {
-                                match app.nav_focus {
-                                    NavFocus::Tree => app.list_state.select(Some(0)),
-                                    NavFocus::Pins => app.pins_selected = 0,
-                                    NavFocus::Recents => app.recents_selected = 0,
-                                }
-                            }
-                            KeyCode::Char('G') => {
-                                match app.nav_focus {
-                                    NavFocus::Tree => {
-                                        if !app.visible_nodes.is_empty() {
-                                            app.list_state.select(Some(app.visible_nodes.len() - 1));
-                                        }
-                                    }
-                                    NavFocus::Pins => {
-                                        if !app.pinned_nodes.is_empty() {
-                                            app.pins_selected = app.pinned_nodes.len() - 1;
-                                        }
-                                    }
-                                    NavFocus::Recents => {
-                                        if !app.recent_nodes.is_empty() {
-                                            app.recents_selected = app.recent_nodes.len() - 1;
-                                        }
-                                    }
-                                }
-                            }
-                            KeyCode::Char('r') => {
-                                let _ = app.load_tree(db);
-                                app.status_message = format!("Reloaded {} nodes", app.nodes.len());
-                            }
-                            KeyCode::Char('p') => {
-                                // Toggle pin for selected node (works in any focus)
-                                if let Some(ref node) = app.selected_node {
-                                    let new_pinned = !node.is_pinned;
-                                    if db.set_node_pinned(&node.id, new_pinned).is_ok() {
-                                        app.pinned_nodes = db.get_pinned_nodes().unwrap_or_default();
-                                        app.status_message = if new_pinned {
-                                            format!("Pinned: {}", node.ai_title.as_ref().unwrap_or(&node.title))
-                                        } else {
-                                            format!("Unpinned: {}", node.ai_title.as_ref().unwrap_or(&node.title))
-                                        };
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    TuiMode::LeafView => {
-                        match key.code {
-                            // q/Esc: Back to navigation
-                            KeyCode::Char('q') | KeyCode::Esc => {
-                                app.exit_leaf_view();
-                            }
-
-                            // j/k: Scroll content OR navigate in sidebar based on focus
-                            KeyCode::Char('j') | KeyCode::Down => {
-                                match app.leaf_focus {
-                                    LeafFocus::Content => {
-                                        // Calculate visual line count for bounds checking
-                                        if let Some(content) = &app.leaf_content {
-                                            let size = terminal.size().unwrap_or(ratatui::layout::Rect::new(0, 0, 80, 24));
-                                            let visible_lines = size.height.saturating_sub(5) as usize;
-                                            // Content width: 60% of terminal - borders(2)
-                                            let content_width = ((size.width as usize * 60) / 100).saturating_sub(2).max(1);
-
-                                            // Calculate total visual lines after wrapping
-                                            let total_visual_lines: usize = content.lines()
-                                                .map(|line| {
-                                                    let len = line.chars().count();
-                                                    if len == 0 { 1 } else { (len + content_width - 1) / content_width }
-                                                })
-                                                .sum();
-
-                                            // Only scroll if there's more content below
-                                            let max_scroll = total_visual_lines.saturating_sub(visible_lines);
-                                            if (app.leaf_scroll_offset as usize) < max_scroll {
-                                                app.leaf_scroll_offset = app.leaf_scroll_offset.saturating_add(1);
-                                            }
-                                        }
-                                    }
-                                    LeafFocus::Similar => {
-                                        if !app.similar_nodes.is_empty() {
-                                            app.similar_selected = (app.similar_selected + 1).min(app.similar_nodes.len() - 1);
-                                        }
-                                    }
-                                    LeafFocus::Calls => {
-                                        if !app.calls_for_node.is_empty() {
-                                            app.calls_selected = (app.calls_selected + 1).min(app.calls_for_node.len() - 1);
-                                        }
-                                    }
-                                }
-                            }
-                            KeyCode::Char('k') | KeyCode::Up => {
-                                match app.leaf_focus {
-                                    LeafFocus::Content => {
-                                        app.leaf_scroll_offset = app.leaf_scroll_offset.saturating_sub(1);
-                                    }
-                                    LeafFocus::Similar => {
-                                        app.similar_selected = app.similar_selected.saturating_sub(1);
-                                    }
-                                    LeafFocus::Calls => {
-                                        app.calls_selected = app.calls_selected.saturating_sub(1);
-                                    }
-                                }
-                            }
-
-                            // Page down/up (only in Content focus)
-                            KeyCode::Char('d') => {
-                                if app.leaf_focus == LeafFocus::Content {
-                                    if let Some(content) = &app.leaf_content {
-                                        let size = terminal.size().unwrap_or(ratatui::layout::Rect::new(0, 0, 80, 24));
-                                        let visible_lines = size.height.saturating_sub(5) as usize;
-                                        let content_width = ((size.width as usize * 60) / 100).saturating_sub(2).max(1);
-
-                                        let total_visual_lines: usize = content.lines()
-                                            .map(|line| {
-                                                let len = line.chars().count();
-                                                if len == 0 { 1 } else { (len + content_width - 1) / content_width }
-                                            })
-                                            .sum();
-
-                                        let max_scroll = total_visual_lines.saturating_sub(visible_lines);
-                                        let new_offset = (app.leaf_scroll_offset as usize).saturating_add(visible_lines / 2).min(max_scroll);
-                                        app.leaf_scroll_offset = new_offset as u16;
-                                    }
-                                }
-                            }
-                            KeyCode::Char('u') => {
-                                if app.leaf_focus == LeafFocus::Content {
-                                    let size = terminal.size().unwrap_or(ratatui::layout::Rect::new(0, 0, 80, 24));
-                                    let visible_lines = size.height.saturating_sub(5) as usize;
-                                    app.leaf_scroll_offset = app.leaf_scroll_offset.saturating_sub(visible_lines as u16 / 2);
-                                }
-                            }
-
-                            // Tab: Cycle focus Content → Similar → Calls (if code node)
-                            KeyCode::Tab => {
-                                app.leaf_focus = match app.leaf_focus {
-                                    LeafFocus::Content => LeafFocus::Similar,
-                                    LeafFocus::Similar => {
-                                        // Only cycle to Calls if this is a code node with call edges
-                                        if app.is_code_node && !app.calls_for_node.is_empty() {
-                                            LeafFocus::Calls
-                                        } else {
-                                            LeafFocus::Content
-                                        }
-                                    }
-                                    LeafFocus::Calls => LeafFocus::Content,
-                                };
-                                app.status_message = match app.leaf_focus {
-                                    LeafFocus::Content => "Focus: Content".to_string(),
-                                    LeafFocus::Similar => "Focus: Similar".to_string(),
-                                    LeafFocus::Calls => "Focus: Calls".to_string(),
-                                };
-                            }
-                            // Shift+Tab: Cycle focus in reverse
-                            KeyCode::BackTab => {
-                                app.leaf_focus = match app.leaf_focus {
-                                    LeafFocus::Content => {
-                                        // Only cycle to Calls if this is a code node with call edges
-                                        if app.is_code_node && !app.calls_for_node.is_empty() {
-                                            LeafFocus::Calls
-                                        } else {
-                                            LeafFocus::Similar
-                                        }
-                                    }
-                                    LeafFocus::Similar => LeafFocus::Content,
-                                    LeafFocus::Calls => LeafFocus::Similar,
-                                };
-                                app.status_message = match app.leaf_focus {
-                                    LeafFocus::Content => "Focus: Content".to_string(),
-                                    LeafFocus::Similar => "Focus: Similar".to_string(),
-                                    LeafFocus::Calls => "Focus: Calls".to_string(),
-                                };
-                            }
-
-                            // n/N: Navigate similar nodes (quick access from any focus)
-                            KeyCode::Char('n') => {
-                                if !app.similar_nodes.is_empty() {
-                                    app.similar_selected = (app.similar_selected + 1) % app.similar_nodes.len();
-                                }
-                            }
-                            KeyCode::Char('N') => {
-                                if !app.similar_nodes.is_empty() {
-                                    app.similar_selected = if app.similar_selected == 0 {
-                                        app.similar_nodes.len() - 1
-                                    } else {
-                                        app.similar_selected - 1
-                                    };
-                                }
-                            }
-
-                            // Enter: Navigate to selected similar/call node
-                            KeyCode::Enter => {
-                                let target_id = match app.leaf_focus {
-                                    LeafFocus::Similar if !app.similar_nodes.is_empty() => {
-                                        Some(app.similar_nodes[app.similar_selected].id.clone())
-                                    }
-                                    LeafFocus::Calls if !app.calls_for_node.is_empty() => {
-                                        Some(app.calls_for_node[app.calls_selected].0.clone())
-                                    }
-                                    _ => None,
-                                };
-                                if let Some(id) = target_id {
-                                    app.exit_leaf_view();
-                                    if let Err(e) = app.enter_leaf_view(db, &id) {
-                                        app.status_message = format!("Error: {}", e);
-                                    }
-                                }
-                            }
-
-                            // e: Enter edit mode
-                            KeyCode::Char('e') => {
-                                app.enter_edit_mode();
-                            }
-
-                            // v: View PDF in external viewer
-                            KeyCode::Char('v') => {
-                                if let Some(ref node) = app.selected_node {
-                                    if node.pdf_available == Some(true) {
-                                        match db.get_paper_document(&node.id) {
-                                            Ok(Some((doc_data, format))) => {
-                                                let title = node.ai_title.as_ref().unwrap_or(&node.title);
-                                                let safe_name: String = title.chars()
-                                                    .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
-                                                    .take(50)
-                                                    .collect();
-                                                let safe_name = safe_name.trim().replace(' ', "_");
-
-                                                let temp_dir = std::env::temp_dir();
-                                                let file_path = temp_dir.join(format!("{}.{}", safe_name, format));
-
-                                                match std::fs::File::create(&file_path) {
-                                                    Ok(mut file) => {
-                                                        if let Err(e) = file.write_all(&doc_data) {
-                                                            app.status_message = format!("Failed to write temp file: {}", e);
-                                                        } else {
-                                                            #[cfg(target_os = "linux")]
-                                                            let result = std::process::Command::new("xdg-open")
-                                                                .arg(&file_path)
-                                                                .spawn();
-                                                            #[cfg(target_os = "macos")]
-                                                            let result = std::process::Command::new("open")
-                                                                .arg(&file_path)
-                                                                .spawn();
-                                                            #[cfg(target_os = "windows")]
-                                                            let result = std::process::Command::new("cmd")
-                                                                .args(["/C", "start", "", &file_path.to_string_lossy()])
-                                                                .spawn();
-
-                                                            match result {
-                                                                Ok(_) => app.status_message = format!("Opening {}...", format.to_uppercase()),
-                                                                Err(e) => app.status_message = format!("Failed to open viewer: {}", e),
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(e) => app.status_message = format!("Failed to create temp file: {}", e),
-                                                }
-                                            }
-                                            Ok(None) => app.status_message = "PDF not available (not downloaded)".to_string(),
-                                            Err(e) => app.status_message = format!("Database error: {}", e),
-                                        }
-                                    } else {
-                                        app.status_message = "No PDF available for this paper".to_string();
-                                    }
-                                }
-                            }
-
-                            // o: Open URL in browser
-                            KeyCode::Char('o') => {
-                                if let Some(ref node) = app.selected_node {
-                                    if let Some(ref url) = node.url {
-                                        #[cfg(target_os = "linux")]
-                                        let result = std::process::Command::new("xdg-open")
-                                            .arg(url)
-                                            .spawn();
-                                        #[cfg(target_os = "macos")]
-                                        let result = std::process::Command::new("open")
-                                            .arg(url)
-                                            .spawn();
-                                        #[cfg(target_os = "windows")]
-                                        let result = std::process::Command::new("cmd")
-                                            .args(["/C", "start", "", url])
-                                            .spawn();
-
-                                        match result {
-                                            Ok(_) => app.status_message = format!("Opening {}...", url),
-                                            Err(e) => app.status_message = format!("Failed to open browser: {}", e),
-                                        }
-                                    } else {
-                                        app.status_message = "No URL available for this node".to_string();
-                                    }
-                                }
-                            }
-
-                            KeyCode::Char('?') => {
-                                app.status_message = "Tab:focus  j/k:nav  v:pdf  o:url  e:edit  n/N:similar  Enter:goto  q:back".to_string();
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    TuiMode::Edit => {
-                        use crossterm::event::KeyModifiers;
-
-                        match key.code {
-                            // Ctrl+S: Save
-                            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                if let Err(e) = app.save_edit(db) {
-                                    app.status_message = format!("Save error: {}", e);
-                                }
-                            }
-
-                            // Esc: Cancel edit
-                            KeyCode::Esc => {
-                                app.cancel_edit();
-                            }
-
-                            // Arrow keys: Move cursor
-                            KeyCode::Left => app.edit_cursor_left(),
-                            KeyCode::Right => app.edit_cursor_right(),
-                            KeyCode::Up => app.edit_cursor_up(),
-                            KeyCode::Down => app.edit_cursor_down(),
-
-                            // Home/End: Jump to line start/end
-                            KeyCode::Home => app.edit_cursor_home(),
-                            KeyCode::End => app.edit_cursor_end(),
-
-                            // Backspace: Delete character before cursor
-                            KeyCode::Backspace => app.edit_backspace(),
-
-                            // Delete: Delete character at cursor
-                            KeyCode::Delete => app.edit_delete(),
-
-                            // Enter: Insert newline
-                            KeyCode::Enter => app.edit_insert_char('\n'),
-
-                            // Tab: Insert 4 spaces (or actual tab)
-                            KeyCode::Tab => {
-                                for _ in 0..4 {
-                                    app.edit_insert_char(' ');
-                                }
-                            }
-
-                            // Regular character input
-                            KeyCode::Char(c) => {
-                                app.edit_insert_char(c);
-                            }
-
-                            _ => {}
-                        }
-
-                        // Keep cursor visible (estimate ~20 visible lines)
-                        let visible_lines = 20;
-                        app.edit_ensure_cursor_visible(visible_lines);
-
-                        // Update status with cursor position
-                        let dirty_marker = if app.edit_dirty { " [modified]" } else { "" };
-                        app.status_message = format!(
-                            "Edit mode: Ln {}, Col {} {} | Ctrl+S save, Esc cancel",
-                            app.edit_cursor_line + 1,
-                            app.edit_cursor_col + 1,
-                            dirty_marker
-                        );
-                    }
-
-                    // Other modes (Maintenance, Settings, Jobs) - placeholder
-                    _ => {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => {
-                                app.mode = TuiMode::Navigation;
-                                app.status_message = "Back to navigation".to_string();
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn draw_ui(f: &mut Frame, app: &TuiApp) {
-    match app.mode {
-        TuiMode::Navigation => draw_navigation_mode(f, app),
-        TuiMode::LeafView => draw_leaf_view_mode(f, app),
-        TuiMode::Edit => draw_edit_mode(f, app),
-        _ => draw_navigation_mode(f, app), // Fallback for unimplemented modes
-    }
-}
-
-fn draw_navigation_mode(f: &mut Frame, app: &TuiApp) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),  // Breadcrumb bar
-            Constraint::Min(0),     // Main content
-            Constraint::Length(1),  // Status bar
-        ])
-        .split(f.size());
-
-    // Breadcrumb bar
-    draw_breadcrumb(f, app, chunks[0]);
-
-    // 3-column layout: Tree (50%) | Pins+Recents (25%) | Preview (25%)
-    let main_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(50),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-        ])
-        .split(chunks[1]);
-
-    // Tree view
-    draw_tree(f, app, main_chunks[0]);
-
-    // Pins + Recents pane
-    draw_pins_recents(f, app, main_chunks[1]);
-
-    // Preview pane
-    draw_preview(f, app, main_chunks[2]);
-
-    // Status bar
-    let status = if app.search_mode {
-        format!("Search: {}_", app.search_query)
-    } else {
-        app.status_message.clone()
-    };
-    let status_bar = Paragraph::new(status)
-        .style(Style::default().bg(Color::DarkGray).fg(Color::White));
-    f.render_widget(status_bar, chunks[2]);
-}
-
-fn draw_pins_recents(f: &mut Frame, app: &TuiApp, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(50),  // Pinned
-            Constraint::Percentage(50),  // Recent
-        ])
-        .split(area);
-
-    // Border styles based on focus
-    let pins_border = if app.nav_focus == NavFocus::Pins {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let recents_border = if app.nav_focus == NavFocus::Recents {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    // Pinned nodes with selection highlight
-    let pinned_items: Vec<ListItem> = app.pinned_nodes.iter().enumerate().take(10).map(|(i, node)| {
-        let emoji = node.emoji.as_deref().unwrap_or("📌");
-        let title = node.ai_title.as_ref().unwrap_or(&node.title);
-        let truncated = if title.len() > 20 {
-            format!("{}...", &title[..17])
-        } else {
-            title.clone()
-        };
-        let content = format!("{} {}", emoji, truncated);
-
-        // Highlight selected item when Pins pane is focused
-        if app.nav_focus == NavFocus::Pins && i == app.pins_selected {
-            ListItem::new(content).style(Style::default().bg(Color::Blue).fg(Color::White))
-        } else {
-            ListItem::new(content)
-        }
-    }).collect();
-
-    let pinned_list = List::new(pinned_items)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_style(pins_border)
-            .title(format!(" 📌 Pinned ({}) ", app.pinned_nodes.len())));
-    f.render_widget(pinned_list, chunks[0]);
-
-    // Recent nodes with selection highlight
-    let recent_items: Vec<ListItem> = app.recent_nodes.iter().enumerate().take(10).map(|(i, node)| {
-        let emoji = node.emoji.as_deref().unwrap_or("📄");
-        let title = node.ai_title.as_ref().unwrap_or(&node.title);
-        let truncated = if title.len() > 20 {
-            format!("{}...", &title[..17])
-        } else {
-            title.clone()
-        };
-        let content = format!("{} {}", emoji, truncated);
-
-        // Highlight selected item when Recents pane is focused
-        if app.nav_focus == NavFocus::Recents && i == app.recents_selected {
-            ListItem::new(content).style(Style::default().bg(Color::Blue).fg(Color::White))
-        } else {
-            ListItem::new(content)
-        }
-    }).collect();
-
-    let recent_list = List::new(recent_items)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_style(recents_border)
-            .title(format!(" 🕐 Recent ({}) ", app.recent_nodes.len())));
-    f.render_widget(recent_list, chunks[1]);
-}
-
-fn draw_preview(f: &mut Frame, app: &TuiApp, area: Rect) {
-    let content = if let Some(ref node) = app.selected_node {
-        let emoji = node.emoji.as_deref().unwrap_or("");
-        let title = node.ai_title.as_ref().unwrap_or(&node.title);
-        let node_type = if node.is_item { "Item" } else { "Category" };
-
-        let mut lines = vec![
-            Line::from(vec![
-                Span::styled(emoji, Style::default()),
-                Span::raw(" "),
-                Span::styled(title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("Type: ", Style::default().fg(Color::Yellow)),
-                Span::raw(node_type),
-            ]),
-            Line::from(vec![
-                Span::styled("Children: ", Style::default().fg(Color::Yellow)),
-                Span::raw(node.child_count.to_string()),
-            ]),
-        ];
-
-        // Add date (use derived date for clusters, own date for items)
-        let effective_date = node.latest_child_date.unwrap_or(node.created_at);
-        let date_str = format_date_time(effective_date);
-        let date_color = date_color(effective_date, app.date_min, app.date_max);
-        lines.push(Line::from(vec![
-            Span::styled("Date: ", Style::default().fg(Color::Yellow)),
-            Span::styled(date_str, Style::default().fg(date_color)),
-        ]));
-
-        // Add tags if present
-        if let Some(ref tags) = node.tags {
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled("Tags: ", Style::default().fg(Color::Cyan)),
-            ]));
-            // Wrap tags
-            for chunk in tags.chars().collect::<Vec<_>>().chunks(25) {
-                lines.push(Line::from(chunk.iter().collect::<String>()));
-            }
-        }
-
-        // Add summary if present
-        if let Some(ref summary) = node.summary {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("Summary:", Style::default().fg(Color::Magenta))));
-            // Wrap summary
-            let preview = if summary.len() > 500 {
-                format!("{}...", &summary[..497])
-            } else {
-                summary.clone()
-            };
-            for chunk in preview.chars().collect::<Vec<_>>().chunks(45) {
-                lines.push(Line::from(chunk.iter().collect::<String>()));
-            }
-        }
-
-        Text::from(lines)
-    } else {
-        Text::from("No node selected")
-    };
-
-    let preview = Paragraph::new(content)
-        .block(Block::default().borders(Borders::ALL).title(" Preview "))
-        .wrap(Wrap { trim: false });
-
-    f.render_widget(preview, area);
-}
-
-fn draw_breadcrumb(f: &mut Frame, app: &TuiApp, area: Rect) {
-    let mut spans = vec![Span::styled(" ", Style::default().bg(Color::Rgb(40, 40, 60)))];
-
-    for (i, (_, title)) in app.breadcrumb_path.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" > ", Style::default().fg(Color::DarkGray).bg(Color::Rgb(40, 40, 60))));
-        }
-
-        let style = if i == app.breadcrumb_path.len() - 1 {
-            // Current location (highlighted)
-            Style::default().fg(Color::Cyan).bg(Color::Rgb(40, 40, 60)).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Gray).bg(Color::Rgb(40, 40, 60))
-        };
-
-        // Truncate long titles
-        let display_title = if title.len() > 20 {
-            format!("{}...", &title[..17])
-        } else {
-            title.clone()
-        };
-        spans.push(Span::styled(display_title, style));
-    }
-
-    // Add hint for going back
-    if app.breadcrumb_path.len() > 1 {
-        spans.push(Span::styled(
-            "   [Esc/Backspace: up]",
-            Style::default().fg(Color::DarkGray).bg(Color::Rgb(40, 40, 60))
-        ));
-    }
-
-    let breadcrumb = Paragraph::new(Line::from(spans))
-        .style(Style::default().bg(Color::Rgb(40, 40, 60)));
-    f.render_widget(breadcrumb, area);
-}
-
-fn draw_leaf_view_mode(f: &mut Frame, app: &TuiApp) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),  // Header
-            Constraint::Min(0),     // Main content
-            Constraint::Length(1),  // Status bar
-        ])
-        .split(f.size());
-
-    // Header with title and back hint
-    let title = if let Some(ref node) = app.selected_node {
-        let emoji = node.emoji.as_deref().unwrap_or("");
-        let title = node.ai_title.as_ref().unwrap_or(&node.title);
-        format!("{} {} ", emoji, title)
-    } else {
-        "Content".to_string()
-    };
-
-    let header = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled(" ← [q/Esc] Back", Style::default().fg(Color::Yellow)),
-            Span::raw("   "),
-            Span::styled(&title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        ]),
-    ])
-    .style(Style::default().bg(Color::Rgb(30, 30, 50)));
-    f.render_widget(header, chunks[0]);
-
-    // Main content area: Content (60%) | Sidebar (40%)
-    let main_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(60),
-            Constraint::Percentage(40),
-        ])
-        .split(chunks[1]);
-
-    // Content pane
-    draw_leaf_content(f, app, main_chunks[0]);
-
-    // Sidebar
-    draw_leaf_sidebar(f, app, main_chunks[1]);
-
-    // Status bar
-    let status_bar = Paragraph::new(&*app.status_message)
-        .style(Style::default().bg(Color::DarkGray).fg(Color::White));
-    f.render_widget(status_bar, chunks[2]);
-}
-
-fn draw_leaf_content(f: &mut Frame, app: &TuiApp, area: Rect) {
-    let content = app.leaf_content.as_deref().unwrap_or("No content");
-
-    let border_style = if app.leaf_focus == LeafFocus::Content {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    let scroll_info = format!(" Content (line {}) ", app.leaf_scroll_offset + 1);
-
-    // Use Paragraph's native scroll - this handles wrapped text properly
-    // by scrolling visual lines, not raw newline-separated lines
-    let paragraph = Paragraph::new(content)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_style(border_style)
-            .title(scroll_info))
-        .wrap(Wrap { trim: false })
-        .scroll((app.leaf_scroll_offset, 0));
-
-    f.render_widget(paragraph, area);
-}
-
-fn draw_leaf_sidebar(f: &mut Frame, app: &TuiApp, area: Rect) {
-    // Only show Calls section for code nodes with call edges
-    let show_calls = app.is_code_node && !app.calls_for_node.is_empty();
-
-    let chunks = if show_calls {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(50),  // Similar nodes
-                Constraint::Percentage(50),  // Calls
-            ])
-            .split(area)
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(100)])  // Only Similar
-            .split(area)
-    };
-
-    // Border style for Similar section
-    let similar_border = if app.leaf_focus == LeafFocus::Similar {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    // Similar nodes section with selection highlight
-    // Calculate min/max for normalization (like GraphCanvas.tsx line 346)
-    let (min_sim, max_sim) = if app.similar_nodes.is_empty() {
-        (0.5, 1.0)
-    } else {
-        let min = app.similar_nodes.iter().map(|s| s.similarity).fold(f32::MAX, f32::min);
-        let max = app.similar_nodes.iter().map(|s| s.similarity).fold(f32::MIN, f32::max);
-        (min as f64, max as f64)
-    };
-
-    // Calculate available width for titles (area width - borders - emoji - percentage - spaces)
-    let available_width = area.width.saturating_sub(2 + 2 + 5) as usize; // borders + emoji + " XX%"
-    let title_max_len = available_width.saturating_sub(2).max(10); // at least 10 chars
-
-    let similar_items: Vec<ListItem> = app.similar_nodes.iter().enumerate().map(|(i, sim)| {
-        let emoji = sim.emoji.as_deref().unwrap_or("📄");
-        let similarity_pct = (sim.similarity * 100.0) as i32;
-        // Normalized gradient: spreads colors across visible range (red→yellow | blue→cyan)
-        let color = similarity_color_normalized(sim.similarity as f64, min_sim, max_sim);
-
-        let truncated_title = utils::safe_truncate(&sim.title, title_max_len);
-        let content = format!("{} {} {}%", emoji, truncated_title, similarity_pct);
-
-        // Highlight selected item when Similar section is focused
-        if i == app.similar_selected && app.leaf_focus == LeafFocus::Similar {
-            ListItem::new(Span::styled(content, Style::default().bg(Color::Blue).fg(Color::White)))
-        } else {
-            ListItem::new(Span::styled(content, Style::default().fg(color)))
-        }
-    }).collect();
-
-    let similar_list = List::new(similar_items)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_style(similar_border)
-            .title(format!(" Similar ({}) ", app.similar_nodes.len())));
-    f.render_widget(similar_list, chunks[0]);
-
-    // Calls section - only shown for code nodes with call edges
-    if show_calls {
-        let calls_border = if app.leaf_focus == LeafFocus::Calls {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-
-        // Calculate available width for call titles (area width - borders - arrow - space)
-        let calls_title_max = area.width.saturating_sub(2 + 2 + 1) as usize; // borders + "→ "
-
-        let call_items: Vec<ListItem> = app.calls_for_node.iter().enumerate().map(|(i, (_, title, is_outgoing))| {
-            // Direction indicator: → for outgoing (calls), ← for incoming (called by)
-            let arrow = if *is_outgoing { "→" } else { "←" };
-            let truncated_title = utils::safe_truncate(title, calls_title_max.max(10));
-            let content = format!("{} {}", arrow, truncated_title);
-
-            // Highlight selected item when Calls section is focused
-            if i == app.calls_selected && app.leaf_focus == LeafFocus::Calls {
-                ListItem::new(Span::styled(content, Style::default().bg(Color::Blue).fg(Color::White)))
-            } else {
-                // Color by direction: outgoing = green, incoming = yellow
-                let color = if *is_outgoing { Color::Green } else { Color::Yellow };
-                ListItem::new(Span::styled(content, Style::default().fg(color)))
-            }
-        }).collect();
-
-        let calls_list = List::new(call_items)
-            .block(Block::default()
-                .borders(Borders::ALL)
-                .border_style(calls_border)
-                .title(format!(" Calls ({}) ", app.calls_for_node.len())));
-        f.render_widget(calls_list, chunks[1]);
-    }
-}
-
-fn draw_edit_mode(f: &mut Frame, app: &TuiApp) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),  // Header
-            Constraint::Min(0),     // Editor
-            Constraint::Length(1),  // Status bar
-        ])
-        .split(f.size());
-
-    // Header with title and mode indicator
-    let title = if let Some(ref node) = app.selected_node {
-        let emoji = node.emoji.as_deref().unwrap_or("");
-        let title = node.ai_title.as_ref().unwrap_or(&node.title);
-        format!("{} {} ", emoji, title)
-    } else {
-        "Editing".to_string()
-    };
-
-    let dirty_indicator = if app.edit_dirty { " [modified]" } else { "" };
-    let header = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled(" ✏️  EDIT MODE", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(dirty_indicator, Style::default().fg(Color::Red)),
-            Span::raw("   "),
-            Span::styled(&title, Style::default().fg(Color::White)),
-        ]),
-    ])
-    .style(Style::default().bg(Color::Rgb(50, 30, 30)));
-    f.render_widget(header, chunks[0]);
-
-    // Calculate visible area for the editor
-    let editor_area = chunks[1];
-    let inner_height = editor_area.height.saturating_sub(2) as usize; // Account for borders
-
-    // Build editor lines with line numbers and cursor
-    let lines: Vec<&str> = app.edit_buffer.lines().collect();
-    let total_lines = lines.len().max(1);
-
-    // Calculate line number width (for alignment)
-    let line_num_width = total_lines.to_string().len();
-
-    // Build styled lines
-    let mut styled_lines: Vec<Line> = Vec::new();
-
-    // Handle empty buffer case
-    if app.edit_buffer.is_empty() {
-        let line_num = format!("{:>width$} │ ", 1, width = line_num_width);
-        styled_lines.push(Line::from(vec![
-            Span::styled(line_num, Style::default().fg(Color::DarkGray)),
-            Span::styled("█", Style::default().bg(Color::White).fg(Color::Black)), // Cursor
-        ]));
-    } else {
-        for (line_idx, line_content) in lines.iter().enumerate() {
-            // Skip lines before scroll offset
-            if line_idx < app.edit_scroll_offset {
-                continue;
-            }
-            // Stop if we've filled the visible area
-            if styled_lines.len() >= inner_height {
-                break;
-            }
-
-            let line_num = format!("{:>width$} │ ", line_idx + 1, width = line_num_width);
-            let is_cursor_line = line_idx == app.edit_cursor_line;
-
-            if is_cursor_line {
-                // Build line with cursor
-                let chars: Vec<char> = line_content.chars().collect();
-                let mut spans = vec![
-                    Span::styled(line_num, Style::default().fg(Color::Yellow)),
-                ];
-
-                // Characters before cursor
-                if app.edit_cursor_col > 0 {
-                    let before: String = chars[..app.edit_cursor_col.min(chars.len())].iter().collect();
-                    spans.push(Span::raw(before));
-                }
-
-                // Cursor character (or space if at end of line)
-                if app.edit_cursor_col < chars.len() {
-                    let cursor_char = chars[app.edit_cursor_col].to_string();
-                    spans.push(Span::styled(cursor_char, Style::default().bg(Color::White).fg(Color::Black)));
-                } else {
-                    // Cursor at end of line
-                    spans.push(Span::styled(" ", Style::default().bg(Color::White).fg(Color::Black)));
-                }
-
-                // Characters after cursor
-                if app.edit_cursor_col + 1 < chars.len() {
-                    let after: String = chars[app.edit_cursor_col + 1..].iter().collect();
-                    spans.push(Span::raw(after));
-                }
-
-                styled_lines.push(Line::from(spans));
-            } else {
-                // Regular line without cursor
-                styled_lines.push(Line::from(vec![
-                    Span::styled(line_num, Style::default().fg(Color::DarkGray)),
-                    Span::raw(*line_content),
-                ]));
-            }
-        }
-    }
-
-    // Editor pane
-    let scroll_info = format!(
-        " Editor - Ln {}/{}, Col {} ",
-        app.edit_cursor_line + 1,
-        total_lines,
-        app.edit_cursor_col + 1
-    );
-
-    let editor = Paragraph::new(styled_lines)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
-            .title(scroll_info))
-        .wrap(Wrap { trim: false });
-    f.render_widget(editor, editor_area);
-
-    // Status bar with keybindings
-    let status_bar = Paragraph::new(&*app.status_message)
-        .style(Style::default().bg(Color::Rgb(60, 40, 40)).fg(Color::White));
-    f.render_widget(status_bar, chunks[2]);
-}
-
-fn draw_tree(f: &mut Frame, app: &TuiApp, area: Rect) {
-    // Fixed date width: "01 Jan 2020" = 11 chars
-    const DATE_WIDTH: usize = 11;
-    // Account for: borders (2), highlight symbol "→ " (3), separator space (1)
-    let usable_width = area.width.saturating_sub(6) as usize;
-    // Reserve space for date at the end
-    let title_max_width = usable_width.saturating_sub(DATE_WIDTH + 1);
-
-    let items: Vec<ListItem> = app.visible_nodes.iter().map(|&idx| {
-        let node = &app.nodes[idx];
-        let indent = "  ".repeat(node.depth as usize);
-
-        // Use emoji if available, otherwise default icons
-        let prefix = if node.is_item {
-            node.emoji.as_deref().unwrap_or("📄").to_string()
-        } else if node.is_expanded {
-            "▼".to_string()
-        } else if node.child_count > 0 {
-            node.emoji.as_deref().unwrap_or("▶").to_string()
-        } else {
-            node.emoji.as_deref().unwrap_or("○").to_string()
-        };
-
-        let count = if !node.is_item && node.child_count > 0 {
-            format!(" ({})", node.child_count)
-        } else {
-            String::new()
-        };
-
-        // Use effective date (derived from children for clusters, own date for items)
-        let effective_date = node.latest_child_date.unwrap_or(node.created_at);
-
-        // Calculate date color using graph-matching gradient (red=old → cyan=new)
-        let node_date_color = date_color(effective_date, app.date_min, app.date_max);
-
-        // Format date (date only, no time, for hierarchy view)
-        let date_str = format_date_only(effective_date);
-
-        // Build title with indent, prefix, title, and count
-        let full_title = format!("{}{} {}{}", indent, prefix, node.title, count);
-
-        // Truncate title if needed, accounting for unicode graphemes
-        let title_chars: Vec<char> = full_title.chars().collect();
-        let truncated_title = if title_chars.len() > title_max_width {
-            let truncate_at = title_max_width.saturating_sub(1);
-            let truncated: String = title_chars.iter().take(truncate_at).collect();
-            format!("{}…", truncated)
-        } else {
-            full_title
-        };
-
-        // Pad title to align dates (left-aligned dates at fixed position)
-        let display_width = truncated_title.chars().count();
-        let padding = title_max_width.saturating_sub(display_width);
-        let padded_title = format!("{}{}", truncated_title, " ".repeat(padding));
-
-        // Create styled content with colored date
-        let content = Line::from(vec![
-            Span::raw(padded_title),
-            Span::raw(" "),
-            Span::styled(date_str, Style::default().fg(node_date_color)),
-        ]);
-
-        ListItem::new(content)
-    }).collect();
-
-    // Border style based on focus
-    let border_style = if app.nav_focus == NavFocus::Tree {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    let tree = List::new(items)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_style(border_style)
-            .title(" Hierarchy "))
-        .highlight_style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD))
-        .highlight_symbol("→ ");
-
-    f.render_stateful_widget(tree, area, &mut app.list_state.clone());
-}
-
-/// Convert HSL to RGB Color
-fn hsl_to_color(hue: f64, saturation: f64, lightness: f64) -> Color {
-    let h = (hue % 360.0) / 360.0;
-    let s = saturation.clamp(0.0, 1.0);
-    let l = lightness.clamp(0.0, 1.0);
-
-    let (r, g, b) = if s == 0.0 {
-        let v = (l * 255.0) as u8;
-        (v, v, v)
-    } else {
-        let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
-        let p = 2.0 * l - q;
-
-        let hue_to_rgb = |p: f64, q: f64, mut t: f64| -> f64 {
-            if t < 0.0 { t += 1.0; }
-            if t > 1.0 { t -= 1.0; }
-            if t < 1.0 / 6.0 { return p + (q - p) * 6.0 * t; }
-            if t < 1.0 / 2.0 { return q; }
-            if t < 2.0 / 3.0 { return p + (q - p) * (2.0 / 3.0 - t) * 6.0; }
-            p
-        };
-
-        let r = (hue_to_rgb(p, q, h + 1.0 / 3.0) * 255.0) as u8;
-        let g = (hue_to_rgb(p, q, h) * 255.0) as u8;
-        let b = (hue_to_rgb(p, q, h - 1.0 / 3.0) * 255.0) as u8;
-        (r, g, b)
-    };
-
-    Color::Rgb(r, g, b)
-}
-
-/// Get similarity color with range normalization (like GraphCanvas.tsx line 346)
-/// Normalizes similarity to visible range, then applies two-segment gradient.
-/// RED (0°) → YELLOW (60°) | BLUE (210°) → CYAN (180°)
-fn similarity_color_normalized(similarity: f64, min_sim: f64, max_sim: f64) -> Color {
-    // Normalize to 0-1 based on visible range (exactly like graph edges)
-    let range = (max_sim - min_sim).max(0.01); // avoid div by zero
-    let t = ((similarity - min_sim) / range).clamp(0.0, 1.0);
-
-    // Two-segment gradient from getEdgeColor
-    let hue = if t < 0.5 {
-        t * 2.0 * 60.0              // RED (0°) → YELLOW (60°)
-    } else {
-        210.0 - (t - 0.5) * 2.0 * 30.0  // BLUE (210°) → CYAN (180°)
-    };
-
-    hsl_to_color(hue, 0.80, 0.50)
-}
-
-/// Get similarity color with default 0.5-1.0 range normalization
-fn similarity_color(similarity: f64) -> Color {
-    similarity_color_normalized(similarity, 0.5, 1.0)
-}
-
-/// Get date color using EXACT formula from GraphCanvas.tsx getDateColor
-/// RED (0°) → YELLOW (60°) at 50% | BLUE (210°) → CYAN (180°) at 100%
-/// NO GREEN anywhere. NO saturation tricks.
-fn date_color(timestamp: i64, min_date: i64, max_date: i64) -> Color {
-    if max_date <= min_date {
-        return Color::Gray;
-    }
-    let t = (timestamp - min_date) as f64 / (max_date - min_date) as f64;
-
-    // EXACT formula from GraphCanvas.tsx getEdgeColor (lines 160-168):
-    let hue = if t <= 0.5 {
-        t * 2.0 * 60.0              // 0→0°, 50%→60° (red to yellow)
-    } else {
-        210.0 - (t - 0.5) * 2.0 * 30.0  // 50%→210°, 100%→180° (blue to cyan)
-    };
-
-    // Match GraphStatusBar.tsx legend: hsl(h, 75%, 65%)
-    hsl_to_color(hue, 0.75, 0.65)
-}
-
-fn format_date_time(timestamp: i64) -> String {
-    // timestamp is in milliseconds; 0 = unknown date
-    if timestamp == 0 {
-        return "Unknown".to_string();
-    }
-    chrono::DateTime::from_timestamp_millis(timestamp)
-        .map(|dt| {
-            // Only show time if not midnight (papers only have dates, shown as 00:00)
-            if dt.hour() == 0 && dt.minute() == 0 {
-                dt.format("%d %b %Y").to_string()
-            } else {
-                dt.format("%d %b %Y %H:%M").to_string()
-            }
-        })
-        .unwrap_or_else(|| "Unknown".to_string())
-}
-
-/// Format date only (no time) - fixed width of 11 chars for alignment
-fn format_date_only(timestamp: i64) -> String {
-    // timestamp is in milliseconds; 0 = unknown date
-    if timestamp == 0 {
-        return "    Unknown".to_string(); // Pad to 11 chars
-    }
-    chrono::DateTime::from_timestamp_millis(timestamp)
-        .map(|dt| dt.format("%d %b %Y").to_string()) // Always 11 chars: "01 Jan 2020"
-        .unwrap_or_else(|| "    Unknown".to_string())
-}
-
-// ============================================================================
 // Utility Functions
 // ============================================================================
 
 /// Auto-discover project-specific database by walking up from current directory.
 /// Looks for .mycelica.db in each directory up to root.
-fn find_project_db() -> Option<PathBuf> {
+pub(crate) fn find_project_db() -> Option<PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
     loop {
         // Check for .mycelica.db in this directory
@@ -12058,7 +8698,7 @@ fn find_project_db() -> Option<PathBuf> {
     }
 }
 
-fn find_database() -> PathBuf {
+pub(crate) fn find_database() -> PathBuf {
     // 1. Auto-discover project-specific database (highest priority when in a repo)
     if let Some(project_db) = find_project_db() {
         return project_db;
@@ -12093,10 +8733,2232 @@ fn find_database() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("mycelica.db"))
 }
 
-fn escape_json(s: &str) -> String {
+pub(crate) fn escape_json(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_runs_list_limit_default_is_zero() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list",
+        ]).expect("should parse without --limit");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { limit, .. } } } => {
+                assert_eq!(limit, 0, "default limit should be 0 (no limit)");
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_limit_explicit_value() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--limit", "5",
+        ]).expect("should parse --limit 5");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { limit, .. } } } => {
+                assert_eq!(limit, 5);
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_limit_one() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--limit", "1",
+        ]).expect("should parse --limit 1");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { limit, .. } } } => {
+                assert_eq!(limit, 1);
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_format_compact() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--format", "compact",
+        ]).expect("should parse --format compact");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { format, .. } } } => {
+                assert!(matches!(format, DashboardFormat::Compact));
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_format_default_is_text() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list",
+        ]).expect("should parse without --format");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { format, .. } } } => {
+                assert!(matches!(format, DashboardFormat::Text), "default format should be text");
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_format_text_explicit() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--format", "text",
+        ]).expect("should parse --format text");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { format, .. } } } => {
+                assert!(matches!(format, DashboardFormat::Text));
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_format_json() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--format", "json",
+        ]).expect("should parse --format json");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { format, .. } } } => {
+                assert!(matches!(format, DashboardFormat::Json));
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_format_csv() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--format", "csv",
+        ]).expect("should parse --format csv");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { format, .. } } } => {
+                assert!(matches!(format, DashboardFormat::Csv));
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_format_invalid_value() {
+        let result = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--format", "xml",
+        ]);
+        assert!(result.is_err(), "invalid format value should fail");
+    }
+
+    #[test]
+    fn test_runs_list_format_compact_with_verbose() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--format", "compact", "--verbose",
+        ]).expect("should parse --format compact with --verbose");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { format, verbose, .. } } } => {
+                assert!(matches!(format, DashboardFormat::Compact));
+                assert!(verbose);
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_format_compact_combined_with_all_flags() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list",
+            "--format", "compact", "--all", "--cost", "--limit", "5",
+        ]).expect("should parse compact with all flags");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { format, all, cost, limit, .. } } } => {
+                assert!(matches!(format, DashboardFormat::Compact));
+                assert!(all);
+                assert!(cost);
+                assert_eq!(limit, 5);
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_dashboard_format_compact() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "dashboard", "--format", "compact",
+        ]).expect("should parse --format compact on dashboard");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Dashboard { format, .. } } => {
+                assert!(matches!(format, DashboardFormat::Compact));
+            }
+            _ => panic!("expected Spore > Dashboard"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_limit_invalid_not_a_number() {
+        let result = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--limit", "abc",
+        ]);
+        assert!(result.is_err(), "non-numeric --limit should fail");
+    }
+
+    #[test]
+    fn test_runs_list_limit_combined_with_other_flags() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--all", "--limit", "10", "--cost",
+        ]).expect("should parse --limit with --all and --cost");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { all, cost, limit, .. } } } => {
+                assert!(all);
+                assert!(cost);
+                assert_eq!(limit, 10);
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_limit_zero_preserves_all_rows() {
+        let rows: Vec<i32> = vec![1, 2, 3, 4, 5];
+        let limit: usize = 0;
+        let result: Vec<i32> = if limit > 0 {
+            rows.into_iter().take(limit).collect()
+        } else {
+            rows
+        };
+        assert_eq!(result, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_limit_truncates_to_n() {
+        let rows: Vec<i32> = vec![1, 2, 3, 4, 5];
+        let limit: usize = 3;
+        let result: Vec<i32> = if limit > 0 {
+            rows.into_iter().take(limit).collect()
+        } else {
+            rows
+        };
+        assert_eq!(result, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_limit_larger_than_rows_returns_all() {
+        let rows: Vec<i32> = vec![1, 2];
+        let limit: usize = 100;
+        let result: Vec<i32> = if limit > 0 {
+            rows.into_iter().take(limit).collect()
+        } else {
+            rows
+        };
+        assert_eq!(result, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_limit_on_empty_vec() {
+        let rows: Vec<i32> = vec![];
+        let limit: usize = 5;
+        let result: Vec<i32> = if limit > 0 {
+            rows.into_iter().take(limit).collect()
+        } else {
+            rows
+        };
+        assert!(result.is_empty());
+    }
+
+    // --- Tests for --cost flag on 'spore dashboard' ---
+
+    #[test]
+    fn test_dashboard_cost_flag_default_false() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "dashboard",
+        ]).expect("should parse without --cost");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Dashboard { cost, .. } } => {
+                assert!(!cost, "--cost should default to false");
+            }
+            _ => panic!("expected Spore > Dashboard"),
+        }
+    }
+
+    #[test]
+    fn test_dashboard_cost_flag_true() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "dashboard", "--cost",
+        ]).expect("should parse --cost");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Dashboard { cost, .. } } => {
+                assert!(cost, "--cost should be true when provided");
+            }
+            _ => panic!("expected Spore > Dashboard"),
+        }
+    }
+
+    #[test]
+    fn test_dashboard_cost_with_count_flag() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "dashboard", "--cost", "--count",
+        ]).expect("should parse --cost --count");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Dashboard { cost, count, .. } } => {
+                assert!(cost);
+                assert!(count);
+            }
+            _ => panic!("expected Spore > Dashboard"),
+        }
+    }
+
+    #[test]
+    fn test_dashboard_cost_with_format_json() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "dashboard", "--cost", "--format", "json",
+        ]).expect("should parse --cost --format json");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Dashboard { cost, format, .. } } => {
+                assert!(cost);
+                assert!(matches!(format, DashboardFormat::Json));
+            }
+            _ => panic!("expected Spore > Dashboard"),
+        }
+    }
+
+    #[test]
+    fn test_dashboard_cost_with_format_csv() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "dashboard", "--cost", "--format", "csv",
+        ]).expect("should parse --cost --format csv");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Dashboard { cost, format, .. } } => {
+                assert!(cost);
+                assert!(matches!(format, DashboardFormat::Csv));
+            }
+            _ => panic!("expected Spore > Dashboard"),
+        }
+    }
+
+    #[test]
+    fn test_dashboard_cost_with_limit() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "dashboard", "--cost", "--limit", "10",
+        ]).expect("should parse --cost --limit 10");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Dashboard { cost, limit, .. } } => {
+                assert!(cost);
+                assert_eq!(limit, 10);
+            }
+            _ => panic!("expected Spore > Dashboard"),
+        }
+    }
+
+    #[test]
+    fn test_dashboard_all_flags_combined() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "dashboard", "--cost", "--count", "--format", "json", "--limit", "3",
+        ]).expect("should parse all dashboard flags together");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Dashboard { cost, count, format, limit, .. } } => {
+                assert!(cost);
+                assert!(count);
+                assert!(matches!(format, DashboardFormat::Json));
+                assert_eq!(limit, 3);
+            }
+            _ => panic!("expected Spore > Dashboard"),
+        }
+    }
+
+    // --- Tests for --stale flag on 'spore dashboard' ---
+
+    #[test]
+    fn test_dashboard_stale_flag_default_false() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "dashboard",
+        ]).expect("should parse without --stale");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Dashboard { stale, .. } } => {
+                assert!(!stale, "--stale should default to false");
+            }
+            _ => panic!("expected Spore > Dashboard"),
+        }
+    }
+
+    #[test]
+    fn test_dashboard_stale_flag_true() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "dashboard", "--stale",
+        ]).expect("should parse --stale");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Dashboard { stale, .. } } => {
+                assert!(stale, "--stale should be true when provided");
+            }
+            _ => panic!("expected Spore > Dashboard"),
+        }
+    }
+
+    #[test]
+    fn test_dashboard_stale_with_cost_flag() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "dashboard", "--stale", "--cost",
+        ]).expect("should parse --stale --cost");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Dashboard { stale, cost, .. } } => {
+                assert!(stale);
+                assert!(cost);
+            }
+            _ => panic!("expected Spore > Dashboard"),
+        }
+    }
+
+    #[test]
+    fn test_dashboard_stale_with_count_flag() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "dashboard", "--stale", "--count",
+        ]).expect("should parse --stale --count");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Dashboard { stale, count, .. } } => {
+                assert!(stale);
+                assert!(count);
+            }
+            _ => panic!("expected Spore > Dashboard"),
+        }
+    }
+
+    #[test]
+    fn test_dashboard_stale_with_format_json() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "dashboard", "--stale", "--format", "json",
+        ]).expect("should parse --stale --format json");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Dashboard { stale, format, .. } } => {
+                assert!(stale);
+                assert!(matches!(format, DashboardFormat::Json));
+            }
+            _ => panic!("expected Spore > Dashboard"),
+        }
+    }
+
+    #[test]
+    fn test_dashboard_stale_with_format_csv() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "dashboard", "--stale", "--format", "csv",
+        ]).expect("should parse --stale --format csv");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Dashboard { stale, format, .. } } => {
+                assert!(stale);
+                assert!(matches!(format, DashboardFormat::Csv));
+            }
+            _ => panic!("expected Spore > Dashboard"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_status_filter_parses() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--status", "verified,escalated",
+        ]).expect("should parse --status verified,escalated");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { status, .. } } } => {
+                assert_eq!(status, Some("verified,escalated".to_string()));
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_status_filter_default_none() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list",
+        ]).expect("should parse without --status");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { status, .. } } } => {
+                assert_eq!(status, None);
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    // --- Tests for `spore runs list --duration` flag ---
+
+    #[test]
+    fn test_runs_list_duration_default_none() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list",
+        ]).expect("should parse without --duration");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { duration, .. } } } => {
+                assert_eq!(duration, None, "default duration should be None");
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_duration_explicit_value() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--duration", "120",
+        ]).expect("should parse --duration 120");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { duration, .. } } } => {
+                assert_eq!(duration, Some(120));
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_duration_invalid_not_a_number() {
+        let result = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--duration", "abc",
+        ]);
+        assert!(result.is_err(), "--duration abc should fail to parse");
+    }
+
+    #[test]
+    fn test_runs_list_duration_zero() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--duration", "0",
+        ]).expect("should parse --duration 0");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { duration, .. } } } => {
+                assert_eq!(duration, Some(0), "--duration 0 should be Some(0)");
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_duration_equals_syntax() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--duration=300",
+        ]).expect("should parse --duration=300 (equals syntax)");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { duration, .. } } } => {
+                assert_eq!(duration, Some(300));
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_duration_negative_rejected() {
+        let result = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--duration", "-10",
+        ]);
+        assert!(result.is_err(), "negative --duration should be rejected (u64 type)");
+    }
+
+    #[test]
+    fn test_runs_list_duration_combined_with_other_flags() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list",
+            "--duration", "120",
+            "--status", "verified",
+            "--since", "7d",
+            "--limit", "10",
+            "--format", "json",
+        ]).expect("should parse --duration combined with --status, --since, --limit, --format");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { duration, status, since, limit, format, .. } } } => {
+                assert_eq!(duration, Some(120));
+                assert_eq!(status, Some("verified".to_string()));
+                assert_eq!(since, Some("7d".to_string()));
+                assert_eq!(limit, 10);
+                assert!(matches!(format, DashboardFormat::Json));
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_duration_large_value() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--duration", "86400",
+        ]).expect("should parse --duration 86400 (24 hours)");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { duration, .. } } } => {
+                assert_eq!(duration, Some(86400));
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    /// Tests the duration filtering logic: seconds → milliseconds conversion
+    /// and comparison with `unwrap_or(0)` for missing duration values.
+    #[test]
+    fn test_duration_filter_logic() {
+        // Simulate the filtering logic from handle_runs (spore.rs ~line 2681)
+        struct FakeRun { total_duration_ms: Option<u64> }
+
+        let runs = vec![
+            FakeRun { total_duration_ms: Some(180_000) }, // 3 minutes
+            FakeRun { total_duration_ms: Some(60_000) },  // 1 minute
+            FakeRun { total_duration_ms: Some(300_000) }, // 5 minutes
+            FakeRun { total_duration_ms: None },          // unknown duration
+            FakeRun { total_duration_ms: Some(0) },       // zero duration
+        ];
+
+        // Filter: --duration 120 (2 minutes = 120_000ms)
+        let min_secs: u64 = 120;
+        let min_ms = min_secs * 1000;
+        let filtered: Vec<_> = runs.iter()
+            .filter(|r| r.total_duration_ms.unwrap_or(0) >= min_ms)
+            .collect();
+        assert_eq!(filtered.len(), 2, "only 3min and 5min runs should pass");
+        assert_eq!(filtered[0].total_duration_ms, Some(180_000));
+        assert_eq!(filtered[1].total_duration_ms, Some(300_000));
+
+        // Filter: --duration 0 (should pass everything since all >= 0)
+        let min_secs: u64 = 0;
+        let min_ms = min_secs * 1000;
+        let filtered: Vec<_> = runs.iter()
+            .filter(|r| r.total_duration_ms.unwrap_or(0) >= min_ms)
+            .collect();
+        assert_eq!(filtered.len(), 5, "--duration 0 should pass all runs");
+    }
+
+    /// Tests that runs with None duration are excluded by any non-zero filter,
+    /// since unwrap_or(0) < any positive threshold.
+    #[test]
+    fn test_duration_filter_excludes_none_duration() {
+        struct FakeRun { total_duration_ms: Option<u64> }
+
+        let runs = vec![
+            FakeRun { total_duration_ms: None },
+            FakeRun { total_duration_ms: None },
+            FakeRun { total_duration_ms: Some(1000) },
+        ];
+
+        let min_secs: u64 = 1; // 1 second = 1000ms
+        let min_ms = min_secs * 1000;
+        let filtered: Vec<_> = runs.iter()
+            .filter(|r| r.total_duration_ms.unwrap_or(0) >= min_ms)
+            .collect();
+        assert_eq!(filtered.len(), 1, "only the 1000ms run should pass; None durations should be excluded");
+        assert_eq!(filtered[0].total_duration_ms, Some(1000));
+    }
+
+    // --- Tests for `spore runs list --agent` flag ---
+
+    #[test]
+    fn test_runs_list_agent_full_name() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--agent", "spore:coder",
+        ]).expect("should parse --agent spore:coder");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { agent, .. } } } => {
+                assert_eq!(agent, Some("spore:coder".to_string()));
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    /// Tests the agent filtering logic: short name normalization and matching.
+    #[test]
+    fn test_agent_filter_logic() {
+        let agents_a = vec!["spore:coder".to_string(), "spore:verifier".to_string()];
+        let agents_b = vec!["spore:researcher".to_string()];
+        let agents_c: Vec<String> = vec![];
+
+        // Short name "coder" → matches "spore:coder"
+        let needle = format!("spore:{}", "coder");
+        assert!(agents_a.iter().any(|a| a.to_lowercase() == needle));
+        assert!(!agents_b.iter().any(|a| a.to_lowercase() == needle));
+        assert!(!agents_c.iter().any(|a| a.to_lowercase() == needle));
+
+        // Full name "spore:researcher" → matches directly
+        let needle = "spore:researcher".to_lowercase();
+        assert!(!agents_a.iter().any(|a| a.to_lowercase() == needle));
+        assert!(agents_b.iter().any(|a| a.to_lowercase() == needle));
+
+        // Case insensitive
+        let needle = format!("spore:{}", "Coder".to_lowercase());
+        assert!(agents_a.iter().any(|a| a.to_lowercase() == needle));
+    }
+
+    // --- Tests for `spore runs top --limit` flag ---
+
+    #[test]
+    fn test_runs_top_limit_default_is_five() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "top",
+        ]).expect("should parse without --limit");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::Top { limit } } } => {
+                assert_eq!(limit, 5, "default limit should be 5");
+            }
+            _ => panic!("expected Spore > Runs > Top"),
+        }
+    }
+
+    #[test]
+    fn test_runs_top_limit_explicit_value() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "top", "--limit", "10",
+        ]).expect("should parse --limit 10");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::Top { limit } } } => {
+                assert_eq!(limit, 10);
+            }
+            _ => panic!("expected Spore > Runs > Top"),
+        }
+    }
+
+    #[test]
+    fn test_runs_top_limit_one() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "top", "--limit", "1",
+        ]).expect("should parse --limit 1");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::Top { limit } } } => {
+                assert_eq!(limit, 1);
+            }
+            _ => panic!("expected Spore > Runs > Top"),
+        }
+    }
+
+    #[test]
+    fn test_runs_top_limit_invalid_not_a_number() {
+        let result = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "top", "--limit", "abc",
+        ]);
+        assert!(result.is_err(), "non-numeric --limit should fail");
+    }
+
+    #[test]
+    fn test_runs_top_limit_large_value() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "top", "--limit", "100",
+        ]).expect("should parse --limit 100");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::Top { limit } } } => {
+                assert_eq!(limit, 100);
+            }
+            _ => panic!("expected Spore > Runs > Top"),
+        }
+    }
+
+    #[test]
+    fn test_runs_top_limit_zero() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "top", "--limit", "0",
+        ]).expect("should parse --limit 0");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::Top { limit } } } => {
+                assert_eq!(limit, 0);
+            }
+            _ => panic!("expected Spore > Runs > Top"),
+        }
+    }
+
+    #[test]
+    fn test_runs_top_truncate_with_limit() {
+        // Simulates the truncate(limit) behavior in handle_runs Top handler
+        let mut entries = vec![5.0, 4.0, 3.0, 2.0, 1.0];
+        let limit: usize = 3;
+        entries.truncate(limit);
+        assert_eq!(entries, vec![5.0, 4.0, 3.0]);
+    }
+
+    #[test]
+    fn test_runs_top_truncate_with_default_limit() {
+        let mut entries = vec![10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0];
+        let limit: usize = 5; // default
+        entries.truncate(limit);
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries, vec![10.0, 9.0, 8.0, 7.0, 6.0]);
+    }
+
+    #[test]
+    fn test_runs_top_truncate_limit_larger_than_entries() {
+        let mut entries = vec![3.0, 2.0, 1.0];
+        let limit: usize = 10;
+        entries.truncate(limit);
+        assert_eq!(entries, vec![3.0, 2.0, 1.0], "should keep all when limit > count");
+    }
+
+    #[test]
+    fn test_runs_top_truncate_limit_zero_clears() {
+        let mut entries = vec![3.0, 2.0, 1.0];
+        let limit: usize = 0;
+        entries.truncate(limit);
+        assert!(entries.is_empty(), "truncate(0) should clear all entries");
+    }
+
+    #[test]
+    fn test_dashboard_all_flags_with_stale() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "dashboard", "--cost", "--count", "--stale", "--format", "json", "--limit", "3",
+        ]).expect("should parse all dashboard flags including --stale");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Dashboard { cost, count, stale, format, limit } } => {
+                assert!(cost);
+                assert!(count);
+                assert!(stale);
+                assert!(matches!(format, DashboardFormat::Json));
+                assert_eq!(limit, 3);
+            }
+            _ => panic!("expected Spore > Dashboard"),
+        }
+    }
+
+    // --- Tests for 'spore runs stats' subcommand ---
+
+    #[test]
+    fn test_runs_stats_parses() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "stats",
+        ]).expect("should parse 'spore runs stats'");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::Stats { .. } } } => {}
+            _ => panic!("expected Spore > Runs > Stats"),
+        }
+    }
+
+    #[test]
+    fn test_runs_stats_rejects_positional_args() {
+        let result = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "stats", "extra",
+        ]);
+        assert!(result.is_err(), "stats should not accept positional args");
+    }
+
+    // --- Tests for --agent flag on 'spore runs list' ---
+
+    #[test]
+    fn test_runs_list_agent_default_none() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list",
+        ]).expect("should parse without --agent");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { agent, .. } } } => {
+                assert!(agent.is_none(), "--agent should default to None");
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_agent_short_name() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--agent", "researcher",
+        ]).expect("should parse --agent researcher");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { agent, .. } } } => {
+                assert_eq!(agent, Some("researcher".to_string()));
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_agent_qualified_name() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--agent", "spore:coder",
+        ]).expect("should parse --agent spore:coder");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { agent, .. } } } => {
+                assert_eq!(agent, Some("spore:coder".to_string()));
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_agent_combined_with_other_flags() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list",
+            "--agent", "coder", "--limit", "5", "--cost", "--status", "verified",
+        ]).expect("should parse --agent with other flags");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { agent, limit, cost, status, .. } } } => {
+                assert_eq!(agent, Some("coder".to_string()));
+                assert_eq!(limit, 5);
+                assert!(cost);
+                assert_eq!(status, Some("verified".to_string()));
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_agent_requires_value() {
+        let result = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--agent",
+        ]);
+        assert!(result.is_err(), "--agent without a value should fail");
+    }
+
+    // --- Tests for agent filter normalization logic ---
+
+    #[test]
+    fn test_agent_filter_normalizes_short_name() {
+        // Replicates the normalization logic from handle_runs
+        let agent_name = "researcher";
+        let needle = if agent_name.contains(':') {
+            agent_name.to_lowercase()
+        } else {
+            format!("spore:{}", agent_name.to_lowercase())
+        };
+        assert_eq!(needle, "spore:researcher");
+    }
+
+    #[test]
+    fn test_agent_filter_preserves_qualified_name() {
+        let agent_name = "spore:coder";
+        let needle = if agent_name.contains(':') {
+            agent_name.to_lowercase()
+        } else {
+            format!("spore:{}", agent_name.to_lowercase())
+        };
+        assert_eq!(needle, "spore:coder");
+    }
+
+    #[test]
+    fn test_agent_filter_case_insensitive() {
+        let agent_name = "Researcher";
+        let needle = if agent_name.contains(':') {
+            agent_name.to_lowercase()
+        } else {
+            format!("spore:{}", agent_name.to_lowercase())
+        };
+        assert_eq!(needle, "spore:researcher");
+
+        // Simulates matching against agents list
+        let agents = vec!["spore:Researcher".to_string()];
+        let matches = agents.iter().any(|a| a.to_lowercase() == needle);
+        assert!(matches, "should match case-insensitively");
+    }
+
+    #[test]
+    fn test_agent_filter_qualified_case_insensitive() {
+        let agent_name = "Spore:Verifier";
+        let needle = if agent_name.contains(':') {
+            agent_name.to_lowercase()
+        } else {
+            format!("spore:{}", agent_name.to_lowercase())
+        };
+        assert_eq!(needle, "spore:verifier");
+    }
+
+    #[test]
+    fn test_agent_filter_matches_in_agents_list() {
+        let agent_filter = "coder";
+        let needle = if agent_filter.contains(':') {
+            agent_filter.to_lowercase()
+        } else {
+            format!("spore:{}", agent_filter.to_lowercase())
+        };
+
+        struct FakeRun { agents: Vec<String> }
+        let runs = vec![
+            FakeRun { agents: vec!["spore:coder".to_string(), "spore:verifier".to_string()] },
+            FakeRun { agents: vec!["spore:researcher".to_string()] },
+            FakeRun { agents: vec!["spore:coder".to_string()] },
+            FakeRun { agents: vec![] },
+        ];
+
+        let filtered: Vec<&FakeRun> = runs.iter().filter(|r| {
+            r.agents.iter().any(|a| a.to_lowercase() == needle)
+        }).collect();
+
+        assert_eq!(filtered.len(), 2, "should keep only runs with a matching agent");
+        assert!(filtered[0].agents.contains(&"spore:coder".to_string()));
+        assert!(filtered[1].agents.contains(&"spore:coder".to_string()));
+    }
+
+    #[test]
+    fn test_agent_filter_no_match_returns_empty() {
+        let agent_filter = "planner";
+        let needle = if agent_filter.contains(':') {
+            agent_filter.to_lowercase()
+        } else {
+            format!("spore:{}", agent_filter.to_lowercase())
+        };
+
+        struct FakeRun { agents: Vec<String> }
+        let runs = vec![
+            FakeRun { agents: vec!["spore:coder".to_string()] },
+            FakeRun { agents: vec!["spore:researcher".to_string()] },
+        ];
+
+        let filtered: Vec<&FakeRun> = runs.iter().filter(|r| {
+            r.agents.iter().any(|a| a.to_lowercase() == needle)
+        }).collect();
+
+        assert!(filtered.is_empty(), "no runs should match 'planner'");
+    }
+
+    #[test]
+    fn test_agent_filter_empty_agents_list() {
+        let agent_filter = "coder";
+        let needle = format!("spore:{}", agent_filter.to_lowercase());
+
+        struct FakeRun { agents: Vec<String> }
+        let runs = vec![
+            FakeRun { agents: vec![] },
+        ];
+
+        let filtered: Vec<&FakeRun> = runs.iter().filter(|r| {
+            r.agents.iter().any(|a| a.to_lowercase() == needle)
+        }).collect();
+
+        assert!(filtered.is_empty(), "run with no agents should not match");
+    }
+
+    #[test]
+    fn test_agent_filter_none_skips_filtering() {
+        // When --agent is not provided, all runs are kept
+        let agent_filter: Option<String> = None;
+
+        let runs = vec![1, 2, 3, 4, 5];
+        let result: Vec<i32> = if agent_filter.is_some() {
+            runs.into_iter().filter(|_| false).collect() // would filter
+        } else {
+            runs
+        };
+        assert_eq!(result.len(), 5, "None filter should keep all runs");
+    }
+
+    // --- Tests for agent filter edge cases (tester agent) ---
+
+    #[test]
+    fn test_agent_filter_partial_name_does_not_match() {
+        // "code" should NOT match "spore:coder" — exact match required
+        let agent_filter = "code";
+        let needle = format!("spore:{}", agent_filter.to_lowercase());
+        assert_eq!(needle, "spore:code");
+
+        struct FakeRun { agents: Vec<String> }
+        let runs = vec![
+            FakeRun { agents: vec!["spore:coder".to_string()] },
+        ];
+        let filtered: Vec<&FakeRun> = runs.iter().filter(|r| {
+            r.agents.iter().any(|a| a.to_lowercase() == needle)
+        }).collect();
+        assert!(filtered.is_empty(), "partial name 'code' must not match 'spore:coder'");
+    }
+
+    #[test]
+    fn test_agent_filter_non_spore_namespace() {
+        // "other:coder" should be preserved as-is (contains ':')
+        let agent_name = "other:coder";
+        let needle = if agent_name.contains(':') {
+            agent_name.to_lowercase()
+        } else {
+            format!("spore:{}", agent_name.to_lowercase())
+        };
+        assert_eq!(needle, "other:coder", "non-spore namespace should be preserved");
+
+        // It should not match spore:coder
+        let agents = vec!["spore:coder".to_string()];
+        assert!(!agents.iter().any(|a| a.to_lowercase() == needle));
+    }
+
+    #[test]
+    fn test_runs_list_agent_equals_syntax() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--agent=verifier",
+        ]).expect("should parse --agent=verifier");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { agent, .. } } } => {
+                assert_eq!(agent, Some("verifier".to_string()));
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_agent_with_all_flag() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--all", "--agent", "coder",
+        ]).expect("should parse --all --agent coder");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { all, agent, .. } } } => {
+                assert!(all);
+                assert_eq!(agent, Some("coder".to_string()));
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_agent_and_duration_filters_combined() {
+        // Both filters should apply: agent narrows by agent, duration narrows by time
+        struct FakeRun { agents: Vec<String>, total_duration_ms: Option<u64> }
+
+        let runs = vec![
+            FakeRun { agents: vec!["spore:coder".to_string()], total_duration_ms: Some(300_000) },
+            FakeRun { agents: vec!["spore:coder".to_string()], total_duration_ms: Some(30_000) },
+            FakeRun { agents: vec!["spore:researcher".to_string()], total_duration_ms: Some(300_000) },
+            FakeRun { agents: vec!["spore:researcher".to_string()], total_duration_ms: Some(30_000) },
+        ];
+
+        let needle = "spore:coder".to_string();
+        let min_ms: u64 = 120 * 1000;
+
+        // Apply duration filter first, then agent filter (mirrors handle_runs order)
+        let after_duration: Vec<&FakeRun> = runs.iter()
+            .filter(|r| r.total_duration_ms.unwrap_or(0) >= min_ms)
+            .collect();
+        assert_eq!(after_duration.len(), 2, "duration filter should keep 2 runs");
+
+        let after_agent: Vec<&&FakeRun> = after_duration.iter()
+            .filter(|r| r.agents.iter().any(|a| a.to_lowercase() == needle))
+            .collect();
+        assert_eq!(after_agent.len(), 1, "combined filters should keep only coder run with long duration");
+        assert!(after_agent[0].agents.contains(&"spore:coder".to_string()));
+        assert_eq!(after_agent[0].total_duration_ms, Some(300_000));
+    }
+
+    #[test]
+    fn test_agent_filter_multiple_agents_per_run() {
+        // A run with multiple agents should match if ANY agent matches
+        let needle = "spore:verifier".to_string();
+
+        struct FakeRun { agents: Vec<String> }
+        let runs = vec![
+            FakeRun { agents: vec![
+                "spore:coder".to_string(),
+                "spore:verifier".to_string(),
+                "spore:tester".to_string(),
+            ]},
+        ];
+
+        let filtered: Vec<&FakeRun> = runs.iter().filter(|r| {
+            r.agents.iter().any(|a| a.to_lowercase() == needle)
+        }).collect();
+        assert_eq!(filtered.len(), 1, "should match when verifier is one of multiple agents");
+    }
+
+    #[test]
+    fn test_runs_list_agent_with_duration_flag() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list",
+            "--agent", "tester", "--duration", "60",
+        ]).expect("should parse --agent with --duration");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { agent, duration, .. } } } => {
+                assert_eq!(agent, Some("tester".to_string()));
+                assert_eq!(duration, Some(60));
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    // --- Tests for 'spore runs timeline' subcommand ---
+
+    #[test]
+    fn test_runs_timeline_parses_run_id() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "timeline", "abc12345",
+        ]).expect("should parse timeline with run_id");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::Timeline { run_id } } } => {
+                assert_eq!(run_id, "abc12345");
+            }
+            _ => panic!("expected Spore > Runs > Timeline"),
+        }
+    }
+
+    #[test]
+    fn test_runs_timeline_parses_full_uuid() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "timeline",
+            "deb1da1e-391e-4216-9690-0ad0f8c88070",
+        ]).expect("should parse timeline with full UUID");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::Timeline { run_id } } } => {
+                assert_eq!(run_id, "deb1da1e-391e-4216-9690-0ad0f8c88070");
+            }
+            _ => panic!("expected Spore > Runs > Timeline"),
+        }
+    }
+
+    #[test]
+    fn test_runs_timeline_missing_run_id_fails() {
+        let result = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "timeline",
+        ]);
+        assert!(result.is_err(), "timeline without run_id should fail");
+    }
+
+    #[test]
+    fn test_runs_timeline_wall_duration_single_phase() {
+        // When there's only one phase, wall duration = that phase's duration
+        let total_duration_ms: u64 = 45_000;
+        let phases_len = 1;
+        let first_ts = 1000_i64;
+        let last_ts = 1000_i64;
+        let last_phase_duration_ms: u64 = 45_000;
+
+        let wall_duration_secs = if phases_len >= 2 {
+            let last_dur = last_phase_duration_ms;
+            ((last_ts - first_ts) as u64 + last_dur) / 1000
+        } else {
+            total_duration_ms / 1000
+        };
+        assert_eq!(wall_duration_secs, 45);
+    }
+
+    #[test]
+    fn test_runs_timeline_wall_duration_multiple_phases() {
+        // Two phases: first at t=0, second at t=120_000ms with 30s duration
+        // Wall = (120_000 - 0 + 30_000) / 1000 = 150s
+        let phases_len = 2;
+        let first_ts: i64 = 0;
+        let last_ts: i64 = 120_000;
+        let last_phase_duration_ms: u64 = 30_000;
+
+        let wall_duration_secs = if phases_len >= 2 {
+            ((last_ts - first_ts) as u64 + last_phase_duration_ms) / 1000
+        } else {
+            unreachable!();
+        };
+        assert_eq!(wall_duration_secs, 150);
+        assert_eq!(wall_duration_secs / 60, 2);
+        assert_eq!(wall_duration_secs % 60, 30);
+    }
+
+    #[test]
+    fn test_runs_timeline_wall_duration_last_phase_no_duration() {
+        // When last phase has no duration_ms, last_dur defaults to 0
+        let phases_len = 3;
+        let first_ts: i64 = 1_000_000;
+        let last_ts: i64 = 1_300_000;
+        let last_phase_duration_ms: u64 = 0; // no duration recorded
+
+        let wall_duration_secs = if phases_len >= 2 {
+            ((last_ts - first_ts) as u64 + last_phase_duration_ms) / 1000
+        } else {
+            unreachable!();
+        };
+        assert_eq!(wall_duration_secs, 300); // 5 minutes
+    }
+
+    #[test]
+    fn test_runs_timeline_phase_duration_seconds_format() {
+        // Duration < 60s should display as "{secs}s"
+        let duration_ms: u64 = 45_000;
+        let secs = duration_ms / 1000;
+        assert!(secs < 60);
+        let display = format!("Duration: {}s", secs);
+        assert_eq!(display, "Duration: 45s");
+    }
+
+    #[test]
+    fn test_runs_timeline_phase_duration_minutes_format() {
+        // Duration >= 60s should display as "{min}m {sec}s"
+        let duration_ms: u64 = 135_000;
+        let secs = duration_ms / 1000;
+        assert!(secs >= 60);
+        let display = format!("Duration: {}m {}s", secs / 60, secs % 60);
+        assert_eq!(display, "Duration: 2m 15s");
+    }
+
+    #[test]
+    fn test_runs_timeline_phase_duration_exact_minute() {
+        let duration_ms: u64 = 60_000;
+        let secs = duration_ms / 1000;
+        assert!(secs >= 60);
+        let display = format!("Duration: {}m {}s", secs / 60, secs % 60);
+        assert_eq!(display, "Duration: 1m 0s");
+    }
+
+    #[test]
+    fn test_runs_timeline_cost_accumulation() {
+        // Test that cost accumulates correctly across phases
+        let costs: Vec<Option<f64>> = vec![Some(0.15), None, Some(0.25), Some(0.10)];
+        let mut total_cost = 0.0_f64;
+        for c in &costs {
+            if let Some(v) = c { total_cost += v; }
+        }
+        assert!((total_cost - 0.50).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_runs_timeline_turns_accumulation() {
+        // Test turns from either "turns" or "num_turns" keys
+        let metas: Vec<serde_json::Value> = vec![
+            serde_json::json!({"turns": 5}),
+            serde_json::json!({"num_turns": 8}),
+            serde_json::json!({"other": "no turns"}),
+            serde_json::json!({"turns": 3}),
+        ];
+        let mut total_turns = 0_u64;
+        for meta in &metas {
+            let turns = meta["turns"].as_u64().or_else(|| meta["num_turns"].as_u64());
+            if let Some(t) = turns { total_turns += t; }
+        }
+        assert_eq!(total_turns, 16);
+    }
+
+    #[test]
+    fn test_runs_timeline_agent_strip_prefix() {
+        // Agent names with "spore:" prefix should have it stripped for display
+        let agent = "spore:coder";
+        let short = agent.strip_prefix("spore:").unwrap_or(agent);
+        assert_eq!(short, "coder");
+
+        let agent2 = "external-agent";
+        let short2 = agent2.strip_prefix("spore:").unwrap_or(agent2);
+        assert_eq!(short2, "external-agent");
+    }
+
+    #[test]
+    fn test_runs_timeline_task_desc_truncation_short() {
+        // Descriptions <= 60 chars should not be truncated
+        let task_desc = "Short task description";
+        let short_desc = if task_desc.chars().count() > 60 {
+            format!("{}...", &task_desc[..57])
+        } else {
+            task_desc.to_string()
+        };
+        assert_eq!(short_desc, "Short task description");
+    }
+
+    #[test]
+    fn test_runs_timeline_task_desc_truncation_long() {
+        // Descriptions > 60 chars should be truncated to 57 + "..."
+        let task_desc = "This is a very long task description that exceeds sixty characters limit and should be truncated";
+        assert!(task_desc.chars().count() > 60);
+        let short_desc = if task_desc.chars().count() > 60 {
+            format!("{}...", &task_desc[..57])
+        } else {
+            task_desc.to_string()
+        };
+        assert_eq!(short_desc.len(), 60);
+        assert!(short_desc.ends_with("..."));
+    }
+
+    #[test]
+    fn test_runs_timeline_orchestration_prefix_strip() {
+        // Task titles with "Orchestration:" prefix should have it stripped
+        let title = "Orchestration: Build the widget";
+        let desc = title.strip_prefix("Orchestration:").unwrap_or(title).trim();
+        assert_eq!(desc, "Build the widget");
+
+        // Titles without the prefix should be unchanged
+        let title2 = "Regular task title";
+        let desc2 = title2.strip_prefix("Orchestration:").unwrap_or(title2).trim();
+        assert_eq!(desc2, "Regular task title");
+    }
+
+    #[test]
+    fn test_runs_timeline_timestamp_formatting() {
+        // Verify timestamp millis -> HH:MM:SS formatting
+        let ts: i64 = 1708300800000; // 2024-02-19 00:00:00 UTC
+        let time_str = chrono::DateTime::from_timestamp_millis(ts)
+            .map(|d| d.format("%H:%M:%S").to_string())
+            .unwrap_or_else(|| "??:??:??".to_string());
+        assert_eq!(time_str, "00:00:00");
+    }
+
+    #[test]
+    fn test_runs_timeline_timestamp_invalid() {
+        // Invalid timestamp should fall back to "??:??:??"
+        // Note: from_timestamp_millis returns None for out-of-range values
+        let time_str = chrono::DateTime::from_timestamp_millis(i64::MAX)
+            .map(|d| d.format("%H:%M:%S").to_string())
+            .unwrap_or_else(|| "??:??:??".to_string());
+        assert_eq!(time_str, "??:??:??");
+    }
+
+    #[test]
+    fn test_runs_timeline_connector_chars_last_vs_middle() {
+        // Last phase uses "\-" prefix, middle phases use "+-"
+        let phase_count = 3;
+        for i in 0..phase_count {
+            let is_last = i == phase_count - 1;
+            let connector = if is_last { "\\-" } else { "+-" };
+            let pipe = if is_last { " " } else { "|" };
+            if i < phase_count - 1 {
+                assert_eq!(connector, "+-");
+                assert_eq!(pipe, "|");
+            } else {
+                assert_eq!(connector, "\\-");
+                assert_eq!(pipe, " ");
+            }
+        }
+    }
+
+    #[test]
+    fn test_runs_timeline_bounce_display() {
+        // Bounce number should format as " (bounce N)" or empty
+        let bounce: Option<u64> = Some(2);
+        let bounce_str = bounce.map(|b| format!(" (bounce {})", b)).unwrap_or_default();
+        assert_eq!(bounce_str, " (bounce 2)");
+
+        let no_bounce: Option<u64> = None;
+        let no_bounce_str = no_bounce.map(|b| format!(" (bounce {})", b)).unwrap_or_default();
+        assert_eq!(no_bounce_str, "");
+    }
+
+    #[test]
+    fn test_runs_timeline_details_join() {
+        // Multiple details should be joined with " | "
+        let mut details = Vec::new();
+        details.push(format!("Turns: {}", 5));
+        details.push(format!("Duration: {}s", 45));
+        details.push(format!("Cost: ${:.2}", 0.15));
+        let joined = details.join(" | ");
+        assert_eq!(joined, "Turns: 5 | Duration: 45s | Cost: $0.15");
+    }
+
+    #[test]
+    fn test_runs_timeline_footer_format() {
+        // Test the footer total line format
+        let phase_count = 4;
+        let total_turns = 18_u64;
+        let wall_duration_secs = 310_u64; // 5m 10s
+        let total_cost = 1.23_f64;
+        let footer = format!("Total: {} phases | {} turns | {}m {}s | ${:.2}",
+            phase_count, total_turns,
+            wall_duration_secs / 60, wall_duration_secs % 60,
+            total_cost);
+        assert_eq!(footer, "Total: 4 phases | 18 turns | 5m 10s | $1.23");
+    }
+
+    // --- Tests for --cost sort on 'spore runs list' ---
+
+    #[test]
+    fn test_runs_list_cost_flag_alone() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list", "--cost",
+        ]).expect("should parse --cost alone");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { cost, .. } } } => {
+                assert!(cost, "--cost should be true");
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_runs_list_cost_flag_default_false() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "list",
+        ]).expect("should parse without --cost");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::List { cost, .. } } } => {
+                assert!(!cost, "--cost should default to false");
+            }
+            _ => panic!("expected Spore > Runs > List"),
+        }
+    }
+
+    #[test]
+    fn test_cost_sort_descending_order() {
+        // Mirrors the sorting logic in handle_runs when show_cost=true
+        struct FakeRun { id: &'static str, total_cost: Option<f64> }
+
+        let runs = vec![
+            FakeRun { id: "cheap",   total_cost: Some(0.05) },
+            FakeRun { id: "mid",     total_cost: Some(0.50) },
+            FakeRun { id: "costly",  total_cost: Some(2.10) },
+        ];
+
+        let mut sorted = runs;
+        sorted.sort_by(|a, b| {
+            let cost_a = a.total_cost.unwrap_or(0.0);
+            let cost_b = b.total_cost.unwrap_or(0.0);
+            cost_b.partial_cmp(&cost_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        assert_eq!(sorted[0].id, "costly");
+        assert_eq!(sorted[1].id, "mid");
+        assert_eq!(sorted[2].id, "cheap");
+    }
+
+    #[test]
+    fn test_cost_sort_none_costs_sort_to_bottom() {
+        struct FakeRun { id: &'static str, total_cost: Option<f64> }
+
+        let runs = vec![
+            FakeRun { id: "no_cost",  total_cost: None },
+            FakeRun { id: "has_cost", total_cost: Some(0.10) },
+            FakeRun { id: "no_cost2", total_cost: None },
+        ];
+
+        let mut sorted = runs;
+        sorted.sort_by(|a, b| {
+            let cost_a = a.total_cost.unwrap_or(0.0);
+            let cost_b = b.total_cost.unwrap_or(0.0);
+            cost_b.partial_cmp(&cost_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        assert_eq!(sorted[0].id, "has_cost");
+        // None costs (treated as 0.0) should be after any run with positive cost
+        assert!(sorted[0].total_cost.is_some());
+        assert!(sorted[1].total_cost.is_none() || sorted[1].total_cost == Some(0.0));
+        assert!(sorted[2].total_cost.is_none() || sorted[2].total_cost == Some(0.0));
+    }
+
+    #[test]
+    fn test_cost_sort_all_none_costs() {
+        // When all costs are None, sort should not panic and order is stable
+        struct FakeRun { id: &'static str, total_cost: Option<f64> }
+
+        let runs = vec![
+            FakeRun { id: "a", total_cost: None },
+            FakeRun { id: "b", total_cost: None },
+            FakeRun { id: "c", total_cost: None },
+        ];
+
+        let mut sorted = runs;
+        sorted.sort_by(|a, b| {
+            let cost_a = a.total_cost.unwrap_or(0.0);
+            let cost_b = b.total_cost.unwrap_or(0.0);
+            cost_b.partial_cmp(&cost_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Stable sort: order should be preserved when all equal
+        assert_eq!(sorted[0].id, "a");
+        assert_eq!(sorted[1].id, "b");
+        assert_eq!(sorted[2].id, "c");
+    }
+
+    #[test]
+    fn test_cost_sort_no_sort_when_flag_false() {
+        // Without --cost, order should be preserved (chronological)
+        struct FakeRun { id: &'static str, total_cost: Option<f64> }
+
+        let runs = vec![
+            FakeRun { id: "oldest", total_cost: Some(5.00) },
+            FakeRun { id: "middle", total_cost: Some(0.10) },
+            FakeRun { id: "newest", total_cost: Some(1.00) },
+        ];
+
+        let show_cost = false;
+        let result: Vec<&str> = if show_cost {
+            let mut sorted = runs;
+            sorted.sort_by(|a, b| {
+                let cost_a = a.total_cost.unwrap_or(0.0);
+                let cost_b = b.total_cost.unwrap_or(0.0);
+                cost_b.partial_cmp(&cost_a).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            sorted.iter().map(|r| r.id).collect()
+        } else {
+            runs.iter().map(|r| r.id).collect()
+        };
+
+        // Original order should be preserved
+        assert_eq!(result, vec!["oldest", "middle", "newest"]);
+    }
+
+    #[test]
+    fn test_cost_sort_after_filters_applied() {
+        // --cost sort should happen AFTER agent and duration filters
+        struct FakeRun { id: &'static str, total_cost: Option<f64>, agents: Vec<String>, total_duration_ms: Option<u64> }
+
+        let runs = vec![
+            FakeRun { id: "expensive_coder",  total_cost: Some(3.00), agents: vec!["spore:coder".into()],      total_duration_ms: Some(120_000) },
+            FakeRun { id: "cheap_researcher",  total_cost: Some(0.10), agents: vec!["spore:researcher".into()], total_duration_ms: Some(60_000) },
+            FakeRun { id: "mid_coder",         total_cost: Some(1.50), agents: vec!["spore:coder".into()],      total_duration_ms: Some(300_000) },
+            FakeRun { id: "cheap_coder_short", total_cost: Some(0.05), agents: vec!["spore:coder".into()],      total_duration_ms: Some(30_000) },
+        ];
+
+        // Apply duration filter (>= 60s)
+        let min_ms: u64 = 60 * 1000;
+        let filtered: Vec<&FakeRun> = runs.iter()
+            .filter(|r| r.total_duration_ms.unwrap_or(0) >= min_ms)
+            .collect();
+
+        // Apply agent filter
+        let needle = "spore:coder".to_string();
+        let mut filtered: Vec<&FakeRun> = filtered.into_iter()
+            .filter(|r| r.agents.iter().any(|a| a.to_lowercase() == needle))
+            .collect();
+
+        // Apply cost sort
+        filtered.sort_by(|a, b| {
+            let cost_a = a.total_cost.unwrap_or(0.0);
+            let cost_b = b.total_cost.unwrap_or(0.0);
+            cost_b.partial_cmp(&cost_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Should only have coder runs with duration >= 60s, sorted by cost desc
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].id, "expensive_coder");
+        assert_eq!(filtered[1].id, "mid_coder");
+    }
+
+    #[test]
+    fn test_cost_sort_equal_costs_stable() {
+        // Runs with equal costs should maintain their relative order (stable sort)
+        struct FakeRun { id: &'static str, total_cost: Option<f64> }
+
+        let runs = vec![
+            FakeRun { id: "first",  total_cost: Some(1.00) },
+            FakeRun { id: "second", total_cost: Some(1.00) },
+            FakeRun { id: "third",  total_cost: Some(1.00) },
+        ];
+
+        let mut sorted = runs;
+        sorted.sort_by(|a, b| {
+            let cost_a = a.total_cost.unwrap_or(0.0);
+            let cost_b = b.total_cost.unwrap_or(0.0);
+            cost_b.partial_cmp(&cost_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        assert_eq!(sorted[0].id, "first");
+        assert_eq!(sorted[1].id, "second");
+        assert_eq!(sorted[2].id, "third");
+    }
+
+    #[test]
+    fn test_runs_summary_parses() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "summary",
+        ]).expect("should parse 'spore runs summary'");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Runs { cmd: RunCommands::Summary } } => {}
+            _ => panic!("expected Spore > Runs > Summary"),
+        }
+    }
+
+    #[test]
+    fn test_runs_summary_rejects_positional_args() {
+        let result = Cli::try_parse_from([
+            "mycelica-cli", "spore", "runs", "summary", "extra",
+        ]);
+        assert!(result.is_err(), "summary should not accept positional args");
+    }
+
+    // --- Tests for 'spore runs summary' prose-building logic ---
+
+    #[test]
+    fn test_summary_status_parts_ordering() {
+        // The summary iterates statuses in a fixed order: verified, implemented, pending, escalated, cancelled
+        let mut status_counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        status_counts.insert("cancelled".to_string(), 1);
+        status_counts.insert("verified".to_string(), 5);
+        status_counts.insert("pending".to_string(), 2);
+        status_counts.insert("escalated".to_string(), 1);
+        status_counts.insert("implemented".to_string(), 3);
+
+        let mut status_parts: Vec<String> = Vec::new();
+        for s in &["verified", "implemented", "pending", "escalated", "cancelled"] {
+            if let Some(c) = status_counts.get(*s) {
+                status_parts.push(format!("{} {}", c, s));
+            }
+        }
+
+        assert_eq!(status_parts, vec![
+            "5 verified", "3 implemented", "2 pending", "1 escalated", "1 cancelled"
+        ]);
+    }
+
+    #[test]
+    fn test_summary_status_parts_skips_missing_statuses() {
+        // Only present statuses should appear in the output
+        let mut status_counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        status_counts.insert("verified".to_string(), 3);
+        status_counts.insert("pending".to_string(), 1);
+
+        let mut status_parts: Vec<String> = Vec::new();
+        for s in &["verified", "implemented", "pending", "escalated", "cancelled"] {
+            if let Some(c) = status_counts.get(*s) {
+                status_parts.push(format!("{} {}", c, s));
+            }
+        }
+
+        assert_eq!(status_parts, vec!["3 verified", "1 pending"]);
+    }
+
+    #[test]
+    fn test_summary_success_rate_percentage() {
+        // Mirrors the percentage calculation in the summary prose builder
+        let total = 10;
+        let verified = 7_usize;
+        let pct = if total > 0 { (verified as f64 / total as f64) * 100.0 } else { 0.0 };
+        assert_eq!(format!("{:.0}% success rate", pct), "70% success rate");
+    }
+
+    #[test]
+    fn test_summary_success_rate_zero_total() {
+        let total = 0;
+        let verified = 0_usize;
+        let pct = if total > 0 { (verified as f64 / total as f64) * 100.0 } else { 0.0 };
+        assert_eq!(format!("{:.0}% success rate", pct), "0% success rate");
+    }
+
+    #[test]
+    fn test_summary_success_rate_all_verified() {
+        let total = 5;
+        let verified = 5_usize;
+        let pct = (verified as f64 / total as f64) * 100.0;
+        assert_eq!(format!("{:.0}% success rate", pct), "100% success rate");
+    }
+
+    #[test]
+    fn test_summary_success_rate_none_verified() {
+        let total = 8;
+        let verified = 0_usize;
+        let pct = if total > 0 { (verified as f64 / total as f64) * 100.0 } else { 0.0 };
+        assert_eq!(format!("{:.0}% success rate", pct), "0% success rate");
+    }
+
+    #[test]
+    fn test_summary_verified_titles_single() {
+        // A single verified title should be quoted without joining
+        let verified_titles = vec!["Add dark mode".to_string()];
+        let titles_str = if verified_titles.len() == 1 {
+            format!("\"{}\"", verified_titles[0])
+        } else {
+            let all: Vec<String> = verified_titles.iter().map(|t| {
+                let display = if t.chars().count() > 50 {
+                    format!("{}...", t.chars().take(47).collect::<String>())
+                } else {
+                    t.clone()
+                };
+                format!("\"{}\"", display)
+            }).collect();
+            all.join(", ")
+        };
+        assert_eq!(titles_str, "\"Add dark mode\"");
+    }
+
+    #[test]
+    fn test_summary_verified_titles_multiple() {
+        let verified_titles = vec![
+            "Add dark mode".to_string(),
+            "Fix auth bug".to_string(),
+            "Refactor DB layer".to_string(),
+        ];
+        let titles_str = if verified_titles.len() == 1 {
+            format!("\"{}\"", verified_titles[0])
+        } else {
+            let all: Vec<String> = verified_titles.iter().map(|t| {
+                let display = if t.chars().count() > 50 {
+                    format!("{}...", t.chars().take(47).collect::<String>())
+                } else {
+                    t.clone()
+                };
+                format!("\"{}\"", display)
+            }).collect();
+            all.join(", ")
+        };
+        assert_eq!(titles_str, "\"Add dark mode\", \"Fix auth bug\", \"Refactor DB layer\"");
+    }
+
+    #[test]
+    fn test_summary_verified_title_truncation_at_50_chars() {
+        // Titles > 50 chars should be truncated to 47 chars + "..."
+        let long_title = "This is a very long feature title that exceeds fifty characters easily".to_string();
+        assert!(long_title.chars().count() > 50);
+
+        let display = if long_title.chars().count() > 50 {
+            format!("{}...", long_title.chars().take(47).collect::<String>())
+        } else {
+            long_title.clone()
+        };
+        assert_eq!(display.chars().count(), 50);
+        assert!(display.ends_with("..."));
+        assert_eq!(display, "This is a very long feature title that exceeds ...");
+    }
+
+    #[test]
+    fn test_summary_verified_title_no_truncation_at_50() {
+        // Title of exactly 50 chars should NOT be truncated
+        let title = "A".repeat(50);
+        assert_eq!(title.chars().count(), 50);
+        let display = if title.chars().count() > 50 {
+            format!("{}...", title.chars().take(47).collect::<String>())
+        } else {
+            title.clone()
+        };
+        assert_eq!(display, title);
+    }
+
+    #[test]
+    fn test_summary_escalated_plural_single() {
+        // 1 escalated task: "was" (singular)
+        let escalated_titles = vec!["broken feature".to_string()];
+        let plural = if escalated_titles.len() == 1 { " was" } else { "s were" };
+        let msg = format!("{} task{} escalated", escalated_titles.len(), plural);
+        assert_eq!(msg, "1 task was escalated");
+    }
+
+    #[test]
+    fn test_summary_escalated_plural_multiple() {
+        // 2+ escalated tasks: "were" (plural)
+        let escalated_titles = vec!["broken feature".to_string(), "another issue".to_string()];
+        let plural = if escalated_titles.len() == 1 { " was" } else { "s were" };
+        let msg = format!("{} task{} escalated", escalated_titles.len(), plural);
+        assert_eq!(msg, "2 tasks were escalated");
+    }
+
+    #[test]
+    fn test_summary_today_spend_format() {
+        let today_cost = 1.5_f64;
+        assert_eq!(format!("Today's spend is ${:.2}", today_cost), "Today's spend is $1.50");
+    }
+
+    #[test]
+    fn test_summary_today_spend_zero() {
+        let today_cost = 0.0_f64;
+        assert_eq!(format!("Today's spend is ${:.2}", today_cost), "Today's spend is $0.00");
+    }
+
+    #[test]
+    fn test_summary_prose_joins_with_periods() {
+        // The final output joins parts with ". " and appends a trailing "."
+        let parts = vec![
+            "Across 10 runs, 7 verified, 3 pending (70% success rate)".to_string(),
+            "Today's spend is $1.50".to_string(),
+        ];
+        let output = parts.join(". ") + ".";
+        assert!(output.ends_with("."));
+        assert!(output.contains(". Today's spend"));
+    }
+
+    #[test]
+    fn test_summary_full_prose_all_statuses() {
+        // Simulate full prose building with all status types
+        let total = 12;
+        let mut status_counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        status_counts.insert("verified".to_string(), 5);
+        status_counts.insert("implemented".to_string(), 3);
+        status_counts.insert("pending".to_string(), 2);
+        status_counts.insert("escalated".to_string(), 1);
+        status_counts.insert("cancelled".to_string(), 1);
+
+        let verified_titles = vec!["dark mode".to_string(), "auth fix".to_string()];
+        let escalated_titles = vec!["data migration".to_string()];
+        let today_cost = 2.75_f64;
+
+        let mut parts: Vec<String> = Vec::new();
+
+        // Opening
+        let mut status_parts: Vec<String> = Vec::new();
+        for s in &["verified", "implemented", "pending", "escalated", "cancelled"] {
+            if let Some(c) = status_counts.get(*s) {
+                status_parts.push(format!("{} {}", c, s));
+            }
+        }
+        let verified = *status_counts.get("verified").unwrap_or(&0);
+        let pct = if total > 0 { (verified as f64 / total as f64) * 100.0 } else { 0.0 };
+        parts.push(format!("Across {} orchestrator runs, {} ({})",
+            total, status_parts.join(", "), format!("{:.0}% success rate", pct)));
+
+        // Verified
+        if !verified_titles.is_empty() {
+            let titles_str = if verified_titles.len() == 1 {
+                format!("\"{}\"", verified_titles[0])
+            } else {
+                let all: Vec<String> = verified_titles.iter().map(|t| {
+                    let display = if t.chars().count() > 50 {
+                        format!("{}...", t.chars().take(47).collect::<String>())
+                    } else { t.clone() };
+                    format!("\"{}\"", display)
+                }).collect();
+                all.join(", ")
+            };
+            parts.push(format!("The most recently verified features are: {}", titles_str));
+        }
+
+        // Escalated
+        if !escalated_titles.is_empty() {
+            let titles_str: Vec<String> = escalated_titles.iter().map(|t| {
+                let display = if t.chars().count() > 50 {
+                    format!("{}...", t.chars().take(47).collect::<String>())
+                } else { t.clone() };
+                format!("\"{}\"", display)
+            }).collect();
+            parts.push(format!("{} task{} escalated: {}",
+                escalated_titles.len(),
+                if escalated_titles.len() == 1 { " was" } else { "s were" },
+                titles_str.join(", ")));
+        }
+
+        // Today's spend
+        parts.push(format!("Today's spend is ${:.2}", today_cost));
+
+        let output = parts.join(". ") + ".";
+
+        assert!(output.starts_with("Across 12 orchestrator runs"));
+        assert!(output.contains("5 verified, 3 implemented, 2 pending, 1 escalated, 1 cancelled"));
+        assert!(output.contains("42% success rate"));
+        assert!(output.contains("The most recently verified features are: \"dark mode\", \"auth fix\""));
+        assert!(output.contains("1 task was escalated: \"data migration\""));
+        assert!(output.contains("Today's spend is $2.75."));
+    }
+
+    #[test]
+    fn test_summary_prose_no_verified_no_escalated() {
+        // When there are no verified/escalated, those sentences are omitted
+        let total = 3;
+        let mut status_counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        status_counts.insert("pending".to_string(), 3);
+
+        let verified_titles: Vec<String> = Vec::new();
+        let escalated_titles: Vec<String> = Vec::new();
+        let today_cost = 0.0_f64;
+
+        let mut parts: Vec<String> = Vec::new();
+
+        let mut status_parts: Vec<String> = Vec::new();
+        for s in &["verified", "implemented", "pending", "escalated", "cancelled"] {
+            if let Some(c) = status_counts.get(*s) {
+                status_parts.push(format!("{} {}", c, s));
+            }
+        }
+        let verified = *status_counts.get("verified").unwrap_or(&0);
+        let pct = if total > 0 { (verified as f64 / total as f64) * 100.0 } else { 0.0 };
+        parts.push(format!("Across {} orchestrator runs, {} ({})",
+            total, status_parts.join(", "), format!("{:.0}% success rate", pct)));
+
+        if !verified_titles.is_empty() {
+            parts.push("verified features sentence".to_string());
+        }
+        if !escalated_titles.is_empty() {
+            parts.push("escalated tasks sentence".to_string());
+        }
+        parts.push(format!("Today's spend is ${:.2}", today_cost));
+
+        let output = parts.join(". ") + ".";
+
+        // Should have exactly 2 sentences: opening + today's spend
+        assert_eq!(parts.len(), 2);
+        assert!(output.contains("3 pending"));
+        assert!(output.contains("0% success rate"));
+        assert!(!output.contains("verified features"));
+        assert!(!output.contains("escalated"));
+        assert!(output.contains("Today's spend is $0.00."));
+    }
+
+    #[test]
+    fn test_summary_orchestration_prefix_strip() {
+        // Title "Orchestration: foo" → "foo", used for short_title in summary
+        let title = "Orchestration: Add dark mode toggle";
+        let short_title = title.strip_prefix("Orchestration:").unwrap_or(title).trim();
+        assert_eq!(short_title, "Add dark mode toggle");
+    }
+
+    #[test]
+    fn test_summary_orchestration_prefix_strip_no_prefix() {
+        let title = "Just a regular title";
+        let short_title = title.strip_prefix("Orchestration:").unwrap_or(title).trim();
+        assert_eq!(short_title, "Just a regular title");
+    }
+
+    #[test]
+    fn test_summary_verified_titles_capped_at_five() {
+        // The implementation caps verified_titles at 5
+        let mut verified_titles: Vec<String> = Vec::new();
+        let all_titles = vec![
+            "feat A", "feat B", "feat C", "feat D", "feat E", "feat F", "feat G",
+        ];
+        for title in all_titles {
+            if verified_titles.len() < 5 {
+                verified_titles.push(title.to_string());
+            }
+        }
+        assert_eq!(verified_titles.len(), 5);
+        assert_eq!(verified_titles.last().unwrap(), "feat E");
+    }
+
+    #[test]
+    fn test_summary_escalated_titles_capped_at_three() {
+        // The implementation caps escalated_titles at 3
+        let mut escalated_titles: Vec<String> = Vec::new();
+        let all_titles = vec!["esc A", "esc B", "esc C", "esc D", "esc E"];
+        for title in all_titles {
+            if escalated_titles.len() < 3 {
+                escalated_titles.push(title.to_string());
+            }
+        }
+        assert_eq!(escalated_titles.len(), 3);
+        assert_eq!(escalated_titles.last().unwrap(), "esc C");
+    }
+
+    #[test]
+    fn test_summary_cost_from_tracks_metadata() {
+        // Mirrors how the summary extracts cost_usd from tracks edge metadata
+        let metas: Vec<serde_json::Value> = vec![
+            serde_json::json!({"cost_usd": 0.50, "run_id": "abc"}),
+            serde_json::json!({"cost_usd": 0.25}),
+            serde_json::json!({"status": "done"}),  // no cost_usd
+        ];
+        let run_cost: f64 = metas.iter()
+            .filter_map(|v| v["cost_usd"].as_f64())
+            .sum();
+        assert!((run_cost - 0.75).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_summary_cost_no_metadata() {
+        // When there are no tracks edges with cost_usd, cost should be 0
+        let metas: Vec<serde_json::Value> = vec![
+            serde_json::json!({"status": "done"}),
+            serde_json::json!({"note": "no cost here"}),
+        ];
+        let run_cost: f64 = metas.iter()
+            .filter_map(|v| v["cost_usd"].as_f64())
+            .sum();
+        assert_eq!(run_cost, 0.0);
+    }
+
+    // Helpers mirroring the inline logic from handle_setup step 1c (code embeddings).
+    // Uses unwrap_or_default() + is_empty() pattern matching the setup path (~line 6089).
+    // Tests verify the [file_path] bracket-prefix format added to embedding text construction.
+    fn extract_file_path_from_tags(tags: Option<&str>) -> String {
+        tags.and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+            .and_then(|v| v.get("file_path").and_then(|s| s.as_str()).map(|s| s.to_string()))
+            .unwrap_or_default()
+    }
+
+    fn build_code_embed_text(file_path: &str, title: &str, content: Option<&str>) -> String {
+        if file_path.is_empty() {
+            format!("{}\n{}", title, content.unwrap_or(""))
+        } else {
+            format!("[{}] {}\n{}", file_path, title, content.unwrap_or(""))
+        }
+    }
+
+    // Helper mirroring the import code / embeddings regenerate paths (~lines 2411, 5206).
+    // These use Option<String> instead of unwrap_or_default(), and the bracket format when Some.
+    fn build_embed_text_option(title: &str, content: Option<&str>, tags: Option<&str>) -> String {
+        let file_path = tags
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+            .and_then(|v| v.get("file_path").and_then(|s| s.as_str()).map(|s| s.to_string()));
+        if let Some(fp) = file_path {
+            format!("[{}] {}\n{}", fp, title, content.unwrap_or(""))
+        } else {
+            format!("{}\n{}", title, content.unwrap_or(""))
+        }
+    }
+
+    #[test]
+    fn test_code_embed_text_with_file_path() {
+        let tags = r#"{"file_path": "src-tauri/src/bin/cli.rs", "line_start": 100}"#;
+        let file_path = extract_file_path_from_tags(Some(tags));
+        let text = build_code_embed_text(&file_path, "fn handle_setup()", Some("sets up the database"));
+        assert!(text.starts_with("[src-tauri/src/bin/cli.rs]"));
+        assert!(text.contains("fn handle_setup()"));
+        assert!(text.contains("sets up the database"));
+    }
+
+    #[test]
+    fn test_code_embed_text_ordering_file_path_first() {
+        // file_path must appear first as [file_path] title on one line, then content on next
+        let tags = r#"{"file_path": "src/commands/graph.rs"}"#;
+        let file_path = extract_file_path_from_tags(Some(tags));
+        let text = build_code_embed_text(&file_path, "pub fn get_node()", Some("returns a node"));
+        let parts: Vec<&str> = text.splitn(2, '\n').collect();
+        assert_eq!(parts[0], "[src/commands/graph.rs] pub fn get_node()");
+        assert_eq!(parts[1], "returns a node");
+    }
+
+    #[test]
+    fn test_code_embed_text_tags_none_omits_file_path() {
+        let file_path = extract_file_path_from_tags(None);
+        assert!(file_path.is_empty());
+        let text = build_code_embed_text(&file_path, "fn bar()", Some("content"));
+        assert_eq!(text, "fn bar()\ncontent");
+    }
+
+    #[test]
+    fn test_code_embed_text_tags_missing_file_path_key() {
+        // Tags JSON present but no "file_path" key — falls back to title+content only
+        let tags = r#"{"line_start": 100, "line_end": 200}"#;
+        let file_path = extract_file_path_from_tags(Some(tags));
+        assert!(file_path.is_empty());
+        let text = build_code_embed_text(&file_path, "fn foo()", Some("body"));
+        assert_eq!(text, "fn foo()\nbody");
+    }
+
+    #[test]
+    fn test_code_embed_text_tags_malformed_json_falls_back() {
+        let file_path = extract_file_path_from_tags(Some("not valid json"));
+        assert!(file_path.is_empty());
+        let text = build_code_embed_text(&file_path, "fn baz()", None);
+        assert_eq!(text, "fn baz()\n");
+    }
+
+    #[test]
+    fn test_code_embed_text_no_content_uses_empty_string() {
+        let tags = r#"{"file_path": "src/lib.rs"}"#;
+        let file_path = extract_file_path_from_tags(Some(tags));
+        let text = build_code_embed_text(&file_path, "fn qux()", None);
+        assert_eq!(text, "[src/lib.rs] fn qux()\n");
+    }
+
+    #[test]
+    fn test_code_embed_text_truncated_at_1000_bytes() {
+        let tags = r#"{"file_path": "src/lib.rs"}"#;
+        let file_path = extract_file_path_from_tags(Some(tags));
+        let long_content = "x".repeat(2000);
+        let text = build_code_embed_text(&file_path, "fn huge()", Some(&long_content));
+        let truncated = utils::safe_truncate(&text, 1000);
+        assert!(truncated.len() <= 1000);
+        assert!(truncated.starts_with("[src/lib.rs]"));
+    }
+
+    // --- Tests for the import-code / embeddings-regenerate path (Option<String> variant) ---
+
+    #[test]
+    fn test_embed_text_option_path_with_file_path() {
+        let tags = r#"{"file_path": "src-tauri/src/similarity.rs"}"#;
+        let text = build_embed_text_option("fn cosine_sim()", Some("computes similarity"), Some(tags));
+        assert_eq!(text, "[src-tauri/src/similarity.rs] fn cosine_sim()\ncomputes similarity");
+    }
+
+    #[test]
+    fn test_embed_text_option_path_tags_none_fallback() {
+        let text = build_embed_text_option("fn my_fn()", Some("body text"), None);
+        assert_eq!(text, "fn my_fn()\nbody text");
+    }
+
+    #[test]
+    fn test_embed_text_option_path_no_file_path_key_fallback() {
+        let tags = r#"{"line_start": 42}"#;
+        let text = build_embed_text_option("fn bar()", Some("impl"), Some(tags));
+        assert_eq!(text, "fn bar()\nimpl");
+    }
+
+    #[test]
+    fn test_embed_text_option_path_invalid_json_fallback() {
+        let text = build_embed_text_option("fn baz()", None, Some("{broken"));
+        assert_eq!(text, "fn baz()\n");
+    }
+
+    #[test]
+    fn test_embed_text_option_path_file_path_not_string_fallback() {
+        // file_path value is a JSON number — as_str() returns None, so falls back
+        let tags = r#"{"file_path": 123}"#;
+        let text = build_embed_text_option("fn num()", Some("content"), Some(tags));
+        assert_eq!(text, "fn num()\ncontent");
+    }
+
+    #[test]
+    fn test_embed_text_option_path_content_none_empty_string() {
+        let tags = r#"{"file_path": "src/main.rs"}"#;
+        let text = build_embed_text_option("fn main()", None, Some(tags));
+        assert_eq!(text, "[src/main.rs] fn main()\n");
+    }
+
+    #[test]
+    fn test_code_embed_text_empty_file_path_string_treated_as_no_path() {
+        // Setup path uses is_empty() — explicit empty string in tags → fallback format
+        let tags = r#"{"file_path": ""}"#;
+        let file_path = extract_file_path_from_tags(Some(tags));
+        assert!(file_path.is_empty(), "empty string file_path should be treated as absent");
+        let text = build_code_embed_text(&file_path, "fn empty()", Some("body"));
+        assert_eq!(text, "fn empty()\nbody");
+    }
+
+    #[test]
+    fn test_embed_text_bracket_format_exact() {
+        // Explicit check that brackets and space are used, not just newlines
+        let tags = r#"{"file_path": "src/db/schema.rs"}"#;
+        let file_path = extract_file_path_from_tags(Some(tags));
+        let text = build_code_embed_text(&file_path, "struct Node", Some("graph node"));
+        assert!(text.starts_with('['), "must start with opening bracket");
+        assert!(text.contains("] struct Node\n"), "title follows bracket-wrapped path with space");
+    }
+
+    #[test]
+    fn test_prefix_extraction_logic() {
+        // 1. tags with file_path → "[path] title\ncontent"
+        let tags_with_path = r#"{"file_path": "src/lib.rs"}"#;
+        let text = build_embed_text_option("fn foo()", Some("body"), Some(tags_with_path));
+        assert_eq!(text, "[src/lib.rs] fn foo()\nbody");
+
+        // 2. tags without file_path → "title\ncontent"
+        let tags_no_path = r#"{"line_start": 10}"#;
+        let text = build_embed_text_option("fn foo()", Some("body"), Some(tags_no_path));
+        assert_eq!(text, "fn foo()\nbody");
+
+        // 3. no tags → "title\ncontent"
+        let text = build_embed_text_option("fn foo()", Some("body"), None);
+        assert_eq!(text, "fn foo()\nbody");
+    }
+
+    // Tests for --native-agent flag on `spore orchestrate`
+    #[test]
+    fn test_orchestrate_native_agent_default_is_false() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "orchestrate", "fix the bug",
+        ]).expect("should parse without --native-agent");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Orchestrate { native_agent, .. } } => {
+                assert!(!native_agent, "native_agent should default to false");
+            }
+            _ => panic!("expected Spore > Orchestrate"),
+        }
+    }
+
+    #[test]
+    fn test_orchestrate_native_agent_flag_sets_true() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "orchestrate", "fix the bug", "--native-agent",
+        ]).expect("should parse --native-agent");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Orchestrate { native_agent, .. } } => {
+                assert!(native_agent, "native_agent should be true when --native-agent is passed");
+            }
+            _ => panic!("expected Spore > Orchestrate"),
+        }
+    }
+
+    #[test]
+    fn test_orchestrate_native_agent_combined_with_verbose() {
+        let cli = Cli::try_parse_from([
+            "mycelica-cli", "spore", "orchestrate", "add feature",
+            "--native-agent", "--verbose",
+        ]).expect("should parse --native-agent with --verbose");
+        match cli.command {
+            Commands::Spore { cmd: SporeCommands::Orchestrate { native_agent, verbose, .. } } => {
+                assert!(native_agent);
+                assert!(verbose);
+            }
+            _ => panic!("expected Spore > Orchestrate"),
+        }
+    }
+
+    #[test]
+    fn test_parse_spore_analyze_default() {
+        let args = Cli::try_parse_from(&["mycelica-cli", "--db", "test.db", "spore", "analyze"]).unwrap();
+        if let Commands::Spore { cmd, .. } = args.command {
+            if let SporeCommands::Analyze { region, top_n, stale_days, hub_threshold } = cmd {
+                assert!(region.is_none());
+                assert_eq!(top_n, 10);
+                assert_eq!(stale_days, 60);
+                assert_eq!(hub_threshold, 15);
+            } else {
+                panic!("Expected Analyze command");
+            }
+        } else {
+            panic!("Expected Spore command");
+        }
+    }
+
+    #[test]
+    fn test_parse_spore_analyze_all_flags() {
+        let args = Cli::try_parse_from(&[
+            "mycelica-cli", "--db", "test.db", "spore", "analyze",
+            "--region", "abc123", "--top-n", "5",
+            "--stale-days", "90", "--hub-threshold", "20"
+        ]).unwrap();
+        if let Commands::Spore { cmd, .. } = args.command {
+            if let SporeCommands::Analyze { region, top_n, stale_days, hub_threshold } = cmd {
+                assert_eq!(region.as_deref(), Some("abc123"));
+                assert_eq!(top_n, 5);
+                assert_eq!(stale_days, 90);
+                assert_eq!(hub_threshold, 20);
+            } else {
+                panic!("Expected Analyze command");
+            }
+        } else {
+            panic!("Expected Spore command");
+        }
+    }
+
 }

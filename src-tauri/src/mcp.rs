@@ -49,11 +49,15 @@ pub enum AgentRole {
     Human,
     Ingestor,
     Coder,
+    Tester,
     Verifier,
     Planner,
+    Architect,
     Synthesizer,
     Summarizer,
     DocWriter,
+    Researcher,
+    Operator,
 }
 
 impl AgentRole {
@@ -62,11 +66,15 @@ impl AgentRole {
             "human" => Some(Self::Human),
             "ingestor" => Some(Self::Ingestor),
             "coder" => Some(Self::Coder),
+            "tester" => Some(Self::Tester),
             "verifier" => Some(Self::Verifier),
             "planner" => Some(Self::Planner),
+            "architect" => Some(Self::Architect),
             "synthesizer" => Some(Self::Synthesizer),
             "summarizer" => Some(Self::Summarizer),
             "docwriter" => Some(Self::DocWriter),
+            "researcher" => Some(Self::Researcher),
+            "operator" => Some(Self::Operator),
             _ => None,
         }
     }
@@ -82,26 +90,37 @@ impl AgentRole {
             ],
             Self::Ingestor => &["mycelica_create_edge", "mycelica_create_node"],
             Self::Coder => &["mycelica_create_edge", "mycelica_create_node"],
+            Self::Tester => &["mycelica_create_edge", "mycelica_create_node"],
             Self::Verifier => &["mycelica_create_edge", "mycelica_create_node"],
             Self::Planner => &[
                 "mycelica_create_edge",
                 "mycelica_create_meta",
                 "mycelica_create_node",
             ],
+            Self::Architect => &["mycelica_create_edge", "mycelica_create_node"],
             Self::Synthesizer => &["mycelica_create_edge"],
             Self::Summarizer => &[
                 "mycelica_create_edge",
+                "mycelica_create_node",
                 "mycelica_create_meta",
                 "mycelica_update_meta",
             ],
             Self::DocWriter => &["mycelica_create_edge"],
+            Self::Researcher => &["mycelica_create_edge", "mycelica_create_node"],
+            Self::Operator => &[
+                "mycelica_create_edge",
+                "mycelica_create_node",
+                "mycelica_create_meta",
+                "mycelica_update_meta",
+            ],
         };
         tools.extend(write);
         tools
     }
 }
 
-const READ_TOOLS: [&str; 14] = [
+const READ_TOOLS: [&str; 16] = [
+    "mycelica_explore",
     "mycelica_search",
     "mycelica_node_get",
     "mycelica_read_content",
@@ -112,6 +131,7 @@ const READ_TOOLS: [&str; 14] = [
     "mycelica_explain_edge",
     "mycelica_path_between",
     "mycelica_edges_for_context",
+    "mycelica_context_for_task",
     "mycelica_list_region",
     "mycelica_check_freshness",
     "mycelica_status",
@@ -199,6 +219,24 @@ struct EdgesForContextParams {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ContextForTaskParams {
+    /// Starting node ID, prefix, or title
+    id: String,
+    /// Maximum number of context nodes to return (default: 20)
+    budget: Option<usize>,
+    /// Maximum hops from source (default: 6)
+    max_hops: Option<usize>,
+    /// Maximum cumulative path cost (default: 3.0)
+    max_cost: Option<f64>,
+    /// Comma-separated edge types to follow
+    edge_types: Option<String>,
+    /// If true, exclude superseded edges
+    not_superseded: Option<bool>,
+    /// If true, only return item nodes (skip categories)
+    items_only: Option<bool>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 struct ListRegionParams {
     /// Parent node ID, prefix, or title
     id: String,
@@ -221,6 +259,17 @@ struct StatusParams {}
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 struct DbStatsParams {}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ExploreParams {
+    /// Query to explore: function name, concept, or natural language.
+    /// Searches the graph, reads source code, and returns callers/callees in one call.
+    query: String,
+    /// Maximum code nodes to return with source (default: 5)
+    limit: Option<u32>,
+    /// Maximum lines of source code per result (default: 40)
+    max_lines: Option<usize>,
+}
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 struct CreateEdgeParams {
@@ -460,6 +509,158 @@ impl Tools {
     }
 
     // ── Read Tools ───────────────────────────────────────────────────────
+
+    #[tool(description = "Explore the codebase around a query. Combines search + source code + call graph into one response. Use this instead of separate search/code_show/nav_edges calls.")]
+    async fn mycelica_explore(
+        &self,
+        Parameters(p): Parameters<ExploreParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = p.limit.unwrap_or(5) as usize;
+        let max_lines = p.max_lines.unwrap_or(40);
+
+        // 1. Search for matching nodes
+        let nodes = match self.db.search_nodes(&p.query) {
+            Ok(n) => n,
+            Err(e) => return Ok(Self::tool_error(format!("Search failed: {}", e))),
+        };
+
+        // Filter to code nodes, skip operational
+        let code_nodes: Vec<&Node> = nodes.iter()
+            .filter(|n| n.node_class.as_deref() != Some("operational"))
+            .filter(|n| n.content_type.as_ref().map(|ct| ct.starts_with("code_")).unwrap_or(false))
+            .take(limit)
+            .collect();
+
+        if code_nodes.is_empty() {
+            // No code nodes found — return general search results instead
+            let general: Vec<&Node> = nodes.iter()
+                .filter(|n| n.node_class.as_deref() != Some("operational"))
+                .take(limit)
+                .collect();
+            let results: Vec<serde_json::Value> = general.iter().map(|n| {
+                serde_json::json!({
+                    "id": &n.id[..8.min(n.id.len())],
+                    "title": n.ai_title.as_ref().unwrap_or(&n.title),
+                    "type": n.content_type,
+                    "class": n.node_class,
+                })
+            }).collect();
+            return Ok(Self::tool_ok(&serde_json::json!({
+                "query": p.query,
+                "note": "No code nodes found. Showing general results.",
+                "results": results,
+            })));
+        }
+
+        // Helper to parse code metadata from tags
+        #[derive(serde::Deserialize)]
+        struct CodeMeta {
+            file_path: Option<String>,
+            #[serde(default)]
+            line_start: Option<usize>,
+            #[serde(default)]
+            line_end: Option<usize>,
+        }
+
+        let db_dir = std::path::Path::new(&self.db.get_path())
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+
+        let mut results: Vec<serde_json::Value> = Vec::new();
+
+        for node in &code_nodes {
+            let mut entry = serde_json::json!({
+                "id": &node.id[..8.min(node.id.len())],
+                "title": node.ai_title.as_ref().unwrap_or(&node.title),
+                "content_type": node.content_type,
+            });
+
+            // Parse source location from tags
+            let meta: Option<CodeMeta> = node.tags.as_ref()
+                .and_then(|t| if t.trim().starts_with('{') { serde_json::from_str(t).ok() } else { None });
+
+            if let Some(ref meta) = meta {
+                if let Some(ref fp) = meta.file_path {
+                    entry["file"] = serde_json::json!(fp);
+                    if let (Some(start), Some(end)) = (meta.line_start, meta.line_end) {
+                        entry["lines"] = serde_json::json!(format!("{}-{}", start, end));
+
+                        // Read source code
+                        let abs_path = {
+                            let p = std::path::PathBuf::from(fp);
+                            if p.is_relative() { db_dir.join(&p) } else { p }
+                        };
+                        if let Ok(content) = std::fs::read_to_string(&abs_path) {
+                            let all_lines: Vec<&str> = content.lines().collect();
+                            let s = start.max(1);
+                            let e = end.min(all_lines.len());
+                            if s <= all_lines.len() {
+                                let code_lines = &all_lines[s - 1..e];
+                                let truncated = if code_lines.len() > max_lines {
+                                    let mut snippet: Vec<String> = code_lines[..max_lines].iter()
+                                        .enumerate()
+                                        .map(|(i, l)| format!("{:4} | {}", s + i, l))
+                                        .collect();
+                                    snippet.push(format!("     ... ({} more lines)", code_lines.len() - max_lines));
+                                    snippet.join("\n")
+                                } else {
+                                    code_lines.iter()
+                                        .enumerate()
+                                        .map(|(i, l)| format!("{:4} | {}", s + i, l))
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                };
+                                entry["source"] = serde_json::json!(truncated);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Get callers and callees
+            if let Ok(edges) = self.db.get_edges_for_node(&node.id) {
+                let callers: Vec<String> = edges.iter()
+                    .filter(|e| e.edge_type.as_str() == "calls" && e.target == node.id)
+                    .filter_map(|e| self.db.get_node(&e.source).ok().flatten())
+                    .filter(|n| n.node_class.as_deref() != Some("operational"))
+                    .take(5)
+                    .map(|n| {
+                        let title = n.ai_title.as_ref().unwrap_or(&n.title);
+                        let short = if title.len() > 60 { format!("{}...", &title[..57]) } else { title.clone() };
+                        short
+                    })
+                    .collect();
+                let callees: Vec<String> = edges.iter()
+                    .filter(|e| e.edge_type.as_str() == "calls" && e.source == node.id)
+                    .filter_map(|e| self.db.get_node(&e.target).ok().flatten())
+                    .filter(|n| n.node_class.as_deref() != Some("operational"))
+                    .take(5)
+                    .map(|n| {
+                        let title = n.ai_title.as_ref().unwrap_or(&n.title);
+                        let short = if title.len() > 60 { format!("{}...", &title[..57]) } else { title.clone() };
+                        short
+                    })
+                    .collect();
+
+                if !callers.is_empty() {
+                    entry["called_by"] = serde_json::json!(callers);
+                }
+                if !callees.is_empty() {
+                    entry["calls"] = serde_json::json!(callees);
+                }
+            }
+
+            results.push(entry);
+        }
+
+        Ok(Self::tool_ok(&serde_json::json!({
+            "query": p.query,
+            "results": results,
+            "count": results.len(),
+            "total_matches": nodes.len(),
+        })))
+    }
 
     #[tool(description = "Search the knowledge graph by text query. Returns matching nodes.")]
     async fn mycelica_search(
@@ -721,6 +922,62 @@ impl Tools {
             "node": node.id,
             "edges": slim,
             "count": slim.len(),
+        })))
+    }
+
+    #[tool(description = "Dijkstra context retrieval: find the N most relevant nodes by weighted graph proximity from a starting node. Uses edge confidence and type priority as weights. Returns nodes sorted by relevance — the graph's attention mechanism.")]
+    async fn mycelica_context_for_task(
+        &self,
+        Parameters(p): Parameters<ContextForTaskParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let node = match self.resolve(&p.id) {
+            Ok(n) => n,
+            Err(msg) => return Ok(Self::tool_error(msg)),
+        };
+        let budget = p.budget.unwrap_or(20);
+        let not_superseded = p.not_superseded.unwrap_or(false);
+        let items_only = p.items_only.unwrap_or(false);
+
+        let type_list: Option<Vec<String>> = p.edge_types.map(|s|
+            s.split(',').map(|t| t.trim().to_string()).collect()
+        );
+        let type_refs: Option<Vec<&str>> = type_list.as_ref()
+            .map(|v| v.iter().map(|s| s.as_str()).collect());
+
+        let results = match self.db.context_for_task(
+            &node.id, budget, p.max_hops, p.max_cost,
+            type_refs.as_deref(), None, not_superseded, items_only,
+        ) {
+            Ok(r) => r,
+            Err(e) => return Ok(Self::tool_error(format!("Context retrieval failed: {}", e))),
+        };
+
+        // Slim output: node info + path with slim edges
+        let slim_results: Vec<serde_json::Value> = results.iter().map(|r| {
+            let slim_path: Vec<serde_json::Value> = r.path.iter().map(|hop| {
+                serde_json::json!({
+                    "node_id": hop.node_id,
+                    "node_title": hop.node_title,
+                    "edge": SlimEdge::from(&hop.edge),
+                })
+            }).collect();
+            serde_json::json!({
+                "rank": r.rank,
+                "node_id": r.node_id,
+                "node_title": r.node_title,
+                "distance": r.distance,
+                "relevance": r.relevance,
+                "hops": r.hops,
+                "node_class": r.node_class,
+                "is_item": r.is_item,
+                "path": slim_path,
+            })
+        }).collect();
+
+        Ok(Self::tool_ok(&serde_json::json!({
+            "source": node.id,
+            "results": slim_results,
+            "count": slim_results.len(),
         })))
     }
 
@@ -1555,4 +1812,66 @@ pub async fn run_mcp_server(
         .await
         .map_err(|e| format!("MCP server terminated: {}", e))?;
     Ok(())
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_agent_role_from_str_architect() {
+        assert_eq!(AgentRole::from_str("architect"), Some(AgentRole::Architect));
+    }
+
+    #[test]
+    fn test_agent_role_from_str_architect_case_insensitive() {
+        assert_eq!(AgentRole::from_str("ARCHITECT"), Some(AgentRole::Architect));
+        assert_eq!(AgentRole::from_str("Architect"), Some(AgentRole::Architect));
+    }
+
+    #[test]
+    fn test_agent_role_from_str_unknown_returns_none() {
+        assert_eq!(AgentRole::from_str("unknown_role"), None);
+    }
+
+    #[test]
+    fn test_architect_allowed_tools_includes_create_edge() {
+        let tools = AgentRole::Architect.allowed_tools();
+        assert!(tools.contains("mycelica_create_edge"));
+    }
+
+    #[test]
+    fn test_architect_allowed_tools_includes_create_node() {
+        let tools = AgentRole::Architect.allowed_tools();
+        assert!(tools.contains("mycelica_create_node"));
+    }
+
+    #[test]
+    fn test_architect_allowed_tools_excludes_create_meta() {
+        let tools = AgentRole::Architect.allowed_tools();
+        assert!(!tools.contains("mycelica_create_meta"));
+        assert!(!tools.contains("mycelica_update_meta"));
+    }
+
+    #[test]
+    fn test_architect_allowed_tools_includes_read_tools() {
+        let tools = AgentRole::Architect.allowed_tools();
+        for read_tool in READ_TOOLS.iter() {
+            assert!(tools.contains(read_tool), "Missing read tool: {}", read_tool);
+        }
+    }
+
+    #[test]
+    fn test_all_roles_parse() {
+        let valid = [
+            "human", "ingestor", "coder", "tester", "verifier",
+            "planner", "architect", "synthesizer", "summarizer",
+            "docwriter", "researcher", "operator",
+        ];
+        for role in valid {
+            assert!(AgentRole::from_str(role).is_some(), "Failed to parse: {}", role);
+        }
+    }
 }

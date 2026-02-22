@@ -16,6 +16,7 @@ mod format_abstract;
 pub mod code;
 mod holerabbit;
 pub mod dendrogram;
+pub mod graph_analysis;
 pub mod remote_client;
 pub mod team;
 #[cfg(feature = "signal")]

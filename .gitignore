@@ -3,6 +3,7 @@
 # ===================
 dist/
 dist-ssr/
+spore/spore
 node_modules/
 target/
 releases/
@@ -15,7 +16,12 @@ archive/
 binaries/
 docs/private/
 docs/implementation/
-docs/spore/
+docs/spore/tasks/
+docs/spore/guide/
+src-tauri/docs/spore/tasks/
+PRIORITIES.md
+TASK_QUEUE.md
+docs/spore/TASK_QUEUE.md
 *.db
 *-hnsw.bin
 mycelica-openAIRE-preview.db
@@ -71,7 +77,9 @@ Thumbs.db
 # ===================
 # Claude Code
 # ===================
-.claude/
+.claude/*
+!.claude/agents/
+!.claude/skills/
 .mcp.json
 
 # ===================

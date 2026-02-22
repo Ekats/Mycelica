@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
-use super::models::{Node, Edge, NodeType, EdgeType, Position, Tag, Paper, EdgeWithNodes, EdgeExplanation, PathHop};
+use super::models::{Node, Edge, NodeType, EdgeType, Position, Tag, Paper, EdgeWithNodes, EdgeExplanation, PathHop, ContextNode};
 
 pub struct Database {
     conn: Mutex<Connection>,
@@ -1313,6 +1313,24 @@ impl Database {
         )?;
 
         Ok(deleted)
+    }
+
+    /// Get all distinct file paths stored in code node tags.
+    /// Returns (file_path, node_count) pairs sorted by file_path.
+    pub fn get_all_code_file_paths(&self) -> Result<Vec<(String, usize)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT JSON_EXTRACT(tags, '$.file_path') AS fp, COUNT(*) AS cnt \
+             FROM nodes \
+             WHERE tags IS NOT NULL AND JSON_EXTRACT(tags, '$.file_path') IS NOT NULL \
+               AND id LIKE 'code-%' \
+             GROUP BY fp \
+             ORDER BY fp"
+        )?;
+        let rows: Vec<(String, usize)> = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
+        })?.filter_map(|r| r.ok()).collect();
+        Ok(rows)
     }
 
     /// Get node IDs for a specific file path (for targeted edge refresh)
@@ -4421,6 +4439,17 @@ impl Database {
         Ok(count)
     }
 
+    /// Count edges where source or target node doesn't exist (read-only)
+    pub fn count_dead_edges(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count: usize = conn.query_row(
+            "SELECT COUNT(*) FROM edges WHERE source_id NOT IN (SELECT id FROM nodes) OR target_id NOT IN (SELECT id FROM nodes)",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Remove duplicate edges (same source, target, type), keep oldest
     pub fn deduplicate_edges(&self) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
@@ -5631,6 +5660,17 @@ impl Database {
     }
 
     /// Get the N most relevant edges for a node, ranked by composite score.
+    /// Edge type priority for scoring (higher = more important).
+    /// Used by edges_for_context and context_for_task.
+    fn edge_type_priority(edge_type: &EdgeType) -> f64 {
+        match edge_type {
+            EdgeType::Contradicts | EdgeType::Flags => 1.0,
+            EdgeType::DerivesFrom | EdgeType::Summarizes | EdgeType::Resolves | EdgeType::Supersedes => 0.7,
+            EdgeType::Supports | EdgeType::Questions | EdgeType::Prerequisite | EdgeType::EvolvedFrom => 0.5,
+            _ => 0.3,
+        }
+    }
+
     pub fn edges_for_context(&self, node_id: &str, top_n: usize, not_superseded: bool) -> Result<Vec<Edge>> {
         let all_edges = self.get_edges_for_node(node_id)?;
 
@@ -5657,12 +5697,7 @@ impl Database {
                 1.0
             };
             let confidence = e.confidence.unwrap_or(0.5);
-            let type_priority = match e.edge_type {
-                EdgeType::Contradicts | EdgeType::Flags => 1.0,
-                EdgeType::DerivesFrom | EdgeType::Summarizes | EdgeType::Resolves | EdgeType::Supersedes => 0.7,
-                EdgeType::Supports | EdgeType::Questions | EdgeType::Prerequisite | EdgeType::EvolvedFrom => 0.5,
-                _ => 0.3,
-            };
+            let type_priority = Self::edge_type_priority(&e.edge_type);
             let score = 0.3 * recency + 0.3 * confidence + 0.4 * type_priority;
             (score, e)
         }).collect();
@@ -5671,6 +5706,192 @@ impl Database {
         scored.truncate(top_n);
 
         Ok(scored.into_iter().map(|(_, e)| e).collect())
+    }
+
+    /// Dijkstra context retrieval: find the N most relevant nodes by weighted
+    /// graph proximity from a starting node. Edge cost = (1 - confidence) * (1 - 0.5 * type_priority).
+    /// High confidence + important edge type = low cost = preferred path.
+    pub fn context_for_task(
+        &self,
+        source_id: &str,
+        budget: usize,
+        max_hops: Option<usize>,
+        max_cost: Option<f64>,
+        edge_types: Option<&[&str]>,
+        exclude_edge_types: Option<&[&str]>,
+        not_superseded: bool,
+        items_only: bool,
+    ) -> Result<Vec<ContextNode>> {
+        use std::collections::{BinaryHeap, HashMap, HashSet};
+
+        let max_h = max_hops.unwrap_or(6);
+        let max_c = max_cost.unwrap_or(3.0);
+
+        // Min-heap entry (smallest distance pops first)
+        struct Entry {
+            distance: f64,
+            node_id: String,
+            hops: usize,
+        }
+        impl PartialEq for Entry {
+            fn eq(&self, other: &Self) -> bool {
+                self.distance.total_cmp(&other.distance) == std::cmp::Ordering::Equal
+            }
+        }
+        impl Eq for Entry {}
+        impl PartialOrd for Entry {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for Entry {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                // Reversed: smaller distance = higher priority
+                other.distance.total_cmp(&self.distance)
+            }
+        }
+
+        let mut dist: HashMap<String, f64> = HashMap::new();
+        let mut prev: HashMap<String, (String, Edge)> = HashMap::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut heap: BinaryHeap<Entry> = BinaryHeap::new();
+        let mut results: Vec<ContextNode> = Vec::new();
+
+        dist.insert(source_id.to_string(), 0.0);
+        heap.push(Entry { distance: 0.0, node_id: source_id.to_string(), hops: 0 });
+
+        while let Some(entry) = heap.pop() {
+            let current = entry.node_id;
+            let current_dist = entry.distance;
+            let current_hops = entry.hops;
+
+            if visited.contains(&current) {
+                continue;
+            }
+            visited.insert(current.clone());
+
+            // Collect this node (skip the source itself)
+            if current != source_id {
+                if let Some(n) = self.get_node(&current)? {
+                    // items_only: skip categories from results but still traverse through them
+                    if !items_only || n.is_item {
+                        let path = Self::reconstruct_path(&prev, source_id, &current, self)?;
+                        results.push(ContextNode {
+                            rank: 0,
+                            node_id: current.clone(),
+                            node_title: n.ai_title.unwrap_or(n.title),
+                            distance: current_dist,
+                            relevance: 1.0 / (1.0 + current_dist),
+                            hops: current_hops,
+                            path,
+                            node_class: n.node_class,
+                            is_item: n.is_item,
+                        });
+                        if results.len() >= budget {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Stop expanding if max hops reached
+            if current_hops >= max_h {
+                continue;
+            }
+
+            // Expand neighbors
+            let edges = self.get_edges_for_node(&current)?;
+
+            for edge in edges {
+                if not_superseded && edge.superseded_by.is_some() {
+                    continue;
+                }
+
+                if let Some(types) = edge_types {
+                    if !types.contains(&edge.edge_type.as_str()) {
+                        continue;
+                    }
+                }
+
+                if let Some(exclude) = exclude_edge_types {
+                    if exclude.contains(&edge.edge_type.as_str()) {
+                        continue;
+                    }
+                }
+
+                let neighbor = if edge.source == current {
+                    &edge.target
+                } else {
+                    &edge.source
+                };
+
+                if visited.contains(neighbor.as_str()) {
+                    continue;
+                }
+
+                let confidence = edge.confidence.unwrap_or(0.5);
+                let type_priority = Self::edge_type_priority(&edge.edge_type);
+                let base_cost = ((1.0 - confidence) * (1.0 - 0.5 * type_priority)).max(0.001);
+                // Structural edges (defined_in, belongs_to, sibling) are high-confidence
+                // but low-information: "same file" != "semantically relevant". Apply a
+                // higher cost floor so they don't flood the budget before semantic edges.
+                let edge_cost = match edge.edge_type {
+                    EdgeType::DefinedIn | EdgeType::BelongsTo | EdgeType::Sibling => base_cost.max(0.4),
+                    _ => base_cost,
+                };
+
+                let new_dist = current_dist + edge_cost;
+
+                if new_dist > max_c {
+                    continue;
+                }
+
+                if new_dist < *dist.get(neighbor.as_str()).unwrap_or(&f64::INFINITY) {
+                    dist.insert(neighbor.clone(), new_dist);
+                    prev.insert(neighbor.clone(), (current.clone(), edge.clone()));
+                    heap.push(Entry {
+                        distance: new_dist,
+                        node_id: neighbor.clone(),
+                        hops: current_hops + 1,
+                    });
+                }
+            }
+        }
+
+        // Assign ranks
+        for (i, node) in results.iter_mut().enumerate() {
+            node.rank = i + 1;
+        }
+
+        Ok(results)
+    }
+
+    /// Reconstruct path from Dijkstra's prev map
+    fn reconstruct_path(
+        prev: &std::collections::HashMap<String, (String, Edge)>,
+        source: &str,
+        target: &str,
+        db: &Database,
+    ) -> Result<Vec<PathHop>> {
+        let mut path = Vec::new();
+        let mut current = target.to_string();
+        while current != source {
+            if let Some((prev_node, edge)) = prev.get(&current) {
+                let node_title = db.get_node(&current)?
+                    .map(|n| n.ai_title.unwrap_or(n.title))
+                    .unwrap_or_else(|| current[..8.min(current.len())].to_string());
+                path.push(PathHop {
+                    edge: edge.clone(),
+                    node_id: current.clone(),
+                    node_title,
+                });
+                current = prev_node.clone();
+            } else {
+                break;
+            }
+        }
+        path.reverse();
+        Ok(path)
     }
 
     /// Find all simple paths between two nodes via DFS with per-path visited set.
@@ -6117,4 +6338,350 @@ fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::models::*;
+
+    fn make_node(id: &str) -> Node {
+        Node {
+            id: id.to_string(),
+            node_type: NodeType::Thought,
+            title: format!("Test node {}", id),
+            url: None,
+            content: None,
+            position: Position { x: 0.0, y: 0.0 },
+            created_at: 0,
+            updated_at: 0,
+            cluster_id: None,
+            cluster_label: None,
+            ai_title: None,
+            summary: None,
+            tags: None,
+            emoji: None,
+            is_processed: false,
+            depth: 1,
+            is_item: true,
+            is_universe: false,
+            parent_id: None,
+            child_count: 0,
+            conversation_id: None,
+            sequence_index: None,
+            is_pinned: false,
+            last_accessed_at: None,
+            latest_child_date: None,
+            is_private: None,
+            privacy_reason: None,
+            source: None,
+            pdf_available: None,
+            content_type: None,
+            associated_idea_id: None,
+            privacy: None,
+            human_edited: None,
+            human_created: false,
+            author: None,
+            agent_id: None,
+            node_class: None,
+            meta_type: None,
+        }
+    }
+
+    fn make_edge(id: &str, source: &str, target: &str) -> Edge {
+        Edge {
+            id: id.to_string(),
+            source: source.to_string(),
+            target: target.to_string(),
+            edge_type: EdgeType::Related,
+            label: None,
+            weight: None,
+            edge_source: None,
+            evidence_id: None,
+            confidence: None,
+            created_at: 0,
+            updated_at: None,
+            author: None,
+            reason: None,
+            content: None,
+            agent_id: None,
+            superseded_by: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_count_dead_edges_empty_db() {
+        let db = Database::in_memory().unwrap();
+        let count = db.count_dead_edges().unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_count_dead_edges_no_orphans() {
+        let db = Database::in_memory().unwrap();
+        db.insert_node(&make_node("a")).unwrap();
+        db.insert_node(&make_node("b")).unwrap();
+        db.insert_edge(&make_edge("e1", "a", "b")).unwrap();
+
+        let count = db.count_dead_edges().unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// Insert an edge bypassing FK constraints (for testing orphan edge scenarios).
+    fn insert_orphan_edge(db: &Database, id: &str, source: &str, target: &str) {
+        let conn = db.conn.lock().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        conn.execute(
+            "INSERT INTO edges (id, source_id, target_id, type, created_at) VALUES (?1, ?2, ?3, 'Related', 0)",
+            rusqlite::params![id, source, target],
+        ).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+    }
+
+    #[test]
+    fn test_count_dead_edges_source_missing() {
+        let db = Database::in_memory().unwrap();
+        db.insert_node(&make_node("b")).unwrap();
+        // Edge references non-existent source "ghost"
+        insert_orphan_edge(&db, "e1", "ghost", "b");
+
+        let count = db.count_dead_edges().unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_count_dead_edges_target_missing() {
+        let db = Database::in_memory().unwrap();
+        db.insert_node(&make_node("a")).unwrap();
+        // Edge references non-existent target "ghost"
+        insert_orphan_edge(&db, "e1", "a", "ghost");
+
+        let count = db.count_dead_edges().unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_count_dead_edges_both_missing() {
+        let db = Database::in_memory().unwrap();
+        // Edge where neither source nor target exists
+        insert_orphan_edge(&db, "e1", "ghost1", "ghost2");
+
+        let count = db.count_dead_edges().unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_count_dead_edges_mixed_valid_and_orphan() {
+        let db = Database::in_memory().unwrap();
+        db.insert_node(&make_node("a")).unwrap();
+        db.insert_node(&make_node("b")).unwrap();
+
+        // Valid edge
+        db.insert_edge(&make_edge("e1", "a", "b")).unwrap();
+        // Orphan: source missing
+        insert_orphan_edge(&db, "e2", "ghost", "b");
+        // Orphan: target missing
+        insert_orphan_edge(&db, "e3", "a", "ghost");
+
+        let count = db.count_dead_edges().unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_count_dead_edges_is_readonly() {
+        let db = Database::in_memory().unwrap();
+        db.insert_node(&make_node("a")).unwrap();
+        // Create orphan edge
+        insert_orphan_edge(&db, "e1", "ghost", "a");
+
+        // Count should find the orphan
+        let count = db.count_dead_edges().unwrap();
+        assert_eq!(count, 1);
+
+        // Call again — edge should still be there (not deleted)
+        let count2 = db.count_dead_edges().unwrap();
+        assert_eq!(count2, 1);
+
+        // Verify edge count hasn't changed
+        let total: usize = {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(total, 1, "count_dead_edges must not delete edges");
+    }
+
+    #[test]
+    fn test_count_dead_edges_matches_prune_dead_edges() {
+        let db = Database::in_memory().unwrap();
+        db.insert_node(&make_node("a")).unwrap();
+        db.insert_node(&make_node("b")).unwrap();
+
+        // 2 valid edges
+        db.insert_edge(&make_edge("e1", "a", "b")).unwrap();
+        db.insert_edge(&make_edge("e2", "b", "a")).unwrap();
+        // 3 orphan edges
+        insert_orphan_edge(&db, "e3", "ghost1", "a");
+        insert_orphan_edge(&db, "e4", "b", "ghost2");
+        insert_orphan_edge(&db, "e5", "ghost3", "ghost4");
+
+        // count_dead_edges should report 3
+        let count = db.count_dead_edges().unwrap();
+        assert_eq!(count, 3);
+
+        // prune_dead_edges should delete exactly the same 3
+        let pruned = db.prune_dead_edges().unwrap();
+        assert_eq!(pruned, 3);
+
+        // After pruning, count should be 0
+        let count_after = db.count_dead_edges().unwrap();
+        assert_eq!(count_after, 0);
+    }
+
+    fn make_edge_typed(id: &str, source: &str, target: &str, et: EdgeType) -> Edge {
+        let mut e = make_edge(id, source, target);
+        e.edge_type = et;
+        e
+    }
+
+    // --- context_for_task exclude_edge_types tests ---
+
+    #[test]
+    fn test_context_for_task_no_exclusion_returns_browser_edge_nodes() {
+        // Baseline: without exclusion, nodes reachable via clicked are returned.
+        let db = Database::in_memory().unwrap();
+        db.insert_node(&make_node("src")).unwrap();
+        db.insert_node(&make_node("tgt")).unwrap();
+        db.insert_edge(&make_edge_typed("e1", "src", "tgt", EdgeType::Clicked)).unwrap();
+
+        let results = db.context_for_task("src", 10, None, None, None, None, false, false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].node_id, "tgt");
+    }
+
+    #[test]
+    fn test_context_for_task_exclude_clicked_blocks_node() {
+        // Nodes reachable only via clicked should not appear when clicked is excluded.
+        let db = Database::in_memory().unwrap();
+        db.insert_node(&make_node("src")).unwrap();
+        db.insert_node(&make_node("tgt")).unwrap();
+        db.insert_edge(&make_edge_typed("e1", "src", "tgt", EdgeType::Clicked)).unwrap();
+
+        let results = db.context_for_task(
+            "src", 10, None, None, None,
+            Some(&["clicked"]),
+            false, false,
+        ).unwrap();
+        assert!(results.is_empty(), "clicked edge should be excluded");
+    }
+
+    #[test]
+    fn test_context_for_task_exclude_backtracked_blocks_node() {
+        let db = Database::in_memory().unwrap();
+        db.insert_node(&make_node("src")).unwrap();
+        db.insert_node(&make_node("tgt")).unwrap();
+        db.insert_edge(&make_edge_typed("e1", "src", "tgt", EdgeType::Backtracked)).unwrap();
+
+        let results = db.context_for_task(
+            "src", 10, None, None, None,
+            Some(&["backtracked"]),
+            false, false,
+        ).unwrap();
+        assert!(results.is_empty(), "backtracked edge should be excluded");
+    }
+
+    #[test]
+    fn test_context_for_task_exclude_session_item_blocks_node() {
+        let db = Database::in_memory().unwrap();
+        db.insert_node(&make_node("src")).unwrap();
+        db.insert_node(&make_node("tgt")).unwrap();
+        db.insert_edge(&make_edge_typed("e1", "src", "tgt", EdgeType::SessionItem)).unwrap();
+
+        let results = db.context_for_task(
+            "src", 10, None, None, None,
+            Some(&["session_item"]),
+            false, false,
+        ).unwrap();
+        assert!(results.is_empty(), "session_item edge should be excluded");
+    }
+
+    #[test]
+    fn test_context_for_task_exclude_all_three_browser_types() {
+        // All three browser edge types excluded simultaneously.
+        let db = Database::in_memory().unwrap();
+        db.insert_node(&make_node("src")).unwrap();
+        db.insert_node(&make_node("n_clicked")).unwrap();
+        db.insert_node(&make_node("n_back")).unwrap();
+        db.insert_node(&make_node("n_session")).unwrap();
+        db.insert_edge(&make_edge_typed("e1", "src", "n_clicked", EdgeType::Clicked)).unwrap();
+        db.insert_edge(&make_edge_typed("e2", "src", "n_back", EdgeType::Backtracked)).unwrap();
+        db.insert_edge(&make_edge_typed("e3", "src", "n_session", EdgeType::SessionItem)).unwrap();
+
+        let results = db.context_for_task(
+            "src", 10, None, None, None,
+            Some(&["clicked", "backtracked", "session_item"]),
+            false, false,
+        ).unwrap();
+        assert!(results.is_empty(), "all three browser edge types should be excluded");
+    }
+
+    #[test]
+    fn test_context_for_task_exclude_does_not_affect_non_excluded_edges() {
+        // Excluding browser edges should not affect Related or other edge types.
+        let db = Database::in_memory().unwrap();
+        db.insert_node(&make_node("src")).unwrap();
+        db.insert_node(&make_node("related_node")).unwrap();
+        db.insert_node(&make_node("clicked_node")).unwrap();
+        db.insert_edge(&make_edge("e1", "src", "related_node")).unwrap(); // Related
+        db.insert_edge(&make_edge_typed("e2", "src", "clicked_node", EdgeType::Clicked)).unwrap();
+
+        let results = db.context_for_task(
+            "src", 10, None, None, None,
+            Some(&["clicked", "backtracked", "session_item"]),
+            false, false,
+        ).unwrap();
+        assert_eq!(results.len(), 1, "only the non-excluded node should appear");
+        assert_eq!(results[0].node_id, "related_node");
+    }
+
+    #[test]
+    fn test_context_for_task_alt_path_bypasses_exclusion() {
+        // A node reachable via both an excluded edge and a non-excluded edge
+        // should still appear in results (via the non-excluded path).
+        let db = Database::in_memory().unwrap();
+        db.insert_node(&make_node("src")).unwrap();
+        db.insert_node(&make_node("tgt")).unwrap();
+        db.insert_edge(&make_edge_typed("e1", "src", "tgt", EdgeType::Clicked)).unwrap();
+        db.insert_edge(&make_edge("e2", "src", "tgt")).unwrap(); // Related (not excluded)
+
+        let results = db.context_for_task(
+            "src", 10, None, None, None,
+            Some(&["clicked"]),
+            false, false,
+        ).unwrap();
+        assert_eq!(results.len(), 1, "node reachable via non-excluded edge should still appear");
+        assert_eq!(results[0].node_id, "tgt");
+    }
+
+    #[test]
+    fn test_context_for_task_exclude_blocks_transitive_traversal() {
+        // If the only path to a distant node goes through an excluded edge, it's unreachable.
+        // src -clicked-> mid -related-> distant
+        // With clicked excluded, mid is not visited, so distant is also unreachable.
+        let db = Database::in_memory().unwrap();
+        db.insert_node(&make_node("src")).unwrap();
+        db.insert_node(&make_node("mid")).unwrap();
+        db.insert_node(&make_node("distant")).unwrap();
+        db.insert_edge(&make_edge_typed("e1", "src", "mid", EdgeType::Clicked)).unwrap();
+        db.insert_edge(&make_edge("e2", "mid", "distant")).unwrap(); // Related
+
+        let results = db.context_for_task(
+            "src", 10, None, None, None,
+            Some(&["clicked"]),
+            false, false,
+        ).unwrap();
+        let ids: Vec<&str> = results.iter().map(|r| r.node_id.as_str()).collect();
+        assert!(!ids.contains(&"mid"), "mid should not be reached via excluded clicked edge");
+        assert!(!ids.contains(&"distant"), "distant should not be reached if only path goes through excluded edge");
+    }
 }

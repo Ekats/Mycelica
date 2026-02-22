@@ -2,6 +2,8 @@
 
 Mycelica: Knowledge graph for conversations, notes, papers, and source code. Tauri (Rust + React) with CLI.
 
+> **For the Guide session:** This is reference material, not your task list. Delegate tactical work to Hypha. Conventions are also in `.claude/skills/mycelica-conventions/SKILL.md` (auto-injected into Hypha's prompt).
+
 **This codebase is indexed. Use `mycelica-cli` instead of grep/find — it's faster. (See "For Explore Agents" below.)**
 
 ## CRITICAL: Database Safety
@@ -10,7 +12,7 @@ Mycelica: Knowledge graph for conversations, notes, papers, and source code. Tau
 
 ## START HERE
 
-Run this now:
+Verify the database is populated:
 ```bash
 mycelica-cli db stats
 ```
@@ -47,7 +49,7 @@ Add `.mycelica.db` to `.gitignore`.
 
 ## BEFORE WRITING CODE: Explore
 
-**Use these commands first.** The graph knows relationships grep doesn't.
+**Prefer these commands over grep/glob.** The graph knows relationships grep doesn't.
 
 **Why faster than explore agents:** Pre-computed embeddings enable instant semantic search (no LLM calls), call graph is pre-indexed, and it's a single SQLite query vs. iterative file traversal.
 
@@ -91,7 +93,7 @@ When spawning explore agents for this repo, include in prompt:
 
 ## After Editing: MANDATORY
 
-**Run immediately after any code change:**
+**After any code change, update the index:**
 ```bash
 mycelica-cli import code <file-or-directory> --update
 ```
@@ -116,7 +118,9 @@ The sidecar copy is needed for the GUI to spawn the CLI (Tauri bundles it from `
 |------|-------|
 | Database schema | `src-tauri/src/db/schema.rs` |
 | Data models | `src-tauri/src/db/models.rs` |
-| CLI commands | `src-tauri/src/bin/cli.rs` |
+| CLI commands (core) | `src-tauri/src/bin/cli.rs` |
+| CLI spore/orchestrator | `src-tauri/src/bin/cli/spore.rs` |
+| CLI terminal UI (TUI) | `src-tauri/src/bin/cli/tui.rs` |
 | Tauri commands | `src-tauri/src/commands/graph.rs` |
 | Hierarchy build | `src-tauri/src/hierarchy.rs` |
 | **Adaptive tree algorithm** | `src-tauri/src/dendrogram.rs` |
@@ -202,5 +206,11 @@ The sidecar copy is needed for the GUI to spawn the CLI (Tauri bundles it from `
 | Update after edit | `mycelica-cli import code <file> --update` |
 | Rebuild call graph | `mycelica-cli analyze code-edges` |
 | Place orphan items | `mycelica-cli hierarchy smart-add` |
+| Research a topic | `mycelica-cli spore research "topic"` |
+| Orchestrate a task | `mycelica-cli spore orchestrate "task"` |
+| System health | `mycelica-cli spore health` |
+| Run statistics | `mycelica-cli spore runs stats` |
+| Run timeline | `mycelica-cli spore runs timeline <id>` |
+| Dashboard | `mycelica-cli spore dashboard` |
 | Stats | `mycelica-cli db stats` |
 | Interactive browser | `mycelica-cli tui` |

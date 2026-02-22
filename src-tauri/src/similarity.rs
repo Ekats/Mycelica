@@ -137,4 +137,64 @@ mod tests {
         let similar = find_similar(&target, &embeddings, "x", 5, 0.0);
         assert!(similar.is_empty());
     }
+
+    // Tests for the 0.15 lesson similarity threshold introduced in generate_task_file()
+
+    /// Lessons with similarity below 0.15 should be excluded entirely.
+    #[test]
+    fn test_find_similar_below_threshold_excluded() {
+        let target = vec![1.0, 0.0, 0.0];
+        // sim(target, a) ≈ 0.10 — below 0.15 threshold
+        let a = vec![0.10_f32, 0.99498_f32, 0.0];
+        // sim(target, b) ≈ 0.05 — below 0.15 threshold
+        let b = vec![0.05_f32, 0.99875_f32, 0.0];
+        let embeddings = vec![
+            ("a".to_string(), a),
+            ("b".to_string(), b),
+        ];
+        let similar = find_similar(&target, &embeddings, "x", 5, 0.15);
+        assert!(similar.is_empty(), "Expected no results below 0.15, got {:?}", similar);
+    }
+
+    /// Lesson at exactly the 0.15 boundary should be included.
+    #[test]
+    fn test_find_similar_at_threshold_boundary_included() {
+        let target = vec![1.0, 0.0, 0.0];
+        // Construct a vector with cosine similarity exactly 0.15 to [1,0,0]:
+        // [0.15, sqrt(1 - 0.15^2), 0] is already unit-length
+        let at_threshold = vec![0.15_f32, (1.0_f32 - 0.15_f32 * 0.15_f32).sqrt(), 0.0];
+        let embeddings = vec![("a".to_string(), at_threshold)];
+        let similar = find_similar(&target, &embeddings, "x", 5, 0.15);
+        assert_eq!(similar.len(), 1, "Lesson at exactly 0.15 should be included");
+        assert!((similar[0].1 - 0.15).abs() < 0.001, "Similarity should be ~0.15");
+    }
+
+    /// Mix of lessons: above threshold kept, below discarded.
+    #[test]
+    fn test_find_similar_mixed_threshold_filters_low() {
+        let target = vec![1.0, 0.0, 0.0];
+        // sim ≈ 0.20 — above threshold
+        let high = vec![0.20_f32, (1.0_f32 - 0.04_f32).sqrt(), 0.0];
+        // sim ≈ 0.05 — below threshold
+        let low = vec![0.05_f32, (1.0_f32 - 0.0025_f32).sqrt(), 0.0];
+        let embeddings = vec![
+            ("high".to_string(), high),
+            ("low".to_string(), low),
+        ];
+        let similar = find_similar(&target, &embeddings, "x", 5, 0.15);
+        assert_eq!(similar.len(), 1);
+        assert_eq!(similar[0].0, "high");
+    }
+
+    /// When all lessons pass the threshold, top_n cap still applies.
+    #[test]
+    fn test_find_similar_lesson_threshold_respects_top_n() {
+        let target = vec![1.0, 0.0, 0.0];
+        // All embeddings have similarity > 0.15 (identical = 1.0)
+        let embeddings: Vec<(String, Vec<f32>)> = (0..10)
+            .map(|i| (format!("lesson-{}", i), vec![1.0, 0.0, 0.0]))
+            .collect();
+        let similar = find_similar(&target, &embeddings, "x", 5, 0.15);
+        assert_eq!(similar.len(), 5, "top_n cap should still apply");
+    }
 }
