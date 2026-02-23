@@ -80,7 +80,7 @@ func (d *DB) CreateEdge(sourceID, targetID, edgeType string, opts CreateEdgeOpts
 	}
 
 	args := []string{
-		"spore", "create-edge",
+		"graph", "create-edge",
 		"--from", sourceID,
 		"--to", targetID,
 		"--type", edgeType,

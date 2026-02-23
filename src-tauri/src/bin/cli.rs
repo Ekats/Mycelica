@@ -147,6 +147,9 @@ mod tui;
 #[path = "cli/spore_analyzer.rs"]
 mod spore_analyzer;
 
+#[path = "cli/graph_ops.rs"]
+mod graph_ops;
+
 // Privacy scoring imports
 use serde::{Deserialize, Serialize};
 
@@ -442,6 +445,11 @@ enum Commands {
         #[command(subcommand)]
         cmd: SporeCommands,
     },
+    /// Graph operations (edges, nodes, meta)
+    Graph {
+        #[command(subcommand)]
+        cmd: GraphCommands,
+    },
     #[cfg(feature = "mcp")]
     /// Start MCP server for agent coordination
     McpServer {
@@ -466,6 +474,220 @@ enum Commands {
 
 #[derive(Subcommand)]
 pub(crate) enum SporeCommands {
+    /// Run tracking: list, inspect, or rollback orchestrator runs
+    Runs {
+        #[command(subcommand)]
+        cmd: RunCommands,
+    },
+    /// Dijkstra context retrieval: find the N most relevant nodes by weighted graph proximity
+    ContextForTask {
+        /// Starting node (ID prefix, UUID, or title substring)
+        id: String,
+        /// Maximum number of context nodes to return
+        #[arg(long, default_value = "20")]
+        budget: usize,
+        /// Maximum number of hops from source
+        #[arg(long, default_value = "6")]
+        max_hops: usize,
+        /// Maximum cumulative path cost (lower = stricter)
+        #[arg(long, default_value = "3.0")]
+        max_cost: f64,
+        /// Comma-separated edge types to follow (e.g. "supports,derives_from,calls")
+        #[arg(long = "edge-types")]
+        edge_types: Option<String>,
+        /// Exclude superseded edges
+        #[arg(long)]
+        not_superseded: bool,
+        /// Only include item nodes in results (categories still traversed)
+        #[arg(long)]
+        items_only: bool,
+    },
+    /// List all Lesson: nodes from the graph
+    Lessons {
+        /// Show one lesson per line (title only, no content preview)
+        #[arg(long)]
+        compact: bool,
+    },
+    /// Show a combined dashboard: recent runs, lessons, costs, and graph health
+    Dashboard {
+        /// Number of recent runs to show
+        #[arg(long, default_value = "5")]
+        limit: usize,
+        /// Output format: text (default), json, or csv
+        #[arg(long, default_value = "text", value_enum)]
+        format: DashboardFormat,
+        /// Show only summary counts (runs, verified, cost) without recent runs table or lessons
+        #[arg(long)]
+        count: bool,
+        /// Show today's cost (runs created today UTC)
+        #[arg(long)]
+        cost: bool,
+        /// Show count of stale code nodes (files no longer on disk)
+        #[arg(long)]
+        stale: bool,
+    },
+    /// Distill an orchestrator run into a summary node with lessons learned
+    Distill {
+        /// Run ID prefix (from task node ID) or "latest" for most recent run
+        #[arg(default_value = "latest")]
+        run: String,
+        /// Print only one-line summary (outcome, duration, bounces) without the full trail
+        #[arg(long)]
+        compact: bool,
+    },
+    /// Check system health: database, CLI binary, agent prompts, MCP sidecar
+    Health,
+    /// Show line counts for all agent prompt files
+    PromptStats,
+    /// Analyze graph structure: topology, staleness, bridges, health score
+    Analyze {
+        /// Scope analysis to descendants of this node ID
+        #[arg(long)]
+        region: Option<String>,
+        /// Number of top items to show per section
+        #[arg(long, default_value = "10")]
+        top_n: usize,
+        /// Days since update to consider a node stale
+        #[arg(long, default_value = "60")]
+        stale_days: i64,
+        /// Minimum degree to consider a node a hub
+        #[arg(long, default_value = "15")]
+        hub_threshold: usize,
+    },
+
+    // ---- Deprecation aliases: old `spore <graph-cmd>` paths ----
+    // Hidden from help; print a deprecation warning then delegate to graph_ops.
+
+    #[command(hide = true)]
+    QueryEdges {
+        #[arg(long = "type", short = 't')]
+        edge_type: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        target_agent: Option<String>,
+        #[arg(long)]
+        confidence_min: Option<f64>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        not_superseded: bool,
+        #[arg(long, default_value = "20")]
+        limit: usize,
+        #[arg(long)]
+        compact: bool,
+    },
+    #[command(hide = true)]
+    ExplainEdge {
+        id: String,
+        #[arg(long, default_value = "1")]
+        depth: usize,
+    },
+    #[command(hide = true)]
+    PathBetween {
+        from: String,
+        to: String,
+        #[arg(long, default_value = "5")]
+        max_hops: usize,
+        #[arg(long = "edge-types")]
+        edge_types: Option<String>,
+    },
+    #[command(hide = true)]
+    EdgesForContext {
+        id: String,
+        #[arg(long, default_value = "10")]
+        top: usize,
+        #[arg(long)]
+        not_superseded: bool,
+    },
+    #[command(hide = true)]
+    CreateMeta {
+        #[arg(long = "type", short = 't')]
+        meta_type: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        content: Option<String>,
+        #[arg(long, default_value = "human")]
+        agent: String,
+        #[arg(long = "connects-to", num_args = 1..)]
+        connects_to: Vec<String>,
+        #[arg(long = "edge-type", default_value = "summarizes")]
+        edge_type: String,
+    },
+    #[command(hide = true)]
+    UpdateMeta {
+        id: String,
+        #[arg(long)]
+        content: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long, default_value = "human")]
+        agent: String,
+        #[arg(long = "add-connects", num_args = 1..)]
+        add_connects: Vec<String>,
+        #[arg(long = "edge-type", default_value = "summarizes")]
+        edge_type: String,
+    },
+    #[command(hide = true)]
+    Status {
+        #[arg(long)]
+        all: bool,
+        #[arg(long, default_value = "compact")]
+        format: String,
+    },
+    #[command(hide = true)]
+    CreateEdge {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long = "type", short = 't')]
+        edge_type: String,
+        #[arg(long)]
+        content: Option<String>,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, default_value = "spore")]
+        agent: String,
+        #[arg(long)]
+        confidence: Option<f64>,
+        #[arg(long)]
+        supersedes: Option<String>,
+        #[arg(long)]
+        metadata: Option<String>,
+    },
+    #[command(hide = true)]
+    ReadContent {
+        id: String,
+    },
+    #[command(hide = true)]
+    ListRegion {
+        id: String,
+        #[arg(long)]
+        class: Option<String>,
+        #[arg(long)]
+        items_only: bool,
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+    #[command(hide = true)]
+    CheckFreshness {
+        id: String,
+    },
+    #[command(hide = true)]
+    Gc {
+        #[arg(long, default_value = "7")]
+        days: u32,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum GraphCommands {
     /// Query edges with multi-filter (type, agent, confidence, recency)
     QueryEdges {
         /// Filter by edge type
@@ -566,7 +788,7 @@ pub(crate) enum SporeCommands {
         #[arg(long = "edge-type", default_value = "summarizes")]
         edge_type: String,
     },
-    /// Spore status dashboard
+    /// Graph status dashboard (meta nodes, edge activity, coverage, coherence)
     Status {
         /// Show all details (meta nodes, edge breakdown, contradictions)
         #[arg(long)]
@@ -629,239 +851,17 @@ pub(crate) enum SporeCommands {
         /// Node ID prefix or title substring
         id: String,
     },
-    /// Run tracking: list, inspect, or rollback orchestrator runs
-    Runs {
-        #[command(subcommand)]
-        cmd: RunCommands,
-    },
-    /// Orchestrate a Coder → Verifier bounce loop for a task
-    Orchestrate {
-        /// Task description
-        task: String,
-        /// Maximum bounce iterations before escalation
-        #[arg(long, default_value = "3")]
-        max_bounces: usize,
-        /// Max turns per agent invocation
-        #[arg(long, default_value = "50")]
-        max_turns: usize,
-        /// Path to coder agent prompt
-        #[arg(long, default_value = "docs/spore/agents/coder.md")]
-        coder_prompt: std::path::PathBuf,
-        /// Path to verifier agent prompt
-        #[arg(long, default_value = "docs/spore/agents/verifier.md")]
-        verifier_prompt: std::path::PathBuf,
-        /// Path to summarizer agent prompt
-        #[arg(long, default_value = "docs/spore/agents/summarizer.md")]
-        summarizer_prompt: std::path::PathBuf,
-        /// Skip summarizer after verification
-        #[arg(long)]
-        no_summarize: bool,
-        /// Show what would happen without running agents
-        #[arg(long)]
-        dry_run: bool,
-        /// Print agent stdout/stderr
-        #[arg(long, short)]
-        verbose: bool,
-        /// Suppress per-agent detail output; only show phase headers and final status
-        #[arg(long, short = 'q')]
-        quiet: bool,
-        /// Custom process timeout in seconds (overrides default: max(turns*120, 600))
-        #[arg(long)]
-        timeout: Option<u64>,
-        /// Run as a single named agent role (skips coder/verifier pipeline)
-        #[arg(long)]
-        agent: Option<String>,
-        /// Path to the agent prompt file (used with --agent)
-        #[arg(long)]
-        agent_prompt: Option<std::path::PathBuf>,
-        // Deprecated: native agent mode is now auto-detected via resolve_agent_name() in spore.rs
-        /// Use native Claude Code agent file for coder (--agent coder) [DEPRECATED: auto-detected]
-        #[arg(long)]
-        native_agent: bool,
-        /// Tag this run with an experiment label for A/B comparisons
-        #[arg(long)]
-        experiment: Option<String>,
-        /// Override model for the coder role (e.g., "opus", "sonnet", "haiku")
-        #[arg(long)]
-        coder_model: Option<String>,
-    },
-    /// Re-run an escalated or failed task with optional higher turn/bounce budget
-    Retry {
-        /// Run ID (prefix match) of a previous orchestrator run to retry
-        run_id: String,
-        /// Maximum bounce iterations (default: 3)
-        #[arg(long, default_value = "3")]
-        max_bounces: usize,
-        /// Max turns per agent invocation (default: 50)
-        #[arg(long, default_value = "50")]
-        max_turns: usize,
-        /// Skip summarizer after verification
-        #[arg(long)]
-        no_summarize: bool,
-        /// Print agent stdout/stderr
-        #[arg(long, short)]
-        verbose: bool,
-    },
-    /// Run multiple orchestrator tasks from a file (one task per line)
-    Batch {
-        /// Path to task file (one task description per line, # comments ignored)
-        file: std::path::PathBuf,
-        /// Maximum bounce iterations per task (default: 3)
-        #[arg(long, default_value = "3")]
-        max_bounces: usize,
-        /// Max turns per agent invocation (default: 50)
-        #[arg(long, default_value = "50")]
-        max_turns: usize,
-        /// Custom process timeout in seconds
-        #[arg(long)]
-        timeout: Option<u64>,
-        /// Print agent stdout/stderr
-        #[arg(long, short)]
-        verbose: bool,
-        /// Stop on first failure (default: continue all tasks)
-        #[arg(long)]
-        stop_on_failure: bool,
-        /// Show what would happen without running agents
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Continuous orchestration loop: read tasks from file, dispatch sequentially, evaluate mechanically
-    Loop {
-        /// Task source: path to task file (one task per line, # comments ignored)
-        #[arg(long)]
-        source: String,
-        /// Total cost budget in USD (default: $20.00)
-        #[arg(long, default_value = "20.0")]
-        budget: f64,
-        /// Maximum tasks to dispatch (default: 10)
-        #[arg(long, default_value = "10")]
-        max_runs: usize,
-        /// Per-task bounce limit (default: 3)
-        #[arg(long, default_value = "3")]
-        max_bounces: usize,
-        /// Max turns per agent invocation (default: 50)
-        #[arg(long, default_value = "50")]
-        max_turns: usize,
-        /// Custom process timeout in seconds per task
-        #[arg(long)]
-        timeout: Option<u64>,
-        /// Show what would be dispatched without running
-        #[arg(long)]
-        dry_run: bool,
-        /// Stop the loop when a task escalates (default: continue)
-        #[arg(long)]
-        pause_on_escalation: bool,
-        /// Run summarizer after verified tasks
-        #[arg(long)]
-        summarize: bool,
-        /// Print agent stdout/stderr
-        #[arg(long, short)]
-        verbose: bool,
-        /// Delete loop state before starting (clears all verified task history)
-        #[arg(long)]
-        reset: bool,
-        /// Tag this run with an experiment label for A/B comparisons
-        #[arg(long)]
-        experiment: Option<String>,
-        /// Override model for the coder role (e.g., "opus", "sonnet", "haiku")
-        #[arg(long)]
-        coder_model: Option<String>,
-    },
-    /// Resume an interrupted orchestrator run from its last checkpoint
-    Resume {
-        /// Task node ID or 'last' for most recent checkpoint
-        #[arg(default_value = "last")]
-        id: String,
-        /// Print agent stdout/stderr
-        #[arg(long, short)]
-        verbose: bool,
-    },
-    /// Dijkstra context retrieval: find the N most relevant nodes by weighted graph proximity
-    ContextForTask {
-        /// Starting node (ID prefix, UUID, or title substring)
-        id: String,
-        /// Maximum number of context nodes to return
-        #[arg(long, default_value = "20")]
-        budget: usize,
-        /// Maximum number of hops from source
-        #[arg(long, default_value = "6")]
-        max_hops: usize,
-        /// Maximum cumulative path cost (lower = stricter)
-        #[arg(long, default_value = "3.0")]
-        max_cost: f64,
-        /// Comma-separated edge types to follow (e.g. "supports,derives_from,calls")
-        #[arg(long = "edge-types")]
-        edge_types: Option<String>,
-        /// Exclude superseded edges
-        #[arg(long)]
-        not_superseded: bool,
-        /// Only include item nodes in results (categories still traversed)
-        #[arg(long)]
-        items_only: bool,
-    },
     /// Find stale operational nodes with no incoming edges (GC candidates)
     Gc {
         /// Age threshold in days (default: 7)
         #[arg(long, default_value = "7")]
         days: u32,
-        /// Dry run — only print candidates without deleting
+        /// Dry run -- only print candidates without deleting
         #[arg(long)]
         dry_run: bool,
         /// Include Lesson: and Summary: nodes in GC candidates (normally excluded)
         #[arg(long)]
         force: bool,
-    },
-    /// List all Lesson: nodes from the graph
-    Lessons {
-        /// Show one lesson per line (title only, no content preview)
-        #[arg(long)]
-        compact: bool,
-    },
-    /// Show a combined dashboard: recent runs, lessons, costs, and graph health
-    Dashboard {
-        /// Number of recent runs to show
-        #[arg(long, default_value = "5")]
-        limit: usize,
-        /// Output format: text (default), json, or csv
-        #[arg(long, default_value = "text", value_enum)]
-        format: DashboardFormat,
-        /// Show only summary counts (runs, verified, cost) without recent runs table or lessons
-        #[arg(long)]
-        count: bool,
-        /// Show today's cost (runs created today UTC)
-        #[arg(long)]
-        cost: bool,
-        /// Show count of stale code nodes (files no longer on disk)
-        #[arg(long)]
-        stale: bool,
-    },
-    /// Distill an orchestrator run into a summary node with lessons learned
-    Distill {
-        /// Run ID prefix (from task node ID) or "latest" for most recent run
-        #[arg(default_value = "latest")]
-        run: String,
-        /// Print only one-line summary (outcome, duration, bounces) without the full trail
-        #[arg(long)]
-        compact: bool,
-    },
-    /// Check system health: database, CLI binary, agent prompts, MCP sidecar
-    Health,
-    /// Show line counts for all agent prompt files
-    PromptStats,
-    /// Analyze graph structure: topology, staleness, bridges, health score
-    Analyze {
-        /// Scope analysis to descendants of this node ID
-        #[arg(long)]
-        region: Option<String>,
-        /// Number of top items to show per section
-        #[arg(long, default_value = "10")]
-        top_n: usize,
-        /// Days since update to consider a node stale
-        #[arg(long, default_value = "60")]
-        stale_days: i64,
-        /// Minimum degree to consider a node a hub
-        #[arg(long, default_value = "15")]
-        hub_threshold: usize,
     },
 }
 
@@ -1815,10 +1815,11 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Ask { question, connects_to } => handle_ask(&question, connects_to, &db, cli.json).await,
         Commands::Concept { title, note, connects_to } => handle_concept(&title, note, connects_to, &db, cli.json).await,
         Commands::Decide { title, reason, connects_to } => handle_decide(&title, reason, connects_to, &db, cli.json).await,
-        Commands::Link { source, target, edge_type, reason, content, agent, confidence, supersedes } => spore::handle_link(&source, &target, &edge_type, reason, content, &agent, confidence, supersedes, None, "user", &db, cli.json).await,
+        Commands::Link { source, target, edge_type, reason, content, agent, confidence, supersedes } => graph_ops::handle_link(&source, &target, &edge_type, reason, content, &agent, confidence, supersedes, None, "user", &db, cli.json).await,
         Commands::Orphans { limit } => handle_orphans(limit, &db, cli.json).await,
         Commands::Migrate { cmd } => handle_migrate(cmd, &db, &db_path, cli.json),
         Commands::Spore { cmd } => spore::handle_spore(cmd, &db, cli.json).await,
+        Commands::Graph { cmd } => graph_ops::handle_graph(cmd, &db, cli.json).await,
         #[cfg(feature = "mcp")]
         Commands::McpServer { agent_role, agent_id, stdio, run_id } => {
             if !stdio {
@@ -10897,48 +10898,6 @@ mod tests {
         // 3. no tags → "title\ncontent"
         let text = build_embed_text_option("fn foo()", Some("body"), None);
         assert_eq!(text, "fn foo()\nbody");
-    }
-
-    // Tests for --native-agent flag on `spore orchestrate`
-    #[test]
-    fn test_orchestrate_native_agent_default_is_false() {
-        let cli = Cli::try_parse_from([
-            "mycelica-cli", "spore", "orchestrate", "fix the bug",
-        ]).expect("should parse without --native-agent");
-        match cli.command {
-            Commands::Spore { cmd: SporeCommands::Orchestrate { native_agent, .. } } => {
-                assert!(!native_agent, "native_agent should default to false");
-            }
-            _ => panic!("expected Spore > Orchestrate"),
-        }
-    }
-
-    #[test]
-    fn test_orchestrate_native_agent_flag_sets_true() {
-        let cli = Cli::try_parse_from([
-            "mycelica-cli", "spore", "orchestrate", "fix the bug", "--native-agent",
-        ]).expect("should parse --native-agent");
-        match cli.command {
-            Commands::Spore { cmd: SporeCommands::Orchestrate { native_agent, .. } } => {
-                assert!(native_agent, "native_agent should be true when --native-agent is passed");
-            }
-            _ => panic!("expected Spore > Orchestrate"),
-        }
-    }
-
-    #[test]
-    fn test_orchestrate_native_agent_combined_with_verbose() {
-        let cli = Cli::try_parse_from([
-            "mycelica-cli", "spore", "orchestrate", "add feature",
-            "--native-agent", "--verbose",
-        ]).expect("should parse --native-agent with --verbose");
-        match cli.command {
-            Commands::Spore { cmd: SporeCommands::Orchestrate { native_agent, verbose, .. } } => {
-                assert!(native_agent);
-                assert!(verbose);
-            }
-            _ => panic!("expected Spore > Orchestrate"),
-        }
     }
 
     #[test]
