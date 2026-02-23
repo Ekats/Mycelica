@@ -2,6 +2,38 @@
 
 All notable changes to Mycelica will be documented in this file.
 
+## [0.10.0] - 2026-02-23
+
+### Added
+- **Spore Go binary**: Full Go port of the multi-agent orchestration system (`spore/`)
+  - Phase 1: Graph analyzer (`spore analyze`) — graph stats, hierarchy analysis (~1,200 lines)
+  - Phase 2: Context-for-task (`spore context-for-task`) — Dijkstra expansion, FTS, embeddings (~2,200 lines)
+  - Phase 3: Orchestration pipeline (`spore orchestrate`) — bounce loop, Claude subprocess spawning, verdict detection, task file generation (~3,006 lines, 132 tests)
+  - Phase 4: Loop mode (`spore loop`) and retry (`spore retry`) — multi-task dispatch with budget tracking, state persistence, auto-commit (~610 lines)
+  - Native Go binary at `spore/spore`, built with `go build ./...`
+  - Graph writes shell out to `mycelica-cli` to preserve embedding generation, FTS indexing, and hierarchy processing
+- **`mycelica-cli graph` subcommand**: New top-level subcommand for graph operations
+  - 12 commands moved from `spore`: query-edges, explain-edge, path-between, edges-for-context, create-meta, update-meta, status, create-edge, read-content, list-region, check-freshness, gc
+  - Old `mycelica-cli spore <graph-cmd>` paths still work with deprecation warning
+
+### Changed
+- **CLI refactoring**: Graph operations extracted from `spore` into `graph` subcommand
+  - `spore` subcommand now analytics-only: runs, context-for-task, lessons, dashboard, distill, health, prompt-stats, analyze
+  - New `graph_ops.rs` (915 lines) houses all graph operation handlers
+  - `spore.rs` reduced from 8,839 to 3,427 lines (after Phase 4 deletion + graph extraction)
+- **Rust orchestration deleted**: ~4,700 lines of Rust orchestration code removed from `spore.rs`, replaced by Go port
+  - Removed: handle_orchestrate, handle_single_agent, handle_spore_loop, spawn_claude, generate_task_file, checkpoint system, all orchestration utilities
+  - Removed SporeCommands variants: Orchestrate, Retry, Batch, Loop, Resume
+- **CLI node create/edge flags extended**: `--agent-id`, `--node-class`, `--meta-type`, `--source`, `--author` on node create; `--metadata` on create-edge
+
+### Technical
+- Go binary: 18 source files, 6,481 lines, 143 tests across 5 packages
+- Rust CLI: 435 tests passing, 18 pre-existing warnings
+- Deprecation aliases use `#[command(hide = true)]` clap attribute — hidden from help but parseable
+- Go→Rust bridge: `mycelica-cli graph create-edge` (was `spore create-edge`)
+
+---
+
 ## [0.9.2] - 2026-02-07
 
 ### Fixed

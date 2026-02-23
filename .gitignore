@@ -16,12 +16,10 @@ archive/
 binaries/
 docs/private/
 docs/implementation/
-docs/spore/tasks/
-docs/spore/guide/
+docs/spore/
 src-tauri/docs/spore/tasks/
 PRIORITIES.md
 TASK_QUEUE.md
-docs/spore/TASK_QUEUE.md
 *.db
 *-hnsw.bin
 mycelica-openAIRE-preview.db

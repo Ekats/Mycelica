@@ -147,6 +147,9 @@ mod tui;
 #[path = "cli/spore_analyzer.rs"]
 mod spore_analyzer;
 
+#[path = "cli/graph_ops.rs"]
+mod graph_ops;
+
 // Privacy scoring imports
 use serde::{Deserialize, Serialize};
 
@@ -442,6 +445,11 @@ enum Commands {
         #[command(subcommand)]
         cmd: SporeCommands,
     },
+    /// Graph operations (edges, nodes, meta)
+    Graph {
+        #[command(subcommand)]
+        cmd: GraphCommands,
+    },
     #[cfg(feature = "mcp")]
     /// Start MCP server for agent coordination
     McpServer {
@@ -466,6 +474,220 @@ enum Commands {
 
 #[derive(Subcommand)]
 pub(crate) enum SporeCommands {
+    /// Run tracking: list, inspect, or rollback orchestrator runs
+    Runs {
+        #[command(subcommand)]
+        cmd: RunCommands,
+    },
+    /// Dijkstra context retrieval: find the N most relevant nodes by weighted graph proximity
+    ContextForTask {
+        /// Starting node (ID prefix, UUID, or title substring)
+        id: String,
+        /// Maximum number of context nodes to return
+        #[arg(long, default_value = "20")]
+        budget: usize,
+        /// Maximum number of hops from source
+        #[arg(long, default_value = "6")]
+        max_hops: usize,
+        /// Maximum cumulative path cost (lower = stricter)
+        #[arg(long, default_value = "3.0")]
+        max_cost: f64,
+        /// Comma-separated edge types to follow (e.g. "supports,derives_from,calls")
+        #[arg(long = "edge-types")]
+        edge_types: Option<String>,
+        /// Exclude superseded edges
+        #[arg(long)]
+        not_superseded: bool,
+        /// Only include item nodes in results (categories still traversed)
+        #[arg(long)]
+        items_only: bool,
+    },
+    /// List all Lesson: nodes from the graph
+    Lessons {
+        /// Show one lesson per line (title only, no content preview)
+        #[arg(long)]
+        compact: bool,
+    },
+    /// Show a combined dashboard: recent runs, lessons, costs, and graph health
+    Dashboard {
+        /// Number of recent runs to show
+        #[arg(long, default_value = "5")]
+        limit: usize,
+        /// Output format: text (default), json, or csv
+        #[arg(long, default_value = "text", value_enum)]
+        format: DashboardFormat,
+        /// Show only summary counts (runs, verified, cost) without recent runs table or lessons
+        #[arg(long)]
+        count: bool,
+        /// Show today's cost (runs created today UTC)
+        #[arg(long)]
+        cost: bool,
+        /// Show count of stale code nodes (files no longer on disk)
+        #[arg(long)]
+        stale: bool,
+    },
+    /// Distill an orchestrator run into a summary node with lessons learned
+    Distill {
+        /// Run ID prefix (from task node ID) or "latest" for most recent run
+        #[arg(default_value = "latest")]
+        run: String,
+        /// Print only one-line summary (outcome, duration, bounces) without the full trail
+        #[arg(long)]
+        compact: bool,
+    },
+    /// Check system health: database, CLI binary, agent prompts, MCP sidecar
+    Health,
+    /// Show line counts for all agent prompt files
+    PromptStats,
+    /// Analyze graph structure: topology, staleness, bridges, health score
+    Analyze {
+        /// Scope analysis to descendants of this node ID
+        #[arg(long)]
+        region: Option<String>,
+        /// Number of top items to show per section
+        #[arg(long, default_value = "10")]
+        top_n: usize,
+        /// Days since update to consider a node stale
+        #[arg(long, default_value = "60")]
+        stale_days: i64,
+        /// Minimum degree to consider a node a hub
+        #[arg(long, default_value = "15")]
+        hub_threshold: usize,
+    },
+
+    // ---- Deprecation aliases: old `spore <graph-cmd>` paths ----
+    // Hidden from help; print a deprecation warning then delegate to graph_ops.
+
+    #[command(hide = true)]
+    QueryEdges {
+        #[arg(long = "type", short = 't')]
+        edge_type: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        target_agent: Option<String>,
+        #[arg(long)]
+        confidence_min: Option<f64>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        not_superseded: bool,
+        #[arg(long, default_value = "20")]
+        limit: usize,
+        #[arg(long)]
+        compact: bool,
+    },
+    #[command(hide = true)]
+    ExplainEdge {
+        id: String,
+        #[arg(long, default_value = "1")]
+        depth: usize,
+    },
+    #[command(hide = true)]
+    PathBetween {
+        from: String,
+        to: String,
+        #[arg(long, default_value = "5")]
+        max_hops: usize,
+        #[arg(long = "edge-types")]
+        edge_types: Option<String>,
+    },
+    #[command(hide = true)]
+    EdgesForContext {
+        id: String,
+        #[arg(long, default_value = "10")]
+        top: usize,
+        #[arg(long)]
+        not_superseded: bool,
+    },
+    #[command(hide = true)]
+    CreateMeta {
+        #[arg(long = "type", short = 't')]
+        meta_type: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        content: Option<String>,
+        #[arg(long, default_value = "human")]
+        agent: String,
+        #[arg(long = "connects-to", num_args = 1..)]
+        connects_to: Vec<String>,
+        #[arg(long = "edge-type", default_value = "summarizes")]
+        edge_type: String,
+    },
+    #[command(hide = true)]
+    UpdateMeta {
+        id: String,
+        #[arg(long)]
+        content: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long, default_value = "human")]
+        agent: String,
+        #[arg(long = "add-connects", num_args = 1..)]
+        add_connects: Vec<String>,
+        #[arg(long = "edge-type", default_value = "summarizes")]
+        edge_type: String,
+    },
+    #[command(hide = true)]
+    Status {
+        #[arg(long)]
+        all: bool,
+        #[arg(long, default_value = "compact")]
+        format: String,
+    },
+    #[command(hide = true)]
+    CreateEdge {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long = "type", short = 't')]
+        edge_type: String,
+        #[arg(long)]
+        content: Option<String>,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, default_value = "spore")]
+        agent: String,
+        #[arg(long)]
+        confidence: Option<f64>,
+        #[arg(long)]
+        supersedes: Option<String>,
+        #[arg(long)]
+        metadata: Option<String>,
+    },
+    #[command(hide = true)]
+    ReadContent {
+        id: String,
+    },
+    #[command(hide = true)]
+    ListRegion {
+        id: String,
+        #[arg(long)]
+        class: Option<String>,
+        #[arg(long)]
+        items_only: bool,
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+    #[command(hide = true)]
+    CheckFreshness {
+        id: String,
+    },
+    #[command(hide = true)]
+    Gc {
+        #[arg(long, default_value = "7")]
+        days: u32,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum GraphCommands {
     /// Query edges with multi-filter (type, agent, confidence, recency)
     QueryEdges {
         /// Filter by edge type
@@ -566,7 +788,7 @@ pub(crate) enum SporeCommands {
         #[arg(long = "edge-type", default_value = "summarizes")]
         edge_type: String,
     },
-    /// Spore status dashboard
+    /// Graph status dashboard (meta nodes, edge activity, coverage, coherence)
     Status {
         /// Show all details (meta nodes, edge breakdown, contradictions)
         #[arg(long)]
@@ -629,97 +851,17 @@ pub(crate) enum SporeCommands {
         /// Node ID prefix or title substring
         id: String,
     },
-    /// Run tracking: list, inspect, or rollback orchestrator runs
-    Runs {
-        #[command(subcommand)]
-        cmd: RunCommands,
-    },
-    /// Dijkstra context retrieval: find the N most relevant nodes by weighted graph proximity
-    ContextForTask {
-        /// Starting node (ID prefix, UUID, or title substring)
-        id: String,
-        /// Maximum number of context nodes to return
-        #[arg(long, default_value = "20")]
-        budget: usize,
-        /// Maximum number of hops from source
-        #[arg(long, default_value = "6")]
-        max_hops: usize,
-        /// Maximum cumulative path cost (lower = stricter)
-        #[arg(long, default_value = "3.0")]
-        max_cost: f64,
-        /// Comma-separated edge types to follow (e.g. "supports,derives_from,calls")
-        #[arg(long = "edge-types")]
-        edge_types: Option<String>,
-        /// Exclude superseded edges
-        #[arg(long)]
-        not_superseded: bool,
-        /// Only include item nodes in results (categories still traversed)
-        #[arg(long)]
-        items_only: bool,
-    },
     /// Find stale operational nodes with no incoming edges (GC candidates)
     Gc {
         /// Age threshold in days (default: 7)
         #[arg(long, default_value = "7")]
         days: u32,
-        /// Dry run — only print candidates without deleting
+        /// Dry run -- only print candidates without deleting
         #[arg(long)]
         dry_run: bool,
         /// Include Lesson: and Summary: nodes in GC candidates (normally excluded)
         #[arg(long)]
         force: bool,
-    },
-    /// List all Lesson: nodes from the graph
-    Lessons {
-        /// Show one lesson per line (title only, no content preview)
-        #[arg(long)]
-        compact: bool,
-    },
-    /// Show a combined dashboard: recent runs, lessons, costs, and graph health
-    Dashboard {
-        /// Number of recent runs to show
-        #[arg(long, default_value = "5")]
-        limit: usize,
-        /// Output format: text (default), json, or csv
-        #[arg(long, default_value = "text", value_enum)]
-        format: DashboardFormat,
-        /// Show only summary counts (runs, verified, cost) without recent runs table or lessons
-        #[arg(long)]
-        count: bool,
-        /// Show today's cost (runs created today UTC)
-        #[arg(long)]
-        cost: bool,
-        /// Show count of stale code nodes (files no longer on disk)
-        #[arg(long)]
-        stale: bool,
-    },
-    /// Distill an orchestrator run into a summary node with lessons learned
-    Distill {
-        /// Run ID prefix (from task node ID) or "latest" for most recent run
-        #[arg(default_value = "latest")]
-        run: String,
-        /// Print only one-line summary (outcome, duration, bounces) without the full trail
-        #[arg(long)]
-        compact: bool,
-    },
-    /// Check system health: database, CLI binary, agent prompts, MCP sidecar
-    Health,
-    /// Show line counts for all agent prompt files
-    PromptStats,
-    /// Analyze graph structure: topology, staleness, bridges, health score
-    Analyze {
-        /// Scope analysis to descendants of this node ID
-        #[arg(long)]
-        region: Option<String>,
-        /// Number of top items to show per section
-        #[arg(long, default_value = "10")]
-        top_n: usize,
-        /// Days since update to consider a node stale
-        #[arg(long, default_value = "60")]
-        stale_days: i64,
-        /// Minimum degree to consider a node a hub
-        #[arg(long, default_value = "15")]
-        hub_threshold: usize,
     },
 }
 
@@ -1673,10 +1815,11 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Ask { question, connects_to } => handle_ask(&question, connects_to, &db, cli.json).await,
         Commands::Concept { title, note, connects_to } => handle_concept(&title, note, connects_to, &db, cli.json).await,
         Commands::Decide { title, reason, connects_to } => handle_decide(&title, reason, connects_to, &db, cli.json).await,
-        Commands::Link { source, target, edge_type, reason, content, agent, confidence, supersedes } => spore::handle_link(&source, &target, &edge_type, reason, content, &agent, confidence, supersedes, None, "user", &db, cli.json).await,
+        Commands::Link { source, target, edge_type, reason, content, agent, confidence, supersedes } => graph_ops::handle_link(&source, &target, &edge_type, reason, content, &agent, confidence, supersedes, None, "user", &db, cli.json).await,
         Commands::Orphans { limit } => handle_orphans(limit, &db, cli.json).await,
         Commands::Migrate { cmd } => handle_migrate(cmd, &db, &db_path, cli.json),
         Commands::Spore { cmd } => spore::handle_spore(cmd, &db, cli.json).await,
+        Commands::Graph { cmd } => graph_ops::handle_graph(cmd, &db, cli.json).await,
         #[cfg(feature = "mcp")]
         Commands::McpServer { agent_role, agent_id, stdio, run_id } => {
             if !stdio {
