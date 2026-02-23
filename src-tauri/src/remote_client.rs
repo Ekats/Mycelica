@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub struct RemoteClient {
     base_url: String,
     client: reqwest::Client,
+    api_key: Option<String>,
 }
 
 // ============================================================================
@@ -110,6 +111,15 @@ impl RemoteClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             client: reqwest::Client::new(),
+            api_key: None,
+        }
+    }
+
+    pub fn with_api_key(base_url: &str, api_key: Option<String>) -> Self {
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            client: reqwest::Client::new(),
+            api_key,
         }
     }
 
@@ -117,8 +127,21 @@ impl RemoteClient {
         &self.base_url
     }
 
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
+    }
+
+    /// Add auth header to a request builder if an API key is configured.
+    fn auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(ref key) = self.api_key {
+            builder.bearer_auth(key)
+        } else {
+            builder
+        }
     }
 
     async fn check_response(&self, resp: reqwest::Response) -> Result<reqwest::Response, String> {
@@ -143,7 +166,7 @@ impl RemoteClient {
     // --- Nodes ---
 
     pub async fn create_node(&self, req: &CreateNodeRequest) -> Result<CreateNodeResponse, String> {
-        let resp = self.client.post(self.url("/nodes"))
+        let resp = self.auth(self.client.post(self.url("/nodes")))
             .json(req).send().await.map_err(|e| format!("HTTP error: {}", e))?;
         let resp = self.check_response(resp).await?;
         resp.json().await.map_err(|e| format!("Parse error: {}", e))
@@ -173,14 +196,14 @@ impl RemoteClient {
     }
 
     pub async fn patch_node(&self, id: &str, req: &PatchNodeRequest) -> Result<Node, String> {
-        let resp = self.client.patch(self.url(&format!("/nodes/{}", id)))
+        let resp = self.auth(self.client.patch(self.url(&format!("/nodes/{}", id))))
             .json(req).send().await.map_err(|e| format!("HTTP error: {}", e))?;
         let resp = self.check_response(resp).await?;
         resp.json().await.map_err(|e| format!("Parse error: {}", e))
     }
 
     pub async fn delete_node(&self, id: &str) -> Result<(), String> {
-        let resp = self.client.delete(self.url(&format!("/nodes/{}", id)))
+        let resp = self.auth(self.client.delete(self.url(&format!("/nodes/{}", id))))
             .send().await.map_err(|e| format!("HTTP error: {}", e))?;
         self.check_response(resp).await?;
         Ok(())
@@ -189,7 +212,7 @@ impl RemoteClient {
     // --- Edges ---
 
     pub async fn create_edge(&self, req: &CreateEdgeRequest) -> Result<CreateEdgeResponse, String> {
-        let resp = self.client.post(self.url("/edges"))
+        let resp = self.auth(self.client.post(self.url("/edges")))
             .json(req).send().await.map_err(|e| format!("HTTP error: {}", e))?;
         let resp = self.check_response(resp).await?;
         resp.json().await.map_err(|e| format!("Parse error: {}", e))
@@ -204,14 +227,14 @@ impl RemoteClient {
     }
 
     pub async fn patch_edge(&self, id: &str, req: &PatchEdgeRequest) -> Result<Edge, String> {
-        let resp = self.client.patch(self.url(&format!("/edges/{}", id)))
+        let resp = self.auth(self.client.patch(self.url(&format!("/edges/{}", id))))
             .json(req).send().await.map_err(|e| format!("HTTP error: {}", e))?;
         let resp = self.check_response(resp).await?;
         resp.json().await.map_err(|e| format!("Parse error: {}", e))
     }
 
     pub async fn delete_edge(&self, id: &str) -> Result<(), String> {
-        let resp = self.client.delete(self.url(&format!("/edges/{}", id)))
+        let resp = self.auth(self.client.delete(self.url(&format!("/edges/{}", id))))
             .send().await.map_err(|e| format!("HTTP error: {}", e))?;
         self.check_response(resp).await?;
         Ok(())

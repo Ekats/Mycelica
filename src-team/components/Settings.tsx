@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { X, Wifi, WifiOff } from "lucide-react";
+import { X, Wifi, WifiOff, Eye, EyeOff } from "lucide-react";
 import { useTeamStore } from "../stores/teamStore";
 
 export default function Settings() {
@@ -7,6 +7,8 @@ export default function Settings() {
 
   const [serverUrl, setServerUrl] = useState(config?.server_url || "http://localhost:3741");
   const [author, setAuthor] = useState(config?.author || "");
+  const [apiKey, setApiKey] = useState(config?.api_key || "");
+  const [showKey, setShowKey] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
 
@@ -14,6 +16,7 @@ export default function Settings() {
     if (config) {
       setServerUrl(config.server_url);
       setAuthor(config.author);
+      setApiKey(config.api_key || "");
     }
   }, [config]);
 
@@ -21,12 +24,17 @@ export default function Settings() {
     setTesting(true);
     setTestResult(null);
     try {
-      // Temporarily save to test, then use team_refresh as a connectivity test
-      // We'll just do a simple fetch to /health
-      const resp = await fetch(`${serverUrl}/health`);
+      const headers: HeadersInit = {};
+      if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+      const resp = await fetch(`${serverUrl}/health`, { headers });
       if (resp.ok) {
         const data = await resp.json();
-        setTestResult({ ok: true, message: `Connected: ${data.nodes} nodes, ${data.edges} edges` });
+        const authInfo = data.auth_enabled
+          ? (apiKey ? "authenticated" : "read-only")
+          : "no auth required";
+        setTestResult({ ok: true, message: `Connected (${authInfo}): ${data.nodes} nodes, ${data.edges} edges` });
+      } else if (resp.status === 401) {
+        setTestResult({ ok: false, message: "Invalid API key" });
       } else {
         setTestResult({ ok: false, message: `Server returned ${resp.status}` });
       }
@@ -35,11 +43,15 @@ export default function Settings() {
     } finally {
       setTesting(false);
     }
-  }, [serverUrl]);
+  }, [serverUrl, apiKey]);
 
   const handleSave = useCallback(() => {
-    saveSettings({ server_url: serverUrl, author: author.trim() || "anonymous" });
-  }, [serverUrl, author, saveSettings]);
+    saveSettings({
+      server_url: serverUrl,
+      author: author.trim() || "anonymous",
+      api_key: apiKey || undefined,
+    });
+  }, [serverUrl, author, apiKey, saveSettings]);
 
   return (
     <div className="modal-overlay" onClick={(e) => e.target === e.currentTarget && setShowSettings(false)}>
@@ -84,6 +96,32 @@ export default function Settings() {
               </span>
             </div>
           )}
+        </div>
+
+        {/* API Key */}
+        <div className="mb-4">
+          <label className="block text-xs mb-1 font-medium" style={{ color: "var(--text-secondary)" }}>
+            API Key
+          </label>
+          <div className="flex gap-2">
+            <input
+              type={showKey ? "text" : "password"}
+              className="flex-1"
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              placeholder="Optional — leave empty for read-only"
+            />
+            <button
+              className="btn-secondary p-1.5"
+              onClick={() => setShowKey(!showKey)}
+              title={showKey ? "Hide" : "Show"}
+            >
+              {showKey ? <EyeOff size={14} /> : <Eye size={14} />}
+            </button>
+          </div>
+          <p className="text-[11px] mt-1" style={{ color: apiKey ? "#10b981" : "var(--text-secondary)" }}>
+            {apiKey ? "Writes enabled" : "Read-only mode — ask admin for a key"}
+          </p>
         </div>
 
         {/* Author */}

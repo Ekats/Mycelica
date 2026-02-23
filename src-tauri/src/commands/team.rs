@@ -24,6 +24,8 @@ pub struct TeamConfig {
     pub author: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
 }
 
 impl TeamConfig {
@@ -68,6 +70,7 @@ impl Default for TeamConfig {
             server_url: "http://localhost:3741".to_string(),
             author,
             snapshot_path: None,
+            api_key: None,
         }
     }
 }
@@ -99,7 +102,7 @@ impl TeamState {
         let local_db = Database::new(&local_db_path).expect("Failed to open local.db");
         init_local_schema(&local_db);
 
-        let client = RemoteClient::new(&config.server_url);
+        let client = RemoteClient::with_api_key(&config.server_url, config.api_key.clone());
 
         Self {
             client: Mutex::new(client),
@@ -112,7 +115,7 @@ impl TeamState {
 
     fn make_client(&self) -> Result<RemoteClient, String> {
         let c = self.client.lock().map_err(|e| e.to_string())?;
-        Ok(RemoteClient::new(c.base_url()))
+        Ok(RemoteClient::with_api_key(c.base_url(), c.api_key().map(|s| s.to_string())))
     }
 }
 
@@ -214,11 +217,11 @@ pub struct PersonalData {
 
 #[tauri::command]
 pub async fn team_refresh(state: State<'_, TeamState>) -> Result<TeamSnapshot, String> {
-    let base_url = {
+    let (base_url, api_key) = {
         let c = state.client.lock().map_err(|e| e.to_string())?;
-        c.base_url().to_string()
+        (c.base_url().to_string(), c.api_key().map(|s| s.to_string()))
     };
-    let client = RemoteClient::new(&base_url);
+    let client = RemoteClient::with_api_key(&base_url, api_key);
 
     // Download snapshot to temp file
     let tmp_path = state.snapshot_path.with_extension("db.tmp");
@@ -709,7 +712,7 @@ pub fn team_save_settings(
 
     {
         let mut client = state.client.lock().map_err(|e| e.to_string())?;
-        *client = RemoteClient::new(&new_config.server_url);
+        *client = RemoteClient::with_api_key(&new_config.server_url, new_config.api_key.clone());
     }
     {
         let mut config = state.config.lock().map_err(|e| e.to_string())?;

@@ -2,7 +2,7 @@
 
 ## Context
 
-Mycelica is being set up for a hackerspace. The original team mode plan assumed 4 trusted people on a private Tailscale network where "if you're on the network, you're authorized." A hackerspace changes the threat model — semi-trusted users, shared network, unknown devices. We need application-level security before deployment.
+Mycelica is being set up for a shared team environment. The original team mode plan assumed 4 trusted people on a private Tailscale network where "if you're on the network, you're authorized." A shared network changes the threat model — semi-trusted users, shared network, unknown devices. We need application-level security before deployment.
 
 **Do NOT implement anything yet.** This is investigation only. Use `plan` mode. Spawn explore agents for parallel investigation.
 
@@ -191,7 +191,7 @@ After all agents report back, produce a single document:
 - Critical vulnerabilities ranked by severity
 
 ### 2. Gap Analysis
-- What needs to exist for hackerspace deployment
+- What needs to exist for team server deployment
 - What already exists that can be reused
 - What's partially built and needs finishing
 

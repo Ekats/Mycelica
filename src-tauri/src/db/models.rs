@@ -447,3 +447,16 @@ pub struct PaperSubject {
     pub scheme: String,  // "FOS", "keyword", etc.
     pub value: String,
 }
+
+// ============================================================================
+// API Keys (team server authentication)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKey {
+    pub id: String,
+    pub key_hash: String,
+    pub user_name: String,
+    pub role: String,  // "admin" or "editor"
+    pub created_at: i64,
+}

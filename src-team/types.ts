@@ -71,6 +71,7 @@ export interface TeamSnapshot {
 export interface TeamConfig {
   server_url: string;
   author: string;
+  api_key?: string;
 }
 
 export interface CreateNodeRequest {

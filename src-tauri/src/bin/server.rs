@@ -4,34 +4,150 @@
 //! Sovereignty enforcement point: all write endpoints set human_created,
 //! human_edited, author, and edge_source correctly.
 //!
-//! Usage:
-//!   MYCELICA_DB=/path/to/team.db MYCELICA_BIND=100.x.x.x:3741 mycelica-server
+//! Authentication: API key-based. GET endpoints are public (no auth required).
+//! POST/PATCH/DELETE require a valid `Authorization: Bearer <key>` header.
+//! Use `--no-auth` to disable authentication (for trusted networks like Tailscale).
 //!
-//! Or with args:
-//!   mycelica-server --db /path/to/team.db --bind 0.0.0.0:3741
+//! Usage:
+//!   MYCELICA_DB=/path/to/team.db mycelica-server
+//!   mycelica-server --db /path/to/team.db --bind 0.0.0.0:3741  # all interfaces
+//!   mycelica-server --no-auth  # disable auth for trusted networks
+//!
+//! Admin commands:
+//!   mycelica-server admin create-key <name> [--role admin|editor]
+//!   mycelica-server admin list-keys
+//!   mycelica-server admin revoke-key <id>
 
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{ConnectInfo, Extension, Path, Query, Request, State},
+    http::{Method, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response, Json},
-    routing::{get, post, patch, delete},
+    routing::{get, post, patch},
     Router,
 };
-use mycelica_lib::db::{Database, Node, Edge, EdgeType};
+use governor::{Quota, RateLimiter, clock::Clock};
+use governor::clock::DefaultClock;
+use governor::state::keyed::DashMapStateStore;
+use mycelica_lib::db::{Database, Node, Edge, EdgeType, ApiKey};
 use mycelica_lib::{settings, local_embeddings, team};
 use serde::{Deserialize, Serialize};
+use sha2::{Sha256, Digest};
+use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use tower_http::cors::{CorsLayer, Any};
+use tower_http::limit::RequestBodyLimitLayer;
 
 // ============================================================================
 // AppState
 // ============================================================================
 
+type WriteRateLimiter = RateLimiter<std::net::IpAddr, DashMapStateStore<std::net::IpAddr>, DefaultClock>;
+
 #[derive(Clone)]
 struct AppState {
     db: Arc<Database>,
     start_time: Instant,
+    no_auth: bool,
+    rate_limiter: Arc<WriteRateLimiter>,
+}
+
+// ============================================================================
+// Auth
+// ============================================================================
+
+/// Injected into request extensions by auth middleware.
+#[derive(Clone, Debug)]
+struct AuthContext {
+    user_name: String,
+    role: String,  // "admin" or "editor"
+}
+
+fn hash_api_key(raw_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(raw_key.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Auth middleware: GET/HEAD/OPTIONS pass through. Writes require Bearer token.
+async fn auth_middleware(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    // Skip auth for read-only methods
+    if matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+        return Ok(next.run(request).await);
+    }
+
+    // Skip auth if --no-auth mode
+    if state.no_auth {
+        return Ok(next.run(request).await);
+    }
+
+    // Extract bearer token
+    let auth_header = request.headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string());
+
+    let token = match auth_header {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err(AppError(StatusCode::UNAUTHORIZED,
+            "Missing or invalid Authorization header. Use: Authorization: Bearer <api-key>".to_string())),
+    };
+
+    // Hash and look up
+    let key_hash = hash_api_key(&token);
+    let api_key = state.db.get_api_key_by_hash(&key_hash)
+        .map_err(|e| AppError::from(e.to_string()))?
+        .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "Invalid API key".to_string()))?;
+
+    // Inject auth context into request extensions
+    request.extensions_mut().insert(AuthContext {
+        user_name: api_key.user_name,
+        role: api_key.role,
+    });
+
+    Ok(next.run(request).await)
+}
+
+// ============================================================================
+// Rate limiting
+// ============================================================================
+
+/// Rate limit middleware: only applies to write methods (POST/PATCH/DELETE).
+/// GET/HEAD/OPTIONS pass through unthrottled.
+async fn rate_limit_middleware(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    // Read methods pass through — public reads are never rate limited
+    if matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+        return next.run(request).await;
+    }
+
+    match state.rate_limiter.check_key(&addr.ip()) {
+        Ok(_) => next.run(request).await,
+        Err(not_until) => {
+            let wait = not_until.wait_time_from(DefaultClock::default().now());
+            let retry_after = wait.as_secs().max(1);
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("Retry-After", retry_after.to_string())],
+                Json(serde_json::json!({
+                    "error": "rate_limited",
+                    "retry_after_seconds": retry_after
+                })),
+            ).into_response()
+        }
+    }
 }
 
 // ============================================================================
@@ -58,6 +174,41 @@ fn not_found(msg: impl Into<String>) -> AppError {
 
 fn bad_request(msg: impl Into<String>) -> AppError {
     AppError(StatusCode::BAD_REQUEST, msg.into())
+}
+
+fn forbidden(msg: impl Into<String>) -> AppError {
+    AppError(StatusCode::FORBIDDEN, msg.into())
+}
+
+// ============================================================================
+// Input validation
+// ============================================================================
+
+fn validate_node_input(title: Option<&str>, content: Option<&str>, tags: Option<&str>, author: Option<&str>) -> Result<(), AppError> {
+    if let Some(t) = title {
+        if t.len() > 2000 { return Err(bad_request("title exceeds maximum length of 2000 characters")); }
+        if t.trim().is_empty() { return Err(bad_request("title cannot be empty")); }
+    }
+    if let Some(c) = content {
+        if c.len() > 1_048_576 { return Err(bad_request("content exceeds maximum size of 1MB")); }
+    }
+    if let Some(t) = tags {
+        if t.len() > 10_000 { return Err(bad_request("tags exceeds maximum length of 10000 characters")); }
+    }
+    if let Some(a) = author {
+        if a.len() > 100 { return Err(bad_request("author exceeds maximum length of 100 characters")); }
+    }
+    Ok(())
+}
+
+fn validate_edge_input(reason: Option<&str>, author: Option<&str>) -> Result<(), AppError> {
+    if let Some(r) = reason {
+        if r.len() > 2000 { return Err(bad_request("reason exceeds maximum length of 2000 characters")); }
+    }
+    if let Some(a) = author {
+        if a.len() > 100 { return Err(bad_request("author exceeds maximum length of 100 characters")); }
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -162,6 +313,7 @@ struct HealthResponse {
     nodes: usize,
     edges: usize,
     uptime_secs: u64,
+    auth_enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -175,7 +327,11 @@ struct DeletedItem {
 // Helpers
 // ============================================================================
 
-fn resolve_author(req_author: Option<String>) -> String {
+/// Resolve author: prefer auth context (server-enforced), fall back to request body (--no-auth mode).
+fn resolve_author(auth: Option<&AuthContext>, req_author: Option<String>) -> String {
+    if let Some(ctx) = auth {
+        return ctx.user_name.clone();
+    }
     req_author.unwrap_or_else(|| settings::get_author_or_default())
 }
 
@@ -197,9 +353,12 @@ fn parse_since(s: &str) -> Result<i64, AppError> {
 // POST /nodes
 async fn create_node_handler(
     State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
     Json(req): Json<CreateNodeRequest>,
 ) -> Result<(StatusCode, Json<CreateNodeResponse>), AppError> {
-    let author = resolve_author(req.author);
+    validate_node_input(Some(&req.title), req.content.as_deref(), req.tags.as_deref(), req.author.as_deref())?;
+    let auth = auth.map(|Extension(ctx)| ctx);
+    let author = resolve_author(auth.as_ref(), req.author);
     let content_type = req.content_type.as_deref().unwrap_or("concept");
 
     let node_id = team::create_human_node(
@@ -243,14 +402,30 @@ async fn create_node_handler(
 async fn patch_node_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    auth: Option<Extension<AuthContext>>,
     Json(req): Json<PatchNodeRequest>,
 ) -> Result<Json<Node>, AppError> {
+    validate_node_input(req.title.as_deref(), req.content.as_deref(), req.tags.as_deref(), req.author.as_deref())?;
+    let auth = auth.map(|Extension(ctx)| ctx);
+
     // Verify node exists
-    state.db.get_node(&id)
+    let existing = state.db.get_node(&id)
         .map_err(|e| AppError::from(e.to_string()))?
         .ok_or_else(|| not_found(format!("Node '{}' not found", id)))?;
 
-    let author = resolve_author(req.author.clone());
+    // Editor ownership check: editors can only modify their own nodes
+    if let Some(ref ctx) = auth {
+        if ctx.role == "editor" {
+            if existing.author.as_deref() != Some(&ctx.user_name) {
+                return Err(forbidden(format!(
+                    "Editor '{}' cannot modify node owned by '{}'",
+                    ctx.user_name, existing.author.as_deref().unwrap_or("unknown")
+                )));
+            }
+        }
+    }
+
+    let author = resolve_author(auth.as_ref(), req.author.clone());
 
     state.db.patch_node_fields(
         &id,
@@ -291,12 +466,28 @@ async fn patch_node_handler(
 async fn delete_node_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    auth: Option<Extension<AuthContext>>,
 ) -> Result<StatusCode, AppError> {
-    state.db.get_node(&id)
+    let auth = auth.map(|Extension(ctx)| ctx);
+
+    let existing = state.db.get_node(&id)
         .map_err(|e| AppError::from(e.to_string()))?
         .ok_or_else(|| not_found(format!("Node '{}' not found", id)))?;
 
-    let deleted_by = settings::get_author_or_default();
+    let deleted_by = resolve_author(auth.as_ref(), None);
+
+    // Editor ownership check: editors can only delete their own nodes
+    if let Some(ref ctx) = auth {
+        if ctx.role == "editor" {
+            if existing.author.as_deref() != Some(&ctx.user_name) {
+                return Err(forbidden(format!(
+                    "Editor '{}' cannot delete node owned by '{}'",
+                    ctx.user_name, existing.author.as_deref().unwrap_or("unknown")
+                )));
+            }
+        }
+    }
+
     state.db.delete_node_tracked(&id, &deleted_by)
         .map_err(|e| AppError::from(e.to_string()))?;
 
@@ -308,8 +499,12 @@ async fn delete_node_handler(
 // POST /edges
 async fn create_edge_handler(
     State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
     Json(req): Json<CreateEdgeRequest>,
 ) -> Result<(StatusCode, Json<CreateEdgeResponse>), AppError> {
+    validate_edge_input(req.reason.as_deref(), req.author.as_deref())?;
+    let auth = auth.map(|Extension(ctx)| ctx);
+
     // Resolve source — supports UUID, ID prefix, and title text
     let (source_node, source_summary) = match team::resolve_node(&state.db, &req.source) {
         team::ResolveResult::Found(node) => {
@@ -354,7 +549,7 @@ async fn create_edge_handler(
         }
     };
 
-    let author = resolve_author(req.author);
+    let author = resolve_author(auth.as_ref(), req.author);
     let edge_type_str = req.edge_type.as_deref().unwrap_or("related");
     let edge_type = EdgeType::from_str(&edge_type_str.to_lowercase())
         .ok_or_else(|| bad_request(format!("Unknown edge type '{}'", edge_type_str)))?;
@@ -397,20 +592,35 @@ async fn create_edge_handler(
 async fn patch_edge_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    auth: Option<Extension<AuthContext>>,
     Json(req): Json<PatchEdgeRequest>,
 ) -> Result<Json<Edge>, AppError> {
-    state.db.get_edge(&id)
+    validate_edge_input(req.reason.as_deref(), req.author.as_deref())?;
+    let auth = auth.map(|Extension(ctx)| ctx);
+
+    let existing = state.db.get_edge(&id)
         .map_err(|e| AppError::from(e.to_string()))?
         .ok_or_else(|| not_found(format!("Edge '{}' not found", id)))?;
 
-    let author = req.author.as_deref();
+    // Editor ownership check
+    if let Some(ref ctx) = auth {
+        if ctx.role == "editor" {
+            if existing.author.as_deref() != Some(&ctx.user_name) {
+                return Err(forbidden(format!(
+                    "Editor '{}' cannot modify edge owned by '{}'",
+                    ctx.user_name, existing.author.as_deref().unwrap_or("unknown")
+                )));
+            }
+        }
+    }
+
+    let author = resolve_author(auth.as_ref(), req.author);
     let edge_type = req.edge_type.as_deref();
 
-    state.db.update_edge_fields(&id, req.reason.as_deref(), edge_type, author)
+    state.db.update_edge_fields(&id, req.reason.as_deref(), edge_type, Some(&author))
         .map_err(|e| AppError::from(e.to_string()))?;
 
-    println!("[PATCH /edges/{}] Updated by {}",
-        &id[..8], author.unwrap_or("?"));
+    println!("[PATCH /edges/{}] Updated by {}", &id[..8], author);
 
     let edge = state.db.get_edge(&id)
         .map_err(|e| AppError::from(e.to_string()))?
@@ -423,12 +633,28 @@ async fn patch_edge_handler(
 async fn delete_edge_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    auth: Option<Extension<AuthContext>>,
 ) -> Result<StatusCode, AppError> {
-    state.db.get_edge(&id)
+    let auth = auth.map(|Extension(ctx)| ctx);
+
+    let existing = state.db.get_edge(&id)
         .map_err(|e| AppError::from(e.to_string()))?
         .ok_or_else(|| not_found(format!("Edge '{}' not found", id)))?;
 
-    let deleted_by = settings::get_author_or_default();
+    let deleted_by = resolve_author(auth.as_ref(), None);
+
+    // Editor ownership check
+    if let Some(ref ctx) = auth {
+        if ctx.role == "editor" {
+            if existing.author.as_deref() != Some(&ctx.user_name) {
+                return Err(forbidden(format!(
+                    "Editor '{}' cannot delete edge owned by '{}'",
+                    ctx.user_name, existing.author.as_deref().unwrap_or("unknown")
+                )));
+            }
+        }
+    }
+
     state.db.delete_edge_tracked(&id, &deleted_by)
         .map_err(|e| AppError::from(e.to_string()))?;
 
@@ -569,6 +795,7 @@ async fn health_handler(
         nodes: stats.0,
         edges: edge_count,
         uptime_secs: uptime,
+        auth_enabled: !state.no_auth,
     }))
 }
 
@@ -672,6 +899,129 @@ fn find_database(db_arg: Option<&str>) -> PathBuf {
 }
 
 // ============================================================================
+// Admin commands (run before server starts)
+// ============================================================================
+
+fn handle_admin(args: &[String], db: &Database) {
+    if args.is_empty() {
+        eprintln!("Usage: mycelica-server admin <command>");
+        eprintln!("Commands:");
+        eprintln!("  create-key <name> [--role admin|editor]  Create an API key");
+        eprintln!("  list-keys                                List all API keys");
+        eprintln!("  revoke-key <id>                          Revoke an API key");
+        std::process::exit(1);
+    }
+
+    match args[0].as_str() {
+        "create-key" => {
+            if args.len() < 2 {
+                eprintln!("Usage: mycelica-server admin create-key <name> [--role admin|editor]");
+                std::process::exit(1);
+            }
+            let name = &args[1];
+            let mut role = "editor".to_string();
+            let mut i = 2;
+            while i < args.len() {
+                if args[i] == "--role" && i + 1 < args.len() {
+                    role = args[i + 1].to_lowercase();
+                    if role != "admin" && role != "editor" {
+                        eprintln!("Invalid role '{}'. Must be 'admin' or 'editor'.", role);
+                        std::process::exit(1);
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+
+            // Generate random key (32 bytes = 64 hex chars)
+            let raw_key: String = {
+                use std::io::Read;
+                let mut bytes = [0u8; 32];
+                std::fs::File::open("/dev/urandom")
+                    .and_then(|mut f| f.read_exact(&mut bytes))
+                    .unwrap_or_else(|_| {
+                        // Fallback: use timestamp + uuid
+                        let fallback = format!("{}{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), uuid::Uuid::new_v4());
+                        bytes.copy_from_slice(&sha2::Sha256::digest(fallback.as_bytes())[..32]);
+                    });
+                hex::encode(bytes)
+            };
+
+            let key_hash = hash_api_key(&raw_key);
+            let api_key = ApiKey {
+                id: uuid::Uuid::new_v4().to_string(),
+                key_hash,
+                user_name: name.to_string(),
+                role: role.clone(),
+                created_at: chrono::Utc::now().timestamp_millis(),
+            };
+
+            match db.insert_api_key(&api_key) {
+                Ok(_) => {
+                    println!("API key created successfully.");
+                    println!();
+                    println!("  Name: {}", name);
+                    println!("  Role: {}", role);
+                    println!("  Key:  {}", raw_key);
+                    println!();
+                    println!("Save this key now — it cannot be retrieved later.");
+                    println!("Use it with: Authorization: Bearer {}", raw_key);
+                }
+                Err(e) => {
+                    eprintln!("Failed to create API key: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        "list-keys" => {
+            match db.list_api_keys() {
+                Ok(keys) => {
+                    if keys.is_empty() {
+                        println!("No API keys configured.");
+                        return;
+                    }
+                    println!("{:<36}  {:<16}  {:<8}  {}", "ID", "Name", "Role", "Created");
+                    println!("{}", "-".repeat(80));
+                    for key in keys {
+                        let created = chrono::DateTime::from_timestamp_millis(key.created_at)
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        println!("{:<36}  {:<16}  {:<8}  {}", key.id, key.user_name, key.role, created);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to list API keys: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        "revoke-key" => {
+            if args.len() < 2 {
+                eprintln!("Usage: mycelica-server admin revoke-key <id>");
+                std::process::exit(1);
+            }
+            let id = &args[1];
+            match db.delete_api_key(id) {
+                Ok(count) if count > 0 => println!("API key {} revoked.", id),
+                Ok(_) => {
+                    eprintln!("No API key found with ID: {}", id);
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("Failed to revoke API key: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        cmd => {
+            eprintln!("Unknown admin command: {}", cmd);
+            std::process::exit(1);
+        }
+    }
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -681,6 +1031,8 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut db_arg: Option<&str> = None;
     let mut bind_arg: Option<&str> = None;
+    let mut no_auth = false;
+    let mut admin_args: Option<Vec<String>> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -693,28 +1045,40 @@ async fn main() {
                 bind_arg = Some(&args[i + 1]);
                 i += 2;
             }
+            "--no-auth" => {
+                no_auth = true;
+                i += 1;
+            }
+            "admin" => {
+                admin_args = Some(args[i + 1..].to_vec());
+                break;
+            }
             "--help" | "-h" => {
                 println!("mycelica-server — Team knowledge graph HTTP API");
                 println!();
-                println!("Usage: mycelica-server [--db PATH] [--bind ADDR:PORT]");
+                println!("Usage: mycelica-server [OPTIONS]");
+                println!("       mycelica-server admin <command>");
+                println!();
+                println!("Options:");
+                println!("  --db PATH         Database path");
+                println!("  --bind ADDR:PORT  Bind address (default: 127.0.0.1:3741)");
+                println!("  --no-auth         Disable authentication (for trusted networks)");
+                println!();
+                println!("Admin commands:");
+                println!("  admin create-key <name> [--role admin|editor]");
+                println!("  admin list-keys");
+                println!("  admin revoke-key <id>");
                 println!();
                 println!("Environment variables:");
                 println!("  MYCELICA_DB    Database path");
-                println!("  MYCELICA_BIND  Bind address (default: 0.0.0.0:3741)");
+                println!("  MYCELICA_BIND  Bind address");
                 std::process::exit(0);
             }
             _ => { i += 1; }
         }
     }
 
-    let bind_addr = bind_arg
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("MYCELICA_BIND").ok())
-        .unwrap_or_else(|| "0.0.0.0:3741".to_string());
-
     let db_path = find_database(db_arg);
-    println!("[Server] Database: {}", db_path.display());
-    println!("[Server] Binding to: {}", bind_addr);
 
     // Initialize settings
     let app_data_dir = dirs::data_dir()
@@ -726,10 +1090,34 @@ async fn main() {
     let db = match Database::new(&db_path) {
         Ok(db) => Arc::new(db),
         Err(e) => {
-            eprintln!("[Server] Failed to open database: {}", e);
+            eprintln!("[Server] Failed to open database {}: {}", db_path.display(), e);
             std::process::exit(1);
         }
     };
+
+    // Handle admin commands (exit after)
+    if let Some(admin) = admin_args {
+        handle_admin(&admin, &db);
+        return;
+    }
+
+    let bind_addr = bind_arg
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("MYCELICA_BIND").ok())
+        .unwrap_or_else(|| "127.0.0.1:3741".to_string());
+
+    println!("[Server] Database: {}", db_path.display());
+    println!("[Server] Binding to: {}", bind_addr);
+    if no_auth {
+        println!("[Server] Authentication: DISABLED (--no-auth)");
+    } else {
+        let key_count = db.list_api_keys().map(|k| k.len()).unwrap_or(0);
+        println!("[Server] Authentication: ENABLED ({} API key(s) configured)", key_count);
+        if key_count == 0 {
+            eprintln!("[Server] WARNING: Auth enabled but no API keys exist. All writes will be rejected.");
+            eprintln!("[Server] Create a key: mycelica-server --db {} admin create-key <name>", db_path.display());
+        }
+    }
 
     // Warm up embedding model
     println!("[Server] Warming up embedding model...");
@@ -746,9 +1134,15 @@ async fn main() {
     tokio::spawn(backup_loop(backup_db));
 
     // Build router
+    let rate_limiter = Arc::new(
+        RateLimiter::dashmap(Quota::per_minute(NonZeroU32::new(60).unwrap()))
+    );
+
     let state = AppState {
         db,
         start_time: Instant::now(),
+        no_auth,
+        rate_limiter,
     };
 
     let app = Router::new()
@@ -760,6 +1154,15 @@ async fn main() {
         .route("/recent", get(recent_handler))
         .route("/orphans", get(orphans_handler))
         .route("/health", get(health_handler))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024)) // 2MB body limit
+        .layer(
+            CorsLayer::new()
+                .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE, Method::OPTIONS])
+                .allow_headers(Any)
+                .allow_origin(Any) // Auth middleware handles write protection; CORS allows Tauri webview + local dev
+        )
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
         .with_state(state);
 
     // Bind and serve
@@ -772,7 +1175,7 @@ async fn main() {
     };
 
     println!("[Server] Listening on {}", bind_addr);
-    if let Err(e) = axum::serve(listener, app).await {
+    if let Err(e) = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await {
         eprintln!("[Server] Server error: {}", e);
         std::process::exit(1);
     }

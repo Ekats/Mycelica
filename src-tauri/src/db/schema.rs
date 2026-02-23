@@ -1,9 +1,9 @@
 use rusqlite::{Connection, Result, params, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
-use super::models::{Node, Edge, NodeType, EdgeType, Position, Tag, Paper, EdgeWithNodes, EdgeExplanation, PathHop, ContextNode};
+use super::models::{Node, Edge, NodeType, EdgeType, Position, Tag, Paper, EdgeWithNodes, EdgeExplanation, PathHop, ContextNode, ApiKey};
 
 pub struct Database {
     conn: Mutex<Connection>,
@@ -28,10 +28,21 @@ impl Database {
         &self.conn
     }
 
+    /// Lock the database connection, recovering from mutex poisoning.
+    /// Returns an error instead of panicking if the mutex is poisoned.
+    fn conn(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.conn.lock().map_err(|e| {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERNAL),
+                Some(format!("Database mutex poisoned: {}", e)),
+            )
+        })
+    }
+
     /// Create a consistent backup of the database using SQLite's backup API.
     /// Safe to call while the database is open and being written to.
     pub fn backup_to(&self, dest_path: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut dest = Connection::open(dest_path)?;
         let backup = rusqlite::backup::Backup::new(&conn, &mut dest)?;
         backup.run_to_completion(5, Duration::from_millis(250), None)?;
@@ -40,7 +51,7 @@ impl Database {
 
     /// Get all nodes updated after a timestamp (for delta sync).
     pub fn get_nodes_updated_since(&self, since_ms: i64) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let sql = format!(
             "SELECT {} FROM nodes WHERE updated_at > ?1 ORDER BY updated_at ASC",
             Self::NODE_COLUMNS
@@ -53,7 +64,7 @@ impl Database {
 
     /// Get all edges updated after a timestamp (for delta sync).
     pub fn get_edges_updated_since(&self, since_ms: i64) -> Result<Vec<Edge>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let sql = format!(
             "SELECT {} FROM edges WHERE updated_at > ?1 ORDER BY updated_at ASC",
             Self::EDGE_COLUMNS
@@ -66,7 +77,7 @@ impl Database {
 
     /// Get items deleted after a timestamp (for delta sync).
     pub fn get_deleted_since(&self, since_ms: i64) -> Result<Vec<(String, i64, Option<String>)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT original_id, deleted_at, deleted_by FROM deleted_items WHERE deleted_at > ?1"
         )?;
@@ -95,7 +106,7 @@ impl Database {
     }
 
     fn init(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         conn.execute_batch(
             "
@@ -742,6 +753,17 @@ impl Database {
         conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_superseded ON edges(superseded_by)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_type_conf_time ON edges(type, confidence DESC, created_at DESC)", [])?;
 
+        // Migration: Create api_keys table for team server authentication
+        conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id TEXT PRIMARY KEY,
+                key_hash TEXT NOT NULL UNIQUE,
+                user_name TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('admin', 'editor')),
+                created_at INTEGER NOT NULL
+            );
+        ")?;
+
         // Rebuild FTS index to fix any corruption from interrupted writes (e.g., HMR during dev)
         // This is safe to run on every startup - it rebuilds from the content table
         if let Err(e) = conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')", []) {
@@ -756,7 +778,7 @@ impl Database {
     /// Check if a specific field was human-edited (JSON array check).
     /// human_edited stores '["title","parent_id"]' or NULL.
     pub fn is_field_human_edited(&self, node_id: &str, field: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let human_edited: Option<String> = conn.query_row(
             "SELECT human_edited FROM nodes WHERE id = ?1",
             params![node_id],
@@ -770,7 +792,7 @@ impl Database {
 
     /// Check if node has ANY human edits (human_edited is non-NULL).
     pub fn has_human_edits(&self, node_id: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let human_edited: Option<String> = conn.query_row(
             "SELECT human_edited FROM nodes WHERE id = ?1",
             params![node_id],
@@ -781,7 +803,7 @@ impl Database {
 
     /// Check if a node is human-created (deletion protection).
     pub fn is_human_created(&self, node_id: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let result: Option<i32> = conn.query_row(
             "SELECT human_created FROM nodes WHERE id = ?1",
             params![node_id],
@@ -793,7 +815,7 @@ impl Database {
     /// Get all items with parent_id in human_edited (pinned to their parent).
     /// Returns (item_id, parent_id) pairs.
     pub fn get_pinned_items(&self) -> Result<Vec<(String, Option<String>)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, parent_id FROM nodes WHERE is_item = 1 AND human_edited LIKE '%parent_id%'"
         )?;
@@ -805,7 +827,7 @@ impl Database {
 
     /// Get all human-created categories (deletion-protected).
     pub fn get_human_created_categories(&self) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE is_item = 0 AND human_created = 1",
             Self::NODE_COLUMNS
@@ -818,7 +840,7 @@ impl Database {
     /// Follows merges, orphans if parent was deleted. Returns warnings.
     pub fn validate_pinned_parents(&self) -> Result<Vec<String>> {
         let pinned = self.get_pinned_items()?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut warnings = Vec::new();
 
         for (item_id, parent_id) in &pinned {
@@ -861,7 +883,7 @@ impl Database {
 
     /// Mark a field as human-edited (merges into existing JSON array).
     pub fn mark_field_human_edited(&self, node_id: &str, field: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let existing: Option<String> = conn.query_row(
             "SELECT human_edited FROM nodes WHERE id = ?1",
             params![node_id],
@@ -881,9 +903,55 @@ impl Database {
         Ok(())
     }
 
+    // === API key operations (team server auth) ===
+
+    pub fn insert_api_key(&self, key: &ApiKey) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO api_keys (id, key_hash, user_name, role, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![key.id, key.key_hash, key.user_name, key.role, key.created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_api_key_by_hash(&self, key_hash: &str) -> Result<Option<ApiKey>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT id, key_hash, user_name, role, created_at FROM api_keys WHERE key_hash = ?1",
+            params![key_hash],
+            |row| Ok(ApiKey {
+                id: row.get(0)?,
+                key_hash: row.get(1)?,
+                user_name: row.get(2)?,
+                role: row.get(3)?,
+                created_at: row.get(4)?,
+            }),
+        ).optional()
+    }
+
+    pub fn list_api_keys(&self) -> Result<Vec<ApiKey>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, key_hash, user_name, role, created_at FROM api_keys ORDER BY created_at DESC"
+        )?;
+        let rows = stmt.query_map([], |row| Ok(ApiKey {
+            id: row.get(0)?,
+            key_hash: row.get(1)?,
+            user_name: row.get(2)?,
+            role: row.get(3)?,
+            created_at: row.get(4)?,
+        }))?;
+        rows.collect()
+    }
+
+    pub fn delete_api_key(&self, id: &str) -> Result<usize> {
+        let conn = self.conn()?;
+        Ok(conn.execute("DELETE FROM api_keys WHERE id = ?1", params![id])?)
+    }
+
     // === Node operations ===
     pub fn insert_node(&self, node: &Node) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "INSERT INTO nodes (id, type, title, url, content, position_x, position_y, created_at, updated_at, cluster_id, cluster_label, ai_title, summary, tags, emoji, is_processed, depth, is_item, is_universe, parent_id, child_count, conversation_id, sequence_index, is_pinned, last_accessed_at, source, pdf_available, content_type, associated_idea_id, privacy, human_edited, human_created, author, agent_id, node_class, meta_type)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)",
@@ -930,7 +998,7 @@ impl Database {
     }
 
     pub fn get_node(&self, id: &str) -> Result<Option<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE id = ?1",
             Self::NODE_COLUMNS
@@ -965,7 +1033,7 @@ impl Database {
 
     /// Check if a node is a descendant of another node (by traversing parent_id chain)
     pub fn is_descendant_of(&self, node_id: &str, ancestor_id: &str) -> bool {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut current_id = node_id.to_string();
         let mut depth = 0;
         const MAX_DEPTH: i32 = 50; // Safety limit
@@ -1026,7 +1094,7 @@ impl Database {
             where_clause
         );
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = match conn.prepare(&query) {
             Ok(s) => s,
             Err(e) => {
@@ -1104,7 +1172,7 @@ impl Database {
     /// All nodes are always shown; filtering is handled by frontend if needed
     /// The include_hidden parameter is kept for API compatibility but ignored
     pub fn get_all_nodes(&self, _include_hidden: bool) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes ORDER BY created_at DESC",
             Self::NODE_COLUMNS
@@ -1116,7 +1184,7 @@ impl Database {
 
     /// Get all nodes with a specific source (e.g. "signal")
     pub fn get_nodes_by_source(&self, source: &str) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE source = ?1 ORDER BY sequence_index ASC, created_at ASC",
             Self::NODE_COLUMNS
@@ -1127,7 +1195,7 @@ impl Database {
 
     /// Get all edges where at least one endpoint has the given source
     pub fn get_edges_for_source_nodes(&self, source: &str) -> Result<Vec<Edge>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM edges
              WHERE source_id IN (SELECT id FROM nodes WHERE source = ?1)
@@ -1139,7 +1207,7 @@ impl Database {
     }
 
     pub fn update_node(&self, node: &Node) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE nodes SET type = ?2, title = ?3, url = ?4, content = ?5,
              position_x = ?6, position_y = ?7, updated_at = ?8, cluster_id = ?9, cluster_label = ?10,
@@ -1194,7 +1262,7 @@ impl Database {
                               tags: Option<&str>, content_type: Option<&str>,
                               parent_id: Option<&str>, author: Option<&str>) -> Result<()> {
         let now = chrono::Utc::now().timestamp_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         if let Some(t) = title {
             conn.execute("UPDATE nodes SET title = ?2, updated_at = ?3 WHERE id = ?1", params![id, t, now])?;
@@ -1245,7 +1313,7 @@ impl Database {
     /// Update just the content of a node (simpler API for editing)
     pub fn update_node_content(&self, node_id: &str, content: &str) -> Result<()> {
         {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.conn()?;
             conn.execute(
                 "UPDATE nodes SET content = ?2, updated_at = ?3 WHERE id = ?1",
                 params![node_id, content, chrono::Utc::now().timestamp_millis()],
@@ -1257,7 +1325,7 @@ impl Database {
 
     /// Update just the source field of a node
     pub fn update_node_source(&self, node_id: &str, source: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE nodes SET source = ?2 WHERE id = ?1",
             params![node_id, source],
@@ -1266,7 +1334,7 @@ impl Database {
     }
 
     pub fn delete_node(&self, id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute("DELETE FROM nodes WHERE id = ?1", params![id])?;
         Ok(())
     }
@@ -1274,7 +1342,7 @@ impl Database {
     /// Delete a node and track the deletion in deleted_items table.
     /// Also deletes associated edges and clears parent references.
     pub fn delete_node_tracked(&self, id: &str, deleted_by: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let now = chrono::Utc::now().timestamp_millis();
         conn.execute("DELETE FROM edges WHERE source_id = ?1 OR target_id = ?1", params![id])?;
         conn.execute("UPDATE nodes SET parent_id = NULL WHERE parent_id = ?1", params![id])?;
@@ -1289,7 +1357,7 @@ impl Database {
     /// Delete all nodes from a specific file path (stored in tags JSON)
     /// Also deletes edges where source OR target is in the deleted set
     pub fn delete_nodes_by_file_path(&self, file_path: &str) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // First get IDs to delete (needed for edge cleanup)
         // Sovereignty: protect human-created/edited nodes
@@ -1318,7 +1386,7 @@ impl Database {
     /// Get all distinct file paths stored in code node tags.
     /// Returns (file_path, node_count) pairs sorted by file_path.
     pub fn get_all_code_file_paths(&self) -> Result<Vec<(String, usize)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT JSON_EXTRACT(tags, '$.file_path') AS fp, COUNT(*) AS cnt \
              FROM nodes \
@@ -1335,7 +1403,7 @@ impl Database {
 
     /// Get node IDs for a specific file path (for targeted edge refresh)
     pub fn get_node_ids_by_file_path(&self, file_path: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id FROM nodes WHERE JSON_EXTRACT(tags, '$.file_path') = ?1"
         )?;
@@ -1347,7 +1415,7 @@ impl Database {
 
     /// Delete edges by source and edge type
     pub fn delete_edges_by_source_and_type(&self, source_id: &str, edge_type: &str) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         // Sovereignty: preserve user-created edges
         let deleted = conn.execute(
             "DELETE FROM edges WHERE source_id = ?1 AND type = ?2 AND (edge_source = 'ai' OR edge_source IS NULL)",
@@ -1358,7 +1426,7 @@ impl Database {
 
     /// Delete all edges of a specific type
     pub fn delete_edges_by_type(&self, edge_type: &str) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         // Sovereignty: preserve user-created edges
         let deleted = conn.execute(
             "DELETE FROM edges WHERE type = ?1 AND (edge_source = 'ai' OR edge_source IS NULL)",
@@ -1369,7 +1437,7 @@ impl Database {
 
     // Privacy operations - sets both legacy is_private AND new privacy score
     pub fn update_node_privacy(&self, node_id: &str, is_private: bool, reason: Option<&str>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         // Map boolean to score: is_private=true → 0.0 (private), is_private=false → 1.0 (public)
         let privacy_score = if is_private { 0.0 } else { 1.0 };
         conn.execute(
@@ -1382,7 +1450,7 @@ impl Database {
     // Privacy scoring operations (continuous 0.0-1.0 scale)
     /// Update the privacy score for a node (0.0 = private, 1.0 = public)
     pub fn update_privacy_score(&self, node_id: &str, privacy: f64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE nodes SET privacy = ?2 WHERE id = ?1 AND is_private IS NULL",
             params![node_id, privacy],
@@ -1392,7 +1460,7 @@ impl Database {
 
     /// Get items that need privacy scoring (privacy IS NULL)
     pub fn get_items_needing_privacy_scoring(&self) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE is_item = 1 AND privacy IS NULL ORDER BY created_at DESC",
             Self::NODE_COLUMNS
@@ -1403,7 +1471,7 @@ impl Database {
 
     /// Count items needing privacy scoring
     pub fn count_items_needing_privacy_scoring(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let count: i32 = conn.query_row(
             "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND privacy IS NULL",
             [],
@@ -1414,7 +1482,7 @@ impl Database {
 
     /// Get items with privacy score >= threshold (for export filtering)
     pub fn get_shareable_items(&self, min_privacy: f64) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE is_item = 1 AND privacy >= ?1 ORDER BY created_at DESC",
             Self::NODE_COLUMNS
@@ -1425,7 +1493,7 @@ impl Database {
 
     /// Count shareable items with privacy >= threshold
     pub fn count_shareable_items(&self, min_privacy: f64) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let count: i32 = conn.query_row(
             "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND privacy >= ?1",
             [min_privacy],
@@ -1436,7 +1504,7 @@ impl Database {
 
     /// Reset all privacy flags to unscanned state (is_private = NULL)
     pub fn reset_all_privacy_flags(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let count = conn.execute(
             "UPDATE nodes SET is_private = NULL, privacy_reason = NULL WHERE is_private IS NOT NULL",
             [],
@@ -1445,7 +1513,7 @@ impl Database {
     }
 
     pub fn get_items_needing_privacy_scan(&self) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE is_item = 1 AND is_private IS NULL ORDER BY created_at DESC",
             Self::NODE_COLUMNS
@@ -1455,7 +1523,7 @@ impl Database {
     }
 
     pub fn get_privacy_stats(&self) -> Result<(usize, usize, usize, usize, usize)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let total: i32 = conn.query_row(
             "SELECT COUNT(*) FROM nodes WHERE is_item = 1",
             [],
@@ -1479,7 +1547,7 @@ impl Database {
     /// Get category nodes (non-items with children) that need privacy scanning
     /// These are topics/domains/galaxies - scanning them first allows bulk propagation
     pub fn get_category_nodes_needing_privacy_scan(&self) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE is_item = 0 AND child_count > 0 AND is_private IS NULL ORDER BY depth ASC, child_count DESC",
             Self::NODE_COLUMNS
@@ -1492,7 +1560,7 @@ impl Database {
     /// Uses iterative approach to mark all children, grandchildren, etc. as private
     /// Propagate privacy to descendants (only unscanned nodes - for AI scan)
     pub fn propagate_privacy_to_descendants(&self, node_id: &str, reason: &str) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // Use recursive CTE to find all descendants - only update unscanned
         // Set both is_private=1 and privacy=0.0 (private)
@@ -1515,7 +1583,7 @@ impl Database {
 
     /// Force propagate privacy to ALL descendants (for manual marking)
     pub fn force_propagate_privacy_to_descendants(&self, node_id: &str, reason: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // First get all descendant IDs
         let mut stmt = conn.prepare(
@@ -1550,7 +1618,7 @@ impl Database {
 
     /// Clear privacy from ALL descendants (for manual un-marking)
     pub fn clear_privacy_from_descendants(&self, node_id: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // First get all descendant IDs
         let mut stmt = conn.prepare(
@@ -1583,7 +1651,7 @@ impl Database {
 
     /// Get privacy stats including category counts
     pub fn get_privacy_stats_extended(&self) -> Result<(usize, usize, usize, usize, usize, usize, usize)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // Item stats using new continuous privacy column (0.0 = private, 1.0 = public)
         let total_items: i32 = conn.query_row(
@@ -1634,7 +1702,7 @@ impl Database {
 
     /// Get preview of how many items would be included/excluded at a given privacy threshold
     pub fn get_export_preview(&self, min_privacy: f64) -> Result<(usize, usize, usize)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // Items that would be INCLUDED (privacy >= threshold OR unscored)
         let included: i32 = conn.query_row(
@@ -1662,7 +1730,7 @@ impl Database {
 
     // Edge operations
     pub fn insert_edge(&self, edge: &Edge) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "INSERT INTO edges (id, source_id, target_id, type, label, weight, edge_source, evidence_id, confidence, created_at, updated_at, author, reason, content, agent_id, superseded_by, metadata)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
@@ -1695,7 +1763,7 @@ impl Database {
             return Ok(0);
         }
 
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn()?;
         let tx = conn.transaction()?;
 
         {
@@ -1757,7 +1825,7 @@ impl Database {
     }
 
     pub fn get_all_edges(&self) -> Result<Vec<Edge>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM edges", Self::EDGE_COLUMNS
         ))?;
@@ -1768,7 +1836,7 @@ impl Database {
     }
 
     pub fn count_edges_by_agent(&self) -> Result<Vec<(String, i64)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT COALESCE(agent_id, 'human'), COUNT(*) FROM edges GROUP BY COALESCE(agent_id, 'human')"
         )?;
@@ -1779,7 +1847,7 @@ impl Database {
     }
 
     pub fn count_nodes_by_class(&self) -> Result<Vec<(String, i64)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT COALESCE(node_class, 'knowledge'), COUNT(*) FROM nodes GROUP BY COALESCE(node_class, 'knowledge')"
         )?;
@@ -1790,7 +1858,7 @@ impl Database {
     }
 
     pub fn count_unresolved_contradictions(&self) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.query_row(
             "SELECT COUNT(*) FROM nodes WHERE node_class = 'meta' AND meta_type = 'contradiction'",
             [],
@@ -1799,7 +1867,7 @@ impl Database {
     }
 
     pub fn count_db_stats(&self) -> Result<(i64, i64, i64, i64)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let total_nodes: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
         let total_edges: i64 = conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
         let items: i64 = conn.query_row("SELECT COUNT(*) FROM nodes WHERE is_item = 1", [], |r| r.get(0))?;
@@ -1811,7 +1879,7 @@ impl Database {
     /// Returns (source_id, target_id, weight) tuples for dendrogram building.
     /// Only includes edges where both endpoints are items (is_item = true).
     pub fn get_all_item_edges_sorted(&self) -> Result<Vec<(String, String, f64)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT e.source_id, e.target_id, e.weight
              FROM edges e
@@ -1836,7 +1904,7 @@ impl Database {
     }
 
     pub fn get_edges_for_node(&self, node_id: &str) -> Result<Vec<Edge>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM edges WHERE source_id = ?1 OR target_id = ?1",
             Self::EDGE_COLUMNS
@@ -1855,7 +1923,7 @@ impl Database {
             return Ok(vec![]);
         }
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // Build IN clause
         let placeholders: Vec<&str> = node_ids.iter().map(|_| "?").collect();
@@ -1897,7 +1965,7 @@ impl Database {
             return Ok(vec![]);
         }
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         let placeholders: Vec<&str> = node_ids.iter().map(|_| "?").collect();
         let in_clause = placeholders.join(",");
@@ -1940,7 +2008,7 @@ impl Database {
             return Ok(HashMap::new());
         }
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // Step 1: Get paper IDs for each topic (direct children that are items)
         let mut topic_papers: HashMap<String, Vec<String>> = HashMap::new();
@@ -2011,7 +2079,7 @@ impl Database {
     /// The query joins edges with nodes to find which parent each endpoint belongs to,
     /// then groups by parent pairs to count cross-edges.
     pub fn get_cross_edge_counts_for_children(&self, parent_id: &str) -> Result<Vec<(String, String, usize)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // This query:
         // 1. Joins edges with nodes to get the parent_id of each endpoint
@@ -2067,7 +2135,7 @@ impl Database {
     /// - count is the number of edges between items in cat_a and items in cat_b
     /// - size_a, size_b are the number of items in each category (for normalization)
     pub fn get_sibling_cross_edge_counts(&self, parent_id: &str) -> Result<Vec<(String, String, usize, usize, usize)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // First, get all sibling categories and their item counts
         let mut cat_stmt = conn.prepare(
@@ -2143,7 +2211,7 @@ impl Database {
     /// Get all sibling category pairs under a parent (for creating edges even with 0 cross-count).
     /// Returns Vec<(cat_a_id, cat_b_id, size_a, size_b)> in canonical order.
     pub fn get_all_sibling_pairs(&self, parent_id: &str) -> Result<Vec<(String, String, usize, usize)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // Get all sibling categories and their item counts
         let mut stmt = conn.prepare(
@@ -2176,14 +2244,14 @@ impl Database {
     }
 
     pub fn delete_edge(&self, id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute("DELETE FROM edges WHERE id = ?1", params![id])?;
         Ok(())
     }
 
     /// Get a single edge by ID
     pub fn get_edge(&self, id: &str) -> Result<Option<Edge>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM edges WHERE id = ?1", Self::EDGE_COLUMNS
         ))?;
@@ -2196,7 +2264,7 @@ impl Database {
 
     /// Update edge fields (reason, type, author). Only provided fields are changed.
     pub fn update_edge_fields(&self, id: &str, reason: Option<&str>, edge_type: Option<&str>, author: Option<&str>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let now = chrono::Utc::now().timestamp_millis();
         conn.execute(
             "UPDATE edges SET reason = COALESCE(?2, reason), type = COALESCE(?3, type),
@@ -2208,7 +2276,7 @@ impl Database {
 
     /// Delete an edge and track the deletion in deleted_items table.
     pub fn delete_edge_tracked(&self, id: &str, deleted_by: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let now = chrono::Utc::now().timestamp_millis();
         conn.execute(
             "INSERT OR REPLACE INTO deleted_items (original_id, deleted_at, deleted_by) VALUES (?1, ?2, ?3)",
@@ -2222,7 +2290,7 @@ impl Database {
 
     /// Get all nodes with a specific content_type
     pub fn get_nodes_by_content_type(&self, content_type: &str) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE content_type = ?1 ORDER BY created_at DESC",
             Self::NODE_COLUMNS
@@ -2234,7 +2302,7 @@ impl Database {
 
     /// Count edges from a source with specific type
     pub fn get_edge_count_by_source_and_type(&self, source_id: &str, edge_type: &str) -> Result<i32> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let count: i32 = conn.query_row(
             "SELECT COUNT(*) FROM edges WHERE source_id = ?1 AND type = ?2",
             params![source_id, edge_type],
@@ -2245,7 +2313,7 @@ impl Database {
 
     /// Get edges from a source with specific type
     pub fn get_edges_by_source_and_type(&self, source_id: &str, edge_type: &str) -> Result<Vec<Edge>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM edges WHERE source_id = ?1 AND type = ?2",
             Self::EDGE_COLUMNS
@@ -2256,7 +2324,7 @@ impl Database {
 
     /// Delete edge by source, target, and type
     pub fn delete_edge_by_endpoints(&self, source_id: &str, target_id: &str, edge_type: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "DELETE FROM edges WHERE source_id = ?1 AND target_id = ?2 AND type = ?3",
             params![source_id, target_id, edge_type],
@@ -2267,7 +2335,7 @@ impl Database {
     /// Update node title
     pub fn update_node_title(&self, node_id: &str, title: &str) -> Result<()> {
         {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.conn()?;
             conn.execute(
                 "UPDATE nodes SET title = ?2 WHERE id = ?1",
                 params![node_id, title],
@@ -2280,7 +2348,7 @@ impl Database {
     /// Update edge parent columns based on current node hierarchy
     /// This enables O(1) edge lookups per view instead of O(E) filtering
     pub fn update_edge_parents(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // Update source_parent_id and target_parent_id based on node.parent_id
         let updated = conn.execute(
@@ -2297,7 +2365,7 @@ impl Database {
     /// Get edges for a specific view (where both endpoints are children of the given parent)
     /// Uses indexed lookup on (source_parent_id, target_parent_id) for O(1) performance
     pub fn get_edges_for_view(&self, parent_id: &str) -> Result<Vec<Edge>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM edges WHERE source_parent_id = ?1 AND target_parent_id = ?1",
             Self::EDGE_COLUMNS
@@ -2310,7 +2378,7 @@ impl Database {
 
     // Search
     pub fn search_nodes(&self, query: &str) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let prefixed_columns = Self::NODE_COLUMNS
             .split(", ")
             .map(|c| format!("n.{}", c))
@@ -2331,7 +2399,7 @@ impl Database {
 
     /// Search nodes by ID prefix (for short ID resolution).
     pub fn search_nodes_by_id_prefix(&self, prefix: &str, limit: i32) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let pattern = format!("{}%", prefix);
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE id LIKE ?1 LIMIT ?2",
@@ -2344,7 +2412,7 @@ impl Database {
 
     /// Substring search on title/ai_title (case-insensitive). Fallback when FTS returns nothing.
     pub fn search_nodes_by_title_substring(&self, substring: &str, limit: i32) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let pattern = format!("%{}%", substring);
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE is_item = 1 AND (title LIKE ?1 COLLATE NOCASE OR ai_title LIKE ?1 COLLATE NOCASE)
@@ -2359,7 +2427,7 @@ impl Database {
     // Update cluster assignment for a node (legacy - use update_node_clustering instead)
     #[allow(dead_code)]
     pub fn update_node_cluster(&self, node_id: &str, cluster_id: i32, cluster_label: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE nodes SET cluster_id = ?2, cluster_label = ?3 WHERE id = ?1",
             params![node_id, cluster_id, cluster_label],
@@ -2370,7 +2438,7 @@ impl Database {
     // Update AI processing results for a node
     // Sovereignty: per-field — only updates fields NOT in human_edited
     pub fn update_node_ai(&self, node_id: &str, ai_title: &str, summary: &str, tags: &str, content_type: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // Read human_edited in same lock scope
         let human_edited: Option<String> = conn.query_row(
@@ -2431,7 +2499,7 @@ impl Database {
     // Update only ai_title and summary (preserves tags, content_type) - for code items
     // Sovereignty: per-field — only updates fields NOT in human_edited
     pub fn update_node_ai_summary_only(&self, node_id: &str, ai_title: &str, summary: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         let human_edited: Option<String> = conn.query_row(
             "SELECT human_edited FROM nodes WHERE id = ?1",
@@ -2477,7 +2545,7 @@ impl Database {
 
     /// Update only the tags field for a node (used for repairing code node metadata)
     pub fn update_node_tags(&self, node_id: &str, tags: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE nodes SET tags = ?2 WHERE id = ?1",
             params![node_id, tags],
@@ -2487,7 +2555,7 @@ impl Database {
 
     // Get items that haven't been processed by AI yet
     pub fn get_unprocessed_nodes(&self) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE is_item = 1 AND (is_processed = 0 OR is_processed IS NULL) ORDER BY created_at DESC",
             Self::NODE_COLUMNS
@@ -2499,7 +2567,7 @@ impl Database {
 
     // Learned emoji operations
     pub fn get_learned_emojis(&self) -> Result<std::collections::HashMap<String, String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare("SELECT keyword, emoji FROM learned_emojis")?;
         let mappings = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -2508,7 +2576,7 @@ impl Database {
     }
 
     pub fn save_learned_emoji(&self, keyword: &str, emoji: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2524,7 +2592,7 @@ impl Database {
 
     /// Get all nodes at a specific depth
     pub fn get_nodes_at_depth(&self, depth: i32) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE depth = ?1 ORDER BY child_count DESC, title",
             Self::NODE_COLUMNS
@@ -2536,7 +2604,7 @@ impl Database {
 
     /// Get children of a specific parent node
     pub fn get_children(&self, parent_id: &str) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE parent_id = ?1 ORDER BY child_count DESC, title",
             Self::NODE_COLUMNS
@@ -2548,7 +2616,7 @@ impl Database {
 
     /// Get children with pagination - for large node sets
     pub fn get_children_paginated(&self, parent_id: &str, limit: usize, offset: usize) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE parent_id = ?1 ORDER BY child_count DESC, title LIMIT ?2 OFFSET ?3",
             Self::NODE_COLUMNS
@@ -2560,7 +2628,7 @@ impl Database {
 
     /// Get all descendants of a parent node recursively.
     pub fn get_descendants(&self, parent_id: &str, node_class: Option<&str>, items_only: bool, limit: usize) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         let mut filters = Vec::new();
         if items_only {
@@ -2614,7 +2682,7 @@ impl Database {
     /// Categories (is_item = 0) are always included
     /// If include_hidden is true, also includes HIDDEN tier (debug, code, paste, trivial)
     pub fn get_graph_children(&self, parent_id: &str, include_hidden: bool) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let query = if include_hidden {
             // Include all items (VISIBLE + SUPPORTING + HIDDEN)
             format!(
@@ -2638,7 +2706,7 @@ impl Database {
     /// Returns only SUPPORTING tier: investigation, discussion, reference, creative
     /// HIDDEN tier (code, debug, paste, trivial) is excluded entirely
     pub fn get_supporting_items(&self, parent_id: &str) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE parent_id = ?1
              AND content_type IN ('investigation', 'discussion', 'reference', 'creative')
@@ -2652,7 +2720,7 @@ impl Database {
 
     /// Get items associated with a specific idea
     pub fn get_associated_items(&self, idea_id: &str) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE associated_idea_id = ?1 ORDER BY content_type, created_at DESC",
             Self::NODE_COLUMNS
@@ -2672,7 +2740,7 @@ impl Database {
 
     /// Get count of items associated with a specific idea
     pub fn get_associated_count(&self, idea_id: &str) -> Result<i32> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let count: i32 = conn.query_row(
             "SELECT COUNT(*) FROM nodes WHERE associated_idea_id = ?1",
             params![idea_id],
@@ -2684,7 +2752,7 @@ impl Database {
     /// Get the Universe node (single root, is_universe = true)
     /// Prefers id='universe' if multiple universe nodes exist (legacy cleanup)
     pub fn get_universe(&self) -> Result<Option<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE is_universe = 1 ORDER BY CASE WHEN id = 'universe' THEN 0 ELSE 1 END LIMIT 1",
             Self::NODE_COLUMNS
@@ -2700,7 +2768,7 @@ impl Database {
 
     /// Get all items (is_item = true) - openable content
     pub fn get_items(&self) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE is_item = 1 ORDER BY created_at DESC",
             Self::NODE_COLUMNS
@@ -2715,7 +2783,7 @@ impl Database {
     /// Excludes SUPPORTING (investigation, discussion, reference, creative)
     /// Excludes HIDDEN (debug, code, paste, trivial)
     pub fn get_visible_items(&self) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE is_item = 1
              AND (content_type IN ('insight', 'exploration', 'synthesis', 'question', 'planning', 'concept', 'decision', 'paper', 'bookmark')
@@ -2731,7 +2799,7 @@ impl Database {
 
     /// Get items with pagination - for large datasets
     pub fn get_items_paginated(&self, limit: usize, offset: usize) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE is_item = 1 ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
             Self::NODE_COLUMNS
@@ -2747,7 +2815,7 @@ impl Database {
         if self.is_field_human_edited(node_id, "parent_id")? {
             return Ok(());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE nodes SET parent_id = ?2, depth = ?3 WHERE id = ?1",
             params![node_id, parent_id, depth],
@@ -2757,7 +2825,7 @@ impl Database {
 
     /// Update a node's child count
     pub fn update_child_count(&self, node_id: &str, child_count: i32) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE nodes SET child_count = ?2 WHERE id = ?1",
             params![node_id, child_count],
@@ -2767,7 +2835,7 @@ impl Database {
 
     /// Recalculate and update a node's child count from actual children
     pub fn recalculate_child_count(&self, node_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE nodes SET child_count = (SELECT COUNT(*) FROM nodes WHERE parent_id = ?1) WHERE id = ?1",
             params![node_id],
@@ -2777,7 +2845,7 @@ impl Database {
 
     /// Recalculate child_count for ALL categories (non-items) in one SQL statement
     pub fn recalculate_all_child_counts(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let updated = conn.execute(
             "UPDATE nodes SET child_count = (
                 SELECT COUNT(*) FROM nodes AS children WHERE children.parent_id = nodes.id
@@ -2790,7 +2858,7 @@ impl Database {
     /// Count children of a node
     #[allow(dead_code)]
     pub fn count_children(&self, parent_id: &str) -> Result<i32> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let count: i32 = conn.query_row(
             "SELECT COUNT(*) FROM nodes WHERE parent_id = ?1",
             params![parent_id],
@@ -2801,7 +2869,7 @@ impl Database {
 
     /// Get max depth in the hierarchy
     pub fn get_max_depth(&self) -> Result<i32> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let max_depth: i32 = conn.query_row(
             "SELECT COALESCE(MAX(depth), 0) FROM nodes",
             [],
@@ -2816,7 +2884,7 @@ impl Database {
         use crate::settings;
 
         let protected_ids = self.get_protected_node_ids();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         if protected_ids.is_empty() {
             // No protection - delete all
@@ -2851,7 +2919,7 @@ impl Database {
         use crate::settings;
 
         let protected_ids = self.get_protected_node_ids();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         if protected_ids.is_empty() {
             // No protection - clear all (sovereignty: preserve pinned parents)
@@ -2880,7 +2948,7 @@ impl Database {
     /// Delete hierarchy nodes at depth > min_depth (preserves FOS nodes at depth 1)
     /// Used when rebuilding hierarchy while preserving top-level structure
     pub fn delete_hierarchy_nodes_below_depth(&self, min_depth: i32) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let deleted = conn.execute(
             "DELETE FROM nodes WHERE is_item = 0 AND is_universe = 0 AND depth > ?1",
             [min_depth],
@@ -2891,7 +2959,7 @@ impl Database {
     /// Clear parent_id only on items whose parent no longer exists
     /// Used after deleting hierarchy nodes to clean up orphaned references
     pub fn clear_orphaned_item_parents(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE nodes SET parent_id = NULL
              WHERE is_item = 1 AND parent_id IS NOT NULL
@@ -2904,7 +2972,7 @@ impl Database {
     /// Get all category/topic names in the hierarchy (for duplicate prevention)
     /// Returns distinct names from non-item nodes
     pub fn get_all_category_names(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT DISTINCT COALESCE(cluster_label, title)
              FROM nodes
@@ -2923,7 +2991,7 @@ impl Database {
 
     /// Get items that need clustering (needs_clustering = 1 AND is_item = 1)
     pub fn get_items_needing_clustering(&self) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE is_item = 1 AND needs_clustering = 1 ORDER BY created_at DESC",
             Self::NODE_COLUMNS
@@ -2935,7 +3003,7 @@ impl Database {
 
     /// Count items that need clustering
     pub fn count_items_needing_clustering(&self) -> Result<i32> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let count: i32 = conn.query_row(
             "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND needs_clustering = 1",
             [],
@@ -2946,7 +3014,7 @@ impl Database {
 
     /// Count items that have been assigned to clusters
     pub fn count_clustered_items(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let count: i32 = conn.query_row(
             "SELECT COUNT(*) FROM nodes WHERE is_item = 1 AND cluster_id IS NOT NULL",
             [],
@@ -2957,7 +3025,7 @@ impl Database {
 
     /// Get existing cluster info for AI context
     pub fn get_existing_clusters(&self) -> Result<Vec<(i32, String, i32)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT cluster_id, cluster_label, COUNT(*) as count
              FROM nodes
@@ -2975,7 +3043,7 @@ impl Database {
 
     /// Find a topic node by cluster_label (for quick hierarchy add)
     pub fn find_topic_by_cluster_label(&self, cluster_label: &str) -> Result<Option<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE cluster_label = ? AND is_item = 0 AND depth > 0 LIMIT 1",
             Self::NODE_COLUMNS
@@ -2991,7 +3059,7 @@ impl Database {
 
     /// Get orphaned items (items with no parent_id) that have been clustered
     pub fn get_orphaned_clustered_items(&self) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE is_item = 1 AND parent_id IS NULL AND cluster_id IS NOT NULL ORDER BY created_at DESC",
             Self::NODE_COLUMNS
@@ -3004,7 +3072,7 @@ impl Database {
     /// Get truly orphaned items: is_item=1 nodes whose parent_id is NULL
     /// or whose parent_id points to a non-existent node. Excludes Universe.
     pub fn get_orphan_nodes(&self, limit: i32) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes n
              WHERE n.is_item = 1 AND n.is_universe = 0
@@ -3021,7 +3089,7 @@ impl Database {
 
     /// Update a node's parent and depth
     pub fn set_node_parent(&self, node_id: &str, parent_id: &str, depth: i32) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE nodes SET parent_id = ?, depth = ? WHERE id = ?",
             rusqlite::params![parent_id, depth, node_id],
@@ -3031,7 +3099,7 @@ impl Database {
 
     /// Increment a node's child_count
     pub fn increment_child_count(&self, node_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE nodes SET child_count = child_count + 1 WHERE id = ?",
             [node_id],
@@ -3041,7 +3109,7 @@ impl Database {
 
     /// Get next available cluster_id
     pub fn get_next_cluster_id(&self) -> Result<i32> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let max_id: Option<i32> = conn.query_row(
             "SELECT MAX(cluster_id) FROM nodes WHERE cluster_id >= 0",
             [],
@@ -3052,7 +3120,7 @@ impl Database {
 
     /// Update clustering for a node and mark as clustered
     pub fn update_node_clustering(&self, node_id: &str, cluster_id: i32, cluster_label: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE nodes SET cluster_id = ?2, cluster_label = ?3, needs_clustering = 0 WHERE id = ?1",
             params![node_id, cluster_id, cluster_label],
@@ -3063,7 +3131,7 @@ impl Database {
     /// Mark items as needing re-clustering (e.g., after import)
     #[allow(dead_code)]
     pub fn mark_items_need_clustering(&self, node_ids: &[String]) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         for id in node_ids {
             conn.execute(
                 "UPDATE nodes SET needs_clustering = 1 WHERE id = ?1",
@@ -3075,7 +3143,7 @@ impl Database {
 
     /// Mark all items as needing clustering (for full rebuild)
     pub fn mark_all_items_need_clustering(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let updated = conn.execute(
             "UPDATE nodes SET needs_clustering = 1, cluster_id = NULL, cluster_label = NULL WHERE is_item = 1",
             [],
@@ -3087,7 +3155,7 @@ impl Database {
     /// Returns clusters where the label looks like keyword-generated (contains comma)
     /// or is a generic "Cluster N" name
     pub fn get_clusters_needing_names(&self) -> Result<Vec<(i32, String)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT DISTINCT cluster_id, cluster_label FROM nodes
              WHERE cluster_id IS NOT NULL
@@ -3106,7 +3174,7 @@ impl Database {
 
     /// Get sample items from a cluster for naming
     pub fn get_cluster_sample_items(&self, cluster_id: i32, limit: usize) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let query = format!(
             "SELECT {} FROM nodes WHERE cluster_id = ?1 AND is_item = 1 LIMIT ?2",
             Self::NODE_COLUMNS
@@ -3120,7 +3188,7 @@ impl Database {
 
     /// Update cluster label for all items in a cluster
     pub fn update_cluster_label(&self, cluster_id: i32, new_label: &str) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let updated = conn.execute(
             "UPDATE nodes SET cluster_label = ?2 WHERE cluster_id = ?1",
             params![cluster_id, new_label],
@@ -3133,7 +3201,7 @@ impl Database {
     /// Delete AI-generated BelongsTo edges for a node (preserves user-edited edges)
     /// Only deletes edges where edge_source = 'ai' or edge_source IS NULL (legacy)
     pub fn delete_belongs_to_edges(&self, node_id: &str) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let deleted = conn.execute(
             "DELETE FROM edges WHERE source_id = ?1 AND type = 'belongs_to' AND (edge_source = 'ai' OR edge_source IS NULL)",
             params![node_id],
@@ -3145,7 +3213,7 @@ impl Database {
     /// Used during clustering to skip re-generating edges user has curated
     #[allow(dead_code)]
     pub fn get_user_belongs_to_edges(&self, node_id: &str) -> Result<Vec<Edge>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM edges WHERE source_id = ?1 AND type = 'belongs_to' AND edge_source = 'user'
              ORDER BY weight DESC",
@@ -3180,7 +3248,7 @@ impl Database {
     /// Find topic node ID for a cluster_id (e.g., returns "topic-0" for cluster_id 0)
     /// Topic nodes are created by hierarchy builder with IDs like "topic-{cluster_id}"
     pub fn find_topic_node_for_cluster(&self, cluster_id: i32) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         // Topic nodes have cluster_id set and are not items (intermediate hierarchy nodes)
         let topic_id = format!("topic-{}", cluster_id);
 
@@ -3206,7 +3274,7 @@ impl Database {
 
     /// Get all BelongsTo edges for a node (category associations)
     pub fn get_belongs_to_edges(&self, node_id: &str) -> Result<Vec<Edge>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM edges WHERE source_id = ?1 AND type = 'belongs_to'
              ORDER BY weight DESC",
@@ -3240,7 +3308,7 @@ impl Database {
 
     /// Get all items that belong to a cluster (via BelongsTo edges)
     pub fn get_items_in_cluster_via_edges(&self, cluster_id: i32, min_weight: Option<f64>) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let topic_id = format!("topic-{}", cluster_id);
         let placeholder_id = format!("cluster-{}", cluster_id);
         let min_w = min_weight.unwrap_or(0.0);
@@ -3267,7 +3335,7 @@ impl Database {
     /// Get child count (recursive) for a node - counts all items in subtree
     #[allow(dead_code)]
     pub fn get_recursive_item_count(&self, node_id: &str) -> Result<i32> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // If the node is an item itself, return 1
         let is_item: bool = conn.query_row(
@@ -3331,7 +3399,7 @@ impl Database {
         if self.is_field_human_edited(node_id, "parent_id")? {
             return Ok(());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE nodes SET parent_id = ?2 WHERE id = ?1",
             params![node_id, parent_id],
@@ -3341,7 +3409,7 @@ impl Database {
 
     /// Set depth for a single node (does NOT cascade to descendants)
     pub fn set_node_depth(&self, node_id: &str, depth: i32) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE nodes SET depth = ?2 WHERE id = ?1",
             params![node_id, depth],
@@ -3434,7 +3502,7 @@ impl Database {
 
     /// Get all messages belonging to a conversation, ordered by sequence_index
     pub fn get_conversation_messages(&self, conversation_id: &str) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE conversation_id = ?1 ORDER BY sequence_index ASC",
             Self::NODE_COLUMNS
@@ -3451,7 +3519,7 @@ impl Database {
     /// Leaves (child_count = 0): latest_child_date = created_at
     /// Groups (child_count > 0): latest_child_date = MAX(children's latest_child_date)
     pub fn propagate_latest_dates(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // Get max depth in hierarchy
         let max_depth: i32 = conn.query_row(
@@ -3495,7 +3563,7 @@ impl Database {
 
     /// Pin or unpin a node
     pub fn set_node_pinned(&self, node_id: &str, pinned: bool) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE nodes SET is_pinned = ?2 WHERE id = ?1",
             params![node_id, pinned as i32],
@@ -3505,7 +3573,7 @@ impl Database {
 
     /// Set content type for classification (idea, code, debug, paste)
     pub fn set_content_type(&self, node_id: &str, content_type: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE nodes SET content_type = ?2 WHERE id = ?1",
             params![node_id, content_type],
@@ -3515,7 +3583,7 @@ impl Database {
 
     /// Batch set content_type for multiple nodes (uses transaction for speed)
     pub fn set_content_types_batch(&self, updates: &[(String, String)]) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let tx = conn.unchecked_transaction()?;
 
         let mut updated = 0;
@@ -3533,7 +3601,7 @@ impl Database {
 
     /// Clear all content_type values (for reclassification)
     pub fn clear_all_content_types(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE nodes SET content_type = NULL WHERE is_item = 1",
             [],
@@ -3543,7 +3611,7 @@ impl Database {
 
     /// Set the associated idea ID for a supporting item
     pub fn set_associated_idea(&self, node_id: &str, idea_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE nodes SET associated_idea_id = ?2 WHERE id = ?1",
             params![node_id, idea_id],
@@ -3553,7 +3621,7 @@ impl Database {
 
     /// Clear the associated idea ID for a node
     pub fn clear_associated_idea(&self, node_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE nodes SET associated_idea_id = NULL WHERE id = ?1",
             params![node_id],
@@ -3572,7 +3640,7 @@ impl Database {
         if self.is_field_human_edited(node_id, "parent_id")? {
             return Ok(());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3586,7 +3654,7 @@ impl Database {
 
     /// Increment depth of a node and all its descendants by a given amount
     pub fn increment_subtree_depth_by(&self, root_id: &str, increment: i32) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // Use recursive CTE to find all descendants and update their depth
         conn.execute(
@@ -3605,7 +3673,7 @@ impl Database {
 
     /// Update last accessed timestamp for a node
     pub fn touch_node(&self, node_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3619,7 +3687,7 @@ impl Database {
 
     /// Clear last accessed timestamp for a node (remove from recents)
     pub fn clear_recent(&self, node_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE nodes SET last_accessed_at = NULL WHERE id = ?1",
             params![node_id],
@@ -3630,7 +3698,7 @@ impl Database {
     /// Get pinned nodes (for Sidebar Pinned tab)
     /// Only returns VISIBLE tier items
     pub fn get_pinned_nodes(&self) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes
              WHERE is_pinned = 1 AND ({})
@@ -3645,7 +3713,7 @@ impl Database {
     /// Get recently accessed nodes (for Sidebar Recent tab)
     /// Only returns VISIBLE tier items
     pub fn get_recent_nodes(&self, limit: i32) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes
              WHERE last_accessed_at IS NOT NULL AND ({})
@@ -3661,7 +3729,7 @@ impl Database {
 
     /// Update a node's embedding (for semantic similarity)
     pub fn update_node_embedding(&self, node_id: &str, embedding: &[f32]) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         // Convert f32 slice to raw bytes (little-endian)
         let bytes: Vec<u8> = embedding.iter()
             .flat_map(|f| f.to_le_bytes())
@@ -3675,7 +3743,7 @@ impl Database {
 
     /// Get a node's embedding
     pub fn get_node_embedding(&self, node_id: &str) -> Result<Option<Vec<f32>>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let bytes: Option<Vec<u8>> = conn.query_row(
             "SELECT embedding FROM nodes WHERE id = ?1",
             params![node_id],
@@ -3688,7 +3756,7 @@ impl Database {
     /// Get all nodes that have embeddings (for similarity search)
     /// Returns (node_id, embedding) pairs - no content_type filtering
     pub fn get_nodes_with_embeddings(&self) -> Result<Vec<(String, Vec<f32>)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, embedding FROM nodes WHERE embedding IS NOT NULL"
         )?;
@@ -3704,7 +3772,7 @@ impl Database {
 
     /// Get count of nodes with embeddings
     pub fn count_nodes_with_embeddings(&self) -> Result<i32> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.query_row(
             "SELECT COUNT(*) FROM nodes WHERE embedding IS NOT NULL",
             [],
@@ -3715,7 +3783,7 @@ impl Database {
     /// Get all nodes that need embeddings
     /// Includes ALL items (for association matching) AND category nodes (with title)
     pub fn get_nodes_needing_embeddings(&self) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         // Include all items (needed for association matching) and non-items with titles
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE (is_item = 1 OR (is_item = 0 AND title IS NOT NULL)) AND embedding IS NULL",
@@ -3751,7 +3819,7 @@ impl Database {
             HashMap<String, Option<String>>,
             HashMap<String, bool>
         ) = {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.conn()?;
             let mut stmt = conn.prepare("SELECT id, parent_id, is_item FROM nodes WHERE embedding IS NOT NULL")?;
             let rows = stmt.query_map([], |row| {
                 Ok((
@@ -3874,7 +3942,7 @@ impl Database {
 
     /// Delete all AI-generated semantic edges (for re-generation)
     pub fn delete_semantic_edges(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let deleted = conn.execute(
             "DELETE FROM edges WHERE type = 'related' AND edge_source = 'ai'",
             [],
@@ -3884,7 +3952,7 @@ impl Database {
 
     /// Count AI-generated semantic edges
     pub fn count_semantic_edges(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM edges WHERE type = 'related' AND edge_source = 'ai'",
             [],
@@ -3897,21 +3965,21 @@ impl Database {
 
     /// Delete all nodes
     pub fn delete_all_nodes(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let deleted = conn.execute("DELETE FROM nodes", [])?;
         Ok(deleted)
     }
 
     /// Delete all edges
     pub fn delete_all_edges(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let deleted = conn.execute("DELETE FROM edges", [])?;
         Ok(deleted)
     }
 
     /// Delete all edges where node is source or target
     pub fn delete_edges_for_node(&self, node_id: &str) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let deleted = conn.execute(
             "DELETE FROM edges WHERE source_id = ?1 OR target_id = ?1",
             params![node_id],
@@ -3922,7 +3990,7 @@ impl Database {
     /// Clear parent_id references to a node (set to NULL)
     /// Used before deleting a node to avoid foreign key violations
     pub fn clear_parent_references(&self, node_id: &str) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let updated = conn.execute(
             "UPDATE nodes SET parent_id = NULL WHERE parent_id = ?1",
             params![node_id],
@@ -3932,7 +4000,7 @@ impl Database {
 
     /// Delete empty items (items with no meaningful content/raw data)
     pub fn delete_empty_items(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         // Sovereignty: protect human-created nodes
         let deleted = conn.execute(
             "DELETE FROM nodes WHERE is_item = 1 AND human_created = 0 AND (
@@ -3952,7 +4020,7 @@ impl Database {
     /// - Conversations with Human: but no Assistant: (legacy)
     /// - Conversations with "*No response*" placeholder
     pub fn delete_incomplete_conversations(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         // Sovereignty: protect human-created nodes
         let deleted = conn.execute(
             "DELETE FROM nodes WHERE is_item = 1 AND human_created = 0 AND content IS NOT NULL AND (
@@ -3970,7 +4038,7 @@ impl Database {
 
     /// Reset AI processing flag (mark all items as unprocessed)
     pub fn reset_ai_processing(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let updated = conn.execute(
             "UPDATE nodes SET is_processed = 0, ai_title = NULL, summary = NULL, tags = NULL, emoji = NULL WHERE is_item = 1",
             [],
@@ -3980,7 +4048,7 @@ impl Database {
 
     /// Clear all embeddings
     pub fn clear_all_embeddings(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let updated = conn.execute(
             "UPDATE nodes SET embedding = NULL",
             [],
@@ -3990,7 +4058,7 @@ impl Database {
 
     /// Get database stats for settings panel
     pub fn get_stats(&self) -> Result<(usize, usize, usize, usize, usize, usize, usize, usize)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let total_nodes: usize = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
         let total_items: usize = conn.query_row("SELECT COUNT(*) FROM nodes WHERE is_item = 1", [], |r| r.get(0))?;
         let processed: usize = conn.query_row("SELECT COUNT(*) FROM nodes WHERE is_processed = 1", [], |r| r.get(0))?;
@@ -4009,7 +4077,7 @@ impl Database {
 
     /// Get total edge count.
     pub fn get_edge_count(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let count: usize = conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
         Ok(count)
     }
@@ -4027,7 +4095,7 @@ impl Database {
         // or nodes with "Uncategorized" in the title that are intermediate pass-throughs
         // Process deepest first to avoid orphaning nodes
         let passthrough_nodes: Vec<(String, Option<String>)> = {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.conn()?;
             let mut stmt = conn.prepare(
                 "SELECT n.id, n.parent_id
                  FROM nodes n
@@ -4050,7 +4118,7 @@ impl Database {
         println!("[Flatten] Found {} potential passthrough nodes", passthrough_nodes.len());
 
         for (node_id, grandparent_id) in passthrough_nodes {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.conn()?;
 
             // Get the children of this node
             let children: Vec<String> = {
@@ -4123,7 +4191,7 @@ impl Database {
 
     /// Recalculate depth for all nodes based on parent relationships
     fn update_all_depths(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // Set universe to depth 0
         conn.execute(
@@ -4156,7 +4224,7 @@ impl Database {
     /// Skips protected nodes (Recent Notes)
     pub fn merge_same_name_children(&self) -> Result<usize> {
         let protected_ids = self.get_protected_node_ids();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // Find parent-child pairs where labels match (case-insensitive)
         // Use COALESCE to check cluster_label, ai_title, title
@@ -4223,7 +4291,7 @@ impl Database {
         let mut total_flattened = 0;
 
         loop {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.conn()?;
 
             // Find ALL single-child chains in one query
             // Returns: middle_node_id, grandparent_id, child_id
@@ -4283,7 +4351,7 @@ impl Database {
     /// Skips protected nodes (Recent Notes)
     pub fn remove_empty_categories(&self) -> Result<usize> {
         let protected_ids = self.get_protected_node_ids();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         if protected_ids.is_empty() {
             let count = conn.execute(
@@ -4308,7 +4376,7 @@ impl Database {
 
     /// Fix all child_count fields by actually counting VISIBLE tier children
     pub fn fix_all_child_counts(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // Find all mismatches
         // Count only VISIBLE tier children (insight, idea, exploration, synthesis, question, planning, paper, code_*)
@@ -4346,7 +4414,7 @@ impl Database {
     pub fn fix_all_depths(&self) -> Result<usize> {
         // First, count how many have wrong depth
         let wrong_count: usize = {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.conn()?;
 
             // Build correct depths via CTE and count mismatches
             let count: i32 = conn.query_row(
@@ -4378,7 +4446,7 @@ impl Database {
     /// Skips protected nodes (Recent Notes descendants)
     pub fn reparent_orphans(&self) -> Result<usize> {
         let protected_ids = self.get_protected_node_ids();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // Find universe id
         let universe_id: Option<String> = conn.query_row(
@@ -4428,7 +4496,7 @@ impl Database {
 
     /// Delete edges where source or target node doesn't exist
     pub fn prune_dead_edges(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let count = conn.execute(
             "DELETE FROM edges
              WHERE source_id NOT IN (SELECT id FROM nodes)
@@ -4441,7 +4509,7 @@ impl Database {
 
     /// Count edges where source or target node doesn't exist (read-only)
     pub fn count_dead_edges(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let count: usize = conn.query_row(
             "SELECT COUNT(*) FROM edges WHERE source_id NOT IN (SELECT id FROM nodes) OR target_id NOT IN (SELECT id FROM nodes)",
             [],
@@ -4452,7 +4520,7 @@ impl Database {
 
     /// Remove duplicate edges (same source, target, type), keep oldest
     pub fn deduplicate_edges(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // Find and delete duplicates, keeping the one with minimum rowid
         let count = conn.execute(
@@ -4472,7 +4540,7 @@ impl Database {
     /// Increment depth of a node and all its descendants by 1
     /// Uses recursive CTE to do it in a single query (avoids lock issues)
     pub fn increment_subtree_depth(&self, node_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // Use recursive CTE to find all descendants and increment their depth
         conn.execute(
@@ -4490,7 +4558,7 @@ impl Database {
 
     /// Decrement depth of a subtree by 1 (used when moving nodes up a level)
     pub fn decrement_subtree_depth(&self, node_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // Use recursive CTE to find all descendants and decrement their depth
         conn.execute(
@@ -4513,7 +4581,7 @@ impl Database {
             return Ok(());
         }
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // Level-by-level: update roots, then their children, then grandchildren, etc.
         // Each level uses indexed parent_id lookups instead of recursive CTE traversal
@@ -4598,7 +4666,7 @@ impl Database {
             return Ok(());
         }
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let start = std::time::Instant::now();
 
         // First, set depth for the root nodes
@@ -4690,13 +4758,13 @@ impl Database {
 
     /// Count total tags
     pub fn count_tags(&self) -> Result<i32> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))
     }
 
     /// Insert a new tag
     pub fn insert_tag(&self, tag: &Tag) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "INSERT INTO tags (id, title, parent_tag_id, depth, item_count, pinned, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -4716,7 +4784,7 @@ impl Database {
 
     /// Get a tag by ID
     pub fn get_tag(&self, id: &str) -> Result<Option<Tag>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, title, parent_tag_id, depth, item_count, pinned, created_at, updated_at
              FROM tags WHERE id = ?1"
@@ -4738,7 +4806,7 @@ impl Database {
 
     /// Get all tags
     pub fn get_all_tags(&self) -> Result<Vec<Tag>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, title, parent_tag_id, depth, item_count, pinned, created_at, updated_at
              FROM tags ORDER BY depth, item_count DESC"
@@ -4760,7 +4828,7 @@ impl Database {
 
     /// Get tags by depth range (e.g., 0..=1 for L0 and L1 tags)
     pub fn get_tags_by_depth(&self, min_depth: i32, max_depth: i32) -> Result<Vec<Tag>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, title, parent_tag_id, depth, item_count, pinned, created_at, updated_at
              FROM tags WHERE depth >= ?1 AND depth <= ?2
@@ -4783,7 +4851,7 @@ impl Database {
 
     /// Update tag centroid (embedding)
     pub fn update_tag_centroid(&self, tag_id: &str, centroid: &[f32]) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let bytes: Vec<u8> = centroid.iter()
             .flat_map(|f| f.to_le_bytes())
             .collect();
@@ -4796,7 +4864,7 @@ impl Database {
 
     /// Get tag centroid (embedding)
     pub fn get_tag_centroid(&self, tag_id: &str) -> Result<Option<Vec<f32>>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let bytes: Option<Vec<u8>> = conn.query_row(
             "SELECT centroid FROM tags WHERE id = ?1",
             params![tag_id],
@@ -4807,7 +4875,7 @@ impl Database {
 
     /// Update tag item count
     pub fn update_tag_item_count(&self, tag_id: &str) -> Result<i32> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let count: i32 = conn.query_row(
             "SELECT COUNT(*) FROM item_tags WHERE tag_id = ?1",
             params![tag_id],
@@ -4822,7 +4890,7 @@ impl Database {
 
     /// Insert an item-tag assignment
     pub fn insert_item_tag(&self, item_id: &str, tag_id: &str, confidence: f64, source: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "INSERT OR REPLACE INTO item_tags (item_id, tag_id, confidence, source)
              VALUES (?1, ?2, ?3, ?4)",
@@ -4834,7 +4902,7 @@ impl Database {
     /// Insert an item-tag assignment only if it doesn't already exist
     /// Returns true if inserted, false if already exists
     pub fn insert_item_tag_if_not_exists(&self, item_id: &str, tag_id: &str, confidence: f64, source: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let rows = conn.execute(
             "INSERT OR IGNORE INTO item_tags (item_id, tag_id, confidence, source)
              VALUES (?1, ?2, ?3, ?4)",
@@ -4845,7 +4913,7 @@ impl Database {
 
     /// Get all tags for an item
     pub fn get_item_tags(&self, item_id: &str) -> Result<Vec<(Tag, f64)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT t.id, t.title, t.parent_tag_id, t.depth, t.item_count, t.pinned,
                     t.created_at, t.updated_at, it.confidence
@@ -4874,7 +4942,7 @@ impl Database {
 
     /// Get shared tag IDs between two items (for similarity bonus)
     pub fn get_shared_tag_ids(&self, item_a_id: &str, item_b_id: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT a.tag_id FROM item_tags a
              INNER JOIN item_tags b ON a.tag_id = b.tag_id
@@ -4888,7 +4956,7 @@ impl Database {
 
     /// Count shared tags between two items (faster than get_shared_tag_ids)
     pub fn count_shared_tags(&self, item_a_id: &str, item_b_id: &str) -> Result<i32> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.query_row(
             "SELECT COUNT(*) FROM item_tags a
              INNER JOIN item_tags b ON a.tag_id = b.tag_id
@@ -4900,7 +4968,7 @@ impl Database {
 
     /// Get all items for a tag
     pub fn get_tag_items(&self, tag_id: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT item_id FROM item_tags WHERE tag_id = ?1 ORDER BY confidence DESC"
         )?;
@@ -4917,7 +4985,7 @@ impl Database {
             return Ok(std::collections::HashSet::new());
         }
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         // Build query with placeholders for each tag title
         let placeholders: Vec<String> = tag_titles.iter().enumerate()
             .map(|(i, _)| format!("?{}", i + 1))
@@ -4944,7 +5012,7 @@ impl Database {
 
     /// Delete all tags (for reset/rebuild)
     pub fn delete_all_tags(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         // item_tags will cascade delete due to foreign key
         let count = conn.execute("DELETE FROM tags", [])?;
         Ok(count)
@@ -4952,7 +5020,7 @@ impl Database {
 
     /// Get cluster statistics for bootstrap (cluster_id, cluster_label, item_count)
     pub fn get_cluster_statistics(&self) -> Result<Vec<(i32, String, i32)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT cluster_id, cluster_label, COUNT(*) as item_count
              FROM nodes
@@ -4972,7 +5040,7 @@ impl Database {
 
     /// Get items by cluster_id (for computing centroids)
     pub fn get_items_by_cluster(&self, cluster_id: i32) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let query = format!(
             "SELECT {} FROM nodes WHERE is_item = 1 AND cluster_id = ?1",
             Self::NODE_COLUMNS
@@ -4987,7 +5055,7 @@ impl Database {
     /// Get all item-tag associations as a HashMap for efficient lookup during clustering
     /// Returns HashMap<item_id, Vec<tag_id>>
     pub fn get_all_item_tags_map(&self) -> Result<std::collections::HashMap<String, Vec<String>>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare("SELECT item_id, tag_id FROM item_tags")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -5006,7 +5074,7 @@ impl Database {
 
     /// Get a metadata value by key
     pub fn get_metadata(&self, key: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let result: std::result::Result<String, _> = conn.query_row(
             "SELECT value FROM db_metadata WHERE key = ?1",
             params![key],
@@ -5021,7 +5089,7 @@ impl Database {
 
     /// Set a metadata value (insert or update)
     pub fn set_metadata(&self, key: &str, value: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -5050,7 +5118,7 @@ impl Database {
 
     /// Get all metadata as key-value pairs
     pub fn get_all_metadata(&self) -> Result<Vec<(String, String, i64)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare("SELECT key, value, updated_at FROM db_metadata ORDER BY key")?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -5082,7 +5150,7 @@ impl Database {
         access_right: Option<&str>,
         content_hash: Option<&str>,
     ) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -5098,7 +5166,7 @@ impl Database {
 
     /// Get paper metadata by node ID
     pub fn get_paper_by_node_id(&self, node_id: &str) -> Result<Option<Paper>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.query_row(
             "SELECT id, node_id, openaire_id, doi, authors, publication_date, journal, publisher, abstract, abstract_formatted, abstract_sections, pdf_url, pdf_available, doc_format, subjects, access_right, created_at
              FROM papers WHERE node_id = ?1",
@@ -5129,7 +5197,7 @@ impl Database {
 
     /// Check if a paper with this OpenAIRE ID already exists
     pub fn paper_exists_by_openaire_id(&self, openaire_id: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let count: i32 = conn.query_row(
             "SELECT COUNT(*) FROM papers WHERE openaire_id = ?1",
             params![openaire_id],
@@ -5140,7 +5208,7 @@ impl Database {
 
     /// Get all OpenAIRE IDs for batch duplicate checking (O(1) lookup)
     pub fn get_all_openaire_ids(&self) -> Result<std::collections::HashSet<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare("SELECT openaire_id FROM papers WHERE openaire_id IS NOT NULL")?;
         let ids = stmt.query_map([], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())
@@ -5150,7 +5218,7 @@ impl Database {
 
     /// Get all DOIs for batch duplicate checking (O(1) lookup)
     pub fn get_all_paper_dois(&self) -> Result<std::collections::HashSet<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare("SELECT LOWER(doi) FROM papers WHERE doi IS NOT NULL AND doi != ''")?;
         let ids = stmt.query_map([], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())
@@ -5160,7 +5228,7 @@ impl Database {
 
     /// Get all content hashes for batch duplicate checking (O(1) lookup)
     pub fn get_all_content_hashes(&self) -> Result<std::collections::HashSet<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare("SELECT content_hash FROM papers WHERE content_hash IS NOT NULL")?;
         let ids = stmt.query_map([], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())
@@ -5170,7 +5238,7 @@ impl Database {
 
     /// Update content_hash for a paper (for backfilling existing papers)
     pub fn update_paper_content_hash(&self, node_id: &str, content_hash: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE papers SET content_hash = ?2 WHERE node_id = ?1",
             params![node_id, content_hash],
@@ -5181,7 +5249,7 @@ impl Database {
     /// Get papers that need content_hash backfilled
     /// Returns (node_id, title, abstract_text) tuples
     pub fn get_papers_needing_content_hash(&self) -> Result<Vec<(String, String, Option<String>)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT p.node_id, n.title, p.abstract FROM papers p
              JOIN nodes n ON p.node_id = n.id
@@ -5200,7 +5268,7 @@ impl Database {
         if openaire_ids.is_empty() {
             return Ok(0);
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         // Use IN clause with placeholders
         let placeholders: Vec<_> = (0..openaire_ids.len()).map(|i| format!("?{}", i + 1)).collect();
         let sql = format!(
@@ -5214,7 +5282,7 @@ impl Database {
 
     /// Get PDF blob for a paper
     pub fn get_paper_pdf(&self, node_id: &str) -> Result<Option<Vec<u8>>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.query_row(
             "SELECT pdf_blob FROM papers WHERE node_id = ?1 AND pdf_available = 1",
             params![node_id],
@@ -5224,7 +5292,7 @@ impl Database {
 
     /// Store PDF blob for a paper
     pub fn update_paper_pdf(&self, node_id: &str, pdf_blob: &[u8]) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         // Update papers table with doc_format = 'pdf'
         conn.execute(
             "UPDATE papers SET pdf_blob = ?1, pdf_available = 1, doc_format = 'pdf' WHERE node_id = ?2",
@@ -5241,7 +5309,7 @@ impl Database {
     /// Get document blob and format for a paper (supports PDF, DOCX, DOC)
     /// Returns None if blob is not available (including NULL blob with pdf_available=1)
     pub fn get_paper_document(&self, node_id: &str) -> Result<Option<(Vec<u8>, String)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.query_row(
             "SELECT pdf_blob, doc_format FROM papers WHERE node_id = ?1 AND pdf_available = 1 AND pdf_blob IS NOT NULL",
             params![node_id],
@@ -5255,7 +5323,7 @@ impl Database {
 
     /// Store document blob with format for a paper
     pub fn update_paper_document(&self, node_id: &str, doc_blob: &[u8], format: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         // Update papers table
         conn.execute(
             "UPDATE papers SET pdf_blob = ?1, pdf_available = 1, doc_format = ?2 WHERE node_id = ?3",
@@ -5271,7 +5339,7 @@ impl Database {
 
     /// Update the pdf_source field for a paper
     pub fn update_paper_pdf_source(&self, node_id: &str, source: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE papers SET pdf_source = ?1 WHERE node_id = ?2",
             params![source, node_id],
@@ -5281,7 +5349,7 @@ impl Database {
 
     /// Check if a paper has a PDF available
     pub fn has_paper_pdf(&self, node_id: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let available: Option<i32> = conn.query_row(
             "SELECT pdf_available FROM papers WHERE node_id = ?1",
             params![node_id],
@@ -5292,7 +5360,7 @@ impl Database {
 
     /// Sync pdf_available from papers table to nodes table
     pub fn sync_paper_pdf_status(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         let count = conn.execute(
             "UPDATE nodes SET pdf_available = 1
@@ -5309,7 +5377,7 @@ impl Database {
     /// Papers with missing/unparseable dates get 0 (unknown)
     /// Returns (updated_count, unknown_count)
     pub fn sync_paper_dates(&self) -> Result<(usize, usize)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // Get ALL papers (including those with NULL publication_date)
         let mut stmt = conn.prepare(
@@ -5354,13 +5422,13 @@ impl Database {
 
     /// Get count of papers
     pub fn get_paper_count(&self) -> Result<i32> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.query_row("SELECT COUNT(*) FROM papers", [], |row| row.get(0))
     }
 
     /// Get count of papers with PDFs
     pub fn get_paper_pdf_count(&self) -> Result<i32> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.query_row("SELECT COUNT(*) FROM papers WHERE pdf_available = 1", [], |row| row.get(0))
     }
 
@@ -5368,7 +5436,7 @@ impl Database {
     pub fn reformat_all_paper_abstracts(&self) -> Result<usize> {
         use crate::format_abstract::{format_abstract, strip_html_tags};
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         let mut stmt = conn.prepare(
             "SELECT node_id, abstract FROM papers WHERE abstract IS NOT NULL"
@@ -5413,7 +5481,7 @@ impl Database {
     /// Find duplicate papers by title for cleanup
     /// Returns (node_id, title, doi, abstract_text, node_content) where title appears more than once
     pub fn find_duplicate_papers_by_title(&self) -> Result<Vec<(String, String, Option<String>, Option<String>, Option<String>)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         // Find titles that appear more than once
         let mut stmt = conn.prepare(
@@ -5443,7 +5511,7 @@ impl Database {
 
     /// Delete a paper and its node
     pub fn delete_paper_and_node(&self, node_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         // Cascade will handle papers table due to foreign key
         conn.execute("DELETE FROM nodes WHERE id = ?1", params![node_id])?;
         Ok(())
@@ -5462,7 +5530,7 @@ impl Database {
         not_superseded: bool,
         limit: usize,
     ) -> Result<Vec<EdgeWithNodes>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         let mut conditions: Vec<String> = Vec::new();
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -5553,7 +5621,7 @@ impl Database {
 
     /// Get a single edge by ID.
     pub fn get_edge_by_id(&self, edge_id: &str) -> Result<Option<Edge>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM edges WHERE id = ?1",
             Self::EDGE_COLUMNS
@@ -5995,7 +6063,7 @@ impl Database {
         since: Option<i64>,
         limit: usize,
     ) -> Result<Vec<crate::db::models::RunSummary>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut sql = String::from(
             "SELECT json_extract(metadata, '$.run_id') as run_id, \
              MIN(created_at) as started_at, MAX(created_at) as ended_at, \
@@ -6041,7 +6109,7 @@ impl Database {
 
     /// Get all edges belonging to a specific run.
     pub fn get_run_edges(&self, run_id: &str) -> Result<Vec<Edge>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM edges WHERE json_extract(metadata, '$.run_id') = ?1",
             Self::EDGE_COLUMNS
@@ -6056,7 +6124,7 @@ impl Database {
 
     /// Preview a rollback: return (edges, nodes) that would be deleted without deleting anything.
     pub fn preview_rollback_run(&self, run_id: &str, include_nodes: bool) -> Result<(Vec<Edge>, Vec<Node>)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         let edges = {
             let mut stmt = conn.prepare(&format!(
@@ -6096,7 +6164,7 @@ impl Database {
     /// Rollback a run: delete edges (and optionally operational nodes) created during the run.
     /// Returns (edges_deleted, nodes_deleted).
     pub fn rollback_run(&self, run_id: &str, delete_nodes: bool) -> Result<(usize, usize)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let tx = conn.unchecked_transaction()?;
 
         // Find time range and agents for this run
@@ -6134,7 +6202,7 @@ impl Database {
         agent_id: &str,
         since_ms: i64,
     ) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM nodes WHERE agent_id = ?1 AND created_at >= ?2 AND node_class = 'operational' ORDER BY created_at DESC",
             Self::NODE_COLUMNS
@@ -6149,7 +6217,7 @@ impl Database {
 
     /// Mark an edge as superseded by another edge.
     pub fn supersede_edge(&self, old_edge_id: &str, new_edge_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE edges SET superseded_by = ?2 WHERE id = ?1",
             params![old_edge_id, new_edge_id],
@@ -6159,7 +6227,7 @@ impl Database {
 
     /// Get the full supersession chain for an edge (predecessors and successors).
     pub fn get_supersession_chain(&self, edge_id: &str) -> Result<Vec<Edge>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut chain: Vec<Edge> = Vec::new();
 
         // Walk backward: find edges that were superseded by this one
@@ -6219,7 +6287,7 @@ impl Database {
     /// Get meta nodes, optionally filtered by meta_type.
     /// Excludes superseded nodes (those that are targets of a `supersedes` edge).
     pub fn get_meta_nodes(&self, meta_type: Option<&str>) -> Result<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let superseded_filter = "AND id NOT IN (SELECT target_id FROM edges WHERE type = 'supersedes')";
         let sql = if let Some(mt) = meta_type {
             let _ = mt; // used below
@@ -6246,7 +6314,7 @@ impl Database {
 
     /// Create a meta node and its edges atomically in a transaction.
     pub fn create_meta_node_with_edges(&self, node: &Node, edges: &[Edge]) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn()?;
         let tx = conn.transaction()?;
 
         // Insert node
