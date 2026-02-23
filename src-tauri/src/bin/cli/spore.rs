@@ -614,8 +614,8 @@ pub(crate) async fn handle_spore(cmd: SporeCommands, db: &Database, json: bool) 
         }
 
         // Gap 3a: Create edge between existing nodes (delegates to handle_link)
-        SporeCommands::CreateEdge { from, to, edge_type, content, reason, agent, confidence, supersedes } => {
-            handle_link(&from, &to, &edge_type, reason, content, &agent, confidence, supersedes, "spore", db, json).await
+        SporeCommands::CreateEdge { from, to, edge_type, content, reason, agent, confidence, supersedes, metadata } => {
+            handle_link(&from, &to, &edge_type, reason, content, &agent, confidence, supersedes, metadata, "spore", db, json).await
         }
 
         // Gap 3b: Read full content of a node (no metadata noise)
@@ -4487,6 +4487,7 @@ pub(crate) async fn handle_link(
     agent: &str,
     confidence: Option<f64>,
     supersedes: Option<String>,
+    metadata: Option<String>,
     edge_source: &str,
     db: &Database,
     json: bool,
@@ -4525,7 +4526,7 @@ pub(crate) async fn handle_link(
         content,
         agent_id: Some(agent.to_string()),
         superseded_by: None,
-        metadata: None,
+        metadata,
     };
 
     db.insert_edge(&edge).map_err(|e| e.to_string())?;

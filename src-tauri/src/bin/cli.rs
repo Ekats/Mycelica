@@ -601,6 +601,9 @@ pub(crate) enum SporeCommands {
         /// Edge ID this supersedes
         #[arg(long)]
         supersedes: Option<String>,
+        /// JSON metadata string (e.g. run tracking data)
+        #[arg(long)]
+        metadata: Option<String>,
     },
     /// Read full content of a node (no metadata noise)
     ReadContent {
@@ -1177,6 +1180,21 @@ enum NodeCommands {
         /// Node type: page, thought, context
         #[arg(long, short = 't', default_value = "thought")]
         node_type: String,
+        /// Agent ID attribution (e.g. spore:coder)
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// Node class: knowledge, meta, operational
+        #[arg(long)]
+        node_class: Option<String>,
+        /// Meta type (e.g. task, implementation, summary, escalation)
+        #[arg(long)]
+        meta_type: Option<String>,
+        /// Source attribution
+        #[arg(long)]
+        source: Option<String>,
+        /// Author attribution
+        #[arg(long)]
+        author: Option<String>,
     },
     /// Delete a node
     Delete {
@@ -1797,7 +1815,7 @@ async fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Ask { question, connects_to } => handle_ask(&question, connects_to, &db, cli.json).await,
         Commands::Concept { title, note, connects_to } => handle_concept(&title, note, connects_to, &db, cli.json).await,
         Commands::Decide { title, reason, connects_to } => handle_decide(&title, reason, connects_to, &db, cli.json).await,
-        Commands::Link { source, target, edge_type, reason, content, agent, confidence, supersedes } => spore::handle_link(&source, &target, &edge_type, reason, content, &agent, confidence, supersedes, "user", &db, cli.json).await,
+        Commands::Link { source, target, edge_type, reason, content, agent, confidence, supersedes } => spore::handle_link(&source, &target, &edge_type, reason, content, &agent, confidence, supersedes, None, "user", &db, cli.json).await,
         Commands::Orphans { limit } => handle_orphans(limit, &db, cli.json).await,
         Commands::Migrate { cmd } => handle_migrate(cmd, &db, &db_path, cli.json),
         Commands::Spore { cmd } => spore::handle_spore(cmd, &db, cli.json).await,
@@ -3003,7 +3021,7 @@ async fn handle_node(cmd: NodeCommands, db: &Database, json: bool) -> Result<(),
                 }
             }
         }
-        NodeCommands::Create { title, content, node_type } => {
+        NodeCommands::Create { title, content, node_type, agent_id, node_class, meta_type, source, author } => {
             let id = uuid::Uuid::new_v4().to_string();
             let nt = match node_type.as_str() {
                 "page" => NodeType::Page,
@@ -3041,16 +3059,16 @@ async fn handle_node(cmd: NodeCommands, db: &Database, json: bool) -> Result<(),
                 is_private: None,
                 privacy_reason: None,
                 privacy: None,
-                source: Some("cli".to_string()),
+                source: source.or_else(|| Some("cli".to_string())),
                 pdf_available: None,
                 content_type: None,
                 associated_idea_id: None,
                 human_edited: None,
                 human_created: false,
-                author: None,
-                agent_id: None,
-                node_class: None,
-                meta_type: None,
+                author,
+                agent_id,
+                node_class,
+                meta_type,
             };
 
             db.insert_node(&node).map_err(|e| e.to_string())?;
