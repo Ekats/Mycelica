@@ -91,8 +91,42 @@ use commands::{
     check_ollama_status, get_llm_backend, set_llm_backend, get_ollama_model, set_ollama_model,
 };
 use db::Database;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::Manager;
+
+#[tauri::command]
+fn approve_extension_pair(
+    pairing: tauri::State<'_, Arc<http_server::PairingState>>,
+    approved: bool,
+) -> Result<(), String> {
+    if let Some(tx) = pairing.pending.lock().map_err(|e| e.to_string())?.take() {
+        tx.send(approved).ok();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_extension_api_key_status() -> Result<serde_json::Value, String> {
+    let has_key = settings::get_extension_api_key().is_some();
+    let masked = settings::get_masked_extension_api_key();
+    Ok(serde_json::json!({
+        "hasKey": has_key,
+        "maskedKey": masked,
+    }))
+}
+
+#[tauri::command]
+fn regenerate_extension_api_key() -> Result<String, String> {
+    use rand::Rng;
+    let key: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(48)
+        .map(char::from)
+        .collect();
+    settings::set_extension_api_key(key)?;
+    let masked = settings::get_masked_extension_api_key().unwrap_or_default();
+    Ok(masked)
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -109,6 +143,19 @@ pub fn run() {
 
             // Initialize settings
             settings::init(app_data_dir.clone());
+
+            // Auto-generate extension API key if not set
+            if settings::get_extension_api_key().is_none() {
+                use rand::Rng;
+                let key: String = rand::thread_rng()
+                    .sample_iter(&rand::distributions::Alphanumeric)
+                    .take(48)
+                    .map(char::from)
+                    .collect();
+                if let Err(e) = settings::set_extension_api_key(key) {
+                    eprintln!("Failed to generate extension API key: {}", e);
+                }
+            }
 
             // Check for custom database path in settings first
             let db_path = if let Some(custom_path) = settings::get_custom_db_path() {
@@ -184,7 +231,11 @@ pub fn run() {
             let db = Arc::new(db);
 
             // Start HTTP server for browser extension (localhost:9876)
-            http_server::start(db.clone(), app.handle().clone());
+            let pairing = Arc::new(http_server::PairingState {
+                pending: Mutex::new(None),
+            });
+            app.manage(pairing.clone());
+            http_server::start(db.clone(), app.handle().clone(), pairing);
 
             // Use configurable cache TTL from settings
             let cache_ttl = settings::similarity_cache_ttl_secs();
@@ -473,6 +524,10 @@ pub fn run() {
             set_llm_backend,
             get_ollama_model,
             set_ollama_model,
+            // Extension pairing
+            approve_extension_pair,
+            get_extension_api_key_status,
+            regenerate_extension_api_key,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

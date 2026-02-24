@@ -134,6 +134,11 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
   // Processing stats
   const [processingStats, setProcessingStats] = useState<ProcessingStats | null>(null);
 
+  // Extension pairing
+  const [extensionKeyMasked, setExtensionKeyMasked] = useState<string | null>(null);
+  const [extensionKeyHasKey, setExtensionKeyHasKey] = useState(false);
+  const [regeneratingExtKey, setRegeneratingExtKey] = useState(false);
+
   // Import
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState<string | null>(null);
@@ -241,6 +246,7 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
       loadShowTips();
       loadLocalEmbeddingsStatus();
       loadPrivacyThresholdSetting();
+      loadExtensionKeyStatus();
       setImportResult(null);
       setActionResult(null);
       setPrivacyResult(null);
@@ -286,6 +292,41 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
       console.error('Failed to load LLM backend:', err);
     }
   };
+
+  const loadExtensionKeyStatus = async () => {
+    try {
+      const status = await invoke<{ hasKey: boolean; maskedKey: string | null }>('get_extension_api_key_status');
+      setExtensionKeyHasKey(status.hasKey);
+      setExtensionKeyMasked(status.maskedKey);
+    } catch (err) {
+      console.error('Failed to load extension key status:', err);
+    }
+  };
+
+  const handleRegenerateExtensionKey = async () => {
+    setRegeneratingExtKey(true);
+    try {
+      const masked = await invoke<string>('regenerate_extension_api_key');
+      setExtensionKeyMasked(masked);
+      setExtensionKeyHasKey(true);
+    } catch (err) {
+      console.error('Failed to regenerate extension key:', err);
+    }
+    setRegeneratingExtKey(false);
+  };
+
+  // Listen for extension pair requests
+  useEffect(() => {
+    const unlisten = listen('extension:pair-request', async () => {
+      const approved = window.confirm('Firefox extension wants to connect to Mycelica. Allow?');
+      try {
+        await invoke('approve_extension_pair', { approved });
+      } catch (err) {
+        console.error('Failed to respond to pair request:', err);
+      }
+    });
+    return () => { unlisten.then(fn => fn()); };
+  }, []);
 
   const handleSetLlmBackend = async (backend: 'anthropic' | 'ollama') => {
     try {
@@ -2293,6 +2334,43 @@ export function SettingsPanel({ open, onClose, onDataChanged }: SettingsPanelPro
                   {useLocalEmbeddings && (
                     <span>Local embeddings are optimized for semantic clustering and work offline.</span>
                   )}
+                </p>
+              </div>
+
+              {/* Browser Extension */}
+              <div className="flex items-center gap-2 mt-6 mb-4">
+                <Shield className="w-5 h-5 text-green-400" />
+                <h3 className="text-lg font-medium text-white">Browser Extension</h3>
+              </div>
+
+              <div className="bg-gray-900/50 rounded-lg p-4">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-sm font-medium text-gray-200">Extension API Key</span>
+                  <button
+                    onClick={handleRegenerateExtensionKey}
+                    disabled={regeneratingExtKey}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded text-xs font-medium transition-colors disabled:opacity-50"
+                  >
+                    {regeneratingExtKey ? (
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                    ) : (
+                      <RefreshCw className="w-3 h-3" />
+                    )}
+                    Regenerate
+                  </button>
+                </div>
+                {extensionKeyHasKey ? (
+                  <div className="flex items-center gap-2">
+                    <code className="text-xs text-gray-400 bg-gray-800 px-2 py-1 rounded font-mono">
+                      {extensionKeyMasked}
+                    </code>
+                    <span className="text-xs text-green-400">Active</span>
+                  </div>
+                ) : (
+                  <p className="text-xs text-gray-500">No key generated yet. Restart the app to auto-generate.</p>
+                )}
+                <p className="mt-2 text-xs text-gray-500">
+                  The Firefox extension uses this key for authentication. Regenerating will disconnect paired extensions until they re-pair.
                 </p>
               </div>
             </section>

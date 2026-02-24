@@ -5,20 +5,28 @@
 //! - GET /search?q=<query> - Search nodes
 //! - GET /status - Check connection status
 //! - POST /holerabbit/visit - Record web page visit (Holerabbit extension)
+//! - POST /pair - Browser extension pairing flow
 
 use crate::db::{Database, Node, NodeType, Position};
 use crate::holerabbit;
 use crate::local_embeddings;
+use crate::settings;
 use std::io::Read;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 const PORT: u16 = 9876;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Shared state for the extension pairing flow
+pub struct PairingState {
+    pub pending: Mutex<Option<std::sync::mpsc::Sender<bool>>>,
+}
+
 /// Start the HTTP server in a background thread
-pub fn start(db: Arc<Database>, app_handle: AppHandle) {
+pub fn start(db: Arc<Database>, app_handle: AppHandle, pairing: Arc<PairingState>) {
     // Initialize holerabbit - pause all live sessions on startup
     holerabbit::init(&db);
 
@@ -35,28 +43,61 @@ pub fn start(db: Arc<Database>, app_handle: AppHandle) {
             }
         };
 
+        // Rate limiting state for /pair endpoint
+        let last_pair_time: Mutex<Option<Instant>> = Mutex::new(None);
+
         for request in server.incoming_requests() {
             let db = db.clone();
             let app = app_handle.clone();
+            let pairing = pairing.clone();
             // Handle request in the same thread (tiny_http is single-threaded by default)
-            if let Err(e) = handle_request(request, &db, &app) {
+            if let Err(e) = handle_request(request, &db, &app, &pairing, &last_pair_time) {
                 eprintln!("[HTTP] Error handling request: {}", e);
             }
         }
     });
 }
 
-fn handle_request(mut request: Request, db: &Database, app: &AppHandle) -> Result<(), String> {
+/// Check if request has a valid Bearer token matching the extension API key
+fn check_extension_auth(request: &Request) -> bool {
+    let key = match settings::get_extension_api_key() {
+        Some(k) => k,
+        None => return true, // No key configured = open (shouldn't happen after init)
+    };
+    request.headers().iter()
+        .find(|h| h.field.as_str() == "authorization" || h.field.as_str() == "Authorization")
+        .and_then(|h| h.value.as_str().strip_prefix("Bearer "))
+        .map(|token| token == key)
+        .unwrap_or(false)
+}
+
+fn handle_request(
+    mut request: Request,
+    db: &Database,
+    app: &AppHandle,
+    pairing: &Arc<PairingState>,
+    last_pair_time: &Mutex<Option<Instant>>,
+) -> Result<(), String> {
     let path = request.url().split('?').next().unwrap_or("");
     let method = request.method().clone();
 
     // Log request
     println!("[HTTP] {} {}", method, request.url());
 
+    // Auth check: skip for OPTIONS and POST /pair
+    let is_pair = method == Method::Post && path == "/pair";
+    if method != Method::Options && !is_pair && !check_extension_auth(&request) {
+        return request.respond(json_response(401, r#"{"error":"unauthorized"}"#))
+            .map_err(|e| format!("Failed to send response: {}", e));
+    }
+
     let response = match (method, path) {
         (Method::Options, _) => {
-            // CORS preflight
-            cors_response(Response::from_string(""))
+            // Background scripts don't send preflight, return 204 with no CORS
+            Response::from_string("").with_status_code(tiny_http::StatusCode(204))
+        }
+        (Method::Post, "/pair") => {
+            handle_pair(&request, app, pairing, last_pair_time)
         }
         (Method::Post, "/capture") => {
             let mut body = String::new();
@@ -122,16 +163,54 @@ fn handle_request(mut request: Request, db: &Database, app: &AppHandle) -> Resul
             if !session_id.is_empty() && !session_id.contains('/') {
                 holerabbit::handle_delete_session(db, session_id)
             } else {
-                cors_response(json_response(404, r#"{"error":"Invalid session ID"}"#))
+                json_response(404, r#"{"error":"Invalid session ID"}"#)
             }
         }
         _ => {
-            cors_response(json_response(404, r#"{"error":"Not found"}"#))
+            json_response(404, r#"{"error":"Not found"}"#)
         }
     };
 
     request.respond(response)
         .map_err(|e| format!("Failed to send response: {}", e))
+}
+
+/// POST /pair - Browser extension pairing flow
+fn handle_pair(
+    _request: &Request,
+    app: &AppHandle,
+    pairing: &Arc<PairingState>,
+    last_pair_time: &Mutex<Option<Instant>>,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    // Rate limit: 1 per 30s
+    {
+        let mut last = last_pair_time.lock().unwrap();
+        if let Some(t) = *last {
+            if t.elapsed() < Duration::from_secs(30) {
+                return json_response(429, r#"{"error":"try_again_later"}"#);
+            }
+        }
+        *last = Some(Instant::now());
+    }
+
+    // Create response channel
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let mut pending = pairing.pending.lock().unwrap();
+        *pending = Some(tx);
+    }
+
+    // Ask Tauri frontend for approval
+    app.emit("extension:pair-request", ()).ok();
+
+    // Block waiting for response (30s timeout)
+    match rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(true) => {
+            let key = settings::get_extension_api_key().unwrap_or_default();
+            json_response(200, &format!(r#"{{"key":"{}"}}"#, key))
+        }
+        _ => json_response(403, r#"{"error":"rejected"}"#),
+    }
 }
 
 fn extract_query_param(url: &str, param: &str) -> Option<String> {
@@ -232,7 +311,7 @@ fn handle_capture(db: &Database, body: &str) -> Response<std::io::Cursor<Vec<u8>
     }
 
     println!("[HTTP] Created bookmark node: {} - {}", &node_id[..8], node.title);
-    cors_response(json_response(200, &format!(r#"{{"success":true,"nodeId":"{}"}}"#, node_id)))
+    json_response(200, &format!(r#"{{"success":true,"nodeId":"{}"}}"#, node_id))
 }
 
 /// GET /search?q=<query> - Search nodes
@@ -272,13 +351,13 @@ fn handle_search(db: &Database, query: Option<&str>) -> Response<std::io::Cursor
     let json = serde_json::to_string(&serde_json::json!({ "results": results }))
         .unwrap_or_else(|_| r#"{"results":[]}"#.to_string());
 
-    cors_response(json_response(200, &json))
+    json_response(200, &json)
 }
 
 /// GET /status - Check connection status
 fn handle_status() -> Response<std::io::Cursor<Vec<u8>>> {
     let json = format!(r#"{{"connected":true,"version":"{}"}}"#, VERSION);
-    cors_response(json_response(200, &json))
+    json_response(200, &json)
 }
 
 fn json_response(status: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -293,17 +372,4 @@ fn json_response(status: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> 
         Some(body.len()),
         None,
     )
-}
-
-fn cors_response(mut response: Response<std::io::Cursor<Vec<u8>>>) -> Response<std::io::Cursor<Vec<u8>>> {
-    response.add_header(
-        Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap()
-    );
-    response.add_header(
-        Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"GET, POST, DELETE, OPTIONS"[..]).unwrap()
-    );
-    response.add_header(
-        Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type"[..]).unwrap()
-    );
-    response
 }

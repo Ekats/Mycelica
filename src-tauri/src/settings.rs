@@ -81,6 +81,9 @@ pub struct Settings {
     /// Remote server URL for team sync (Phase 3)
     #[serde(default)]
     pub remote_url: Option<String>,
+    /// API key for browser extension authentication
+    #[serde(default)]
+    pub extension_api_key: Option<String>,
 }
 
 fn default_llm_backend() -> String {
@@ -124,6 +127,7 @@ impl Default for Settings {
             ollama_model: "qwen2.5:7b".to_string(), // Default Ollama model
             author: None,
             remote_url: None,
+            extension_api_key: None,
         }
     }
 }
@@ -905,4 +909,41 @@ pub fn set_remote_url(url: String) -> Result<(), String> {
 
     settings.save(&config_path)?;
     Ok(())
+}
+
+// ==================== Extension API Key ====================
+
+/// Get the extension API key for browser extension authentication
+pub fn get_extension_api_key() -> Option<String> {
+    let guard = SETTINGS.read().ok()?;
+    let settings = guard.as_ref()?;
+    settings.extension_api_key.clone()
+}
+
+/// Set and save the extension API key
+pub fn set_extension_api_key(key: String) -> Result<(), String> {
+    let mut settings_guard = SETTINGS.write()
+        .map_err(|_| "Failed to acquire settings lock")?;
+
+    let settings = settings_guard.get_or_insert_with(Settings::default);
+    settings.extension_api_key = if key.is_empty() { None } else { Some(key) };
+
+    let config_path = CONFIG_PATH.read()
+        .map_err(|_| "Failed to acquire config path lock")?
+        .clone()
+        .ok_or("Settings not initialized")?;
+
+    settings.save(&config_path)?;
+    Ok(())
+}
+
+/// Get masked extension API key for display (shows first 8/last 4 chars)
+pub fn get_masked_extension_api_key() -> Option<String> {
+    get_extension_api_key().map(|key| {
+        if key.len() > 12 {
+            format!("{}...{}", &key[..8], &key[key.len()-4..])
+        } else {
+            "*".repeat(key.len())
+        }
+    })
 }
