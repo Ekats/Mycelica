@@ -2,9 +2,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    #[cfg(feature = "team")]
+    #[cfg(all(feature = "gui", feature = "team"))]
     mycelica_lib::run_team();
 
-    #[cfg(not(feature = "team"))]
+    #[cfg(all(feature = "gui", not(feature = "team")))]
     mycelica_lib::run();
 }

@@ -38,10 +38,20 @@ fn compute_and_store_centroid(db: &Database, parent_id: &str) {
     }
 }
 
+#[cfg(feature = "gui")]
 use tauri::{AppHandle, Emitter};
+
 use tokio::time::{timeout, Duration};
 
+/// When GUI is enabled, EventSink = tauri::AppHandle (can emit to frontend).
+/// Without GUI, EventSink = () (CLI passes None anyway).
+#[cfg(feature = "gui")]
+pub type EventSink = AppHandle;
+#[cfg(not(feature = "gui"))]
+pub type EventSink = ();
+
 /// Log event for frontend dev console
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 #[derive(Clone, Serialize)]
 pub struct HierarchyLogEvent {
     pub message: String,
@@ -49,7 +59,7 @@ pub struct HierarchyLogEvent {
 }
 
 /// Emit a log to the frontend dev console (if app handle available)
-fn emit_log(app: Option<&AppHandle>, level: &str, message: &str) {
+fn emit_log(#[allow(unused)] app: Option<&EventSink>, level: &str, message: &str) {
     // Always print to terminal
     match level {
         "error" => eprintln!("[Hierarchy] {}", message),
@@ -58,6 +68,7 @@ fn emit_log(app: Option<&AppHandle>, level: &str, message: &str) {
     }
 
     // Also emit to frontend if app handle is available
+    #[cfg(feature = "gui")]
     if let Some(app) = app {
         let _ = app.emit("hierarchy-log", HierarchyLogEvent {
             message: message.to_string(),
@@ -225,7 +236,7 @@ fn find_connected_components(
 /// weight = raw_cross_edges / min(papers_in_a, papers_in_b), capped at 1.0.
 pub fn create_category_edges_from_cross_counts(
     db: &Database,
-    app: Option<&AppHandle>,
+    app: Option<&EventSink>,
 ) -> Result<usize, String> {
     // Delete existing sibling edges
     db.delete_edges_by_type("sibling").map_err(|e| e.to_string())?;
@@ -320,7 +331,7 @@ async fn split_leaf_category_by_connectivity(
     db: &Database,
     category_id: &str,
     min_component_size: usize,
-    app: Option<&AppHandle>,
+    app: Option<&EventSink>,
 ) -> Result<SplitResult, String> {
     let mut result = SplitResult::default();
 
@@ -510,7 +521,7 @@ fn merge_category_into_silent(db: &Database, survivor_id: &str, to_delete_id: &s
 /// Main graph-based refinement function
 pub async fn refine_hierarchy_by_graph(
     db: &Database,
-    app: Option<&AppHandle>,
+    app: Option<&EventSink>,
     config: RefineGraphConfig,
 ) -> Result<RefineGraphResult, String> {
     emit_log(app, "info", "Starting graph-based hierarchy refinement...");
@@ -690,7 +701,7 @@ fn find_common_keywords(titles: &[String]) -> Vec<String> {
 async fn name_cluster_from_items(
     items: &[&Node],
     forbidden_names: &[String],
-    app: Option<&AppHandle>,
+    app: Option<&EventSink>,
 ) -> Result<String, String> {
     let sample_size = items.len().min(10);
     let mut sample_indices: Vec<usize> = Vec::new();
@@ -1355,7 +1366,7 @@ pub fn get_children_skip_single_chain(db: &Database, parent_id: &str) -> Result<
 ///
 /// Category privacy = minimum of children's privacy scores (most restrictive wins)
 /// This ensures a category is only as public as its most private child.
-pub fn propagate_privacy_scores(db: &Database, app: Option<&tauri::AppHandle>) -> Result<usize, String> {
+pub fn propagate_privacy_scores(db: &Database, app: Option<&EventSink>) -> Result<usize, String> {
     emit_log(app, "info", "Propagating privacy scores to categories...");
 
     let max_depth = db.get_max_depth().map_err(|e| e.to_string())?;
@@ -1428,7 +1439,7 @@ pub struct MergeCategoriesResult {
 /// - `max_size`: Maximum children for a category to be considered "small" (default 3)
 pub async fn merge_small_categories(
     db: &Database,
-    app: Option<&AppHandle>,
+    app: Option<&EventSink>,
     threshold: f32,
     max_size: i32,
 ) -> Result<MergeCategoriesResult, String> {
@@ -1665,7 +1676,7 @@ fn cluster_by_similarity(embeddings: &[(String, Vec<f32>)], threshold: f32) -> V
 async fn generate_merged_category_name(
     db: &Database,
     category_id: &str,
-    app: Option<&AppHandle>,
+    app: Option<&EventSink>,
 ) -> Result<Option<String>, String> {
     let children = db.get_children(category_id).map_err(|e| e.to_string())?;
     if children.is_empty() {

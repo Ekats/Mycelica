@@ -16,6 +16,7 @@ export default function NodePopup() {
   const {
     nodes, personalNodes, selectedNodeId, edges, personalEdges,
     setSelectedNodeId, updateNode, deleteNode, deletePersonalNode, updatePersonalNode,
+    deleteEdge, deletePersonalEdge,
     navigateToCategory, openLeafView,
     fetchedContent, isFetching, fetchUrlContent, loadFetchedContent,
     mergedBodies, mergeGroupIds,
@@ -30,6 +31,7 @@ export default function NodePopup() {
   const [categoryQuery, setCategoryQuery] = useState("");
   const [categoryResults, setCategoryResults] = useState<Node[]>([]);
   const [showEditModal, setShowEditModal] = useState(false);
+  const [deleteConfirmEdgeId, setDeleteConfirmEdgeId] = useState<string | null>(null);
 
   const teamNode = selectedNodeId ? nodes.get(selectedNodeId) : null;
   const personalNode = selectedNodeId ? personalNodes.get(selectedNodeId) : null;
@@ -51,6 +53,7 @@ export default function NodePopup() {
     setCategoryQuery("");
     setCategoryResults([]);
     setShowEditModal(false);
+    setDeleteConfirmEdgeId(null);
   }, [selectedNodeId, teamNode, personalNode]);
 
   // Load cached fetched content, auto-fetch if URL present and not cached
@@ -372,10 +375,11 @@ export default function NodePopup() {
                 const otherId = groupSet.has(e.source) ? e.target : e.source;
                 const direction = groupSet.has(e.source) ? "\u2192" : "\u2190";
                 const pct = e.weight != null ? `${Math.round(e.weight * 100)}%` : null;
+                const isConfirming = deleteConfirmEdgeId === e.id;
                 return (
                   <div
                     key={e.id}
-                    className="flex items-center gap-2 text-xs px-2 py-1.5 rounded cursor-pointer hover:opacity-80"
+                    className="flex items-center gap-2 text-xs px-2 py-1.5 rounded cursor-pointer hover:opacity-80 group"
                     style={{
                       background: "var(--bg-tertiary)",
                       borderLeft: `3px solid ${e.isPersonal ? "#14b8a6" : "#4b5563"}`,
@@ -388,6 +392,37 @@ export default function NodePopup() {
                     <span style={{ color: "var(--text-secondary)" }}>{e.type}</span>
                     {e.isPersonal && (
                       <span className="text-[10px]" style={{ color: "#14b8a6" }}>(personal)</span>
+                    )}
+                    {isConfirming ? (
+                      <span className="flex items-center gap-1" onClick={(ev) => ev.stopPropagation()}>
+                        <button
+                          className="text-[10px] px-1 rounded hover:opacity-80"
+                          style={{ color: "#ef4444" }}
+                          onClick={(ev) => {
+                            ev.stopPropagation();
+                            if (e.isPersonal) deletePersonalEdge(e.id);
+                            else deleteEdge(e.id);
+                            setDeleteConfirmEdgeId(null);
+                          }}
+                        >
+                          Delete?
+                        </button>
+                        <button
+                          className="text-[10px] px-1 rounded hover:opacity-80"
+                          style={{ color: "var(--text-secondary)" }}
+                          onClick={(ev) => { ev.stopPropagation(); setDeleteConfirmEdgeId(null); }}
+                        >
+                          Cancel
+                        </button>
+                      </span>
+                    ) : (
+                      <button
+                        className="opacity-0 group-hover:opacity-60 hover:!opacity-100 p-0.5"
+                        title="Delete edge"
+                        onClick={(ev) => { ev.stopPropagation(); setDeleteConfirmEdgeId(e.id); }}
+                      >
+                        <Trash2 size={11} />
+                      </button>
                     )}
                   </div>
                 );

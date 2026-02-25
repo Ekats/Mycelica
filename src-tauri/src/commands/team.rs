@@ -606,6 +606,18 @@ pub fn team_update_personal_node(
 }
 
 #[tauri::command]
+pub fn team_delete_personal_edge(
+    state: State<'_, TeamState>,
+    id: String,
+) -> Result<(), String> {
+    let conn = state.local_db.raw_conn();
+    let conn = conn.lock().map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM personal_edges WHERE id = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 pub fn team_get_personal_data(state: State<'_, TeamState>) -> Result<PersonalData, String> {
     let conn = state.local_db.raw_conn();
     let conn = conn.lock().map_err(|e| e.to_string())?;

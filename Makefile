@@ -4,8 +4,8 @@ SIDECAR  = src-tauri/binaries/mycelica-cli-$(ARCH)
 
 # Override with: make cli CLI_FEATURES=mcp,signal,cuda
 CLI_FEATURES    ?= mcp
-SERVER_FEATURES ?= team
-TEAM_FEATURES   ?= team
+SERVER_FEATURES ?=
+TEAM_FEATURES   ?= gui,team
 
 .PHONY: all cli server spore sidecar app team \
         dev dev-team check test clean
@@ -24,7 +24,7 @@ cli:
 
 server:
 	cd src-tauri && $(CARGO) install --path . --bin mycelica-server \
-		--features $(SERVER_FEATURES) --force
+		$(if $(SERVER_FEATURES),--features $(SERVER_FEATURES)) --force
 
 spore:
 	cd spore && go build -o spore .
@@ -35,7 +35,7 @@ sidecar: cli
 # Both run from repo root. Tauri handles npm build via beforeBuildCommand.
 
 app: sidecar
-	$(CARGO) tauri build
+	$(CARGO) tauri build --features gui
 
 team: sidecar
 	$(CARGO) tauri build --config tauri.team.conf.json --features $(TEAM_FEATURES)
@@ -43,10 +43,10 @@ team: sidecar
 # --- Dev mode ---
 
 dev: sidecar
-	$(CARGO) tauri dev
+	$(CARGO) tauri dev --features gui
 
 dev-team: sidecar
-	$(CARGO) tauri dev --config tauri.team.conf.json --features team
+	$(CARGO) tauri dev --config tauri.team.conf.json --features gui,team
 
 # --- Quality ---
 

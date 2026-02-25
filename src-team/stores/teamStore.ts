@@ -80,6 +80,8 @@ interface TeamStore {
   updateNode: (id: string, req: PatchNodeRequest) => Promise<void>;
   deleteNode: (id: string) => Promise<void>;
   createEdge: (req: CreateEdgeRequest) => Promise<void>;
+  deleteEdge: (id: string) => Promise<void>;
+  deletePersonalEdge: (id: string) => Promise<void>;
   search: (query: string) => Promise<void>;
 
   createPersonalNode: (title: string, content?: string, contentType?: string, tags?: string) => Promise<PersonalNode>;
@@ -486,6 +488,24 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
       const result = await invoke<{ edge: Edge }>("team_create_edge", { req });
       set((s) => ({ edges: [...s.edges, result.edge] }));
       get().refresh();
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+
+  deleteEdge: async (id) => {
+    try {
+      await invoke("team_delete_edge", { id });
+      set((s) => ({ edges: s.edges.filter((e) => e.id !== id) }));
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+
+  deletePersonalEdge: async (id) => {
+    try {
+      await invoke("team_delete_personal_edge", { id });
+      set((s) => ({ personalEdges: s.personalEdges.filter((e) => e.id !== id) }));
     } catch (e) {
       set({ error: String(e) });
     }

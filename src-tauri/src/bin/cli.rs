@@ -4535,7 +4535,7 @@ async fn handle_embeddings(cmd: EmbeddingsCommands, db: &Database, json: bool) -
             }
         }
         EmbeddingsCommands::BuildIndex => {
-            use mycelica_lib::commands::{HnswIndex, hnsw_index_path};
+            use mycelica_lib::app_state::{HnswIndex, hnsw_index_path};
 
             eprintln!("Building HNSW index for fast similarity search...");
             eprintln!("This may take several minutes for large databases.");
@@ -5613,7 +5613,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, include_code: bool, al
     log!("▶ STEP 6/7: Build HNSW Index");
     log!("───────────────────────────────────────────────────────────");
     {
-        use mycelica_lib::commands::{HnswIndex, hnsw_index_path};
+        use mycelica_lib::app_state::{HnswIndex, hnsw_index_path};
 
         let embeddings = db.get_nodes_with_embeddings().map_err(|e| e.to_string())?;
         if embeddings.is_empty() {

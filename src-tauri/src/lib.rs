@@ -1,6 +1,9 @@
 pub mod db;
+pub mod app_state;
+#[cfg(feature = "gui")]
 pub mod commands;
 pub mod utils;
+#[cfg(feature = "gui")]
 mod http_server;
 pub mod ai_client;
 pub mod settings;
@@ -14,6 +17,7 @@ pub mod openaire;
 pub mod papers;
 mod format_abstract;
 pub mod code;
+#[cfg(feature = "gui")]
 mod holerabbit;
 pub mod dendrogram;
 pub mod rebuild;
@@ -25,8 +29,8 @@ pub mod signal;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 
+#[cfg(feature = "gui")]
 use commands::{
-    AppState,
     get_nodes, get_node, create_node, add_note, update_node, update_node_content, delete_node,
     get_edges, get_edges_for_node, get_edges_for_view, create_edge, delete_edge,
     search_nodes,
@@ -91,10 +95,16 @@ use commands::{
     // Ollama / LLM backend commands
     check_ollama_status, get_llm_backend, set_llm_backend, get_ollama_model, set_ollama_model,
 };
+#[cfg(feature = "gui")]
+use app_state::AppState;
+#[cfg(feature = "gui")]
 use db::Database;
+#[cfg(feature = "gui")]
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "gui")]
 use tauri::Manager;
 
+#[cfg(feature = "gui")]
 #[tauri::command]
 fn approve_extension_pair(
     pairing: tauri::State<'_, Arc<http_server::PairingState>>,
@@ -106,6 +116,7 @@ fn approve_extension_pair(
     Ok(())
 }
 
+#[cfg(feature = "gui")]
 #[tauri::command]
 fn get_extension_api_key_status() -> Result<serde_json::Value, String> {
     let has_key = settings::get_extension_api_key().is_some();
@@ -116,6 +127,7 @@ fn get_extension_api_key_status() -> Result<serde_json::Value, String> {
     }))
 }
 
+#[cfg(feature = "gui")]
 #[tauri::command]
 fn regenerate_extension_api_key() -> Result<String, String> {
     use rand::Rng;
@@ -129,6 +141,7 @@ fn regenerate_extension_api_key() -> Result<String, String> {
     Ok(masked)
 }
 
+#[cfg(feature = "gui")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -242,8 +255,8 @@ pub fn run() {
             let cache_ttl = settings::similarity_cache_ttl_secs();
 
             // Try to load pre-built HNSW index from disk
-            let mut hnsw_index = commands::HnswIndex::new();
-            let hnsw_path = commands::hnsw_index_path(&db_path);
+            let mut hnsw_index = app_state::HnswIndex::new();
+            let hnsw_path = app_state::hnsw_index_path(&db_path);
             let mut needs_background_build = false;
 
             if hnsw_path.exists() {
@@ -268,8 +281,8 @@ pub fn run() {
             app.manage(AppState {
                 db: std::sync::RwLock::new(db),
                 db_path: db_path.clone(),
-                similarity_cache: std::sync::RwLock::new(commands::SimilarityCache::new(cache_ttl)),
-                embeddings_cache: std::sync::RwLock::new(commands::EmbeddingsCache::new()),
+                similarity_cache: std::sync::RwLock::new(app_state::SimilarityCache::new(cache_ttl)),
+                embeddings_cache: std::sync::RwLock::new(app_state::EmbeddingsCache::new()),
                 hnsw_index: std::sync::RwLock::new(hnsw_index),
                 openaire_cancel: std::sync::atomic::AtomicBool::new(false),
             });
@@ -284,7 +297,7 @@ pub fn run() {
                     let start = std::time::Instant::now();
 
                     // Get state from app handle
-                    let state: tauri::State<'_, commands::AppState> = bg_app_handle.state();
+                    let state: tauri::State<'_, AppState> = bg_app_handle.state();
                     let db_arc = match state.db.read() {
                         Ok(guard) => guard.clone(),
                         Err(e) => {
@@ -298,11 +311,11 @@ pub fn run() {
                         Ok(embeddings) if !embeddings.is_empty() => {
                             println!("[HNSW] Building index for {} embeddings...", embeddings.len());
 
-                            let mut index = commands::HnswIndex::new();
+                            let mut index = app_state::HnswIndex::new();
                             index.build(&embeddings);
 
                             // Save to disk
-                            let hnsw_path = commands::hnsw_index_path(&bg_db_path);
+                            let hnsw_path = app_state::hnsw_index_path(&bg_db_path);
                             if let Err(e) = index.save(&hnsw_path) {
                                 eprintln!("[HNSW] Failed to save index: {}", e);
                                 return;
@@ -534,7 +547,7 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-#[cfg(feature = "team")]
+#[cfg(all(feature = "gui", feature = "team"))]
 pub fn run_team() {
     use commands::team::{
         TeamState, TeamConfig,
@@ -542,7 +555,7 @@ pub fn run_team() {
         team_create_edge, team_delete_edge, team_search, team_get_node,
         team_get_orphans, team_get_recent, team_get_settings, team_save_settings,
         team_create_personal_node, team_create_personal_edge, team_get_personal_data,
-        team_delete_personal_node, team_update_personal_node,
+        team_delete_personal_node, team_delete_personal_edge, team_update_personal_node,
         team_save_positions, team_get_positions,
         team_fetch_url, team_get_fetched_content,
         team_get_local_data,
@@ -576,6 +589,7 @@ pub fn run_team() {
             team_create_personal_edge,
             team_get_personal_data,
             team_delete_personal_node,
+            team_delete_personal_edge,
             team_update_personal_node,
             team_save_positions,
             team_get_positions,
