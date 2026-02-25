@@ -100,6 +100,40 @@ interface TeamStore {
   setPanToNodeId: (id: string | null) => void;
 }
 
+function applySnapshot(
+  snapshot: { nodes: Node[]; edges: Edge[] },
+  get: () => TeamStore,
+  set: (partial: Partial<TeamStore> | ((s: TeamStore) => Partial<TeamStore>)) => void,
+) {
+  const nodeMap = new Map<string, Node>();
+  const authorSet = new Set<string>();
+  for (const n of snapshot.nodes) {
+    nodeMap.set(n.id, n);
+    if (n.author) authorSet.add(n.author);
+  }
+
+  const { savedPositions } = get();
+  for (const [id, pos] of savedPositions) {
+    const node = nodeMap.get(id);
+    if (node) { node.x = pos.x; node.y = pos.y; }
+  }
+
+  let uId: string | null = null;
+  for (const n of nodeMap.values()) {
+    if (n.isUniverse) { uId = n.id; break; }
+  }
+
+  set({
+    nodes: nodeMap,
+    edges: snapshot.edges,
+    authors: Array.from(authorSet),
+    universeId: uId,
+    lastRefreshed: new Date(),
+    isRefreshing: false,
+    connected: true,
+  });
+}
+
 export const useTeamStore = create<TeamStore>((set, get) => ({
   nodes: new Map(),
   edges: [],
@@ -332,42 +366,26 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
 
   refresh: async () => {
     set({ isRefreshing: true, error: null });
+
+    // 1. Load cached snapshot instantly (if exists)
+    try {
+      const cached = await invoke<{ nodes: Node[]; edges: Edge[] } | null>("team_load_snapshot");
+      if (cached) {
+        applySnapshot(cached, get, set);
+      }
+    } catch (_) { /* no cached snapshot, continue to download */ }
+
+    // 2. Download fresh snapshot from server (slow, but UI already has data)
     try {
       const snapshot = await invoke<{ nodes: Node[]; edges: Edge[] }>("team_refresh");
-      const nodeMap = new Map<string, Node>();
-      const authorSet = new Set<string>();
-      for (const n of snapshot.nodes) {
-        nodeMap.set(n.id, n);
-        if (n.author) authorSet.add(n.author);
-      }
-
-      // Restore saved positions
-      const { savedPositions } = get();
-      for (const [id, pos] of savedPositions) {
-        const node = nodeMap.get(id);
-        if (node) {
-          node.x = pos.x;
-          node.y = pos.y;
-        }
-      }
-
-      // Cache universe node ID — only trust the explicit isUniverse flag
-      let uId: string | null = null;
-      for (const n of nodeMap.values()) {
-        if (n.isUniverse) { uId = n.id; break; }
-      }
-
-      set({
-        nodes: nodeMap,
-        edges: snapshot.edges,
-        authors: Array.from(authorSet),
-        universeId: uId,
-        lastRefreshed: new Date(),
-        isRefreshing: false,
-        connected: true,
-      });
+      applySnapshot(snapshot, get, set);
     } catch (e) {
-      set({ isRefreshing: false, connected: false });
+      // If we already loaded cached data, stay connected
+      if (!get().lastRefreshed) {
+        set({ isRefreshing: false, connected: false });
+      } else {
+        set({ isRefreshing: false });
+      }
     }
   },
 
@@ -429,8 +447,6 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
         nodes.set(result.node.id, result.node);
         return { nodes };
       });
-      // Auto-refresh to pick up server-created edges (from connects_to)
-      get().refresh();
       return result.node.id;
     } catch (e) {
       set({ error: String(e) });

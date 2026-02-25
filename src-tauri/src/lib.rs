@@ -546,6 +546,8 @@ pub fn run_team() {
         team_save_positions, team_get_positions,
         team_fetch_url, team_get_fetched_content,
         team_get_local_data,
+        team_test_connection,
+        team_load_snapshot,
     };
 
     tauri::Builder::default()
@@ -580,6 +582,8 @@ pub fn run_team() {
             team_fetch_url,
             team_get_fetched_content,
             team_get_local_data,
+            team_test_connection,
+            team_load_snapshot,
         ])
         .run(tauri::generate_context!())
         .expect("error while running team application");

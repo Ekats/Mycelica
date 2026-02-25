@@ -809,6 +809,19 @@ async fn health_handler(
     }))
 }
 
+// POST /auth/verify — validate API key and return role
+async fn auth_verify_handler(
+    auth: Option<Extension<AuthContext>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let ctx = auth.map(|Extension(ctx)| ctx)
+        .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "Invalid API key".to_string()))?;
+    Ok(Json(serde_json::json!({
+        "authenticated": true,
+        "user_name": ctx.user_name,
+        "role": ctx.role,
+    })))
+}
+
 // POST /admin/rebuild
 async fn rebuild_handler(
     State(state): State<AppState>,
@@ -908,11 +921,20 @@ fn prune_backups() {
 }
 
 async fn backup_loop(db: Arc<Database>) {
+    // Initial backup on startup (non-blocking)
+    let db2 = db.clone();
+    tokio::task::spawn_blocking(move || {
+        run_backup(&db2, "startup");
+    }).await.ok();
+
     let mut interval = tokio::time::interval(Duration::from_secs(3600));
     loop {
         interval.tick().await;
-        run_backup(&db, "hourly");
-        prune_backups();
+        let db2 = db.clone();
+        tokio::task::spawn_blocking(move || {
+            run_backup(&db2, "hourly");
+            prune_backups();
+        }).await.ok();
     }
 }
 
@@ -948,10 +970,10 @@ fn find_database(db_arg: Option<&str>) -> PathBuf {
         }
     }
 
-    // 4. Default app data directory
+    // 4. Default: team database in app data directory
     dirs::data_dir()
-        .map(|p| p.join("com.mycelica.app/mycelica.db"))
-        .unwrap_or_else(|| PathBuf::from("mycelica.db"))
+        .map(|p| p.join("com.mycelica.app/team/local.db"))
+        .unwrap_or_else(|| PathBuf::from("local.db"))
 }
 
 // ============================================================================
@@ -1182,10 +1204,7 @@ async fn main() {
         Err(e) => eprintln!("[Server] Warning: embedding warmup failed: {}", e),
     }
 
-    // Initial backup
-    run_backup(&db, "startup");
-
-    // Start backup loop
+    // Start backup loop (initial backup runs inside, non-blocking)
     let backup_db = db.clone();
     tokio::spawn(backup_loop(backup_db));
 
@@ -1210,6 +1229,7 @@ async fn main() {
         .route("/recent", get(recent_handler))
         .route("/orphans", get(orphans_handler))
         .route("/health", get(health_handler))
+        .route("/auth/verify", post(auth_verify_handler))
         .route("/admin/rebuild", post(rebuild_handler))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024)) // 2MB body limit

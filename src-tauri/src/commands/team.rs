@@ -254,6 +254,27 @@ pub async fn team_refresh(state: State<'_, TeamState>) -> Result<TeamSnapshot, S
     Ok(TeamSnapshot { nodes, edges })
 }
 
+/// Load from existing snapshot.db without downloading. Returns None if no snapshot exists.
+#[tauri::command]
+pub async fn team_load_snapshot(state: State<'_, TeamState>) -> Result<Option<TeamSnapshot>, String> {
+    if !state.snapshot_path.exists() {
+        return Ok(None);
+    }
+
+    let db = Database::open_readonly(&state.snapshot_path)
+        .map_err(|e| format!("Open error: {}", e))?;
+
+    let nodes = db.get_all_nodes(true).map_err(|e| e.to_string())?;
+    let edges = db.get_all_edges().map_err(|e| e.to_string())?;
+
+    {
+        let mut snapshot = state.snapshot_db.lock().map_err(|e| e.to_string())?;
+        *snapshot = Some(db);
+    }
+
+    Ok(Some(TeamSnapshot { nodes, edges }))
+}
+
 // ============================================================================
 // Write commands (thin wrappers around RemoteClient)
 // ============================================================================
@@ -706,8 +727,10 @@ pub fn team_get_settings(state: State<'_, TeamState>) -> Result<TeamConfig, Stri
 #[tauri::command]
 pub fn team_save_settings(
     state: State<'_, TeamState>,
-    new_config: TeamConfig,
+    mut new_config: TeamConfig,
 ) -> Result<(), String> {
+    // Trim API key to prevent whitespace mismatches from copy-paste
+    new_config.api_key = new_config.api_key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     new_config.save()?;
 
     {
@@ -720,6 +743,49 @@ pub fn team_save_settings(
     }
 
     Ok(())
+}
+
+// ============================================================================
+// Connection test
+// ============================================================================
+
+#[derive(Serialize)]
+pub struct TestConnectionResult {
+    pub ok: bool,
+    pub message: String,
+}
+
+#[tauri::command]
+pub async fn team_test_connection(
+    server_url: String,
+    api_key: Option<String>,
+) -> Result<TestConnectionResult, String> {
+    let trimmed_key = api_key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+    let client = RemoteClient::with_api_key(&server_url, trimmed_key.clone());
+
+    // First check if server is reachable
+    let health = match client.health().await {
+        Ok(h) => h,
+        Err(e) => return Ok(TestConnectionResult { ok: false, message: e }),
+    };
+
+    // If key provided, verify it actually works
+    if trimmed_key.is_some() {
+        match client.verify_auth().await {
+            Ok((user, role)) => Ok(TestConnectionResult {
+                ok: true,
+                message: format!("Authenticated as {} ({}): {} nodes, {} edges",
+                    user, role, health.nodes, health.edges),
+            }),
+            Err(e) => Ok(TestConnectionResult { ok: false, message: e }),
+        }
+    } else {
+        let auth_info = if health.auth_enabled { "read-only (no key)" } else { "no auth required" };
+        Ok(TestConnectionResult {
+            ok: true,
+            message: format!("Connected ({}): {} nodes, {} edges", auth_info, health.nodes, health.edges),
+        })
+    }
 }
 
 // ============================================================================

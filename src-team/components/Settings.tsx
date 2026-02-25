@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { X, Wifi, WifiOff, Eye, EyeOff } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 import { useTeamStore } from "../stores/teamStore";
 
 export default function Settings() {
@@ -24,20 +25,11 @@ export default function Settings() {
     setTesting(true);
     setTestResult(null);
     try {
-      const headers: HeadersInit = {};
-      if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
-      const resp = await fetch(`${serverUrl}/health`, { headers });
-      if (resp.ok) {
-        const data = await resp.json();
-        const authInfo = data.auth_enabled
-          ? (apiKey ? "authenticated" : "read-only")
-          : "no auth required";
-        setTestResult({ ok: true, message: `Connected (${authInfo}): ${data.nodes} nodes, ${data.edges} edges` });
-      } else if (resp.status === 401) {
-        setTestResult({ ok: false, message: "Invalid API key" });
-      } else {
-        setTestResult({ ok: false, message: `Server returned ${resp.status}` });
-      }
+      const result = await invoke<{ ok: boolean; message: string }>("team_test_connection", {
+        serverUrl,
+        apiKey: apiKey || null,
+      });
+      setTestResult(result);
     } catch (e) {
       setTestResult({ ok: false, message: String(e) });
     } finally {

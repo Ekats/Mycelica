@@ -1,12 +1,13 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Mycelica",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "identifier": "com.mycelica.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build",
+    "beforeBundleCommand": "rm -f src-tauri/target/release/batch_import src-tauri/target/release/mycelica-team src-tauri/target/release/mycelica-server && ln -sf mycelica-cli src-tauri/target/release/cli",
     "frontendDist": "../dist"
   },
   "app": {

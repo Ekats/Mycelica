@@ -100,6 +100,8 @@ pub struct HealthResponse {
     pub nodes: usize,
     pub edges: usize,
     pub uptime_secs: u64,
+    #[serde(default)]
+    pub auth_enabled: bool,
 }
 
 // ============================================================================
@@ -152,6 +154,24 @@ impl RemoteClient {
             let body = resp.text().await.unwrap_or_default();
             Err(format!("Server error {}: {}", status, body))
         }
+    }
+
+    // --- Auth ---
+
+    /// Verify the API key by POSTing to /auth/verify. Returns (user_name, role) or error.
+    pub async fn verify_auth(&self) -> Result<(String, String), String> {
+        let resp = self.auth(self.client.post(self.url("/auth/verify")))
+            .send().await.map_err(|e| format!("HTTP error: {}", e))?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Invalid API key: {}", body));
+        }
+        let resp = self.check_response(resp).await?;
+        let v: serde_json::Value = resp.json().await.map_err(|e| format!("Parse error: {}", e))?;
+        Ok((
+            v["user_name"].as_str().unwrap_or("").to_string(),
+            v["role"].as_str().unwrap_or("").to_string(),
+        ))
     }
 
     // --- Health ---
