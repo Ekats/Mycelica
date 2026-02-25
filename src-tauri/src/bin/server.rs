@@ -317,6 +317,16 @@ struct HealthResponse {
 }
 
 #[derive(Serialize)]
+struct RebuildResponse {
+    categories: usize,
+    papers_assigned: usize,
+    sibling_edges: usize,
+    bridges: usize,
+    duration_secs: f64,
+    log: Vec<String>,
+}
+
+#[derive(Serialize)]
 struct DeletedItem {
     original_id: String,
     deleted_at: i64,
@@ -799,6 +809,52 @@ async fn health_handler(
     }))
 }
 
+// POST /admin/rebuild
+async fn rebuild_handler(
+    State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
+) -> Result<Json<RebuildResponse>, AppError> {
+    // Admin-only: require admin role when auth is enabled
+    if !state.no_auth {
+        let ctx = auth.as_ref()
+            .map(|Extension(ctx)| ctx)
+            .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED,
+                "Authentication required for admin endpoints".to_string()))?;
+        if ctx.role != "admin" {
+            return Err(forbidden("Only admin users can trigger a rebuild"));
+        }
+    }
+
+    println!("[POST /admin/rebuild] Starting adaptive hierarchy rebuild...");
+    let start = std::time::Instant::now();
+
+    let log: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log_ref = log.clone();
+
+    let config = mycelica_lib::rebuild::RebuildConfig::default();
+    let result = mycelica_lib::rebuild::rebuild_adaptive(&state.db, config, &move |msg| {
+        println!("[rebuild] {}", msg);
+        if let Ok(mut v) = log_ref.lock() {
+            v.push(msg.to_string());
+        }
+    }).await.map_err(AppError::from)?;
+
+    let duration = start.elapsed().as_secs_f64();
+    let log_lines = log.lock().map(|v| v.clone()).unwrap_or_default();
+
+    println!("[POST /admin/rebuild] Done in {:.1}s: {} categories, {} papers",
+        duration, result.categories, result.papers_assigned);
+
+    Ok(Json(RebuildResponse {
+        categories: result.categories,
+        papers_assigned: result.papers_assigned,
+        sibling_edges: result.sibling_edges,
+        bridges: result.bridges,
+        duration_secs: duration,
+        log: log_lines,
+    }))
+}
+
 // ============================================================================
 // Auto-backup system
 // ============================================================================
@@ -1154,6 +1210,7 @@ async fn main() {
         .route("/recent", get(recent_handler))
         .route("/orphans", get(orphans_handler))
         .route("/health", get(health_handler))
+        .route("/admin/rebuild", post(rebuild_handler))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024)) // 2MB body limit
         .layer(
