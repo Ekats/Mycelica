@@ -3882,6 +3882,7 @@ async fn rebuild_hierarchy_adaptive(
             // Use actual data statistics for dynamic scaling even in manual mode
             iqr: auto_cfg.iqr,
             edge_density: auto_cfg.edge_density,
+            max_depth: 7,
         }
     };
 

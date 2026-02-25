@@ -128,6 +128,8 @@ pub struct AdaptiveTreeConfig {
     /// Edge density = edges / (n * (n-1) / 2).
     /// Reference value from somatic-neuroscience: 0.0043
     pub edge_density: f64,
+    /// Hard maximum tree depth. Groups at this depth become leaves.
+    pub max_depth: usize,
 }
 
 impl Default for AdaptiveTreeConfig {
@@ -140,6 +142,7 @@ impl Default for AdaptiveTreeConfig {
             // Reference values from somatic-neuroscience database
             iqr: 0.16,
             edge_density: 0.0043,
+            max_depth: 7,
         }
     }
 }
@@ -155,6 +158,13 @@ impl AdaptiveTreeConfig {
             7 => self.min_size * 8,      // 40 at depth 7
             _ => 100,                    // 100 at depth 8+
         }
+    }
+
+    /// Progress threshold: how much must the largest child shrink relative to parent.
+    /// At depth 0, accept largest_child < 0.9 * parent (any decent split helps).
+    /// At depth 5, require < 0.65. Floor at 0.5.
+    pub fn progress_threshold(&self, depth: usize) -> f64 {
+        (0.9 - depth as f64 * 0.05).max(0.5)
     }
 }
 
@@ -198,6 +208,7 @@ pub fn auto_config(edges: &[(String, String, f64)], n_papers: usize) -> Adaptive
         delta_min: (iqr / 20.0).max(0.02),
         iqr,
         edge_density,
+        max_depth: 7,
     }
 }
 
@@ -1538,54 +1549,6 @@ pub fn create_sibling_edge_meta(
     }
 }
 
-/// Force bisection by centroid similarity when threshold-based splits fail.
-///
-/// Algorithm:
-/// 1. Find centroid paper (highest sum of edge weights to all others in group)
-/// 2. Sort all papers by similarity to centroid
-/// 3. Split into top half / bottom half
-///
-/// Guarantees 50/50 split regardless of graph structure.
-/// Papers with no edge to centroid get similarity 0.0 and sort arbitrarily among themselves.
-pub fn centroid_bisection(
-    papers: &[String],
-    edge_index: &EdgeIndex,
-) -> (Vec<String>, Vec<String>) {
-    if papers.len() < 2 {
-        return (papers.to_vec(), vec![]);
-    }
-
-    let paper_set: HashSet<&String> = papers.iter().collect();
-
-    // Find centroid (highest total edge weight sum to other papers in group)
-    let (centroid_idx, _) = papers.iter().enumerate()
-        .map(|(i, p)| {
-            let sum: f64 = edge_index.edges_for(p)
-                .iter()
-                .filter(|(other, _)| paper_set.contains(other))
-                .map(|(_, w)| *w)
-                .sum();
-            (i, sum)
-        })
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap_or((0, 0.0));
-
-    let centroid = &papers[centroid_idx];
-
-    // Sort by similarity to centroid (descending)
-    let mut paper_sims: Vec<_> = papers.iter()
-        .map(|p| (p.clone(), edge_index.weight(p, centroid).unwrap_or(0.0)))
-        .collect();
-    paper_sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Split at midpoint
-    let mid = paper_sims.len() / 2;
-    let left: Vec<String> = paper_sims[..mid].iter().map(|(p, _)| p.clone()).collect();
-    let right: Vec<String> = paper_sims[mid..].iter().map(|(p, _)| p.clone()).collect();
-
-    (left, right)
-}
-
 /// Louvain community detection for multi-way splits when threshold cutting fails.
 ///
 /// Optimizes modularity Q = (internal edges - expected random) / total edges.
@@ -1727,6 +1690,15 @@ pub fn build_tree(
     let node_id = format!("node-{}", *id_counter);
     *id_counter += 1;
 
+    // Hard depth cap — belt to the suspenders of progress_threshold and min_size ramp
+    if depth >= config.max_depth {
+        return TreeNode::Leaf {
+            id: node_id,
+            papers,
+            range,
+        };
+    }
+
     // Compute depth-aware min_size for this level
     let effective_min_size = config.min_size_at_depth(depth);
 
@@ -1790,15 +1762,16 @@ pub fn build_tree(
     let splits = find_valid_splits(&papers, range.clone(), parent_threshold, edge_index, effective_min_size, config);
 
     // Check if we need forced bisection (no valid splits OR best split doesn't make progress)
+    // Progress bar tightens with depth: shallow splits are cheap, deep splits must earn their existence
+    let progress_threshold = config.progress_threshold(depth);
     let needs_bisection = if splits.is_empty() {
         true
     } else {
-        // Check if best split makes meaningful progress (largest child < 90% of parent)
         let best_candidate = splits.iter()
             .max_by(|a, b| a.quality.partial_cmp(&b.quality).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap();
         let largest_child = best_candidate.children.iter().map(|c| c.len()).max().unwrap_or(0);
-        largest_child as f64 >= 0.9 * papers.len() as f64
+        largest_child as f64 >= progress_threshold * papers.len() as f64
     };
 
     // Force Louvain community detection when threshold cutting fails or doesn't make progress
@@ -1811,7 +1784,22 @@ pub fn build_tree(
 
         let communities = louvain_split(&papers, edge_index, effective_min_size);
 
-        if communities.len() >= 2 {
+        // Apply depth-scaled progress check to Louvain results too
+        let louvain_largest = communities.iter().map(|c| c.len()).max().unwrap_or(0);
+        let louvain_smallest = communities.iter().map(|c| c.len()).min().unwrap_or(0);
+        let louvain_passes_progress = communities.len() >= 2
+            && (louvain_largest as f64) < progress_threshold * papers.len() as f64;
+
+        // At shallow depths (0-3), reject binary Louvain splits where the smaller
+        // child is < 20% of parent. A 90/10 split at L2 means Louvain found a tiny
+        // outlier, not real structure — the user gains nothing from that extra click.
+        let louvain_passes_balance = if communities.len() == 2 && depth <= 3 {
+            louvain_smallest as f64 >= 0.2 * papers.len() as f64
+        } else {
+            true
+        };
+
+        if louvain_passes_progress && louvain_passes_balance {
             eprintln!(
                 "[Adaptive] Louvain found {} communities (sizes: {:?})",
                 communities.len(),
