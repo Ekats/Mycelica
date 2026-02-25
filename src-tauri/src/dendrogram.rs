@@ -2196,6 +2196,99 @@ fn count_descendants(db: &crate::db::Database, node_id: &str) -> Result<usize, S
     Ok(count)
 }
 
+/// Collapse binary cascade nodes — categories with exactly 2 category children
+/// that serve as pure routing nodes without semantic value.
+///
+/// A "binary cascade" is a chain of nodes where each has exactly 2 category children.
+/// These add navigation depth without meaningful differentiation. Collapsing them
+/// promotes the node's children to its parent, removing one level of indirection.
+///
+/// # Guards
+/// - Depth >= 2: preserves top-level binary splits (depth 0-1) which are meaningful
+/// - Fan-out <= 15: after promotion, parent must not exceed 15 category children
+///
+/// # Algorithm
+/// Multi-pass until stable: each pass scans all categories, dissolves qualifying
+/// binary nodes, then repeats until no more dissolutions occur.
+pub fn collapse_binary_cascades(db: &crate::db::Database) -> Result<usize, String> {
+    let mut total_collapsed = 0;
+
+    loop {
+        let all_categories: Vec<crate::db::Node> = db
+            .get_all_nodes(false)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|n| !n.is_item)
+            .collect();
+
+        let mut collapsed_this_pass = 0;
+
+        for node in &all_categories {
+            if node.child_count != 2 {
+                continue;
+            }
+
+            let children = db.get_children(&node.id).map_err(|e| e.to_string())?;
+            if children.len() != 2 {
+                continue;
+            }
+
+            // Both children must be categories
+            if children[0].is_item || children[1].is_item {
+                continue;
+            }
+
+            // Depth guard: preserve depth 0-1 binary splits
+            if node.depth < 2 {
+                continue;
+            }
+
+            // Must have a parent to promote into
+            let parent_id = match &node.parent_id {
+                Some(pid) => pid.clone(),
+                None => continue,
+            };
+
+            // Fan-out guard: count parent's current category children
+            let parent_children = db.get_children(&parent_id).map_err(|e| e.to_string())?;
+            let parent_cat_count = parent_children.iter().filter(|c| !c.is_item).count();
+            // After dissolving: parent loses this node (-1), gains its 2 children (+2) = net +1
+            if parent_cat_count + 1 > 15 {
+                continue;
+            }
+
+            eprintln!(
+                "[Collapse] Dissolving binary node '{}' (depth={}, parent={})",
+                node.title, node.depth, parent_id
+            );
+
+            // Reparent this node's children to its parent
+            for child in &children {
+                db.update_parent(&child.id, &parent_id)
+                    .map_err(|e| e.to_string())?;
+            }
+
+            // Delete the dissolved node (cascades edges via FK)
+            db.delete_node(&node.id).map_err(|e| e.to_string())?;
+
+            collapsed_this_pass += 1;
+        }
+
+        total_collapsed += collapsed_this_pass;
+
+        if collapsed_this_pass == 0 {
+            break;
+        }
+    }
+
+    // Batch-fix all child counts after collapse
+    if total_collapsed > 0 {
+        db.recalculate_all_child_counts().map_err(|e| e.to_string())?;
+    }
+
+    Ok(total_collapsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

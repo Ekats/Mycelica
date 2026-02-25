@@ -1266,6 +1266,8 @@ enum HierarchyCommands {
         #[arg(long, default_value = "percentile")]
         method: String,
     },
+    /// Collapse binary cascade routing nodes (post-processing)
+    CollapseBinary,
     /// Consolidate root: group top-level categories into uber-categories
     Consolidate,
     /// Unconsolidate root: flatten uber-categories back to Universe
@@ -3275,6 +3277,15 @@ async fn handle_hierarchy(cmd: HierarchyCommands, db: &Database, json: bool, qui
         HierarchyCommands::Dendrogram { levels, method } => {
             handle_dendrogram_test(&db, levels, &method, json, quiet)?;
         }
+        HierarchyCommands::CollapseBinary => {
+            let collapsed = mycelica_lib::dendrogram::collapse_binary_cascades(&db)
+                .map_err(|e| e.to_string())?;
+            if json {
+                log!(r#"{{"collapsed":{}}}"#, collapsed);
+            } else {
+                log!("Collapsed {} binary routing nodes", collapsed);
+            }
+        }
         HierarchyCommands::Consolidate => {
             handle_consolidate(&db, json, quiet).await?;
         }
@@ -4372,6 +4383,14 @@ async fn rebuild_hierarchy_adaptive(
             let child_count = db.get_children(parent_id).map_err(|e| e.to_string())?.len();
             let _ = db.update_child_count(parent_id, child_count as i32);
         }
+    }
+
+    // Step 7.6: Collapse binary cascade routing nodes
+    if !quiet { elog!("Step 7.6/7: Collapsing binary cascades..."); }
+    let collapsed = mycelica_lib::dendrogram::collapse_binary_cascades(db)
+        .map_err(|e| e.to_string())?;
+    if collapsed > 0 {
+        if !quiet { elog!("  Collapsed {} binary routing nodes", collapsed); }
     }
 
     // Step 7: Final-pass orphan assignment using nearest-neighbor
