@@ -951,6 +951,8 @@ export default function GraphView() {
         .style("fill", "#f9fafb")
         .style("font-size", "20px")
         .style("pointer-events", "none");
+      nodeEnter.append("foreignObject")
+        .attr("class", "url-label");
     }
 
     const nodeMerge = nodeEnter.merge(nodeSel);
@@ -1047,9 +1049,36 @@ export default function GraphView() {
         .attr("stroke-dasharray", (d) => (d.isPersonal ? "3,2" : "none"));
 
       nodeMerge.select("text.label")
-        .text((d) => truncate(d.title, 14))
+        .text((d) => isUrl(d.title) ? "" : truncate(d.title, 14))
+        .style("display", (d) => isUrl(d.title) ? "none" : null)
         .style("font-size", "20px")
         .attr("y", (d) => Math.min(64 + d.edgeCount * 4, 96) + 16);
+
+      const urlW = 220;
+      nodeMerge.select("foreignObject.url-label")
+        .attr("width", urlW)
+        .attr("x", -urlW / 2)
+        .attr("y", (d) => Math.min(64 + d.edgeCount * 4, 96) + 4)
+        .attr("height", 44)
+        .style("display", (d) => isUrl(d.title) ? null : "none")
+        .style("pointer-events", "none")
+        .each(function (_d) {
+          const el = this as unknown as SVGForeignObjectElement;
+          const d = _d;
+          if (!isUrl(d.title)) { el.innerHTML = ""; return; }
+          el.innerHTML = `<div xmlns="http://www.w3.org/1999/xhtml" style="
+            color: #f9fafb;
+            font-size: 14px;
+            line-height: 1.3;
+            text-align: center;
+            overflow: hidden;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            word-break: break-all;
+            pointer-events: none;
+          ">${formatUrlTitle(d.title)}</div>`;
+        });
 
       // Child count indicator inside category nodes
       nodeMerge.selectAll("text.child-count").remove();
@@ -1223,4 +1252,12 @@ export default function GraphView() {
 
 function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + "\u2026" : s;
+}
+
+function isUrl(s: string): boolean {
+  return /^https?:\/\//i.test(s);
+}
+
+function formatUrlTitle(url: string): string {
+  return url.replace(/^https?:\/\/(www\.)?/, "");
 }

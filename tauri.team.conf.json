@@ -6,7 +6,7 @@
     "beforeDevCommand": "cd src-team && npm run dev",
     "devUrl": "http://localhost:1421",
     "beforeBuildCommand": "cd src-team && npm run build",
-    "beforeBundleCommand": "rm -f src-tauri/target/release/batch_import src-tauri/target/release/mycelica src-tauri/target/release/mycelica-server src-tauri/target/release/mycelica-cli && ln -sf mycelica-cli src-tauri/target/release/cli",
+    "beforeBundleCommand": "ln -sf mycelica-team src-tauri/target/release/batch_import && ln -sf mycelica-team src-tauri/target/release/mycelica && ln -sf mycelica-team src-tauri/target/release/mycelica-server && ln -sf mycelica-team src-tauri/target/release/mycelica-cli && ln -sf mycelica-cli src-tauri/target/release/cli",
     "frontendDist": "../src-team/dist"
   },
   "app": {

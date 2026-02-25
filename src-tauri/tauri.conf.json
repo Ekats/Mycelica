@@ -7,7 +7,7 @@
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build",
-    "beforeBundleCommand": "rm -f src-tauri/target/release/batch_import src-tauri/target/release/mycelica-team src-tauri/target/release/mycelica-server && ln -sf mycelica-cli src-tauri/target/release/cli",
+    "beforeBundleCommand": "ln -sf mycelica src-tauri/target/release/batch_import && ln -sf mycelica src-tauri/target/release/mycelica-team && ln -sf mycelica src-tauri/target/release/mycelica-server && ln -sf mycelica-cli src-tauri/target/release/cli",
     "frontendDist": "../dist"
   },
   "app": {
