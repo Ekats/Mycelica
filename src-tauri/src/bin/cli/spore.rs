@@ -253,7 +253,7 @@ pub(crate) fn truncate_middle(s: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use super::super::spore_runs::{count_agent_prompt_lines, find_project_root};
+    use super::super::spore_runs::{count_agent_prompt_lines, count_agent_prompt_lines_in, find_project_root};
 
     #[test]
     fn test_format_duration_short_zero() {
@@ -1803,48 +1803,31 @@ mod tests {
     // Tests for count_agent_prompt_lines() and handle_prompt_stats() logic
     // ============================================================================
     //
-    // count_agent_prompt_lines() uses find_project_root() to locate the project
-    // root (directory containing .mycelica.db), then reads docs/spore/agents/.
-    // Tests that need real files use tempfile + set_current_dir, serialized
-    // with CWD_MUTEX to prevent CWD races between parallel tests.
-    // Each temp dir must contain a .mycelica.db sentinel for find_project_root().
-
-    use std::sync::Mutex;
-    static CWD_MUTEX: Mutex<()> = Mutex::new(());
+    // Tests use the _from/_in variants with explicit paths, avoiding
+    // std::env::set_current_dir entirely (no CWD mutation, no mutex needed).
 
     #[test]
     fn test_count_agent_prompt_lines_missing_dir_returns_empty() {
-        // Use a temp dir with no docs/spore/agents — CWD-independent
-        let _guard = CWD_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&tmp).unwrap();
-        let result = count_agent_prompt_lines();
-        std::env::set_current_dir(&prev).unwrap();
+        let result = count_agent_prompt_lines_in(tmp.path());
         assert_eq!(result.unwrap(), vec![]);
     }
 
     #[test]
     fn test_count_agent_prompt_lines_readme_excluded() {
-        let _guard = CWD_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(".mycelica.db"), "").unwrap();
         let agent_dir = tmp.path().join("docs/spore/agents");
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::write(agent_dir.join("README.md"), "readme line1\nreadme line2\n").unwrap();
         std::fs::write(agent_dir.join("coder.md"), "a\nb\nc\n").unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&tmp).unwrap();
-        let result = count_agent_prompt_lines();
-        std::env::set_current_dir(&prev).unwrap();
-        let files = result.unwrap();
+        let files = count_agent_prompt_lines_in(tmp.path()).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].0, "coder");
     }
 
     #[test]
     fn test_count_agent_prompt_lines_sorted_alphabetically() {
-        let _guard = CWD_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(".mycelica.db"), "").unwrap();
         let agent_dir = tmp.path().join("docs/spore/agents");
@@ -1852,11 +1835,7 @@ mod tests {
         std::fs::write(agent_dir.join("verifier.md"), "x\n").unwrap();
         std::fs::write(agent_dir.join("architect.md"), "x\n").unwrap();
         std::fs::write(agent_dir.join("coder.md"), "x\n").unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&tmp).unwrap();
-        let result = count_agent_prompt_lines();
-        std::env::set_current_dir(&prev).unwrap();
-        let files = result.unwrap();
+        let files = count_agent_prompt_lines_in(tmp.path()).unwrap();
         assert_eq!(files[0].0, "architect");
         assert_eq!(files[1].0, "coder");
         assert_eq!(files[2].0, "verifier");
@@ -1864,39 +1843,28 @@ mod tests {
 
     #[test]
     fn test_count_agent_prompt_lines_strips_md_extension() {
-        let _guard = CWD_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(".mycelica.db"), "").unwrap();
         let agent_dir = tmp.path().join("docs/spore/agents");
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::write(agent_dir.join("planner.md"), "line\n").unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&tmp).unwrap();
-        let result = count_agent_prompt_lines();
-        std::env::set_current_dir(&prev).unwrap();
-        let files = result.unwrap();
+        let files = count_agent_prompt_lines_in(tmp.path()).unwrap();
         assert_eq!(files[0].0, "planner"); // not "planner.md"
     }
 
     #[test]
     fn test_count_agent_prompt_lines_counts_lines_correctly() {
-        let _guard = CWD_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(".mycelica.db"), "").unwrap();
         let agent_dir = tmp.path().join("docs/spore/agents");
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::write(agent_dir.join("tester.md"), "line one\nline two\nline three\n").unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&tmp).unwrap();
-        let result = count_agent_prompt_lines();
-        std::env::set_current_dir(&prev).unwrap();
-        let files = result.unwrap();
+        let files = count_agent_prompt_lines_in(tmp.path()).unwrap();
         assert_eq!(files[0], ("tester".to_string(), 3));
     }
 
     #[test]
     fn test_count_agent_prompt_lines_ignores_non_md_files() {
-        let _guard = CWD_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(".mycelica.db"), "").unwrap();
         let agent_dir = tmp.path().join("docs/spore/agents");
@@ -1904,29 +1872,20 @@ mod tests {
         std::fs::write(agent_dir.join("notes.txt"), "not markdown\n").unwrap();
         std::fs::write(agent_dir.join("script.sh"), "#!/bin/bash\n").unwrap();
         std::fs::write(agent_dir.join("agent.md"), "real agent\n").unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&tmp).unwrap();
-        let result = count_agent_prompt_lines();
-        std::env::set_current_dir(&prev).unwrap();
-        let files = result.unwrap();
+        let files = count_agent_prompt_lines_in(tmp.path()).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].0, "agent");
     }
 
     #[test]
     fn test_count_agent_prompt_lines_total_sum() {
-        let _guard = CWD_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(".mycelica.db"), "").unwrap();
         let agent_dir = tmp.path().join("docs/spore/agents");
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::write(agent_dir.join("alpha.md"), "a\nb\n").unwrap();      // 2 lines
         std::fs::write(agent_dir.join("beta.md"), "x\ny\nz\n").unwrap();    // 3 lines
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&tmp).unwrap();
-        let result = count_agent_prompt_lines();
-        std::env::set_current_dir(&prev).unwrap();
-        let files = result.unwrap();
+        let files = count_agent_prompt_lines_in(tmp.path()).unwrap();
         let total: usize = files.iter().map(|(_, c)| *c).sum();
         assert_eq!(total, 5);
     }
@@ -1963,17 +1922,12 @@ mod tests {
 
     #[test]
     fn test_count_agent_prompt_lines_empty_file_has_zero_lines() {
-        let _guard = CWD_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(".mycelica.db"), "").unwrap();
         let agent_dir = tmp.path().join("docs/spore/agents");
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::write(agent_dir.join("empty.md"), "").unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&tmp).unwrap();
-        let result = count_agent_prompt_lines();
-        std::env::set_current_dir(&prev).unwrap();
-        let files = result.unwrap();
+        let files = count_agent_prompt_lines_in(tmp.path()).unwrap();
         assert_eq!(files[0], ("empty".to_string(), 0));
     }
 
@@ -2170,9 +2124,8 @@ mod tests {
 
     #[test]
     fn test_prompt_size_pipeline_from_count_fn() {
-        // End-to-end: create temp agent files, run count_agent_prompt_lines(),
+        // End-to-end: create temp agent files, run count_agent_prompt_lines_in(),
         // sum the results, and verify threshold logic produces correct check.
-        let _guard = CWD_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(".mycelica.db"), "").unwrap();
         let agent_dir = tmp.path().join("docs/spore/agents");
@@ -2181,14 +2134,11 @@ mod tests {
         std::fs::write(agent_dir.join("coder.md"), "line1\nline2\n").unwrap();
         std::fs::write(agent_dir.join("verifier.md"), "a\nb\n").unwrap();
         std::fs::write(agent_dir.join("planner.md"), "x\ny\n").unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&tmp).unwrap();
-        let prompt_lines: usize = count_agent_prompt_lines()
+        let prompt_lines: usize = count_agent_prompt_lines_in(tmp.path())
             .unwrap_or_default()
             .iter()
             .map(|(_, c)| c)
             .sum();
-        std::env::set_current_dir(&prev).unwrap();
         assert_eq!(prompt_lines, 6);
         let (ok, detail) = prompt_size_check_logic(prompt_lines);
         assert!(ok);
@@ -2198,7 +2148,6 @@ mod tests {
     #[test]
     fn test_prompt_size_pipeline_over_threshold() {
         // End-to-end with total lines > 1000: expect warning.
-        let _guard = CWD_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(".mycelica.db"), "").unwrap();
         let agent_dir = tmp.path().join("docs/spore/agents");
@@ -2206,14 +2155,11 @@ mod tests {
         // Write one file with 1001 lines
         let big_content = "line\n".repeat(1001);
         std::fs::write(agent_dir.join("big-agent.md"), &big_content).unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&tmp).unwrap();
-        let prompt_lines: usize = count_agent_prompt_lines()
+        let prompt_lines: usize = count_agent_prompt_lines_in(tmp.path())
             .unwrap_or_default()
             .iter()
             .map(|(_, c)| c)
             .sum();
-        std::env::set_current_dir(&prev).unwrap();
         assert_eq!(prompt_lines, 1001);
         let (ok, detail) = prompt_size_check_logic(prompt_lines);
         assert!(!ok);
@@ -2461,23 +2407,17 @@ mod tests {
         assert_eq!(args[1], "verifier");
     }
 
-    // Tests for find_project_root() — the new helper function.
-    // These run from src-tauri/ (cargo test's CWD) and verify that walking up
-    // from a subdirectory correctly locates the project root.
-    // CWD_MUTEX is held because find_project_root() reads std::env::current_dir(),
-    // which races with tests that call std::env::set_current_dir().
+    // Tests for find_project_root() — uses CWD (no mutation, safe to run in parallel).
 
     #[test]
     fn test_find_project_root_finds_root_from_subdir() {
         // Running from src-tauri/, find_project_root() must walk up to the repo root.
-        let _guard = CWD_MUTEX.lock().unwrap();
         let root = find_project_root();
         assert!(root.is_some(), "Expected to find project root by walking up from src-tauri/");
     }
 
     #[test]
     fn test_find_project_root_returns_absolute_path() {
-        let _guard = CWD_MUTEX.lock().unwrap();
         if let Some(root) = find_project_root() {
             assert!(root.is_absolute(), "find_project_root() must return an absolute path");
         }
@@ -2485,7 +2425,6 @@ mod tests {
 
     #[test]
     fn test_find_project_root_root_contains_db_marker() {
-        let _guard = CWD_MUTEX.lock().unwrap();
         if let Some(root) = find_project_root() {
             assert!(
                 root.join(".mycelica.db").exists() || root.join("docs/.mycelica.db").exists(),
@@ -2494,28 +2433,9 @@ mod tests {
         }
     }
 
-    // Integration tests for count_agent_prompt_lines() using the real project.
-    // These confirm the CWD fix works end-to-end: agent files are found even
-    // though cargo test runs from src-tauri/, not the repo root.
-    // CWD_MUTEX is held to prevent CWD races with the tempdir-based tests above.
-
-    #[test]
-    fn test_count_agent_prompt_lines_nonempty_in_project() {
-        // The repo has agent .md files in docs/spore/agents/; should find them.
-        let _guard = CWD_MUTEX.lock().unwrap();
-        let result = count_agent_prompt_lines().expect("should succeed");
-        assert!(!result.is_empty(), "Expected agent files when run inside the project");
-    }
-
-    #[test]
-    fn test_count_agent_prompt_lines_includes_known_agents() {
-        let _guard = CWD_MUTEX.lock().unwrap();
-        let result = count_agent_prompt_lines().expect("should succeed");
-        let names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
-        for expected in &["coder", "verifier", "summarizer"] {
-            assert!(names.contains(expected), "Expected agent '{}' in results", expected);
-        }
-    }
+    // Integration tests removed: they depended on docs/spore/agents/ existing
+    // in the repo, which is project-specific filesystem state. The _in() variants
+    // tested above cover the same logic with controlled tempdir fixtures.
 
     // --- Tests for planned status detection (Tracks edge metadata, lines 2710-2735) ---
     //

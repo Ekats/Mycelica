@@ -198,10 +198,10 @@ pub(crate) fn handle_health(db: &Database, json: bool) -> Result<(), String> {
 // Prompt stats command
 // ============================================================================
 
-/// Walk up from CWD to find the project root (directory containing .mycelica.db).
+/// Walk up from `start` to find the project root (directory containing .mycelica.db).
 /// Returns None if no project root is found.
-pub(crate) fn find_project_root() -> Option<PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
+pub(crate) fn find_project_root_from(start: &Path) -> Option<PathBuf> {
+    let mut dir = start.to_path_buf();
     loop {
         if dir.join(".mycelica.db").exists() || dir.join("docs/.mycelica.db").exists() {
             return Some(dir);
@@ -212,8 +212,14 @@ pub(crate) fn find_project_root() -> Option<PathBuf> {
     }
 }
 
-pub(crate) fn count_agent_prompt_lines() -> Result<Vec<(String, usize)>, String> {
-    let project_root = match find_project_root() {
+/// Walk up from CWD to find the project root.
+pub(crate) fn find_project_root() -> Option<PathBuf> {
+    find_project_root_from(&std::env::current_dir().ok()?)
+}
+
+/// Count lines in agent prompt files under the given start directory.
+pub(crate) fn count_agent_prompt_lines_in(start: &Path) -> Result<Vec<(String, usize)>, String> {
+    let project_root = match find_project_root_from(start) {
         Some(root) => root,
         None => return Ok(vec![]),
     };
@@ -240,6 +246,11 @@ pub(crate) fn count_agent_prompt_lines() -> Result<Vec<(String, usize)>, String>
         results.push((name, content.lines().count()));
     }
     Ok(results)
+}
+
+/// Count lines in agent prompt files, starting from CWD.
+pub(crate) fn count_agent_prompt_lines() -> Result<Vec<(String, usize)>, String> {
+    count_agent_prompt_lines_in(&std::env::current_dir().map_err(|e| e.to_string())?)
 }
 
 pub(crate) fn handle_prompt_stats() -> Result<(), String> {
