@@ -293,14 +293,13 @@ fn extract_macro(m: &ItemMacro, file_path: &str, content: &str, lines: &[&str]) 
 
 /// Get start and end lines for an item based on its span.
 /// Returns 1-indexed line numbers.
-fn get_item_lines(span: proc_macro2::Span, content: &str, lines: &[&str]) -> Option<(usize, usize)> {
+fn get_item_lines(span: proc_macro2::Span, _content: &str, lines: &[&str]) -> Option<(usize, usize)> {
     let start = span.start();
     let line_start = start.line; // Already 1-indexed
 
     // Find the end by searching for the closing brace or semicolon
     // Start from the span line and look for balanced braces
     let mut brace_depth = 0;
-    let mut line_end = line_start;
     let mut found_start = false;
 
     for (idx, line) in lines.iter().enumerate().skip(line_start.saturating_sub(1)) {
@@ -313,14 +312,12 @@ fn get_item_lines(span: proc_macro2::Span, content: &str, lines: &[&str]) -> Opt
                 '}' => {
                     brace_depth -= 1;
                     if found_start && brace_depth == 0 {
-                        line_end = idx + 1; // 1-indexed
-                        return Some((line_start, line_end));
+                        return Some((line_start, idx + 1));
                     }
                 }
                 ';' if !found_start => {
                     // Item without body (e.g., struct Foo;)
-                    line_end = idx + 1;
-                    return Some((line_start, line_end));
+                    return Some((line_start, idx + 1));
                 }
                 _ => {}
             }

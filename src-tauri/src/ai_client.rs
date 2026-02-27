@@ -64,6 +64,7 @@ struct OllamaRequest {
 
 /// Ollama API response format
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OllamaResponse {
     response: String,
     done: bool,

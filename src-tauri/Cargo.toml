@@ -15,9 +15,6 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [features]
 default = []
 gui = ["dep:tauri", "dep:tauri-plugin-opener", "dep:tauri-plugin-dialog", "dep:tauri-plugin-fs", "dep:tauri-plugin-shell", "dep:tauri-build"]
-# cuda feature: for CUDA <= 12.x with stable Rust
-# for CUDA 13.x, see patch section at end of file
-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 team = ["dep:scraper", "dep:ammonia"]  # Team client GUI mode
 signal = ["rusqlite/bundled-sqlcipher-vendored-openssl"]  # Signal Desktop encrypted DB import
 mcp = ["dep:rmcp", "dep:schemars"]  # MCP server for agent coordination
@@ -64,14 +61,12 @@ tui-tree-widget = "0.19"
 nucleo = "0.5"
 arboard = "3"
 
-# Local embeddings via candle
-# Current: git main (requires nightly Rust, supports CUDA 13.x)
-# For stable Rust (CPU only or CUDA ≤12.x): use version = "0.8" instead
-candle-core = { git = "https://github.com/huggingface/candle" }
-candle-nn = { git = "https://github.com/huggingface/candle" }
-candle-transformers = { git = "https://github.com/huggingface/candle" }
-tokenizers = "0.20"
-hf-hub = "0.4"
+# Local embeddings via candle (CPU only, stable Rust)
+candle-core = "0.8"
+candle-nn = "0.8"
+candle-transformers = "0.8"
+tokenizers = { version = "0.22", default-features = false, features = ["progressbar", "fancy-regex"] }
+hf-hub = { version = "0.4", default-features = false, features = ["tokio", "ureq", "rustls-tls"] }
 
 # Code parsing
 syn = { version = "2.0", features = ["full", "parsing", "extra-traits"] }
@@ -150,7 +145,7 @@ path = "src/bin/server.rs"
 name = "mycelica-server"
 maintainer = "Ekats"
 copyright = "2024-2026 Ekats"
-depends = "$auto, libssl3"
+depends = "$auto"
 section = "net"
 priority = "optional"
 assets = [
@@ -160,10 +155,6 @@ assets = [
 # =============================================================================
 # Build Instructions
 # =============================================================================
-# With git candle (current config, requires nightly):
-#   CPU:        cargo +nightly build --release
-#   CUDA 13.x:  cargo +nightly build --release --features cuda
-#
-# For stable Rust, change candle deps above to version = "0.8":
-#   CPU:        cargo build --release
-#   CUDA ≤12.x: cargo build --release --features cuda
+#   CPU:  cargo build --release
+#   CLI:  cargo install --path . --bin mycelica-cli --features mcp --force
+#   musl: cargo build --release --target x86_64-unknown-linux-musl --bin mycelica-cli --features mcp

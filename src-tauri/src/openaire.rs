@@ -119,6 +119,7 @@ struct OpenAireResponse {
 
 /// Header from OpenAIRE API response
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OpenAireHeader {
     #[serde(rename = "numFound")]
     num_found: Option<u32>,
@@ -194,6 +195,7 @@ struct RawAccessRight {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct RawInstance {
     urls: Option<Vec<String>>,
     #[serde(rename = "accessRight")]

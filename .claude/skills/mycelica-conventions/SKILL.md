@@ -53,11 +53,11 @@ Do not proceed without updating the index. Deletes old nodes, reimports, regener
 After editing CLI or library code, always reinstall and update sidecar:
 ```bash
 cd src-tauri
-cargo +nightly install --path . --bin mycelica-cli --features mcp --force
+cargo install --path . --bin mycelica-cli --features mcp --force
 cp ~/.cargo/bin/mycelica-cli binaries/mycelica-cli-x86_64-unknown-linux-gnu
 ```
 
-Never run CLI from `./target/release/` — always install globally with nightly+mcp.
+Never run CLI from `./target/release/` — always install globally with mcp feature.
 The sidecar copy is needed for the GUI to spawn the CLI (Tauri bundles it from `binaries/`).
 
 ## Key Files
@@ -113,7 +113,7 @@ The sidecar copy is needed for the GUI to spawn the CLI (Tauri bundles it from `
 Only needed if `.mycelica.db` doesn't exist:
 ```bash
 cd src-tauri
-cargo +nightly install --path . --bin mycelica-cli --features mcp --force
+cargo install --path . --bin mycelica-cli --features mcp --force
 cd ..
 mycelica-cli db new .mycelica.db
 mycelica-cli import code .

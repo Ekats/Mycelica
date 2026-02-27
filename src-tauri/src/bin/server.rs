@@ -327,6 +327,7 @@ struct RebuildResponse {
 }
 
 #[derive(Serialize)]
+#[allow(dead_code)]
 struct DeletedItem {
     original_id: String,
     deleted_at: i64,

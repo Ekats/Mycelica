@@ -22,6 +22,7 @@ pub fn parse_sections(full_text: &str) -> ExtractedSections {
     }
 }
 
+#[cfg(test)]
 /// Clean text by removing hyphenation and normalizing whitespace
 fn clean_text(text: &str) -> String {
     text.replace("-\n", "")

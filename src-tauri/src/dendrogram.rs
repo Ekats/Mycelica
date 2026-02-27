@@ -782,7 +782,7 @@ pub fn find_dynamic_thresholds(
     }
 
     // Pre-sort merges by weight descending for efficient counting
-    let weights: Vec<f64> = dendrogram.merges.iter().map(|m| m.weight).collect();
+    let _weights: Vec<f64> = dendrogram.merges.iter().map(|m| m.weight).collect();
 
     // Helper: count components at a given threshold
     // Components = papers + (merges above threshold) - (papers merged above threshold)

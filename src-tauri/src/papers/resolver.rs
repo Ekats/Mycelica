@@ -118,7 +118,7 @@ impl PdfResolver {
         }
 
         // 5. Try OpenAIRE URLs (5% baseline success) - fallback
-        for url in openaire_urls {
+        for _url in openaire_urls {
             self.stats.openaire_attempts += 1;
             // We'll need to call the existing OpenAIRE download method here
             // For now, just track the attempt

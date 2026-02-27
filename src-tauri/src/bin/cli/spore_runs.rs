@@ -4,7 +4,7 @@
 //! run inspection, dashboard, health checks, and experiment comparison.
 
 use super::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 // Re-import shared utilities from the spore module.
@@ -3015,7 +3015,7 @@ pub(crate) fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result
                 if let Some(d) = duration_ms { total_duration_ms += d; }
 
                 // Connector characters
-                let (branch, pipe) = if is_last { ("+-", "  ") } else { ("+-", "| ") };
+                let (branch, _pipe) = if is_last { ("+-", "  ") } else { ("+-", "| ") };
                 let _ = branch; // we use custom chars below
 
                 let bounce_str = bounce.map(|b| format!(" (bounce {})", b)).unwrap_or_default();
@@ -3084,6 +3084,7 @@ pub(crate) fn handle_runs(cmd: RunCommands, db: &Database, json: bool) -> Result
 // Tech debt: this duplicates some patterns from RunCommands::Compare and Stats.
 // Consider extracting shared metric-gathering helpers if more comparison modes are added.
 
+#[allow(dead_code)]
 struct ExperimentRunMetrics {
     task_desc: String,
     status: String,

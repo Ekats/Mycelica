@@ -3,7 +3,7 @@
 //! Uses Claude Haiku to analyze nodes for sensitive content and allows
 //! exporting a database with private nodes removed.
 
-use crate::commands::graph::AppState;
+use crate::app_state::AppState;
 use crate::settings;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -25,29 +25,7 @@ pub struct LocalEmbedder {
 impl LocalEmbedder {
     /// Load model from Hugging Face Hub (downloads on first use)
     pub fn new() -> Result<Self, String> {
-        // Try CUDA if feature enabled, otherwise CPU only
-        #[cfg(feature = "cuda")]
-        let device = if candle_core::utils::cuda_is_available() {
-            match Device::new_cuda(0) {
-                Ok(dev) => {
-                    println!("[LocalEmbeddings] Using CUDA device (GPU)");
-                    dev
-                }
-                Err(e) => {
-                    println!("[LocalEmbeddings] CUDA device creation failed: {}, falling back to CPU", e);
-                    Device::Cpu
-                }
-            }
-        } else {
-            println!("[LocalEmbeddings] CUDA not available, using CPU");
-            Device::Cpu
-        };
-
-        #[cfg(not(feature = "cuda"))]
-        let device = {
-            println!("[LocalEmbeddings] Using CPU (cuda feature not enabled)");
-            Device::Cpu
-        };
+        let device = Device::Cpu;
 
         // Download model files from HF Hub
         let api = Api::new().map_err(|e| format!("Failed to create HF API: {}", e))?;

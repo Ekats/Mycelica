@@ -1,6 +1,6 @@
 use crate::db::Database;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::RwLock;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -10,7 +10,7 @@ use instant_distance::{Builder, HnswMap, Search};
 use instant_distance::Point as HnswPoint;
 
 // Global cancellation flags
-static CANCEL_PROCESSING: AtomicBool = AtomicBool::new(false);
+pub static CANCEL_PROCESSING: AtomicBool = AtomicBool::new(false);
 pub static CANCEL_REBUILD: AtomicBool = AtomicBool::new(false);
 
 /// Cache for similarity search results with TTL

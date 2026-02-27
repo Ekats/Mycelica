@@ -1534,7 +1534,7 @@ async fn import_single_paper(
                         max_pdf_size_mb);
                 }
             }
-            Err(e) => {
+            Err(_e) => {
                 // Resolver failed - try fallback to OpenAIRE URL
                 if let Some(url) = &pdf_url {
                     match client.download_document(url, max_pdf_size_mb).await {

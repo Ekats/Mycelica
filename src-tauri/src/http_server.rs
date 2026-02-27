@@ -11,7 +11,6 @@ use crate::db::{Database, Node, NodeType, Position};
 use crate::holerabbit;
 use crate::local_embeddings;
 use crate::settings;
-use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};

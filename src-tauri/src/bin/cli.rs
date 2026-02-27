@@ -6,12 +6,11 @@
 
 use clap::{Parser, Subcommand, CommandFactory};
 use clap_complete::{generate, Shell};
-use mycelica_lib::{db::{Database, Node, NodeType, Edge, EdgeType, Position}, settings, import, hierarchy, similarity, openaire, ai_client, utils, classification, local_embeddings};
+use mycelica_lib::{db::{Database, Node, NodeType, Edge, EdgeType, Position}, settings, import, hierarchy, similarity, openaire, ai_client, utils, classification};
 use serde_json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::collections::HashSet;
-use std::io::{BufRead, Read as _, Write};
+use std::io::Write;
 use chrono::{Timelike, Utc, Datelike, Local};
 use futures::{stream, StreamExt};
 
@@ -99,13 +98,6 @@ pub(crate) fn elog_both(msg: &str) {
             let _ = writeln!(file, "{} [ERROR] {}", timestamp, msg);
         }
     }
-}
-
-/// Check if text is predominantly English using ASCII ratio heuristic.
-/// Returns true if >90% of characters are ASCII (letters, numbers, punctuation).
-/// Used to detect non-English text that local LLMs may hallucinate on.
-pub(crate) fn is_predominantly_english(texts: &[String]) -> bool {
-    mycelica_lib::rebuild::is_predominantly_english(texts)
 }
 
 /// Macro for logging to both terminal and file
@@ -2229,6 +2221,7 @@ async fn handle_db(cmd: DbCommands, db: &Database, json: bool) -> Result<(), Str
 // ============================================================================
 
 /// Summary of a code update operation (delete + reimport + embeddings + call edges).
+#[allow(dead_code)]
 pub(crate) struct CodeUpdateSummary {
     pub deleted: usize,
     pub imported: usize,
@@ -3287,7 +3280,7 @@ async fn handle_hierarchy(cmd: HierarchyCommands, db: &Database, json: bool, qui
 // Dendrogram Test
 // ============================================================================
 
-fn handle_dendrogram_test(db: &Database, target_levels: usize, method: &str, json: bool, quiet: bool) -> Result<(), String> {
+fn handle_dendrogram_test(db: &Database, target_levels: usize, method: &str, json: bool, _quiet: bool) -> Result<(), String> {
     use mycelica_lib::dendrogram::{build_dendrogram, find_natural_thresholds, find_percentile_thresholds, fixed_thresholds, extract_levels, DendrogramConfig};
     use std::time::Instant;
 
@@ -3417,7 +3410,7 @@ fn handle_dendrogram_test(db: &Database, target_levels: usize, method: &str, jso
 
 async fn handle_consolidate(db: &Database, json: bool, quiet: bool) -> Result<(), String> {
     use mycelica_lib::ai_client::{self, TopicInfo};
-    use mycelica_lib::hierarchy;
+    
     use mycelica_lib::db::{Node, NodeType, Position};
     use mycelica_lib::similarity;
     use std::time::Instant;
@@ -3837,7 +3830,7 @@ async fn rebuild_hierarchy_dendrogram(
     use mycelica_lib::ai_client;
     use mycelica_lib::db::{Node, NodeType, Position};
     use std::time::Instant;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     let start = Instant::now();
     let now = chrono::Utc::now().timestamp_millis();
@@ -5119,7 +5112,7 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, include_code: bool, al
     let total = items.len();
     let papers = items.iter().filter(|n| n.content_type.as_deref() == Some("paper")).count();
     let non_papers = total - papers;
-    let processed = items.iter().filter(|n| n.is_processed).count();
+    let _processed = items.iter().filter(|n| n.is_processed).count();
     let non_paper_processed = items.iter()
         .filter(|n| n.is_processed && n.content_type.as_deref() != Some("paper"))
         .count();
@@ -6059,6 +6052,12 @@ async fn handle_nav(cmd: NavCommands, db: &Database, json: bool) -> Result<(), S
 // ============================================================================
 
 async fn handle_search(query: &str, type_filter: &str, author_filter: Option<String>, recent_filter: Option<String>, limit: u32, db: &Database, json: bool) -> Result<(), String> {
+    if query.trim().is_empty() {
+        if json { println!("[]"); }
+        else { log!("Search query cannot be empty"); }
+        return Ok(());
+    }
+
     let results = db.search_nodes(query).map_err(|e| e.to_string())?;
 
     // Parse recency filter (e.g., "7d", "24h", "30d")

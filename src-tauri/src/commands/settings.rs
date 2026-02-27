@@ -97,7 +97,7 @@ pub fn set_use_local_embeddings(enabled: bool) -> Result<(), String> {
 // ==================== Pipeline State ====================
 
 use tauri::State;
-use crate::AppState;
+use crate::app_state::AppState;
 
 /// Get the current database pipeline state
 /// Returns: fresh, imported, processed, clustered, hierarchized, complete

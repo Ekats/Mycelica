@@ -30,9 +30,8 @@ Run once. Database persists. **Skip if `.mycelica.db` exists.**
 ```bash
 # Install CLI globally
 # --features mcp is REQUIRED for spore agent support
-# Add cuda on NVIDIA GPU machines: --features mcp,cuda
 cd src-tauri
-cargo +nightly install --path . --bin mycelica-cli --features mcp --force
+cargo install --path . --bin mycelica-cli --features mcp --force
 cd ..
 
 # Create project database in repo root
@@ -103,11 +102,11 @@ Do not proceed without updating the index. Deletes old nodes, reimports, regener
 **After editing CLI or library code, always reinstall and update sidecar:**
 ```bash
 cd src-tauri
-cargo +nightly install --path . --bin mycelica-cli --features mcp --force
+cargo install --path . --bin mycelica-cli --features mcp --force
 cp ~/.cargo/bin/mycelica-cli binaries/mycelica-cli-x86_64-unknown-linux-gnu
 ```
 
-Never run CLI from `./target/release/` — always install globally with nightly+mcp.
+Never run CLI from `./target/release/` — always install globally with mcp feature.
 The sidecar copy is needed for the GUI to spawn the CLI (Tauri bundles it from `binaries/`).
 
 ---

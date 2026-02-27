@@ -1,8 +1,8 @@
-CARGO    = cargo +nightly
+CARGO    = cargo
 ARCH     = $(shell rustc -vV | grep host | cut -d' ' -f2)
 SIDECAR  = src-tauri/binaries/mycelica-cli-$(ARCH)
 
-# Override with: make cli CLI_FEATURES=mcp,signal,cuda
+# Override with: make cli CLI_FEATURES=mcp,signal
 CLI_FEATURES    ?= mcp
 SERVER_FEATURES ?=
 TEAM_FEATURES   ?= gui,team

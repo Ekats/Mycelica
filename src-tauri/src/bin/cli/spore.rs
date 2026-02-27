@@ -169,6 +169,7 @@ pub(crate) fn parse_since_to_millis(s: &str) -> Result<i64, String> {
 
 /// Format milliseconds into a short human-readable duration string.
 /// Examples: "1.2s", "45.3s", "2m 15s", "1h 05m".
+#[cfg(test)]
 pub(crate) fn format_duration_short(ms: u64) -> String {
     let total_secs = ms / 1000;
     let tenths = (ms % 1000) / 100;

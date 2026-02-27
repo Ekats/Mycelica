@@ -19,6 +19,7 @@ use ratatui::{
 
 /// TUI operating mode
 #[derive(Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 enum TuiMode {
     Navigation,  // Browsing hierarchy (tree view)
     LeafView,    // Viewing item content (full screen)
@@ -47,6 +48,7 @@ enum LeafFocus {
 
 /// Tree node for TUI display
 #[derive(Clone)]
+#[allow(dead_code)]
 struct TreeNode {
     id: String,
     parent_id: Option<String>,
@@ -64,6 +66,7 @@ struct TreeNode {
 
 /// Similar node for leaf view sidebar
 #[derive(Clone)]
+#[allow(dead_code)]
 struct SimilarNodeInfo {
     id: String,
     title: String,
@@ -476,6 +479,7 @@ impl TuiApp {
     }
 
     /// Get the lines of the edit buffer
+    #[allow(dead_code)]
     fn edit_lines(&self) -> Vec<&str> {
         self.edit_buffer.lines().collect()
     }
@@ -2058,6 +2062,7 @@ fn similarity_color_normalized(similarity: f64, min_sim: f64, max_sim: f64) -> C
 }
 
 /// Get similarity color with default 0.5-1.0 range normalization
+#[allow(dead_code)]
 fn similarity_color(similarity: f64) -> Color {
     similarity_color_normalized(similarity, 0.5, 1.0)
 }
