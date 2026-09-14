@@ -94,3 +94,14 @@ pkg/
 PRIVACYFILTER.md
 aur-mycelica-bin/
 src-tauri/binaries/
+.mco/MCA_GUIDE.md
+.mco/bug-protocol.md
+.mco/MCA_COMMANDS.md
+.mco/MCP_GUIDE.md
+.mco/graph.db
+.mco/.seed-manifest.json
+.mco.db
+.mco/graph.db-wal
+.mco/graph.db-shm
+.mco.db-wal
+.mco.db-shm
