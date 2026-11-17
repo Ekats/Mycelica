@@ -7344,7 +7344,7 @@ fn analyze_doc_edges(db: &Database, json: bool, quiet: bool) -> Result<(), Strin
                     return;
                 }
                 let edge = Edge {
-                    id: format!("edge-doc-{}-{}", &doc.id[..8.min(doc.id.len())], &code_id[..8.min(code_id.len())]),
+                    id: format!("edge-doc-{}-{}", doc.id, code_id),
                     source: doc.id.clone(),
                     target: code_id.clone(),
                     edge_type: EdgeType::Documents,
