@@ -253,7 +253,7 @@ pub(crate) fn truncate_middle(s: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use super::super::spore_runs::{count_agent_prompt_lines, count_agent_prompt_lines_in, find_project_root};
+    use super::super::spore_runs::{count_agent_prompt_lines, count_agent_prompt_lines_in, find_project_root, find_project_root_from};
 
     #[test]
     fn test_format_duration_short_zero() {
@@ -2411,9 +2411,13 @@ mod tests {
 
     #[test]
     fn test_find_project_root_finds_root_from_subdir() {
-        // Running from src-tauri/, find_project_root() must walk up to the repo root.
-        let root = find_project_root();
-        assert!(root.is_some(), "Expected to find project root by walking up from src-tauri/");
+        // Hermetic: create a .mycelica.db marker in a temp dir and walk up from a subdir.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".mycelica.db"), b"").unwrap();
+        let sub = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&sub).unwrap();
+        let root = find_project_root_from(&sub);
+        assert_eq!(root.as_deref(), Some(tmp.path()), "Expected to find project root by walking up from a subdir");
     }
 
     #[test]
