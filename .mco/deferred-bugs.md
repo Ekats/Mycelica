@@ -16,9 +16,8 @@ A bug on the way is a **note**, not a detour. One line here beats a five-file ta
 
 | id | date | status | bug |
 |----|------|--------|-----|
-| 1 | 2026-07-31 | open | `.mcp.json:7` points mco MCP at `/home/spore/Repos/mycelica/.mco/graph.db` which does not exist — every `mca_*` tool returns empty from a mycelica-cwd session |
-| 2 | 2026-07-31 | open | `mca_search` returns `[]` for snake_case symbols (e.g. `resolve_call_edges`) though the node is indexed (`code-58bbe0033e19b87e`) — FTS5 tokenization, contradicts MCA_GUIDE "exact symbol names" |
-| 3 | 2026-07-31 | open | (mco repo) `src-tauri/src/db/schema.rs:708,726` adds `vital_level` column twice — redundant guarded migration |
-| 4 | 2026-07-31 | open | (mco repo) `src-tauri/src/db/schema.rs:805,821` creates `crawl_queue` table + wiki/domain indices on every DB open; referenced nowhere — dead crawler scaffolding |
-| 5 | 2026-07-31 | open | (mco repo) `src-tauri/src/bin/cli.rs:6590` doc comment references `crawl import-dump --gpu-embed`, a subcommand that no longer exists |
-| 6 | 2026-07-31 | open | mycelica `src-tauri/src/bin/cli.rs:6010` `collect_paths` takes no depth param — `nav folder --depth` silently ignored and `--summary` unhandled in JSON mode (same class as mca `d145f04`/`0bbeae3`) |
+| 1 | 2026-07-31 | resolved | `.mcp.json:7` points mco MCP at `<repo>/.mco/graph.db`, which existed but held 0 nodes / 0 edges — every `mca_*` tool returned empty from a mycelica-cwd session. Indexed 2026-10-03, now 3,606 edges |
+| 2 | 2026-07-31 | invalid | ~~`mca_search` returns `[]` for snake_case symbols — FTS5 tokenization~~ **Not reproducible.** `mca_search("analyze_code_edges")` returns hits once the graph is indexed. The original `[]` was bug 1 (empty DB) compounded by querying mco-only symbols (`resolve_call_edges`, `import_code_files`) against the mycelica graph. No tokenization defect; MCA_GUIDE is accurate |
+| 3 | 2026-07-31 | open | `src-tauri/src/bin/cli.rs:6010` `collect_paths` takes no depth param — `nav folder --depth` silently ignored and `--summary` unhandled in JSON mode (same class as mca `d145f04`/`0bbeae3`) |
+| 4 | 2026-10-03 | open | `src-tauri/src/bin/cli.rs:7677` `find_called_functions` keys `known_functions` as `HashMap<name, id>` with no language component, so the string-match call-graph pass can emit cross-language phantom edges; mca's AST path keys on `(language, name)` and cannot |
+| 5 | 2026-11-17 | open | `spore::tests::test_find_project_root_finds_root_from_subdir` (`src/bin/cli/spore.rs:2416`) fails on any checkout without a `.mycelica.db`: `find_project_root` (`src/bin/cli/spore_runs.rs:205`) walks up looking for that file, and the test asserts it is found. A DB-content dependency in a unit test — make it create a temp marker or skip when absent. 432/433 `mycelica-cli` tests pass otherwise |
