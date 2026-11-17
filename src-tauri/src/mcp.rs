@@ -1144,14 +1144,12 @@ impl Tools {
             Err(e) => return Ok(Self::tool_error(format!("Failed to parse code metadata: {}", e))),
         };
 
-        // Resolve relative path from database directory
-        let db_dir = std::path::Path::new(&self.db.get_path())
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .to_path_buf();
+        // Resolve relative path from the code root the importer strips
+        // (git repo root containing the database, else the database's directory)
+        let base_dir = std::path::PathBuf::from(crate::code::code_root(&self.db));
         let file_path = {
             let p = std::path::PathBuf::from(&meta.file_path);
-            if p.is_relative() { db_dir.join(&p) } else { p }
+            if p.is_relative() { base_dir.join(&p) } else { p }
         };
 
         let file_content = match std::fs::read_to_string(&file_path) {

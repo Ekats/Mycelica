@@ -1554,6 +1554,18 @@ impl Database {
         Ok(ids)
     }
 
+    /// Get the max updated_at (millis) for nodes with a given file path.
+    /// Returns None if no nodes exist for this path.
+    pub fn get_max_updated_at_for_file(&self, file_path: &str) -> Result<Option<i64>> {
+        let conn = self.conn()?;
+        let ts: Option<i64> = conn.query_row(
+            "SELECT MAX(updated_at) FROM nodes WHERE JSON_EXTRACT(tags, '$.file_path') = ?1",
+            params![file_path],
+            |row| row.get(0),
+        )?;
+        Ok(ts)
+    }
+
     /// Delete edges by source and edge type
     pub fn delete_edges_by_source_and_type(&self, source_id: &str, edge_type: &str) -> Result<usize> {
         let conn = self.conn()?;

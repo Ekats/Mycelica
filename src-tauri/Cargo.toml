@@ -80,6 +80,24 @@ tree-sitter = "0.24"
 tree-sitter-typescript = "0.23"
 tree-sitter-python = "0.23"
 tree-sitter-c = "0.23"
+tree-sitter-go = "0.23"
+# Pinned exactly: 0.7.1+ regenerated parser.c at grammar ABI 15, which
+# tree-sitter 0.24 rejects at runtime (`LanguageError { version: 15 }`) — it
+# still compiles, so only a parse attempt catches it. 0.7.0 is ABI 14.
+# Unpin when the tree-sitter pin above moves to 0.25+.
+tree-sitter-swift = "=0.7.0"
+# `tree-sitter-kotlin-ng`, not `tree-sitter-kotlin`: the latter takes
+# `tree-sitter >= 0.21, < 0.23` as a normal dependency, which collides with the
+# 0.24 pin above (two incompatible `Language` types). This one depends only on
+# `tree-sitter-language` and ships parser.c at ABI 14.
+tree-sitter-kotlin-ng = "1.1.0"
+# Pinned exactly, same trap as Swift: 0.23.5 ships parser.c at grammar ABI 15,
+# which tree-sitter 0.24 rejects at parse time (`LanguageError { version: 15 }`)
+# while `cargo check` still passes. 0.23.1 is ABI 14 and depends only on
+# `tree-sitter-language`. Unpin when the tree-sitter pin above moves to 0.25+.
+tree-sitter-c-sharp = "=0.23.1"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-qmljs = "0.3.1"
 
 # PDF text extraction
 pdf-extract = "0.7"

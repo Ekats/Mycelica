@@ -2931,7 +2931,7 @@ pub fn import_code(
 ) -> Result<CodeImportResult, String> {
     let db = state.db.read().map_err(|e| format!("DB lock error: {}", e))?;
 
-    let result = crate::code::import_code(&db, &path, language.as_deref())?;
+    let result = crate::code::import_code(&db, &path, language.as_deref(), false, false)?;
 
     Ok(result.into())
 }

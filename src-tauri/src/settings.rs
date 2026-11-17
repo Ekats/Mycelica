@@ -616,6 +616,12 @@ pub const TYPESCRIPT_IMPORT_CONTAINER_ID: &str = "import-typescript";
 pub const JAVASCRIPT_IMPORT_CONTAINER_ID: &str = "import-javascript";
 pub const PYTHON_IMPORT_CONTAINER_ID: &str = "import-python";
 pub const C_IMPORT_CONTAINER_ID: &str = "import-c";
+pub const GO_IMPORT_CONTAINER_ID: &str = "import-go";
+pub const SWIFT_IMPORT_CONTAINER_ID: &str = "import-swift";
+pub const KOTLIN_IMPORT_CONTAINER_ID: &str = "import-kotlin";
+pub const CSHARP_IMPORT_CONTAINER_ID: &str = "import-csharp";
+pub const CPP_IMPORT_CONTAINER_ID: &str = "import-cpp";
+pub const QML_IMPORT_CONTAINER_ID: &str = "import-qml";
 pub const DOCS_IMPORT_CONTAINER_ID: &str = "import-docs";
 
 /// All import container IDs for protection during hierarchy rebuilds
@@ -625,6 +631,12 @@ pub const IMPORT_CONTAINER_IDS: &[&str] = &[
     JAVASCRIPT_IMPORT_CONTAINER_ID,
     PYTHON_IMPORT_CONTAINER_ID,
     C_IMPORT_CONTAINER_ID,
+    GO_IMPORT_CONTAINER_ID,
+    SWIFT_IMPORT_CONTAINER_ID,
+    KOTLIN_IMPORT_CONTAINER_ID,
+    CSHARP_IMPORT_CONTAINER_ID,
+    CPP_IMPORT_CONTAINER_ID,
+    QML_IMPORT_CONTAINER_ID,
     DOCS_IMPORT_CONTAINER_ID,
 ];
 

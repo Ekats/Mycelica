@@ -11,7 +11,7 @@
 use std::path::Path;
 use tree_sitter::{Parser, Node};
 
-use super::types::CodeItem;
+use super::types::{CodeItem, CallRef};
 
 /// Parse a TypeScript or JavaScript file and extract code items.
 pub fn parse_ts_file(path: &Path) -> Result<Vec<CodeItem>, String> {
@@ -163,6 +163,9 @@ fn extract_function(
 
     let visibility = if is_exported { "export".to_string() } else { String::new() };
     let doc_comment = extract_leading_comment(node, content);
+    let calls = node.child_by_field_name("body")
+        .map(|body| extract_calls(body, content))
+        .unwrap_or_default();
 
     Some(CodeItem {
         name,
@@ -178,6 +181,7 @@ fn extract_function(
         is_unsafe: false,
         impl_for: None,
         impl_trait: None,
+        calls,
     })
 }
 
@@ -256,6 +260,10 @@ fn extract_variable_declarator(
             format!("const {} = {}{} => ...", name, async_prefix, params)
         };
 
+        let calls = value_node.child_by_field_name("body")
+            .map(|body| extract_calls(body, content))
+            .unwrap_or_default();
+
         Some(CodeItem {
             name,
             item_type: "function".to_string(),
@@ -270,6 +278,7 @@ fn extract_variable_declarator(
             is_unsafe: false,
             impl_for: None,
             impl_trait: None,
+            calls,
         })
     } else {
         // It's an exported constant
@@ -293,6 +302,7 @@ fn extract_variable_declarator(
             is_unsafe: false,
             impl_for: None,
             impl_trait: None,
+        calls: Vec::new(),
         })
     }
 }
@@ -344,6 +354,7 @@ fn extract_class(
         is_unsafe: false,
         impl_for: None,
         impl_trait: None,
+        calls: Vec::new(),
     })
 }
 
@@ -394,6 +405,7 @@ fn extract_interface(
         is_unsafe: false,
         impl_for: None,
         impl_trait: None,
+        calls: Vec::new(),
     })
 }
 
@@ -418,7 +430,7 @@ fn extract_type_alias(
     // Get the type value (abbreviated if long)
     let type_value = node.child_by_field_name("value")
         .and_then(|n| get_node_text(n, content))
-        .map(|v| if v.len() > 50 { format!("{}...", &v[..47]) } else { v })
+        .map(|v| if v.len() > 50 { format!("{}...", crate::utils::safe_truncate(&v, 47)) } else { v })
         .unwrap_or_default();
 
     let signature = format!("type {}{} = {}", name, type_params, type_value);
@@ -440,6 +452,7 @@ fn extract_type_alias(
         is_unsafe: false,
         impl_for: None,
         impl_trait: None,
+        calls: Vec::new(),
     })
 }
 
@@ -479,6 +492,7 @@ fn extract_enum(
         is_unsafe: false,
         impl_for: None,
         impl_trait: None,
+        calls: Vec::new(),
     })
 }
 
@@ -515,12 +529,55 @@ fn extract_module(
         is_unsafe: false,
         impl_for: None,
         impl_trait: None,
+        calls: Vec::new(),
     })
 }
 
 // ============== Helper Functions ==============
 
 /// Get text content of a node.
+fn extract_calls(node: Node, content: &str) -> Vec<CallRef> {
+    let mut calls = Vec::new();
+    collect_calls(node, content, &mut calls);
+    calls
+}
+
+fn collect_calls(node: Node, content: &str, calls: &mut Vec<CallRef>) {
+    if node.kind() == "call_expression" {
+        if let Some(func_node) = node.child_by_field_name("function") {
+            match func_node.kind() {
+                "identifier" => {
+                    if let Some(name) = get_node_text(func_node, content) {
+                        calls.push(CallRef {
+                            name,
+                            receiver: None,
+                            line: func_node.start_position().row + 1,
+                        });
+                    }
+                }
+                "member_expression" => {
+                    if let Some(prop) = func_node.child_by_field_name("property") {
+                        if let Some(name) = get_node_text(prop, content) {
+                            let receiver = func_node.child_by_field_name("object")
+                                .and_then(|n| get_node_text(n, content));
+                            calls.push(CallRef {
+                                name,
+                                receiver,
+                                line: prop.start_position().row + 1,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_calls(child, content, calls);
+    }
+}
+
 fn get_node_text(node: Node, content: &str) -> Option<String> {
     node.utf8_text(content.as_bytes())
         .ok()
@@ -737,5 +794,17 @@ export function Button({ label }: { label: string }) {
 "#, ".tsx");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "Button");
+    }
+
+    /// Same byte-slice truncation as the Go parser, on type alias values.
+    /// Padded three ways so one lands mid-character whatever the cut offset is.
+    #[test]
+    fn test_parse_type_alias_with_multibyte_value_does_not_panic() {
+        for pad in 0..3 {
+            let value = format!("{}配置文件已更新测试全部通过继续下一步 ✔ 🚀", "x".repeat(pad));
+            let items = parse_code(&format!("export type Notice = \"{value}\";\n"), ".ts");
+            let t = items.iter().find(|i| i.name == "Notice").expect("type parsed");
+            assert!(t.signature.as_ref().unwrap().ends_with("..."), "pad {pad}");
+        }
     }
 }

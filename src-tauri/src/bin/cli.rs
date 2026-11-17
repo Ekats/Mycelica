@@ -1666,15 +1666,6 @@ enum ExportCommands {
 
 #[derive(Subcommand)]
 enum AnalyzeCommands {
-    /// Analyze code and create "Calls" edges between functions
-    CodeEdges {
-        /// Only analyze functions from this path prefix
-        #[arg(long)]
-        path: Option<String>,
-        /// Dry run - show what would be created without inserting
-        #[arg(long)]
-        dry_run: bool,
-    },
     /// Create "Documents" edges from docs to code they reference
     DocEdges,
 }
@@ -2230,8 +2221,36 @@ pub(crate) struct CodeUpdateSummary {
     pub node_ids: Vec<String>,
     /// Stale nodes cleaned (from files that no longer exist on disk)
     pub stale_cleaned: usize,
+    /// Nodes cleaned from files still on disk but now skipped (generated or .mcaignore'd)
+    pub skipped_cleaned: usize,
     /// The raw import result (for detailed per-type counts in output)
     pub import_result: mycelica_lib::code::CodeImportResult,
+}
+
+/// Normalize a stored code `file_path` for comparison: strip the `./` prefix and
+/// the repo root (trailing slash included) so that `./src/foo.rs` and
+/// `/home/user/repo/src/foo.rs` both become `src/foo.rs`.
+fn normalize_path_for_compare(p: &str, repo_root: &str) -> String {
+    let s = p.strip_prefix("./").unwrap_or(p);
+    s.strip_prefix(repo_root).unwrap_or(s).to_string()
+}
+
+/// Same form for a file found on disk. Those are relative to the cwd, not the
+/// repo root, so make them absolute first.
+fn normalize_disk_path_for_compare(p: &str, repo_root: &str) -> String {
+    let abs = Path::new(p).canonicalize().map(|c| c.to_string_lossy().to_string());
+    normalize_path_for_compare(abs.as_deref().unwrap_or(p), repo_root)
+}
+
+/// On-disk location of a stored code `file_path`, if the stale-file pass of an
+/// update of `update_dir` should look at it. Relative paths resolve against the
+/// repo root the write side stripped (`code::repo_root_prefix`), not the cwd;
+/// legacy absolute paths are taken as-is. `None` when the file is not under
+/// `update_dir` — an update of a subtree must not judge files outside it.
+/// `update_dir` must be canonical.
+fn stale_candidate_path(db_file: &str, repo_root: &Path, update_dir: &Path) -> Option<PathBuf> {
+    let resolved = repo_root.join(db_file);
+    resolved.starts_with(update_dir).then_some(resolved)
 }
 
 /// Run a full code update: delete existing nodes for the given path, reimport,
@@ -2247,60 +2266,165 @@ pub(crate) async fn run_code_update(
     use mycelica_lib::code;
     use mycelica_lib::ai_client;
 
+    // No CLI flags for these yet; same defaults as a plain `import code`.
+    let include_nested = false;
+    let include_generated = false;
+
     // Collect files and delete existing nodes
     let file_path = std::path::Path::new(path);
+    // The database's code root, the one import strips: never the update path,
+    // which would fork node ids away from the full-import form.
+    let canon_root = code::code_root(db);
     let is_directory = file_path.is_dir();
+    let mut generated_skipped = 0;
     let files_to_process: Vec<String> = if file_path.is_file() {
         vec![path.to_string()]
     } else {
-        code::collect_code_files(file_path, language)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect()
+        let (files, skipped) = code::collect_code_files(file_path, language, include_nested, include_generated)
+            .unwrap_or_default();
+        generated_skipped = skipped;
+        files.into_iter().map(|p| p.to_string_lossy().to_string()).collect()
     };
 
     // When updating a directory, detect and clean stale nodes from deleted/moved files.
     // Compare DB file paths against files found on disk — any DB path under this directory
     // that no longer exists on disk is stale.
     let mut stale_cleaned = 0;
+    let mut skipped_cleaned = 0;
     if is_directory {
-        let disk_files: std::collections::HashSet<String> = files_to_process.iter().cloned().collect();
+        let update_dir = file_path.canonicalize().unwrap_or_else(|_| file_path.to_path_buf());
+        let disk_norms: std::collections::HashSet<String> = files_to_process
+            .iter()
+            .map(|f| normalize_disk_path_for_compare(f, &canon_root))
+            .collect();
+        // Files still on disk that are now skipped (generated or .mcaignore'd).
+        let skipped_norms: std::collections::HashSet<String> =
+            code::now_skipped_files(file_path, language, include_nested, include_generated)
+                .unwrap_or_default()
+                .iter()
+                .map(|p| normalize_disk_path_for_compare(&p.to_string_lossy(), &canon_root))
+                .collect();
         if let Ok(db_paths) = db.get_all_code_file_paths() {
             for (db_file, _count) in &db_paths {
-                // Only check paths that would be under the update directory
-                if db_file.contains(path) && !disk_files.contains(db_file) {
-                    // Verify the file truly doesn't exist (resolve relative paths)
-                    let resolved = if std::path::Path::new(db_file).is_relative() {
-                        std::path::Path::new(".").join(db_file)
-                    } else {
-                        std::path::PathBuf::from(db_file)
-                    };
-                    if !resolved.exists() {
-                        match db.delete_nodes_by_file_path(db_file) {
-                            Ok(deleted) if deleted > 0 => {
-                                if !quiet {
-                                    log!("  Cleaned {} stale nodes: {} (file no longer exists)", deleted, db_file);
-                                }
-                                stale_cleaned += deleted;
-                            }
-                            _ => {}
+                let norm = normalize_path_for_compare(db_file, &canon_root);
+                // Skip files that are still on disk (compare via normalized paths)
+                if disk_norms.contains(&norm) {
+                    continue;
+                }
+                if skipped_norms.contains(&norm) {
+                    if let Ok(deleted) = db.delete_nodes_by_file_path(db_file) {
+                        if deleted > 0 && !quiet {
+                            log!("  Cleaned {} nodes: {} (now skipped: generated or .mcaignore)", deleted, db_file);
                         }
+                        skipped_cleaned += deleted;
+                    }
+                    continue;
+                }
+                // Only check paths under the update directory
+                let Some(resolved) = stale_candidate_path(db_file, Path::new(&canon_root), &update_dir) else {
+                    continue;
+                };
+                // Verify the file truly doesn't exist
+                if !resolved.exists() {
+                    match db.delete_nodes_by_file_path(db_file) {
+                        Ok(deleted) if deleted > 0 => {
+                            if !quiet {
+                                log!("  Cleaned {} stale nodes: {} (file no longer exists)", deleted, db_file);
+                            }
+                            stale_cleaned += deleted;
+                        }
+                        _ => {}
                     }
                 }
             }
-            if stale_cleaned > 0 {
+            if stale_cleaned + skipped_cleaned > 0 {
                 // Prune dangling edges from deleted stale nodes
                 let _ = db.prune_dead_edges();
-                if !quiet {
-                    log!("[Code] Cleaned {} stale nodes from deleted/moved files", stale_cleaned);
-                }
+            }
+            if stale_cleaned > 0 && !quiet {
+                log!("[Code] Cleaned {} stale nodes from deleted/moved files", stale_cleaned);
+            }
+            if skipped_cleaned > 0 && !quiet {
+                log!("[Code] Cleaned {} nodes from files that are now skipped", skipped_cleaned);
             }
         }
     }
 
-    let mut total_deleted = 0;
+    // Build lookup: normalized path → (all raw DB paths, max updated_at across formats).
+    // A single file can have nodes stored under both ./relative and /absolute paths.
+    let mut db_file_times: std::collections::HashMap<String, (Vec<String>, i64)> =
+        std::collections::HashMap::new();
+    for (db_path, _count) in db.get_all_code_file_paths().unwrap_or_default() {
+        if let Ok(Some(ts)) = db.get_max_updated_at_for_file(&db_path) {
+            let norm = normalize_path_for_compare(&db_path, &canon_root);
+            let entry = db_file_times.entry(norm).or_insert_with(|| (Vec::new(), 0));
+            entry.0.push(db_path);
+            if ts > entry.1 {
+                entry.1 = ts;
+            }
+        }
+    }
+
+    // Filter to only files that changed since last import (by mtime vs DB updated_at).
+    let mut changed_files: Vec<String> = Vec::new();
+    let mut changed_db_paths: Vec<String> = Vec::new();
+    let mut skipped_unchanged = 0;
     for file in &files_to_process {
+        let norm = normalize_disk_path_for_compare(file, &canon_root);
+        let file_changed = match std::fs::metadata(file) {
+            Ok(meta) => {
+                let mtime_ms = meta.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                match db_file_times.get(&norm) {
+                    Some((_, db_ts)) => mtime_ms > *db_ts,
+                    None => true,
+                }
+            }
+            Err(_) => true,
+        };
+        if file_changed {
+            if let Some((db_paths, _)) = db_file_times.get(&norm) {
+                changed_db_paths.extend(db_paths.iter().cloned());
+            }
+            changed_files.push(file.clone());
+        } else {
+            skipped_unchanged += 1;
+        }
+    }
+    if !quiet && skipped_unchanged > 0 {
+        log!("[Code] Skipped {} unchanged files", skipped_unchanged);
+    }
+
+    // Snapshot the edges this importer does not own before the delete below
+    // takes them out. `delete_nodes_by_file_path` drops every edge on a file's
+    // nodes, and only `calls`/`defined_in`/`documents` get regenerated — so
+    // hand-made edges and hierarchy placements on code nodes used to die on
+    // every reimport. Fails the update rather than proceeding blind: losing
+    // them silently is the bug being fixed.
+    let mut snapshot_paths: Vec<String> = changed_db_paths.clone();
+    snapshot_paths.extend(changed_files.iter().cloned());
+    let preserved_edges = db
+        .snapshot_foreign_edges_for_files(&snapshot_paths, code::IMPORTER_OWNED_EDGE_TYPES)
+        .map_err(|e| format!("Failed to snapshot non-importer edges: {}", e))?;
+
+    // Delete existing nodes using every known DB path format for changed files
+    let mut total_deleted = 0;
+    for db_path in &changed_db_paths {
+        match db.delete_nodes_by_file_path(db_path) {
+            Ok(deleted) if deleted > 0 => {
+                if !quiet {
+                    log!("  Deleted {} nodes from {}", deleted, db_path);
+                }
+                total_deleted += deleted;
+            }
+            _ => {}
+        }
+    }
+    // Also delete using the canonical disk path (covers formats not yet in DB)
+    for file in &changed_files {
         match db.delete_nodes_by_file_path(file) {
             Ok(deleted) if deleted > 0 => {
                 if !quiet {
@@ -2315,120 +2439,73 @@ pub(crate) async fn run_code_update(
         log!("[Code] Deleted {} existing nodes", total_deleted);
     }
 
-    // Reimport
-    let result = code::import_code(db, path, language)?;
+    // Reimport only changed files
+    let mut result = if changed_files.is_empty() {
+        mycelica_lib::code::CodeImportResult::default()
+    } else if changed_files.len() == files_to_process.len() {
+        code::import_code(db, path, language, include_nested, include_generated)?
+    } else {
+        code::import_code_files(db, &changed_files, language)?
+    };
+    result.generated_skipped = generated_skipped;
 
-    // Generate embeddings and refresh edges
+    // Put the foreign edges back now that the reimport has rewritten the nodes
+    // under their original ids (a node id is a hash of repo-relative path plus
+    // symbol, so it is stable across reimports). Edges whose other endpoint did
+    // not survive are dropped by restore_edges.
+    let edges_restored = db
+        .restore_edges(&preserved_edges)
+        .map_err(|e| format!("Failed to restore non-importer edges: {}", e))?;
+    if !quiet && !preserved_edges.is_empty() {
+        log!(
+            "[Code] Restored {}/{} non-importer edges",
+            edges_restored,
+            preserved_edges.len()
+        );
+    }
+
+    // Embed exactly the nodes the import wrote. (Looking them up by disk path
+    // finds nothing: nodes store repo-relative paths.)
     let mut embeddings_generated = 0;
-    let mut calls_edges_created = 0;
-    let mut new_node_ids: Vec<String> = Vec::new();
-
-    if result.total_items() > 0 {
-        // Collect newly imported node IDs
-        for file in &files_to_process {
-            if let Ok(ids) = db.get_node_ids_by_file_path(file) {
-                new_node_ids.extend(ids);
-            }
+    let new_node_ids = result.node_ids.clone();
+    if !new_node_ids.is_empty() {
+        if !quiet {
+            log!("[Code] Generating embeddings for {} nodes...", new_node_ids.len());
         }
-
-        // Generate embeddings for nodes without them
-        if !new_node_ids.is_empty() {
-            if !quiet {
-                log!("[Code] Generating embeddings for {} nodes...", new_node_ids.len());
-            }
-            for node_id in &new_node_ids {
-                if db.get_node_embedding(node_id).ok().flatten().is_none() {
-                    if let Ok(Some(node)) = db.get_node(node_id) {
-                        let file_path = node.tags.as_ref()
-                            .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
-                            .and_then(|v| v.get("file_path").and_then(|s| s.as_str()).map(|s| s.to_string()));
-                        let text = if let Some(fp) = file_path {
-                            format!("[{}] {}\n{}", fp, node.title, node.content.as_deref().unwrap_or(""))
-                        } else {
-                            format!("{}\n{}", node.title, node.content.as_deref().unwrap_or(""))
-                        };
-                        let embed_text = utils::safe_truncate(&text, 1000);
-                        if let Ok(embedding) = ai_client::generate_embedding(embed_text).await {
-                            db.update_node_embedding(node_id, &embedding).ok();
-                            embeddings_generated += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Refresh Calls edges for functions
-        let functions: Vec<_> = new_node_ids.iter()
-            .filter_map(|id| db.get_node(id).ok().flatten())
-            .filter(|n| n.content_type.as_deref() == Some("code_function"))
-            .collect();
-
-        if !functions.is_empty() {
-            if !quiet {
-                log!("[Code] Refreshing Calls edges for {} functions...", functions.len());
-            }
-
-            let all_functions: Vec<_> = db.get_items()
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .filter(|n| n.content_type.as_deref() == Some("code_function"))
-                .collect();
-
-            let fn_name_to_id: std::collections::HashMap<String, String> = all_functions.iter()
-                .filter_map(|f| {
-                    let title = &f.title;
-                    let name = title.split('(').next()
-                        .and_then(|s| s.split_whitespace().last())
-                        .map(|s| s.to_string());
-                    name.map(|n| (n, f.id.clone()))
-                })
-                .collect();
-
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64;
-
-            for func in &functions {
-                if let Some(content) = &func.content {
-                    for (fn_name, target_id) in &fn_name_to_id {
-                        if target_id != &func.id && content.contains(&format!("{}(", fn_name)) {
-                            let edge = mycelica_lib::db::Edge {
-                                id: format!("calls-{}-{}", func.id, target_id),
-                                source: func.id.clone(),
-                                target: target_id.clone(),
-                                edge_type: mycelica_lib::db::EdgeType::Calls,
-                                label: None,
-                                weight: Some(1.0),
-                                edge_source: Some("code-analysis".to_string()),
-                                evidence_id: None,
-                                confidence: None,
-                                created_at: now,
-                                updated_at: Some(now),
-                                author: None,
-                                reason: None,
-                                content: None,
-                                agent_id: None,
-                                superseded_by: None,
-                                metadata: None,
-                            };
-                            if db.insert_edge(&edge).is_ok() {
-                                calls_edges_created += 1;
-                            }
-                        }
+        for node_id in &new_node_ids {
+            if db.get_node_embedding(node_id).ok().flatten().is_none() {
+                if let Ok(Some(node)) = db.get_node(node_id) {
+                    let file_path = node.tags.as_ref()
+                        .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+                        .and_then(|v| v.get("file_path").and_then(|s| s.as_str()).map(|s| s.to_string()));
+                    let text = if let Some(fp) = file_path {
+                        format!("[{}] {}\n{}", fp, node.title, node.content.as_deref().unwrap_or(""))
+                    } else {
+                        format!("{}\n{}", node.title, node.content.as_deref().unwrap_or(""))
+                    };
+                    let embed_text = utils::safe_truncate(&text, 1000);
+                    if let Ok(embedding) = ai_client::generate_embedding(embed_text).await {
+                        db.update_node_embedding(node_id, &embedding).ok();
+                        embeddings_generated += 1;
                     }
                 }
             }
         }
     }
 
+    // Any node written or deleted makes the cached HNSW index stale.
+    if total_deleted + stale_cleaned + skipped_cleaned + result.total_items() > 0 {
+        mycelica_lib::app_state::delete_hnsw_index(Path::new(&db.get_path()));
+    }
+
     Ok(CodeUpdateSummary {
         deleted: total_deleted,
         imported: result.total_items(),
         embeddings: embeddings_generated,
-        calls_edges: calls_edges_created,
+        calls_edges: result.call_edges,
         node_ids: new_node_ids,
         stale_cleaned,
+        skipped_cleaned,
         import_result: result,
     })
 }
@@ -2611,6 +2688,7 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
                     if summary.embeddings > 0 { log!("  Embeddings generated: {}", summary.embeddings); }
                     if summary.calls_edges > 0 { log!("  Calls edges refreshed: {}", summary.calls_edges); }
                     if summary.stale_cleaned > 0 { log!("  Stale nodes cleaned: {}", summary.stale_cleaned); }
+                    if summary.skipped_cleaned > 0 { log!("  Nodes cleaned from now-skipped files: {}", summary.skipped_cleaned); }
                     if result.files_skipped > 0 {
                         log!("  Files skipped: {}", result.files_skipped);
                     }
@@ -2626,7 +2704,7 @@ async fn handle_import(cmd: ImportCommands, db: &Database, json: bool, quiet: bo
                 }
             } else {
                 // Non-update: plain import (no delete, no embeddings, no edge refresh)
-                let result = code::import_code(db, &path, language.as_deref())?;
+                let result = code::import_code(db, &path, language.as_deref(), false, false)?;
 
                 if json {
                     println!("{}", serde_json::to_string(&result).map_err(|e| e.to_string())?);
@@ -5449,90 +5527,15 @@ async fn handle_setup(db: &Database, skip_pipeline: bool, include_code: bool, al
     log!("▶ STEP 3/7: Code Analysis");
     log!("───────────────────────────────────────────────────────────");
 
-    let code_functions: Vec<_> = items.iter()
-        .filter(|n| n.content_type.as_deref() == Some("code_function"))
-        .collect();
-
-    if !code_functions.is_empty() {
-        log!("Analyzing {} code functions for call relationships...", code_functions.len());
-        // Run analyze_code_edges inline (simplified version)
-        use std::collections::{HashMap, HashSet};
-
-        // Build function name -> id map
-        let mut name_to_id: HashMap<String, String> = HashMap::new();
-        for func in &code_functions {
-            if let Some(name) = extract_function_name(&func.title) {
-                name_to_id.insert(name, func.id.clone());
-            }
-        }
-
-        // Get existing Calls edges
-        let existing_edges: HashSet<(String, String)> = db
-            .get_all_edges()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|e| e.edge_type == EdgeType::Calls)
-            .map(|e| (e.source, e.target))
-            .collect();
-
-        let mut edges_created = 0;
-        for func in &code_functions {
-            let content = match &func.content {
-                Some(c) => c,
-                None => continue,
-            };
-
-            let caller_name = extract_function_name(&func.title).unwrap_or_default();
-            let called_names = find_called_functions(content, &name_to_id);
-
-            for called_name in called_names {
-                if called_name == caller_name {
-                    continue;
-                }
-
-                if let Some(callee_id) = name_to_id.get(&called_name) {
-                    if existing_edges.contains(&(func.id.clone(), callee_id.clone())) {
-                        continue;
-                    }
-
-                    let edge = mycelica_lib::db::Edge {
-                        id: format!("edge-call-{}-{}", &func.id[..8.min(func.id.len())], &callee_id[..8.min(callee_id.len())]),
-                        source: func.id.clone(),
-                        target: callee_id.clone(),
-                        edge_type: EdgeType::Calls,
-                        label: None,
-                        weight: Some(1.0),
-                        edge_source: Some("code-analysis".to_string()),
-                        evidence_id: None,
-                        confidence: Some(0.8),
-                        created_at: chrono::Utc::now().timestamp_millis(),
-                        updated_at: Some(chrono::Utc::now().timestamp_millis()),
-                        author: None,
-                        reason: None,
-                        content: None,
-                        agent_id: None,
-                        superseded_by: None,
-                        metadata: None,
-                    };
-
-                    if db.insert_edge(&edge).is_ok() {
-                        edges_created += 1;
-                    }
-                }
-            }
-        }
-
-        log!("  Indexed {} function names", name_to_id.len());
-        log!("  Found {} existing call edges", existing_edges.len());
-
-        if edges_created > 0 {
-            log!("✓ Created {} new call edges", edges_created);
-        } else {
-            log!("✓ No new edges needed (already analyzed or no calls found)");
-        }
+    let call_edge_count = db.get_all_edges()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e.edge_type == EdgeType::Calls)
+        .count();
+    if call_edge_count > 0 {
+        log!("✓ {} call edges already created during import (AST-based)", call_edge_count);
     } else {
-        log!("⊘ SKIPPED (no code_function nodes found)");
-        log!("  Run 'mycelica-cli import code <path>' to import code first");
+        log!("⊘ No call edges — re-run 'mycelica-cli import code' to generate them");
     }
 
     // Step 4: Flatten hierarchy (remove empty intermediate levels)
@@ -7144,161 +7147,10 @@ fn collect_descendants(db: &Database, parent_id: &str, max_depth: usize, nodes: 
 
 async fn handle_analyze(cmd: AnalyzeCommands, db: &Database, json: bool, quiet: bool) -> Result<(), String> {
     match cmd {
-        AnalyzeCommands::CodeEdges { path, dry_run } => {
-            analyze_code_edges(db, path.as_deref(), dry_run, json, quiet)?;
-        }
         AnalyzeCommands::DocEdges => {
             analyze_doc_edges(db, json, quiet)?;
         }
     }
-    Ok(())
-}
-
-/// Analyze code and create "Calls" edges between functions.
-/// Uses simple heuristic: find identifiers in function bodies that match known function names.
-fn analyze_code_edges(
-    db: &Database,
-    path_filter: Option<&str>,
-    dry_run: bool,
-    json: bool,
-    quiet: bool,
-) -> Result<(), String> {
-    use std::collections::{HashMap, HashSet};
-    use mycelica_lib::db::EdgeType;
-
-    // Get all code function nodes
-    let all_nodes = db.get_items().map_err(|e| e.to_string())?;
-    let code_functions: Vec<_> = all_nodes
-        .iter()
-        .filter(|n| {
-            n.content_type.as_deref() == Some("code_function")
-                && n.source.as_deref().map(|s| s.starts_with("code-")).unwrap_or(false)
-        })
-        .filter(|n| {
-            // Apply path filter if provided
-            if let Some(filter) = path_filter {
-                if let Some(ref tags) = n.tags {
-                    tags.contains(filter)
-                } else {
-                    false
-                }
-            } else {
-                true
-            }
-        })
-        .collect();
-
-    if !quiet {
-        eprintln!("[Analyze] Found {} functions to analyze", code_functions.len());
-    }
-
-    // Build a map of function name -> node ID
-    // Extract function name from title (e.g., "pub fn foo_bar(...)" -> "foo_bar")
-    let mut name_to_id: HashMap<String, String> = HashMap::new();
-    for func in &code_functions {
-        if let Some(name) = extract_function_name(&func.title) {
-            name_to_id.insert(name, func.id.clone());
-        }
-    }
-
-    if !quiet {
-        eprintln!("[Analyze] Built index of {} function names", name_to_id.len());
-    }
-
-    // Get existing edges to avoid duplicates
-    let existing_edges: HashSet<(String, String)> = db
-        .get_all_edges()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|e| e.edge_type == EdgeType::Calls)
-        .map(|e| (e.source, e.target))
-        .collect();
-
-    let mut edges_created = 0;
-    let mut edges_found = Vec::new();
-
-    // For each function, scan its body for calls to other functions
-    for func in &code_functions {
-        let content = match &func.content {
-            Some(c) => c,
-            None => continue,
-        };
-
-        let caller_id = &func.id;
-        let caller_name = extract_function_name(&func.title).unwrap_or_default();
-
-        // Find all identifiers in the content that match known function names
-        let called_names = find_called_functions(content, &name_to_id);
-
-        for called_name in called_names {
-            // Don't create self-edges
-            if called_name == caller_name {
-                continue;
-            }
-
-            if let Some(callee_id) = name_to_id.get(&called_name) {
-                // Skip if edge already exists
-                if existing_edges.contains(&(caller_id.clone(), callee_id.clone())) {
-                    continue;
-                }
-
-                edges_found.push((caller_name.clone(), called_name.clone(), caller_id.clone(), callee_id.clone()));
-
-                if !dry_run {
-                    let edge = mycelica_lib::db::Edge {
-                        id: format!("calls-{}-{}", &caller_id[..8.min(caller_id.len())], &callee_id[..8.min(callee_id.len())]),
-                        source: caller_id.clone(),
-                        target: callee_id.clone(),
-                        edge_type: EdgeType::Calls,
-                        label: Some(format!("{} -> {}", caller_name, called_name)),
-                        weight: Some(1.0),
-                        edge_source: Some("code-analysis".to_string()),
-                        evidence_id: None,
-                        confidence: Some(0.8), // Heuristic confidence
-                        created_at: chrono::Utc::now().timestamp_millis(),
-                        updated_at: Some(chrono::Utc::now().timestamp_millis()),
-                        author: None,
-                        reason: None,
-                        content: None,
-                        agent_id: None,
-                        superseded_by: None,
-                        metadata: None,
-                    };
-
-                    if db.insert_edge(&edge).is_ok() {
-                        edges_created += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    // Output results
-    if json {
-        let result = serde_json::json!({
-            "functions_analyzed": code_functions.len(),
-            "edges_found": edges_found.len(),
-            "edges_created": edges_created,
-            "dry_run": dry_run,
-        });
-        println!("{}", serde_json::to_string(&result).unwrap());
-    } else {
-        println!("Analyzed {} functions", code_functions.len());
-        println!("Found {} call relationships", edges_found.len());
-
-        if dry_run {
-            println!("\nDry run - edges that would be created:");
-            for (caller, callee, _, _) in edges_found.iter().take(20) {
-                println!("  {} -> {}", caller, callee);
-            }
-            if edges_found.len() > 20 {
-                println!("  ... and {} more", edges_found.len() - 20);
-            }
-        } else {
-            println!("Created {} new Calls edges", edges_created);
-        }
-    }
-
     Ok(())
 }
 
@@ -7317,13 +7169,14 @@ fn repair_code_tags(db: &Database, path: &str, dry_run: bool) -> Result<(), Stri
     let path = Path::new(path);
 
     // Collect all code files
-    let files = code::collect_code_files(path, None)
+    let (files, _) = code::collect_code_files(path, None, false, false)
         .map_err(|e| format!("Failed to collect files: {}", e))?;
 
     log!("Found {} source files to scan", files.len());
 
     // Build a map of node_id -> correct metadata JSON
     let mut id_to_metadata: HashMap<String, String> = HashMap::new();
+    let root = code::code_root(db);
 
     for file_path in &files {
         let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -7350,7 +7203,10 @@ fn repair_code_tags(db: &Database, path: &str, dry_run: bool) -> Result<(), Stri
             _ => continue,
         };
 
-        for item in items {
+        // Ids hash the stored root-relative path, so recompute them from that form.
+        let stored_path = code::rel_path(file_path, &root);
+        for mut item in items {
+            item.file_path = stored_path.clone();
             let node_id = item.generate_id();
             let metadata = item.metadata_json();
             id_to_metadata.insert(node_id, metadata);
@@ -7623,116 +7479,22 @@ fn extract_backtick_names(content: &str) -> Vec<String> {
         .collect()
 }
 
-/// Extract function name from a title. Supports Rust, Python, and C patterns.
-fn extract_function_name(title: &str) -> Option<String> {
-    // Rust: "fn name" or "pub fn name" or "async fn name"
-    if let Some(fn_idx) = title.find("fn ") {
-        let after_fn = &title[fn_idx + 3..];
-        let name_end = after_fn
-            .find(|c: char| !c.is_alphanumeric() && c != '_')
-            .unwrap_or(after_fn.len());
-        let name = &after_fn[..name_end];
-        if !name.is_empty() {
-            return Some(name.to_string());
-        }
-    }
-
-    // Python: "def name(" or "async def name("
-    if let Some(def_idx) = title.find("def ") {
-        let after_def = &title[def_idx + 4..];
-        let name_end = after_def
-            .find(|c: char| !c.is_alphanumeric() && c != '_')
-            .unwrap_or(after_def.len());
-        let name = &after_def[..name_end];
-        if !name.is_empty() {
-            return Some(name.to_string());
-        }
-    }
-
-    // C: "type name(" - look for identifier followed by (
-    // Common C patterns: "void foo(", "int bar(", "PyObject *func(", "static void baz("
-    // Strategy: find last identifier before first '('
-    if let Some(paren_idx) = title.find('(') {
-        let before_paren = title[..paren_idx].trim_end();
-        // Find the function name (last word before paren)
-        let name_start = before_paren
-            .rfind(|c: char| !c.is_alphanumeric() && c != '_')
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        let name = &before_paren[name_start..];
-        // Skip if it looks like a keyword or type
-        let skip_words = ["if", "for", "while", "switch", "return", "sizeof", "typeof",
-                          "void", "int", "char", "float", "double", "long", "short",
-                          "unsigned", "signed", "const", "static", "inline", "struct", "enum"];
-        if !name.is_empty() && !skip_words.contains(&name) {
-            return Some(name.to_string());
-        }
-    }
-
-    None
-}
-
-/// Find function names that appear to be called in the given code content.
-/// Uses simple heuristic: identifier followed by '(' that matches a known function name.
-fn find_called_functions(content: &str, known_functions: &std::collections::HashMap<String, String>) -> Vec<String> {
-    let mut called = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    // Simple tokenization: find word boundaries and check if followed by '('
-    let chars: Vec<char> = content.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        // Skip non-identifier starts
-        if !chars[i].is_alphabetic() && chars[i] != '_' {
-            i += 1;
-            continue;
-        }
-
-        // Collect identifier
-        let start = i;
-        while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
-            i += 1;
-        }
-        let ident: String = chars[start..i].iter().collect();
-
-        // Skip whitespace
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-
-        // Check if followed by '(' - indicates a function call
-        if i < chars.len() && chars[i] == '(' {
-            // Also accept method calls like .foo() and turbofish foo::<T>()
-            if known_functions.contains_key(&ident) && !seen.contains(&ident) {
-                called.push(ident.clone());
-                seen.insert(ident);
-            }
-        }
-
-        // Skip any colons for turbofish
-        while i < chars.len() && (chars[i] == ':' || chars[i] == '<') {
-            // Skip through generic params
-            if chars[i] == '<' {
-                let mut depth = 1;
-                i += 1;
-                while i < chars.len() && depth > 0 {
-                    if chars[i] == '<' { depth += 1; }
-                    if chars[i] == '>' { depth -= 1; }
-                    i += 1;
-                }
-            } else {
-                i += 1;
-            }
-        }
-    }
-
-    called
-}
-
 // ============================================================================
 // Code Commands
 // ============================================================================
+
+/// Directory that relative code `file_path` tags resolve against: the git repo
+/// root containing the database, because that is what `import_code` strips on
+/// the write side (`code::repo_root_prefix`). Falls back to the database's own
+/// directory when it is not inside a git repo.
+fn code_path_base(db_path: &Path) -> PathBuf {
+    // A bare `--db graph.db` has an empty parent, which cannot be canonicalized.
+    let db_dir = match db_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    PathBuf::from(mycelica_lib::code::repo_root_prefix(db_dir))
+}
 
 async fn handle_code(cmd: CodeCommands, db: &Database, db_path: &PathBuf) -> Result<(), String> {
     match cmd {
@@ -7784,12 +7546,10 @@ async fn handle_code(cmd: CodeCommands, db: &Database, db_path: &PathBuf) -> Res
             let metadata: CodeMetadata = serde_json::from_str(tags)
                 .map_err(|e| format!("Failed to parse code metadata: {}.\nTags: {}", e, tags))?;
 
-            // Resolve file path - if relative, resolve from database directory
+            // Resolve file path - if relative, resolve from the repo root
             let file_path = PathBuf::from(&metadata.file_path);
             let file_path = if file_path.is_relative() {
-                // Get the directory containing the database
-                let db_dir = db_path.parent().unwrap_or(Path::new("."));
-                db_dir.join(&file_path)
+                code_path_base(db_path).join(&file_path)
             } else {
                 file_path
             };
@@ -7829,7 +7589,7 @@ async fn handle_code(cmd: CodeCommands, db: &Database, db_path: &PathBuf) -> Res
             }
         }
         CodeCommands::Stale { fix, path } => {
-            let db_dir = db_path.parent().unwrap_or(Path::new("."));
+            let base_dir = code_path_base(db_path);
 
             // Get all file paths from code nodes
             let all_paths = db.get_all_code_file_paths().map_err(|e| e.to_string())?;
@@ -7845,9 +7605,9 @@ async fn handle_code(cmd: CodeCommands, db: &Database, db_path: &PathBuf) -> Res
                     }
                 }
 
-                // Resolve relative paths from the DB directory
+                // Resolve relative paths from the repo root
                 let resolved = if PathBuf::from(file_path).is_relative() {
-                    db_dir.join(file_path)
+                    base_dir.join(file_path)
                 } else {
                     PathBuf::from(file_path)
                 };
@@ -8093,6 +7853,67 @@ pub(crate) fn escape_json(s: &str) -> String {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    // Relative code paths resolve against the git repo root holding the DB,
+    // not the DB's own directory.
+    #[test]
+    fn test_code_path_base_layouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(repo.join(".mco")).unwrap();
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        assert_eq!(code_path_base(&repo.join(".mycelica.db")), repo);
+        assert_eq!(code_path_base(&repo.join(".mco/graph.db")), repo);
+        assert_eq!(code_path_base(&repo.join("docs/.mycelica.db")), repo);
+
+        // No .git anywhere above: fall back to the DB's directory.
+        let plain = root.join("plain/.mco");
+        fs::create_dir_all(&plain).unwrap();
+        assert_eq!(code_path_base(&plain.join("graph.db")), plain);
+    }
+
+    // An update of a subtree only judges DB paths under it, resolved against
+    // the repo root rather than the cwd.
+    #[test]
+    fn test_stale_candidate_path_scope() {
+        let repo = Path::new("/r/repo");
+        let a = repo.join("a");
+
+        // Sibling of the update dir: out of scope, whatever the cwd is.
+        assert_eq!(stale_candidate_path("b/y.rs", repo, &a), None);
+        // Path-prefix, not substring: `ab/` and `b/a/` are not under `a/`.
+        assert_eq!(stale_candidate_path("ab/x.rs", repo, &a), None);
+        assert_eq!(stale_candidate_path("b/a/x.rs", repo, &a), None);
+        // Under the update dir: resolved against the repo root.
+        assert_eq!(stale_candidate_path("a/x.rs", repo, &a), Some(a.join("x.rs")));
+        assert_eq!(stale_candidate_path("./a/x.rs", repo, &a), Some(a.join("x.rs")));
+        // Updating the repo root covers everything.
+        assert_eq!(stale_candidate_path("b/y.rs", repo, repo), Some(repo.join("b/y.rs")));
+        // Legacy absolute paths are taken as-is and scoped the same way.
+        assert_eq!(stale_candidate_path("/r/repo/a/x.rs", repo, &a), Some(a.join("x.rs")));
+        assert_eq!(stale_candidate_path("/r/repo/b/y.rs", repo, &a), None);
+        assert_eq!(stale_candidate_path("/r/other/a/x.rs", repo, &a), None);
+    }
+
+    // A file found from a subdirectory cwd must compare equal to its stored
+    // repo-relative path, or the update misses the old nodes and duplicates them.
+    #[test]
+    fn test_normalize_disk_path_is_repo_relative() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(repo.join("a")).unwrap();
+        fs::write(repo.join("a/x.rs"), "").unwrap();
+        let root = format!("{}/", repo.display());
+
+        let on_disk = repo.join("a/./x.rs");
+        assert_eq!(normalize_disk_path_for_compare(&on_disk.to_string_lossy(), &root), "a/x.rs");
+        assert_eq!(normalize_path_for_compare("a/x.rs", &root), "a/x.rs");
+        assert_eq!(normalize_path_for_compare("./a/x.rs", &root), "a/x.rs");
+        assert_eq!(normalize_path_for_compare(&format!("{}a/x.rs", root), &root), "a/x.rs");
+    }
 
     #[test]
     fn test_runs_list_limit_default_is_zero() {

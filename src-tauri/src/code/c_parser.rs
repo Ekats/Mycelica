@@ -12,7 +12,7 @@
 use std::path::Path;
 use tree_sitter::{Parser, Node};
 
-use super::types::CodeItem;
+use super::types::{CodeItem, CallRef};
 
 /// Parse a C file and extract code items.
 pub fn parse_c_file(path: &Path) -> Result<Vec<CodeItem>, String> {
@@ -141,6 +141,9 @@ fn extract_function(
 
     // Extract leading comment as doc
     let doc_comment = extract_leading_comment(node, content, lines);
+    let calls = node.child_by_field_name("body")
+        .map(|body| extract_calls(body, content))
+        .unwrap_or_default();
 
     Some(CodeItem {
         name,
@@ -153,9 +156,10 @@ fn extract_function(
         visibility,
         doc_comment,
         is_async: false,
-        is_unsafe: false, // C functions are inherently "unsafe" by Rust standards
+        is_unsafe: false,
         impl_for: None,
         impl_trait: None,
+        calls,
     })
 }
 
@@ -245,6 +249,7 @@ fn extract_struct(
         is_unsafe: false,
         impl_for: None,
         impl_trait: None,
+        calls: Vec::new(),
     })
 }
 
@@ -282,6 +287,7 @@ fn extract_enum(
         is_unsafe: false,
         impl_for: None,
         impl_trait: None,
+        calls: Vec::new(),
     })
 }
 
@@ -320,6 +326,7 @@ fn extract_typedef(
         is_unsafe: false,
         impl_for: None,
         impl_trait: None,
+        calls: Vec::new(),
     })
 }
 
@@ -372,7 +379,7 @@ fn extract_macro(
         .map(|v| {
             let trimmed = v.trim();
             if trimmed.len() > 30 {
-                format!("{}...", &trimmed[..27])
+                format!("{}...", crate::utils::safe_truncate(trimmed, 27))
             } else {
                 trimmed.to_string()
             }
@@ -399,6 +406,7 @@ fn extract_macro(
         is_unsafe: false,
         impl_for: None,
         impl_trait: None,
+        calls: Vec::new(),
     })
 }
 
@@ -436,12 +444,39 @@ fn extract_macro_function(
         is_unsafe: false,
         impl_for: None,
         impl_trait: None,
+        calls: Vec::new(),
     })
 }
 
 // ============== Helper Functions ==============
 
 /// Get text content of a node.
+fn extract_calls(node: Node, content: &str) -> Vec<CallRef> {
+    let mut calls = Vec::new();
+    collect_calls(node, content, &mut calls);
+    calls
+}
+
+fn collect_calls(node: Node, content: &str, calls: &mut Vec<CallRef>) {
+    if node.kind() == "call_expression" {
+        if let Some(func_node) = node.child_by_field_name("function") {
+            if func_node.kind() == "identifier" {
+                if let Some(name) = get_node_text(func_node, content) {
+                    calls.push(CallRef {
+                        name,
+                        receiver: None,
+                        line: func_node.start_position().row + 1,
+                    });
+                }
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_calls(child, content, calls);
+    }
+}
+
 fn get_node_text(node: Node, content: &str) -> Option<String> {
     node.utf8_text(content.as_bytes())
         .ok()
@@ -688,5 +723,17 @@ int init(void) {
         assert_eq!(items.len(), 1);
         assert!(items[0].doc_comment.is_some());
         assert!(items[0].doc_comment.as_ref().unwrap().contains("Initialize"));
+    }
+
+    /// Same byte-slice truncation as the Go parser, on `#define` values.
+    /// Padded three ways so one lands mid-character whatever the cut offset is.
+    #[test]
+    fn test_parse_define_with_multibyte_value_does_not_panic() {
+        for pad in 0..3 {
+            let value = format!("{}配置文件已更新测试全部通过继续下一步", "x".repeat(pad));
+            let items = parse_code(&format!("#define NOTICE \"{value}\"\n"), ".c");
+            let d = items.iter().find(|i| i.name == "NOTICE").expect("define parsed");
+            assert!(d.signature.as_ref().unwrap().ends_with("..."), "pad {pad}");
+        }
     }
 }

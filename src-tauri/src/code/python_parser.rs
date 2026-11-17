@@ -10,7 +10,7 @@
 use std::path::Path;
 use tree_sitter::{Parser, Node};
 
-use super::types::CodeItem;
+use super::types::{CodeItem, CallRef};
 
 /// Parse a Python file and extract code items.
 pub fn parse_py_file(path: &Path) -> Result<Vec<CodeItem>, String> {
@@ -176,6 +176,10 @@ fn extract_function(
         ("function".to_string(), None) // standalone function
     };
 
+    let calls = node.child_by_field_name("body")
+        .map(|body| extract_calls(body, content))
+        .unwrap_or_default();
+
     Some(CodeItem {
         name,
         item_type,
@@ -190,6 +194,7 @@ fn extract_function(
         is_unsafe: false,
         impl_for,
         impl_trait: None,
+        calls,
     })
 }
 
@@ -240,6 +245,7 @@ fn extract_class(
         is_unsafe: false,
         impl_for: None,
         impl_trait: None,
+        calls: Vec::new(),
     })
 }
 
@@ -298,6 +304,48 @@ fn merge_doc_comment(decorators: Option<String>, doc: Option<String>) -> Option<
 // ============== Helper Functions ==============
 
 /// Get text content of a node.
+fn extract_calls(node: Node, content: &str) -> Vec<CallRef> {
+    let mut calls = Vec::new();
+    collect_calls(node, content, &mut calls);
+    calls
+}
+
+fn collect_calls(node: Node, content: &str, calls: &mut Vec<CallRef>) {
+    if node.kind() == "call" {
+        if let Some(func_node) = node.child_by_field_name("function") {
+            match func_node.kind() {
+                "identifier" => {
+                    if let Some(name) = get_node_text(func_node, content) {
+                        calls.push(CallRef {
+                            name,
+                            receiver: None,
+                            line: func_node.start_position().row + 1,
+                        });
+                    }
+                }
+                "attribute" => {
+                    if let Some(attr) = func_node.child_by_field_name("attribute") {
+                        if let Some(name) = get_node_text(attr, content) {
+                            let receiver = func_node.child_by_field_name("object")
+                                .and_then(|n| get_node_text(n, content));
+                            calls.push(CallRef {
+                                name,
+                                receiver,
+                                line: attr.start_position().row + 1,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_calls(child, content, calls);
+    }
+}
+
 fn get_node_text(node: Node, content: &str) -> Option<String> {
     node.utf8_text(content.as_bytes())
         .ok()

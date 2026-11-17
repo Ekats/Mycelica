@@ -1173,6 +1173,12 @@ fn ensure_import_containers_exist(
         (settings::JAVASCRIPT_IMPORT_CONTAINER_ID, "JavaScript Code", "📒"),
         (settings::PYTHON_IMPORT_CONTAINER_ID, "Python Code", "🐍"),
         (settings::C_IMPORT_CONTAINER_ID, "C Code", "⚙️"),
+        (settings::GO_IMPORT_CONTAINER_ID, "Go Code", "🐹"),
+        (settings::SWIFT_IMPORT_CONTAINER_ID, "Swift Code", "🐦"),
+        (settings::KOTLIN_IMPORT_CONTAINER_ID, "Kotlin Code", "🟣"),
+        (settings::CSHARP_IMPORT_CONTAINER_ID, "C# Code", "🎼"),
+        (settings::CPP_IMPORT_CONTAINER_ID, "C++ Code", "🔷"),
+        (settings::QML_IMPORT_CONTAINER_ID, "QML Code", "🟩"),
         (settings::DOCS_IMPORT_CONTAINER_ID, "Documentation", "📄"),
     ];
 
