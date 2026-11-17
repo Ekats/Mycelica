@@ -70,7 +70,7 @@ tokenizers = { version = "0.22", default-features = false, features = ["progress
 hf-hub = { version = "0.4", default-features = false, features = ["tokio", "ureq", "rustls-tls"] }
 
 # Code parsing
-syn = { version = "2.0", features = ["full", "parsing", "extra-traits"] }
+syn = { version = "2.0", features = ["full", "parsing", "extra-traits", "visit"] }
 quote = "1.0"
 proc-macro2 = { version = "1.0", features = ["span-locations"] }
 ignore = "0.4"

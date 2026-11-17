@@ -10,6 +10,37 @@ pub struct Database {
     path: String,
 }
 
+/// Raw `edges` rows held across a delete-and-reimport cycle.
+///
+/// Column names come from the query itself, so a future migration that adds an
+/// `edges` column is carried through without touching this type. Values stay as
+/// `rusqlite::types::Value` so the row survives verbatim — including a `type`
+/// string the `EdgeType` enum has never heard of.
+#[derive(Debug, Default, Clone)]
+pub struct EdgeSnapshot {
+    columns: Vec<String>,
+    rows: Vec<Vec<rusqlite::types::Value>>,
+    source_idx: usize,
+    target_idx: usize,
+}
+
+impl EdgeSnapshot {
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    fn endpoint<'a>(&self, values: &'a [rusqlite::types::Value], idx: usize) -> Option<&'a str> {
+        match values.get(idx) {
+            Some(rusqlite::types::Value::Text(s)) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+}
+
 impl Database {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_str = path.as_ref().to_string_lossy().to_string();
@@ -1383,6 +1414,116 @@ impl Database {
         Ok(deleted)
     }
 
+    /// Capture every `edges` row touching the nodes of `file_paths` whose type is
+    /// NOT in `importer_owned_types`, so a delete-and-reimport of those files can
+    /// put them back.
+    ///
+    /// `delete_nodes_by_file_path` wipes every edge on a file's nodes, and the
+    /// importer only regenerates the three types it writes itself. Anything else —
+    /// reasoningbank's `derives_from` anchors above all — was gone for good.
+    ///
+    /// Rows are carried verbatim as raw column values rather than as `Edge`:
+    /// `row_to_edge` collapses any type string `EdgeType` does not know into
+    /// `Related`, which would silently rewrite an edge from a producer outside
+    /// this crate (reasoningbank writes `derives_from` from Go) instead of
+    /// preserving it.
+    pub fn snapshot_foreign_edges_for_files(
+        &self,
+        file_paths: &[String],
+        importer_owned_types: &[&str],
+    ) -> Result<EdgeSnapshot> {
+        if file_paths.is_empty() {
+            return Ok(EdgeSnapshot::default());
+        }
+        let conn = self.conn()?;
+
+        let type_ph: Vec<String> = (1..=importer_owned_types.len())
+            .map(|i| format!("?{}", i))
+            .collect();
+        let path_ph: Vec<String> = (1..=file_paths.len())
+            .map(|i| format!("?{}", i + importer_owned_types.len()))
+            .collect();
+        let sql = format!(
+            "SELECT e.* FROM edges e \
+             WHERE e.type NOT IN ({}) \
+               AND EXISTS (SELECT 1 FROM nodes n \
+                           WHERE JSON_EXTRACT(n.tags, '$.file_path') IN ({}) \
+                             AND (n.id = e.source_id OR n.id = e.target_id))",
+            type_ph.join(", "),
+            path_ph.join(", "),
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let columns: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+        let source_idx = columns.iter().position(|c| c == "source_id").unwrap_or(1);
+        let target_idx = columns.iter().position(|c| c == "target_id").unwrap_or(2);
+
+        let mut args: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        for t in importer_owned_types {
+            args.push(t);
+        }
+        for p in file_paths {
+            args.push(p);
+        }
+
+        let n = columns.len();
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args), move |row| {
+                let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(n);
+                for i in 0..n {
+                    values.push(row.get(i)?);
+                }
+                Ok(values)
+            })?
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(EdgeSnapshot { columns, rows, source_idx, target_idx })
+    }
+
+    /// Re-insert a snapshot taken by `snapshot_foreign_edges_for_files`, skipping
+    /// any row whose endpoints did not both come back — a symbol can genuinely
+    /// disappear from a file, and `edges` has FK constraints on both columns.
+    /// `INSERT OR IGNORE` makes a restore idempotent against an edge the reimport
+    /// happened to recreate. Returns the number of rows actually restored.
+    pub fn restore_edges(&self, snapshot: &EdgeSnapshot) -> Result<usize> {
+        if snapshot.rows.is_empty() {
+            return Ok(0);
+        }
+        let placeholders: Vec<String> = (1..=snapshot.columns.len())
+            .map(|i| format!("?{}", i))
+            .collect();
+        let sql = format!(
+            "INSERT OR IGNORE INTO edges ({}) VALUES ({})",
+            snapshot.columns.join(", "),
+            placeholders.join(", "),
+        );
+
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let mut restored = 0;
+        {
+            let mut endpoint = tx.prepare("SELECT 1 FROM nodes WHERE id = ?1")?;
+            let mut insert = tx.prepare(&sql)?;
+            for values in &snapshot.rows {
+                let source = snapshot.endpoint(values, snapshot.source_idx);
+                let target = snapshot.endpoint(values, snapshot.target_idx);
+                match (source, target) {
+                    (Some(s), Some(t)) => {
+                        if !endpoint.exists(params![s])? || !endpoint.exists(params![t])? {
+                            continue;
+                        }
+                    }
+                    _ => continue,
+                }
+                let args: Vec<&dyn rusqlite::ToSql> =
+                    values.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+                restored += insert.execute(rusqlite::params_from_iter(args))?;
+            }
+        }
+        tx.commit()?;
+        Ok(restored)
+    }
+
     /// Get all distinct file paths stored in code node tags.
     /// Returns (file_path, node_count) pairs sorted by file_path.
     pub fn get_all_code_file_paths(&self) -> Result<Vec<(String, usize)>> {
@@ -1431,6 +1572,15 @@ impl Database {
         let deleted = conn.execute(
             "DELETE FROM edges WHERE type = ?1 AND (edge_source = 'ai' OR edge_source IS NULL)",
             params![edge_type],
+        )?;
+        Ok(deleted)
+    }
+
+    pub fn delete_edges_by_type_and_source(&self, edge_type: &str, edge_source: &str) -> Result<usize> {
+        let conn = self.conn()?;
+        let deleted = conn.execute(
+            "DELETE FROM edges WHERE type = ?1 AND edge_source = ?2",
+            params![edge_type, edge_source],
         )?;
         Ok(deleted)
     }
