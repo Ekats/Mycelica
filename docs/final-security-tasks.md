@@ -86,7 +86,7 @@ First, find where the team frontend lives:
 - Check tauri.team.conf.json for the frontend dev/build paths
 - Check package.json or any npm workspace config
 - If there's a shared src/ with team-specific components, find them
-- Run: find /home/ekats/Repos/Mycelica -name "*.tsx" -path "*team*" -o -name "*.tsx" -path "*Team*" -o -name "*.tsx" -path "*Settings*" | head -20
+- Run: find . -name "*.tsx" -path "*team*" -o -name "*.tsx" -path "*Team*" -o -name "*.tsx" -path "*Settings*" | head -20
 
 Once you've found the team frontend:
 
