@@ -1,6 +1,8 @@
 package orchestrate
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -57,10 +59,18 @@ func TestTruncateTitle(t *testing.T) {
 }
 
 func TestFindProjectRoot(t *testing.T) {
-	// Run from somewhere under /home/spore/Mycelica which has .git
-	root := FindProjectRoot("/home/spore/Mycelica/spore/internal/orchestrate")
-	if root != "/home/spore/Mycelica" {
-		t.Errorf("FindProjectRoot = %q, want /home/spore/Mycelica", root)
+	// Hermetic: a temp dir holding .git, looked up from a nested subdirectory.
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	sub := filepath.Join(root, "spore", "internal", "orchestrate")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	if got := FindProjectRoot(sub); got != root {
+		t.Errorf("FindProjectRoot = %q, want %q", got, root)
 	}
 }
 

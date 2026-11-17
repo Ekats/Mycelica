@@ -84,13 +84,16 @@ func TestEstimateComplexity_Cap(t *testing.T) {
 }
 
 func TestResolveAgentName(t *testing.T) {
-	// The Mycelica project has .claude/agents/coder.md etc.
-	projectRoot := "/home/spore/Mycelica"
-
-	// Check that coder agent file actually exists (test precondition)
-	agentFile := filepath.Join(projectRoot, ".claude", "agents", "coder.md")
-	if _, err := os.Stat(agentFile); err != nil {
-		t.Skipf("Skipping: agent file not found at %s", agentFile)
+	// Hermetic: a temp project holding .claude/agents/<role>.md.
+	projectRoot := t.TempDir()
+	agentsDir := filepath.Join(projectRoot, ".claude", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	for _, role := range []AgentRole{RoleCoder, RoleVerifier, RoleSummarizer} {
+		if err := os.WriteFile(filepath.Join(agentsDir, string(role)+".md"), nil, 0o644); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
 	}
 
 	tests := []struct {
@@ -114,12 +117,17 @@ func TestResolveAgentName(t *testing.T) {
 
 func TestResolveAgentName_Subdirectory(t *testing.T) {
 	// Should find agents from a subdirectory by walking up
-	projectRoot := "/home/spore/Mycelica"
+	projectRoot := t.TempDir()
+	agentsDir := filepath.Join(projectRoot, ".claude", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(agentsDir, string(RoleCoder)+".md"), nil, 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
 	subDir := filepath.Join(projectRoot, "src-tauri", "src")
-
-	agentFile := filepath.Join(projectRoot, ".claude", "agents", "coder.md")
-	if _, err := os.Stat(agentFile); err != nil {
-		t.Skipf("Skipping: agent file not found at %s", agentFile)
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
 	}
 
 	got := ResolveAgentName(RoleCoder, subDir)

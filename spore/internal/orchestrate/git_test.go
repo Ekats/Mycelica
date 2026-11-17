@@ -6,10 +6,14 @@ import (
 )
 
 func TestCaptureGitState_InRepo(t *testing.T) {
-	// Use the actual Mycelica repo
-	repoDir := "/home/spore/Mycelica"
+	// Use whichever repo the test is run from, found by walking up from the cwd.
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd failed: %v", err)
+	}
+	repoDir := FindProjectRoot(wd)
 	if _, err := os.Stat(repoDir + "/.git"); os.IsNotExist(err) {
-		t.Skip("not inside a git repo at /home/spore/Mycelica")
+		t.Skip("not inside a git repo")
 	}
 
 	state, err := CaptureGitState(repoDir)
@@ -95,9 +99,13 @@ func TestDiffChangedFiles_Empty(t *testing.T) {
 }
 
 func TestCaptureFileHashes_NonexistentFile(t *testing.T) {
-	repoDir := "/home/spore/Mycelica"
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd failed: %v", err)
+	}
+	repoDir := FindProjectRoot(wd)
 	if _, err := os.Stat(repoDir + "/.git"); os.IsNotExist(err) {
-		t.Skip("not inside a git repo at /home/spore/Mycelica")
+		t.Skip("not inside a git repo")
 	}
 
 	files := map[string]bool{
