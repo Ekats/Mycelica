@@ -888,33 +888,6 @@ const result = await invoke<CodeImportResult>('import_code', {
 
 ---
 
-### analyze_code_edges
-Analyze code and create "Calls" edges between functions.
-
-```rust
-fn analyze_code_edges(
-    state: State<AppState>,
-    path_filter: Option<String>,
-) -> Result<CodeEdgesResult, String>
-```
-
-**Returns:**
-```typescript
-interface CodeEdgesResult {
-  functions_analyzed: number;
-  edges_found: number;
-  edges_created: number;
-}
-```
-
-```typescript
-const result = await invoke<CodeEdgesResult>('analyze_code_edges', {
-  pathFilter: 'src/'  // optional path filter
-});
-```
-
----
-
 ## Paper Operations
 
 ### get_paper_metadata

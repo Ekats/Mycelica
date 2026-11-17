@@ -235,12 +235,9 @@ mycelica-cli export graph [--output FILE]
 
 ### analyze - Code Analysis
 
-```bash
-# Create/refresh Calls edges between functions
-mycelica-cli analyze code-edges
-mycelica-cli analyze code-edges --dry-run    # Preview without writing
-mycelica-cli analyze code-edges --path src/  # Limit to path
-```
+Calls edges between functions are produced by `import code` itself (AST-based, via
+`resolve_call_edges`); there is no separate command. Re-run
+`mycelica-cli import code <path> --update` to refresh them.
 
 ### code - Code Intelligence
 
@@ -352,7 +349,7 @@ mycelica-cli --json node search "rust" | jq '.[].title'
 - Interactive TUI
 - Setup wizard
 - Shell completions
-- Code call graph analysis (`analyze code-edges`)
+- Code call graph analysis (built during `import code`)
 - Folder-based code navigation (`nav folder`)
 
 ### GUI-Only Features
