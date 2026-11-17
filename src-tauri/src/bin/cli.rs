@@ -5905,11 +5905,14 @@ async fn handle_nav(cmd: NavCommands, db: &Database, json: bool) -> Result<(), S
             #[derive(Default)]
             struct FolderNode {
                 items: Vec<(String, String)>,  // (node_id, title)
+                files: std::collections::BTreeSet<String>,  // file names directly in this dir
                 children: BTreeMap<String, FolderNode>,
             }
 
             let mut root = FolderNode::default();
             let path_filter = path.as_deref().unwrap_or("");
+            let filter_depth = if path_filter.is_empty() { 0 } else { path_filter.split('/').count() };
+            let effective_depth = depth + filter_depth;
 
             for node in &code_nodes {
                 let file_path = node.tags.as_ref()
@@ -5933,6 +5936,7 @@ async fn handle_nav(cmd: NavCommands, db: &Database, json: bool) -> Result<(), S
                     if i == parts.len() - 1 {
                         // This is the file - add item here
                         current.items.push((node.id.clone(), node.title.clone()));
+                        current.files.insert(part.to_string());
                     } else {
                         // This is a directory - descend
                         current = current.children.entry(part.to_string()).or_default();
@@ -6009,8 +6013,34 @@ async fn handle_nav(cmd: NavCommands, db: &Database, json: bool) -> Result<(), S
             let total_files = root.children.len();
 
             if json {
+                if summary {
+                    fn collect_summary(node: &FolderNode, current_path: &str, current_depth: usize, max_depth: usize, out: &mut Vec<String>) {
+                        if current_depth > max_depth { return; }
+                        let item_count = count_items(node);
+                        if item_count > 0 {
+                            out.push(format!(r#"{{"path":"{}","files":{},"items":{}}}"#,
+                                current_path, node.files.len(), item_count));
+                        }
+                        for (name, child) in &node.children {
+                            let child_path = if current_path.is_empty() {
+                                name.clone()
+                            } else {
+                                format!("{}/{}", current_path, name)
+                            };
+                            collect_summary(child, &child_path, current_depth + 1, max_depth, out);
+                        }
+                    }
+                    // Start at root's children at depth 0, like print_folder_tree. Deliberately
+                    // diverges from mco, which starts at the synthetic root and loses a depth level.
+                    let mut entries = Vec::new();
+                    for (name, child) in &root.children {
+                        collect_summary(child, name, 0, effective_depth, &mut entries);
+                    }
+                    println!("[{}]", entries.join(","));
+                } else {
                 // JSON output: flat list of paths with counts
-                fn collect_paths(node: &FolderNode, current_path: &str, paths: &mut Vec<(String, usize)>) {
+                fn collect_paths(node: &FolderNode, current_path: &str, current_depth: usize, max_depth: usize, paths: &mut Vec<(String, usize)>) {
+                    if current_depth > max_depth { return; }
                     if !node.items.is_empty() {
                         paths.push((current_path.to_string(), node.items.len()));
                     }
@@ -6020,15 +6050,19 @@ async fn handle_nav(cmd: NavCommands, db: &Database, json: bool) -> Result<(), S
                         } else {
                             format!("{}/{}", current_path, name)
                         };
-                        collect_paths(child, &child_path, paths);
+                        collect_paths(child, &child_path, current_depth + 1, max_depth, paths);
                     }
                 }
+                // Same as collect_summary: start at root's children (diverges from mco on purpose).
                 let mut paths = Vec::new();
-                collect_paths(&root, "", &mut paths);
+                for (name, child) in &root.children {
+                    collect_paths(child, name, 0, effective_depth, &mut paths);
+                }
                 let items: Vec<String> = paths.iter()
                     .map(|(p, c)| format!(r#"{{"path":"{}","count":{}}}"#, p, c))
                     .collect();
                 println!("[{}]", items.join(","));
+                }
             } else {
                 if path_filter.is_empty() {
                     println!("Code folder tree ({} items in {} top-level dirs):\n", total_items, total_files);
@@ -6038,7 +6072,7 @@ async fn handle_nav(cmd: NavCommands, db: &Database, json: bool) -> Result<(), S
 
                 // Print from root children (skip empty root)
                 for (name, child_node) in &root.children {
-                    print_folder_tree(name, child_node, "", 0, depth, summary, false);
+                    print_folder_tree(name, child_node, "", 0, effective_depth, summary, false);
                 }
 
                 if total_items == 0 {
