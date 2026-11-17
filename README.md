@@ -93,9 +93,12 @@ Download from [Releases](https://github.com/Ekats/Mycelica/releases):
 git clone https://github.com/Ekats/Mycelica.git
 cd Mycelica
 npm install
-npm run tauri dev    # Development
-npm run tauri build  # Production
+make sidecar             # Build the CLI sidecar the GUI bundles (see Build the CLI below)
+npm run tauri:dev        # Development (passes --features gui)
+npm run tauri:build      # Production (passes --features gui, then builds the AppImage)
 ```
+
+Alternatively, `make dev` / `make app` do the same (sidecar included); `make dev-team` / `make team` build with `--features gui,team`.
 
 ### API Keys & LLM Backend
 
@@ -119,13 +122,13 @@ Mycelica includes a headless CLI for scripting, automation, and server use.
 ```bash
 cd src-tauri
 
-# Install globally with CUDA (recommended, requires nightly)
-cargo +nightly install --path . --bin mycelica-cli --features cuda --force
+# Install globally (--features mcp is required for spore agent support)
+cargo install --path . --bin mycelica-cli --features mcp --force
 
 # Copy to sidecar location (required for GUI to spawn CLI)
 cp ~/.cargo/bin/mycelica-cli binaries/mycelica-cli-x86_64-unknown-linux-gnu
 
-# CPU-only build (no nightly required)
+# Local build without installing (binary in target/release/)
 cargo build --release --bin mycelica-cli
 ```
 
